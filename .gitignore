@@ -1,0 +1,27 @@
+# System and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Build and dependencies
+target/
+node_modules/
+
+# Service files
+*.log
+*.tmp
+*.orig
+*.rej
+
+# Secrets and local notes
+.env
+.env.*
+!.env.example
+*.local.*
+.ssh/
+
+# Agent working copies (git worktree)
+.claude/
