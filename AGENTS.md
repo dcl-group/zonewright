@@ -129,6 +129,11 @@ document with its reason, so the maintainer can overrule it.
   set of providers is dispatched through an enum, not `dyn Trait`.
 - Check every dependency version and feature name against current documentation (context7, docs.rs)
   before adding it. Do not rely on memory.
+- Always prefer the latest stable release of a dependency. The only reasons to stay on an older one
+  are a bug in the latest release that affects the crate, a security vulnerability in it, or a
+  critical incompatibility with the rest of the stack that has to be waited out. Each such exception
+  is recorded next to the version in `Cargo.toml` with its reason, and lifted when the reason is
+  gone.
 - Gates: `cargo fmt --check`, `cargo clippy`, `cargo deny check`, `cargo test`. CI builds with no
   features, with each feature alone and with all features (`cargo hack --each-feature`).
 - Tests run against mocks. Live-API tests are `#[ignore]`, read credentials from environment
