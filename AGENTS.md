@@ -178,3 +178,19 @@ Not formatted: `target/`, lock files, test fixtures (compared byte for byte).
 - Create and merge branches only on the maintainer's instruction.
 - The remote is `origin` (`git@github.com:dcl-vc/zonewright.git`), default branch `main`.
 - Never push without an explicit instruction for that push.
+
+### Branches and releases
+
+- `main` is the development trunk. It always builds and passes the gates, and it may contain work
+  that is not released yet. Its history is never rewritten.
+- A release is an annotated tag `vX.Y.Z` on a commit of `main`. A published tag is never moved or
+  deleted: builds of other projects are pinned to it.
+- Work reaches `main` from short-lived branches, one per task.
+- A version branch `X.Y.x` is created only when it is needed: `main` already carries incompatible
+  work for the next version and an older line needs a fix. It starts from the last tag of that line.
+  The fix lands in `main` first, is then cherry-picked to the version branch, and the new tag is put
+  there.
+- Version numbers follow [Semantic Versioning 2.0.0](https://semver.org/) as Cargo applies it
+  ([SemVer compatibility](https://doc.rust-lang.org/cargo/reference/semver.html)). Before 1.0 Cargo
+  treats the second number as the breaking one: an incompatible change to the public API raises it
+  (`0.1.z` → `0.2.0`); anything else raises the third.
