@@ -55,10 +55,20 @@ pub(crate) fn ca() -> (rcgen::Certificate, Issuer<'static, KeyPair>) {
 pub(crate) fn server_cert(
     issuer: &Issuer<'static, KeyPair>,
 ) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
-    let mut params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).unwrap();
+    server_cert_for(issuer, &["127.0.0.1"])
+}
+
+/// A server certificate for `names` (host names or IP addresses) signed by `issuer`, with its
+/// key.
+pub(crate) fn server_cert_for(
+    issuer: &Issuer<'static, KeyPair>,
+    names: &[&str],
+) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+    let mut params = CertificateParams::new(names.clone()).unwrap();
     params
         .distinguished_name
-        .push(DnType::CommonName, "127.0.0.1");
+        .push(DnType::CommonName, names[0].as_str());
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     validity(&mut params);

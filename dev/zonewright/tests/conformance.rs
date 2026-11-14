@@ -1136,6 +1136,7 @@ fn error_kind_identifiers_are_stable() {
             "name_outside_zone",
         ),
         (Error::zone_not_found(dn("example.org")), "zone_not_found"),
+        (Error::proxy_auth(), "proxy_auth"),
         (Error::auth("x"), "auth"),
         (Error::forbidden("x"), "forbidden"),
         (Error::rate_limited(None), "rate_limited"),

@@ -86,6 +86,18 @@ pub enum Error {
         zone: DomainName,
     },
 
+    /// The proxy of the context ([`ContextOptions::proxy`]) refused the proxy credentials, or
+    /// demanded credentials that were not configured: an HTTP proxy answered `407`, or a SOCKS5
+    /// proxy refused the username and password (RFC 1929) or the authentication method offered.
+    /// The credentials belong to the configuration of the context, not to the provider, so this
+    /// is never [`Error::Auth`]. Not retryable; the text is fixed and names neither the proxy nor
+    /// a credential.
+    ///
+    /// [`ContextOptions::proxy`]: crate::ContextOptions::proxy
+    #[error("the proxy refused the proxy credentials; check proxy.username and proxy.password")]
+    #[non_exhaustive]
+    ProxyAuth {},
+
     /// The provider did not accept the credentials.
     #[error("provider authentication failed: {detail}")]
     #[non_exhaustive]
@@ -170,6 +182,7 @@ impl Error {
             Error::InvalidInput { .. } => ErrorKind::InvalidInput,
             Error::NameOutsideZone { .. } => ErrorKind::NameOutsideZone,
             Error::ZoneNotFound { .. } => ErrorKind::ZoneNotFound,
+            Error::ProxyAuth { .. } => ErrorKind::ProxyAuth,
             Error::Auth { .. } => ErrorKind::Auth,
             Error::Forbidden { .. } => ErrorKind::Forbidden,
             Error::RateLimited { .. } => ErrorKind::RateLimited,
@@ -252,6 +265,12 @@ impl Error {
     #[must_use]
     pub fn zone_not_found(zone: DomainName) -> Error {
         Error::ZoneNotFound { zone }
+    }
+
+    /// `Error::ProxyAuth`.
+    #[must_use]
+    pub fn proxy_auth() -> Error {
+        Error::ProxyAuth {}
     }
 
     /// `Error::Auth`. The caller keeps secrets out of `detail`.
@@ -366,6 +385,8 @@ pub enum ErrorKind {
     NameOutsideZone,
     /// [`Error::ZoneNotFound`].
     ZoneNotFound,
+    /// [`Error::ProxyAuth`].
+    ProxyAuth,
     /// [`Error::Auth`].
     Auth,
     /// [`Error::Forbidden`].
@@ -397,6 +418,7 @@ impl ErrorKind {
             ErrorKind::InvalidInput => "invalid_input",
             ErrorKind::NameOutsideZone => "name_outside_zone",
             ErrorKind::ZoneNotFound => "zone_not_found",
+            ErrorKind::ProxyAuth => "proxy_auth",
             ErrorKind::Auth => "auth",
             ErrorKind::Forbidden => "forbidden",
             ErrorKind::RateLimited => "rate_limited",
@@ -484,6 +506,9 @@ mod tests {
         assert!(Error::transient("t").is_retryable());
         assert!(!Error::precondition_failed("p").is_retryable());
         assert!(!Error::rejected(Some(400), "r").is_retryable());
+        assert!(!Error::proxy_auth().is_retryable());
+        assert_eq!(Error::proxy_auth().retry_after(), None);
+        assert_eq!(Error::proxy_auth().kind(), ErrorKind::ProxyAuth);
         assert_eq!(
             Error::rate_limited(Some(Duration::from_secs(3))).retry_after(),
             Some(Duration::from_secs(3))

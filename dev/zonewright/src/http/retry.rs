@@ -18,10 +18,13 @@
 //!   `Transient`; every other status goes back to the client.
 //! - Refusals by the URL policy at send time (`loopback_only`, no CA certificates, a plain-HTTP
 //!   URL with a proxy that is not on loopback) are never retried and contact nothing.
-//! - With the context's proxy: a `407` from the proxy, to `CONNECT` or as the answer to a
-//!   forwarded request, is `Error::Config` and never retried; any other failure to reach the
-//!   provider through the proxy is a connection failure like any other (`Transient`, retried for
-//!   an idempotent request).
+//! - With the context's proxy, for a request that goes through it (its host is not excluded):
+//!   a refusal of the proxy credentials is `Error::ProxyAuth` and never retried. That is a `407`
+//!   from an HTTP proxy to `CONNECT` or as the answer to a forwarded plain-HTTP request, and a
+//!   SOCKS5 proxy's refusal of the username and password or of every offered authentication
+//!   method. A `407` that arrives through a tunnel comes from the provider and is handled like
+//!   any other status. Any other failure to reach the provider through the proxy is a
+//!   connection failure like any other (`Transient`, retried for an idempotent request).
 //! - A request with a finisher (`Request::finish_with`) is completed for every attempt, right
 //!   before it is sent, from exactly what that attempt sends.
 //! - [`Http::try_send`] reports with the error whether the request certainly never reached the
@@ -44,6 +47,7 @@ use crate::error::Error;
 use crate::redact::Detail;
 
 use super::Http;
+use super::proxy::ProxyKind;
 use super::request::{
     AuthMode, BODY_LIMIT, BODY_TOO_LARGE, Outgoing, Request, Response, TokenAuth,
 };
@@ -148,13 +152,14 @@ enum Failure {
     Finish(Error),
     /// TLS certificate verification failed, on either side. Repeating it gives the same answer.
     Certificate,
-    /// The proxy answered `CONNECT` with `407`: it refused the proxy credentials. Nothing was
-    /// sent to the provider, and repeating it gives the same answer.
+    /// The proxy refused the proxy credentials while the connection was being established
+    /// (`407` to `CONNECT`, or a SOCKS5 authentication refusal). Nothing was sent to the
+    /// provider, and repeating it gives the same answer.
     ProxyCredentials,
 }
 
 impl Failure {
-    fn from_reqwest(e: &reqwest::Error, status: Option<u16>, proxied: bool) -> Failure {
+    fn from_reqwest(e: &reqwest::Error, status: Option<u16>, route: Option<ProxyKind>) -> Failure {
         // Only the classification of a `reqwest` error is used, never its text: it can contain
         // the URL with its query string.
         //
@@ -162,12 +167,13 @@ impl Failure {
         // a connect timeout), which runs before the request is written; a request on a reused
         // connection does not go through the connector. A certificate failure is classified
         // first and never counts as unsent. With a proxy, the connector also runs the `CONNECT`
-        // exchange (and, for an `https://` proxy, the TLS handshake with it) before the TLS
-        // handshake with the provider, all before the request is written; a refused `CONNECT`
-        // is a connector error and so certainly unsent. A forwarded plain-HTTP request is
-        // written to the proxy once the connection to it stands; whatever fails after that is
-        // not a connector error.
+        // exchange (and, for an `https://` proxy, the TLS handshake with it) or the SOCKS5
+        // handshake before the TLS handshake with the provider, all before the request is
+        // written; a refused `CONNECT` or SOCKS5 handshake is a connector error and so certainly
+        // unsent. A forwarded plain-HTTP request is written to the proxy once the connection to
+        // it stands; whatever fails after that is not a connector error.
         let unsent = status.is_none() && e.is_connect();
+        let proxied = route.is_some();
         let network = |text: &'static str| Failure::Network {
             text,
             status,
@@ -177,7 +183,10 @@ impl Failure {
             Failure::Build
         } else if certificate_failure(e) {
             Failure::Certificate
-        } else if proxied && unsent && super::proxy::refused_credentials(e) {
+        } else if let Some(kind) = route
+            && unsent
+            && super::proxy::refused_credentials(e, kind)
+        {
             Failure::ProxyCredentials
         } else if e.is_timeout() {
             network("the request to the provider timed out")
@@ -359,7 +368,17 @@ impl Http {
                     }
                     return Err(protocol(BODY_TOO_LARGE));
                 }
-                Err(Failure::Certificate) if self.transport.shared.proxy.is_some() => {
+                Err(Failure::Certificate)
+                    if self
+                        .route(&request.url)
+                        .is_some_and(|kind| kind == ProxyKind::Http)
+                        && self
+                            .transport
+                            .shared
+                            .proxy
+                            .as_ref()
+                            .is_some_and(|p| p.is_tls()) =>
+                {
                     return Err(config(
                         "the TLS certificate of the provider or of the proxy, or the client certificate, was not accepted",
                     ));
@@ -371,9 +390,7 @@ impl Http {
                         ),
                     });
                 }
-                Err(Failure::ProxyCredentials) => {
-                    return Err(config(super::proxy::CREDENTIALS_REFUSED));
-                }
+                Err(Failure::ProxyCredentials) => return Err(Error::ProxyAuth {}),
                 Err(Failure::Build) => {
                     return Err(Error::InvalidInput {
                         detail: Detail::constant("the HTTP request could not be built"),
@@ -393,10 +410,15 @@ impl Http {
 
             let status = response.status;
             // A forwarding proxy answers a forwarded request itself when it refuses the proxy
-            // credentials. Checked before the kept statuses: with a proxy, a 407 is never the
-            // provider's answer to give to the client.
-            if status == 407 && self.transport.shared.proxy.is_some() {
-                return Err(config(super::proxy::CREDENTIALS_REFUSED));
+            // credentials. Checked before the kept statuses: for a forwarded request, a 407 is
+            // never the provider's answer to give to the client. Only a plain-HTTP request
+            // through an HTTP proxy is forwarded; an `https://` request runs in a tunnel and a
+            // SOCKS5 proxy relays bytes, so their 407 comes from the provider.
+            if status == 407
+                && request.url.scheme() == "http"
+                && self.route(&request.url) == Some(ProxyKind::Http)
+            {
+                return Err(Error::ProxyAuth {});
             }
             if request.keep.contains(&status) {
                 return Ok(response);
@@ -496,7 +518,12 @@ impl Http {
         // Plain HTTP is accepted only because it never leaves the host. Forwarded through a
         // proxy elsewhere, it would cross the network in clear text (and reach the proxy's own
         // loopback, not this host's).
-        let proxy = self.transport.shared.proxy.as_ref();
+        let proxy = self
+            .transport
+            .shared
+            .proxy
+            .as_ref()
+            .filter(|p| p.route_for(url).is_some());
         if url.scheme() == "http" && proxy.is_some_and(|p| !p.is_loopback()) {
             return Err(config(
                 "a plain-HTTP loopback URL cannot be reached through a proxy that is not on a loopback IP literal",
@@ -561,10 +588,13 @@ impl Http {
                 headers.insert(name, value);
             }
         }
-        let answer =
-            self.transport.client.execute(outgoing).await.map_err(|e| {
-                Failure::from_reqwest(&e, None, self.transport.shared.proxy.is_some())
-            })?;
+        let route = self.route(&request.url);
+        let answer = self
+            .transport
+            .client
+            .execute(outgoing)
+            .await
+            .map_err(|e| Failure::from_reqwest(&e, None, route))?;
         let status = answer.status().as_u16();
         let headers = answer.headers().clone();
         let body = read_body(answer, status).await?;
@@ -574,6 +604,15 @@ impl Http {
             body,
             token_generation: None,
         })
+    }
+
+    /// The kind of proxy a request to `url` goes through, or `None` when it goes directly.
+    fn route(&self, url: &reqwest::Url) -> Option<ProxyKind> {
+        self.transport
+            .shared
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.route_for(url))
     }
 
     /// The `tracing` event of one attempt.
@@ -623,7 +662,7 @@ async fn read_body(mut answer: reqwest::Response, status: u16) -> Result<Bytes, 
     while let Some(chunk) = answer
         .chunk()
         .await
-        .map_err(|e| Failure::from_reqwest(&e, Some(status), false))?
+        .map_err(|e| Failure::from_reqwest(&e, Some(status), None))?
     {
         if body.len().saturating_add(chunk.len()) > BODY_LIMIT {
             return Err(Failure::TooLarge { status });

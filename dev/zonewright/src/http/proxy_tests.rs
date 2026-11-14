@@ -1,11 +1,13 @@
 //! Tests of the explicit proxy (`ContextOptions::proxy`) against loopback servers: forwarding and
 //! `CONNECT` tunnels, what the proxy sees, certificate checks through a tunnel, an `https://`
-//! proxy, the error kinds and `certainly_unsent` of every way a proxy can fail, the interaction
-//! with the URL policy, `loopback_only` and the endpoint binding, the environment, and the proxy
-//! password in errors and `tracing`.
+//! proxy, a SOCKS5 proxy with and without credentials and with local or proxy-side name
+//! resolution, the exclusion list, the error kinds and `certainly_unsent` of every way a proxy
+//! can fail, the interaction with the URL policy, `loopback_only` and the endpoint binding, the
+//! environment, and the proxy password in errors, `Debug` and `tracing`.
 //!
-//! The proxy is `zonewright_mock::proxy::ProxyServer`; the `https://` proxy is a
-//! [`TlsFront`](super::testing::TlsFront) in front of it. Timing follows the rules at the top of
+//! The HTTP proxy is `zonewright_mock::proxy::ProxyServer`; the `https://` proxy is a
+//! [`TlsFront`](super::testing::TlsFront) in front of it; the SOCKS5 proxy is
+//! `zonewright_mock::socks::SocksServer`. Timing follows the rules at the top of
 //! `tests.rs`: lower bounds only where they are the subject, generous upper bounds, and counts
 //! instead of times.
 
@@ -18,6 +20,7 @@ use secrecy::SecretString;
 use zonewright_mock::axum::Router;
 use zonewright_mock::axum::http::StatusCode;
 use zonewright_mock::proxy::{Behavior, ProxyServer};
+use zonewright_mock::socks::{Destination, SocksServer};
 use zonewright_mock::{Fault, MockServer};
 
 use crate::context::{ContextOptions, HttpProxy};
@@ -274,7 +277,7 @@ async fn an_https_proxy_is_verified_with_the_context_trust() {
 // --- a proxy that refuses, fails or stalls ---
 
 #[tokio::test]
-async fn refused_proxy_credentials_are_config_and_not_retried() {
+async fn refused_proxy_credentials_are_proxy_auth_and_not_retried() {
     let (target, ca) = https_target();
     let server = ok_server().await;
     let proxy = ProxyServer::start().await;
@@ -290,9 +293,10 @@ async fn refused_proxy_credentials_are_config_and_not_retried() {
         for request in [Request::get(url(&target.url())), post_to(&target.url())] {
             let before = proxy.log().len();
             let e = http.try_send(&request).await.unwrap_err();
-            assert_eq!(e.error().kind(), ErrorKind::Config, "{e:?}");
+            assert_eq!(e.error().kind(), ErrorKind::ProxyAuth, "{e:?}");
             assert!(!e.error().is_retryable());
-            assert!(e.error().to_string().contains("407"), "{e:?}");
+            assert_eq!(e.error().retry_after(), None);
+            assert!(e.error().to_string().contains("proxy credentials"), "{e:?}");
             assert!(e.certainly_unsent(), "{e:?}");
             assert_eq!(proxy.log().len(), before + 1);
         }
@@ -302,8 +306,7 @@ async fn refused_proxy_credentials_are_config_and_not_retried() {
         for request in [get(&server, "/x"), get(&server, "/x").keep_status(407)] {
             let before = proxy.log().len();
             let e = http.try_send(&request).await.unwrap_err();
-            assert_eq!(e.error().kind(), ErrorKind::Config, "{e:?}");
-            assert!(e.error().to_string().contains("407"), "{e:?}");
+            assert_eq!(e.error().kind(), ErrorKind::ProxyAuth, "{e:?}");
             assert!(!e.certainly_unsent(), "{e:?}");
             assert_eq!(proxy.log().len(), before + 1);
         }
@@ -473,7 +476,7 @@ async fn plain_http_is_never_forwarded_to_a_proxy_off_the_host() {
 fn proxy_settings_are_checked_by_the_context() {
     for (raw, loopback_only) in [
         ("http://user:pw-canary@127.0.0.1:3128", true),
-        ("socks5://127.0.0.1:1080", true),
+        ("socks4://127.0.0.1:1080", true),
         ("http://127.0.0.1:3128/path", true),
         ("http://192.0.2.1:3128", true),
     ] {
@@ -648,4 +651,405 @@ async fn the_proxy_password_never_reaches_errors_or_tracing() {
         !log.to_ascii_lowercase().contains("proxy-authorization"),
         "{log}"
     );
+}
+
+// --- SOCKS5 ---
+
+/// The options of [`with_proxy`] with `exclusions`.
+fn excluding(mut options: ContextOptions, exclusions: &[&str]) -> ContextOptions {
+    let list = exclusions.iter().map(|e| (*e).to_owned()).collect();
+    options.proxy = options.proxy.map(|p| p.with_exclusions(list));
+    options
+}
+
+#[tokio::test]
+async fn requests_go_through_a_socks5_proxy_without_credentials() {
+    let server = ok_server().await;
+    let (target, ca) = https_target();
+    let socks = SocksServer::start().await;
+    for scheme in ["socks5", "socks5h"] {
+        let before = socks.log().len();
+        let ctx = testing::context(ContextOptions {
+            extra_root_certificates: vec![ca.clone()],
+            ..with_proxy(&socks.url(scheme), false)
+        });
+        let http = bearer_http(&ctx, &server.base_url());
+        assert_eq!(
+            http.send(&get(&server, "/x?q=1")).await.unwrap().status(),
+            200
+        );
+        let http = testing::http(&ctx, |b| b);
+        let response = http.send(&Request::get(url(&target.url()))).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let log = socks.log();
+        assert_eq!(log.len(), before + 2, "{scheme}");
+        for (entry, addr) in log[before..].iter().zip([server.addr(), target.addr]) {
+            assert_eq!(entry.methods, [0x00], "{scheme}");
+            assert!(entry.authenticated && entry.username.is_none(), "{scheme}");
+            // An IP-literal URL is sent as an address in both modes.
+            assert_eq!(entry.destination, Some(Destination::Ip(addr)), "{scheme}");
+        }
+        // The plain-HTTP request reached the server in origin form, with the provider
+        // credential and without any proxy header.
+        let logged = server.log().last().unwrap();
+        assert_eq!(logged.path, "/x");
+        assert!(logged.header("proxy-authorization").is_none());
+        assert_eq!(
+            logged.header("authorization"),
+            Some(format!("Bearer {CANARY_KEY}").as_str())
+        );
+    }
+    assert_eq!(target.answered.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_socks5_proxy_gets_the_credentials_with_rfc_1929() {
+    let server = ok_server().await;
+    let socks = SocksServer::start().await;
+    // The canary password contains `@`, `:`-free punctuation, `/`, `+`, quotes and spaces: it is
+    // percent-encoded into the proxy URL and must arrive unchanged.
+    socks.require_credentials(PROXY_USER, CANARY_TOKEN);
+    for scheme in ["socks5", "socks5h"] {
+        let ctx = testing::context(with_proxy(&socks.url(scheme), true));
+        let http = testing::http(&ctx, |b| b);
+        assert_eq!(http.send(&get(&server, "/x")).await.unwrap().status(), 200);
+    }
+    let log = socks.log();
+    assert_eq!(log.len(), 2);
+    for entry in &log {
+        assert_eq!(entry.methods, [0x02]);
+        assert_eq!(entry.username.as_deref(), Some(PROXY_USER));
+        assert_eq!(entry.password.as_deref(), Some(CANARY_TOKEN));
+        assert!(entry.authenticated);
+    }
+    assert_eq!(server.log().len(), 2);
+}
+
+#[tokio::test]
+async fn a_refused_socks5_authentication_is_proxy_auth_and_not_retried() {
+    let server = ok_server().await;
+    let socks = SocksServer::start().await;
+    socks.require_credentials(PROXY_USER, "the-right-password");
+    // With the wrong password, and without credentials (no acceptable method).
+    for auth in [true, false] {
+        let ctx = testing::context(with_proxy(&socks.url("socks5"), auth));
+        let http = testing::http(&ctx, |b| b);
+        for request in [
+            get(&server, "/x"),
+            Request::new(Method::POST, url(&server.url("/x"))),
+        ] {
+            let before = socks.connections();
+            let e = http.try_send(&request).await.unwrap_err();
+            assert_eq!(e.error().kind(), ErrorKind::ProxyAuth, "{auth}: {e:?}");
+            assert!(!e.error().is_retryable());
+            assert!(e.certainly_unsent(), "{e:?}");
+            // One attempt, idempotent or not.
+            assert_eq!(socks.connections(), before + 1);
+        }
+    }
+    let log = socks.log();
+    assert_eq!(log.len(), 4);
+    for entry in &log[..2] {
+        assert_eq!(entry.methods, [0x02]);
+        assert_eq!(entry.password.as_deref(), Some(CANARY_TOKEN));
+        assert!(!entry.authenticated && entry.destination.is_none());
+    }
+    for entry in &log[2..] {
+        assert_eq!(entry.methods, [0x00]);
+        assert!(entry.username.is_none() && !entry.authenticated);
+    }
+    assert_eq!(server.connections(), 0);
+}
+
+#[tokio::test]
+async fn socks5_resolves_names_locally_and_socks5h_at_the_proxy() {
+    let (ca, issuer) = testing::ca();
+    let (leaf, key) = testing::server_cert_for(&issuer, &["localhost"]);
+    let target = TlsServer::start(vec![leaf], key);
+    let port = target.addr.port();
+    let named = format!("https://localhost:{port}/tls");
+    let socks = SocksServer::start().await;
+    // Not `loopback_only`, so that the URL can name a host. The name is `localhost`, and the mock
+    // proxy resolves no other, so nothing leaves the host.
+    let context = |proxy: HttpProxy| {
+        testing::context(ContextOptions {
+            loopback_only: false,
+            extra_root_certificates: vec![ca.der().to_vec()],
+            proxy: Some(proxy),
+            ..testing::options()
+        })
+    };
+    // `socks5h`: the proxy gets the name.
+    let ctx = context(HttpProxy::new(socks.url("socks5h")));
+    let http = testing::http(&ctx, |b| b);
+    let response = http.send(&Request::get(url(&named))).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        socks.log()[0].destination,
+        Some(Destination::Domain("localhost".to_owned(), port))
+    );
+    // `socks5`: the client resolved the name and the proxy gets an address. Which loopback
+    // address the resolver returns first is the platform's choice, so the outcome of the
+    // request is not the subject; a POST is not repeated.
+    let ctx = context(HttpProxy::new(socks.url("socks5")));
+    let http = testing::http(&ctx, |b| b);
+    let _ = http.send(&post_to(&named)).await;
+    let log = socks.log();
+    assert_eq!(log.len(), 2);
+    match &log[1].destination {
+        Some(Destination::Ip(addr)) => {
+            assert!(addr.ip().is_loopback() && addr.port() == port, "{addr}")
+        }
+        other => panic!("the proxy got {other:?}"),
+    }
+    // The longest credentials the crate accepts fit `hyper-util`'s handshake buffer together
+    // with a host name.
+    let password = "p".repeat(super::proxy::SOCKS_CREDENTIALS_MAX - 1);
+    socks.require_credentials("u", &password);
+    let ctx = context(
+        HttpProxy::new(socks.url("socks5h"))
+            .with_credentials("u".to_owned(), SecretString::from(password.clone())),
+    );
+    let http = testing::http(&ctx, |b| b);
+    assert_eq!(
+        http.send(&Request::get(url(&named)))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(socks.log()[2].password.as_deref(), Some(password.as_str()));
+}
+
+// --- exclusions ---
+
+/// A plain-HTTP server on `[::1]` that answers every request `200` and closes the connection:
+/// a second loopback host next to the mock servers on `127.0.0.1`. Plain HTTP, because
+/// `reqwest` 0.13.5 cannot reach an `https://` IPv6 literal through a proxy: it passes the
+/// bracketed host to `ServerName::try_from` (`connect.rs`, `connect_via_proxy` and
+/// `connect_socks`; observed on 2026-11-15).
+struct V6Server {
+    addr: std::net::SocketAddr,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl V6Server {
+    async fn start() -> V6Server {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head).into_owned();
+                    log.lock()
+                        .unwrap()
+                        .push(text.lines().next().unwrap_or("").to_owned());
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        V6Server { addr, requests }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.addr)
+    }
+}
+
+#[tokio::test]
+async fn excluded_hosts_are_reached_directly() {
+    let server = ok_server().await;
+    let v6 = V6Server::start().await;
+    let proxy = ProxyServer::start().await;
+    let options = |exclusions: &[&str]| excluding(with_proxy(&proxy.url(), true), exclusions);
+    // `127.0.0.0/8` excluded: the server on 127.0.0.1 directly, the one on [::1] through the
+    // proxy.
+    let http = testing::http(&testing::context(options(&["127.0.0.0/8"])), |b| b);
+    assert_eq!(
+        http.send(&get(&server, "/direct")).await.unwrap().status(),
+        200
+    );
+    assert!(proxy.log().is_empty());
+    assert_eq!(server.log().len(), 1);
+    let response = http.send(&Request::get(url(&v6.url("/a")))).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let log = proxy.log();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].target, v6.url("/a"));
+    // `::1` excluded: the other way round.
+    let http = testing::http(&testing::context(options(&["::1"])), |b| b);
+    assert_eq!(
+        http.send(&get(&server, "/proxied")).await.unwrap().status(),
+        200
+    );
+    let log = proxy.log();
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[1].target, server.url("/proxied"));
+    let response = http.send(&Request::get(url(&v6.url("/b")))).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(proxy.log().len(), 2);
+    assert_eq!(
+        *v6.requests.lock().unwrap(),
+        ["GET /a HTTP/1.1", "GET /b HTTP/1.1"]
+    );
+    // A SOCKS5 proxy follows the list the same way. `socks5h`, because with `socks5` `reqwest`
+    // 0.13.5 hands the bracketed IPv6 host to its resolver, which fails (`connect.rs`,
+    // `socks::connect`, `http_resolve`).
+    let socks = SocksServer::start().await;
+    let ctx = testing::context(excluding(
+        with_proxy(&socks.url("socks5h"), false),
+        &["127.0.0.1"],
+    ));
+    let http = testing::http(&ctx, |b| b);
+    assert_eq!(
+        http.send(&get(&server, "/direct")).await.unwrap().status(),
+        200
+    );
+    assert_eq!(socks.connections(), 0);
+    let response = http.send(&Request::get(url(&v6.url("/c")))).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let log = socks.log();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].destination, Some(Destination::Ip(v6.addr)));
+}
+
+#[tokio::test]
+async fn an_excluded_host_is_outside_the_proxy_rules() {
+    let server = ok_server().await;
+    let proxy = ProxyServer::start().await;
+    // Through a proxy that is not a loopback IP literal plain HTTP is refused (see
+    // `plain_http_is_never_forwarded_to_a_proxy_off_the_host`), but an excluded loopback host
+    // is reached directly.
+    let options = excluding(
+        ContextOptions {
+            loopback_only: false,
+            ..with_proxy(&format!("http://localhost:{}", proxy.addr().port()), true)
+        },
+        &["127.0.0.1"],
+    );
+    let http = testing::http(&testing::context(options), |b| b);
+    assert_eq!(http.send(&get(&server, "/x")).await.unwrap().status(), 200);
+    assert_eq!(proxy.connections(), 0);
+    // A 407 answered by an excluded host, or relayed through a SOCKS5 proxy, is the provider's
+    // status, not a refusal of the proxy credentials.
+    server.faults().push(Fault::any().always().status(407));
+    let response = http.send(&get(&server, "/y")).await.unwrap();
+    assert_eq!(response.status(), 407);
+    let socks = SocksServer::start().await;
+    let ctx = testing::context(with_proxy(&socks.url("socks5"), false));
+    let response = testing::http(&ctx, |b| b)
+        .send(&get(&server, "/z"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 407);
+    assert_eq!(socks.log().len(), 1);
+    assert_eq!(proxy.connections(), 0);
+}
+
+#[test]
+fn invalid_exclusions_are_refused_by_the_context() {
+    for entry in [
+        "*",
+        ".example.org",
+        "exc-canary.example.org:443",
+        "10.0.0.1/8",
+    ] {
+        let options = excluding(
+            with_proxy("http://127.0.0.1:3128", true),
+            &["api.example.org", entry],
+        );
+        let e = crate::context::Context::new(options).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Config, "{entry}");
+        let text = format!("{e} {e:?}");
+        assert!(text.contains("proxy.exclusions[1]"), "{text}");
+        assert!(
+            !text.contains("canary") && !text.contains("example"),
+            "{text}"
+        );
+    }
+}
+
+/// The SOCKS5 password, in any spelling, in no error, `Debug` output or `tracing` event: a
+/// refused password, an unreachable proxy, a successful request and a provider error through
+/// the proxy.
+#[tokio::test]
+async fn the_socks5_password_never_reaches_errors_debug_or_tracing() {
+    let server = ok_server().await;
+    let refusing = SocksServer::start().await;
+    refusing.require_credentials(PROXY_USER, "the-right-password");
+    let accepting = SocksServer::start().await;
+    accepting.require_credentials(PROXY_USER, CANARY_TOKEN);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed = listener.local_addr().unwrap();
+    drop(listener);
+    let accepting_options = with_proxy(&accepting.url("socks5h"), true);
+    let ctx_refusing = testing::context(with_proxy(&refusing.url("socks5h"), true));
+    let ctx_closed = testing::context(with_proxy(&format!("socks5://{closed}"), true));
+    let ctx_accepting = testing::context(accepting_options.clone());
+    let echoing = SocksServer::start().await;
+    echoing.require_credentials(PROXY_USER, CANARY_TOKEN);
+    echoing.echo_credentials();
+    let ctx_echoing = testing::context(with_proxy(&echoing.url("socks5"), true));
+    // The contexts are built before the capture (a host without CA certificates logs a warning).
+    let (capture, _guard) = LogCapture::install();
+    let mut errors: Vec<Error> = Vec::new();
+
+    let http = testing::http(&ctx_refusing, |b| b);
+    let e = http.send(&get(&server, "/x")).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::ProxyAuth);
+    errors.push(e);
+    let http = testing::http(&ctx_closed, |b| b);
+    let e = http.send(&post_to(&server.url("/x"))).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient);
+    errors.push(e);
+    let http = bearer_http(&ctx_accepting, &server.base_url());
+    assert_eq!(http.send(&get(&server, "/ok")).await.unwrap().status(), 200);
+    server.faults().push(Fault::any().always().status(502));
+    errors.push(http.send(&post_to(&server.url("/x"))).await.unwrap_err());
+    // A proxy that answers a plain-HTTP request itself with the credentials it received: the
+    // echo reaches the error text and is cut out.
+    let echo_http = testing::http(&ctx_echoing, |b| b);
+    let response = echo_http.send(&get(&server, "/echo")).await.unwrap();
+    assert_eq!(response.status(), 400);
+    let e = echo_http.reject(&response);
+    assert!(e.to_string().contains(REDACTED), "{e}");
+    errors.push(e);
+    // Both requests reached the server through the proxy (on one pooled connection or two).
+    assert_eq!(server.log().len(), 2);
+    assert!(accepting.log().iter().all(|e| e.authenticated));
+    assert!(!accepting.log().is_empty());
+    assert_eq!(refusing.log()[0].password.as_deref(), Some(CANARY_TOKEN));
+
+    for e in &errors {
+        for text in [e.to_string(), format!("{e:?}")] {
+            assert_clean("an error", &text, &[CANARY_TOKEN, CANARY_KEY]);
+        }
+    }
+    let debug = format!(
+        "{accepting_options:?} {ctx_accepting:?} {:?} {http:?} {:?}",
+        ctx_accepting.http(),
+        ctx_accepting.http().client
+    );
+    assert_clean("Debug", &debug, &[CANARY_TOKEN]);
+    assert!(debug.contains("proxied: true"), "{debug}");
+    let log = capture.text();
+    assert!(!capture.entries().is_empty());
+    assert_clean("the captured log", &log, &[CANARY_TOKEN, CANARY_KEY]);
 }

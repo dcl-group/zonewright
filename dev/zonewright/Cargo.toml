@@ -59,7 +59,7 @@ tokio = { version = "1.54.1", features = ["sync", "time"] }
 # __http (serde_json and tracing also serve rfc2136; tracing also serves the inspector)
 serde_json = { version = "1.0.154", optional = true }
 tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"], optional = true }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "socks"], optional = true }
 # Must stay on the same 0.23 line as the rustls inside reqwest.
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
 rustls-platform-verifier = { version = "0.7.1", optional = true }

@@ -147,7 +147,7 @@ mod http {
         };
         for (url, loopback_only) in [
             ("http://u:url-canary@127.0.0.1:3128", false),
-            ("socks5://127.0.0.1:1080", false),
+            ("socks4://127.0.0.1:1080", false),
             ("http://127.0.0.1:3128/url-canary", false),
             ("http://proxy.example.test:3128", true),
         ] {
@@ -160,13 +160,37 @@ mod http {
                 "{text}"
             );
         }
-        for url in ["http://127.0.0.1:3128", "https://[::1]:8443"] {
+        for url in [
+            "http://127.0.0.1:3128",
+            "https://[::1]:8443",
+            "socks5://127.0.0.1:1080",
+            "socks5h://[::1]:1080",
+        ] {
             let options = with(url, true);
             let ctx = Context::new(options.clone()).unwrap();
             let text = format!("{options:?} {ctx:?}");
             assert!(!text.contains("pr0xy-pa55-canary"), "{text}");
             assert!(text.contains(url), "{text}");
         }
+        // Exclusions are checked; a refusal names the position, not the entry.
+        let mut options = with("http://127.0.0.1:3128", true);
+        options.proxy = options
+            .proxy
+            .map(|p| p.with_exclusions(vec!["api.example.test".to_owned(), "*".to_owned()]));
+        let e = Context::new(options).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Config);
+        assert!(e.to_string().contains("proxy.exclusions[1]"), "{e}");
+        assert!(!e.to_string().contains("example"), "{e}");
+        let mut options = with("socks5h://127.0.0.1:1080", true);
+        options.proxy = options.proxy.map(|p| {
+            p.with_exclusions(vec![
+                "api.example.test".to_owned(),
+                "*.example.test".to_owned(),
+                "10.0.0.0/8".to_owned(),
+                "::1".to_owned(),
+            ])
+        });
+        assert!(Context::new(options).is_ok());
         // A URL with user info is not printed, even before `Context::new` refuses it.
         let options = with("http://u:url-canary@127.0.0.1:3128", false);
         assert!(!format!("{options:?}").contains("canary"));
@@ -219,10 +243,11 @@ mod http {
             assert!(entry.header("proxy-authorization").is_none());
         }
 
-        // Wrong proxy credentials: a configuration error, not the provider's `Auth`.
+        // Wrong proxy credentials: `ProxyAuth`, not the provider's `Auth`.
         proxy.require_basic("proxy-user", "another-password");
         let e = client.list_zones().await.unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Config, "{e:?}");
+        assert_eq!(e.kind(), ErrorKind::ProxyAuth, "{e:?}");
+        assert_eq!(e.kind().as_str(), "proxy_auth");
         assert!(!e.is_retryable());
         assert_eq!(mock.log().entries().len(), api.len());
     }

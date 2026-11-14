@@ -279,7 +279,7 @@ fn build_client(
     // After `no_proxy`, which clears the list: the explicit proxy is the only one, and adding it
     // keeps the environment unread (`auto_sys_proxy = false` in `ClientBuilder::proxy`).
     if let Some(proxy) = &shared.proxy {
-        builder = builder.proxy(proxy.reqwest()?);
+        builder = builder.proxy(proxy.reqwest());
     }
     builder.build().map_err(|_| Error::Config {
         detail: Detail::constant("the HTTP client could not be built"),

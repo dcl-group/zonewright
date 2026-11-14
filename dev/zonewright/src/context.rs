@@ -142,8 +142,9 @@ pub struct ContextOptions {
     /// With a [`proxy`](ContextOptions::proxy), the proxy must be a loopback IP literal as well;
     /// the policy for request URLs is unchanged.
     pub loopback_only: bool,
-    /// The HTTP proxy every HTTP provider request of the context goes through. Default `None`:
-    /// requests go directly to the provider.
+    /// The proxy, HTTP or SOCKS5, every HTTP provider request of the context goes through,
+    /// except requests to its [exclusions](HttpProxy::exclusions). Default `None`: requests go
+    /// directly to the provider.
     ///
     /// Only this setting configures a proxy. The environment (`HTTP_PROXY`, `HTTPS_PROXY`,
     /// `ALL_PROXY`, `NO_PROXY` and their lowercase forms) and the system proxy configuration are
@@ -170,60 +171,112 @@ impl Default for ContextOptions {
     }
 }
 
-/// An HTTP proxy for the provider requests of a [`Context`] ([`ContextOptions::proxy`]).
+/// A proxy for the provider requests of a [`Context`] ([`ContextOptions::proxy`]): an HTTP proxy
+/// or a SOCKS5 proxy.
 ///
-/// Supported: a proxy reached over `http://` or `https://`. A request to an `https://` provider
-/// endpoint goes through a `CONNECT` tunnel (RFC 9110 section 9.3.6): the proxy sees the host and
-/// port of the endpoint and nothing else; the TLS session with the provider runs inside the
-/// tunnel, and the provider's certificate is verified exactly as without a proxy. A request to a
-/// plain-HTTP loopback endpoint (tests) is forwarded in absolute form; it is refused when the
-/// proxy is not itself on a loopback IP literal, so that plain HTTP never leaves the host. Every
-/// HTTP request of the context goes through the proxy; there is no exclusion list.
+/// Supported schemes of [`url`](HttpProxy::url): `http`, `https`, `socks5` and `socks5h`.
 ///
-/// With `https://`, the connection to the proxy is verified with the context's trust anchors
-/// (the platform's and [`ContextOptions::extra_root_certificates`]). With `http://`, the proxy
-/// credentials travel to the proxy unencrypted; the provider traffic is still protected by TLS.
+/// Through an HTTP proxy (`http://` or `https://`), a request to an `https://` provider endpoint
+/// goes through a `CONNECT` tunnel (RFC 9110 section 9.3.6): the proxy sees the host and port of
+/// the endpoint and nothing else; the TLS session with the provider runs inside the tunnel, and
+/// the provider's certificate is verified exactly as without a proxy. A request to a plain-HTTP
+/// loopback endpoint (tests) is forwarded in absolute form. With `https://`, the connection to
+/// the proxy is verified with the context's trust anchors (the platform's and
+/// [`ContextOptions::extra_root_certificates`]). With `http://`, the proxy credentials travel to
+/// the proxy unencrypted; the provider traffic is still protected by TLS.
+///
+/// Through a SOCKS5 proxy (RFC 1928), every request, `https://` or plain HTTP, goes through a
+/// SOCKS5 `CONNECT`; the TLS session with an `https://` provider runs inside it, verified as
+/// without a proxy. With `socks5://` the client resolves the endpoint's host name itself and
+/// sends the proxy only the IP address; with `socks5h://` it sends the host name and the proxy
+/// resolves it. The connection to a SOCKS5 proxy is not encrypted: the proxy credentials travel
+/// in clear text, as RFC 1929 defines them. Without a port, a SOCKS5 proxy is on 1080.
+///
+/// A request to a plain-HTTP loopback endpoint through a proxy that is not itself on a loopback
+/// IP literal is refused, so that plain HTTP never leaves the host.
+///
+/// Through any proxy, an `https://` endpoint written as an IPv6 literal (`https://[2001:db8::1]`)
+/// cannot be reached, and through a `socks5://` proxy neither can a plain-HTTP one: the HTTP
+/// stack passes the bracketed address on as a name. Such a request fails with
+/// [`Error::Transient`](crate::Error::Transient). Endpoints named by host names and IPv4
+/// literals are not affected.
+///
+/// Every HTTP request of the context goes through the proxy, except requests to the hosts in
+/// [`exclusions`](HttpProxy::exclusions), which go directly.
 ///
 /// Refused with [`Error::Config`] by [`Context::new`]: a URL with user info (the credentials go in
-/// [`username`](HttpProxy::username) and [`password`](HttpProxy::password)), a scheme other than
-/// `http` and `https` (SOCKS is not supported), a path, query or fragment, and, with
+/// [`username`](HttpProxy::username) and [`password`](HttpProxy::password)), another scheme
+/// (`socks4` and `socks4a` included), a host that is neither an IP literal nor a name of
+/// letters, digits, `.`, `-` and `_`, a path, query or fragment, an invalid exclusion, and, with
 /// [`ContextOptions::loopback_only`], a host that is not a loopback IP literal. No error text
-/// repeats the URL or a credential.
+/// repeats the URL, a credential or an exclusion.
 ///
-/// Credentials are sent as `Proxy-Authorization: Basic` (RFC 7617) when
-/// [`username`](HttpProxy::username) is set. A proxy that refuses them (`407`) makes the request
-/// fail with [`Error::Config`], which is not retryable: the credentials belong to the
-/// configuration of the context, not to the provider, so the error is never
-/// [`Error::Auth`](crate::Error::Auth). A proxy that refuses to open a tunnel, or cannot be
-/// reached, gives [`Error::Transient`](crate::Error::Transient). The password is removed from
-/// every error text like a provider credential, and `Debug` shows neither credential.
+/// Credentials, when [`username`](HttpProxy::username) is set, are sent to an HTTP proxy as
+/// `Proxy-Authorization: Basic` (RFC 7617), and to a SOCKS5 proxy with the username/password
+/// method (RFC 1929), which needs both a username and a password, each not empty, together at
+/// most 128 bytes. A proxy that refuses them, or demands credentials that are not configured
+/// (`407` from an HTTP proxy; a refused username and password or authentication method from a
+/// SOCKS5 proxy), makes the request fail with [`Error::ProxyAuth`](crate::Error::ProxyAuth),
+/// which is not retryable. A proxy that refuses to open a tunnel, or cannot be reached, gives
+/// [`Error::Transient`](crate::Error::Transient). The password is removed from every error text
+/// like a provider credential, and `Debug` shows neither credential.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct HttpProxy {
-    /// `http://host:port` or `https://host:port`; without a port, 80 or 443.
+    /// `http://host:port`, `https://host:port`, `socks5://host:port` or `socks5h://host:port`;
+    /// without a port, 80, 443 or 1080.
     pub url: String,
-    /// User name for Basic proxy authentication: not empty, without `:` and control characters.
+    /// User name for proxy authentication: not empty, without `:` and control characters.
     pub username: Option<String>,
-    /// Password for Basic proxy authentication, without control characters. Requires
-    /// [`username`](HttpProxy::username).
+    /// Password for proxy authentication, without control characters. Requires
+    /// [`username`](HttpProxy::username); required with it for a SOCKS5 proxy.
     pub password: Option<SecretString>,
+    /// Hosts reached directly, bypassing the proxy. Default empty: every request goes through
+    /// the proxy.
+    ///
+    /// Each entry is one of:
+    ///
+    /// - a host name, `api.example.com`: exactly that host, not the names below it. Labels of
+    ///   ASCII letters, digits and `-`, the last one starting with a letter; no trailing dot;
+    ///   letter case does not matter. An internationalized name is written in its A-label form
+    ///   (`xn--…`).
+    /// - `*.` and a host name, `*.example.com`: every name below `example.com`, not
+    ///   `example.com` itself (list it as well if it should go directly too).
+    /// - an IP address, `192.0.2.10` or `2001:db8::10` (IPv6 without brackets): exactly that
+    ///   address.
+    /// - a CIDR block, `10.0.0.0/8` or `fd00::/8`: every address in it. The host bits must be
+    ///   zero and the prefix at least 1.
+    ///
+    /// Nothing else is accepted: no `*` alone, no leading dot, no port, no scheme, no spaces, no
+    /// list in one string. An entry is compared with the host of the request URL as it is
+    /// written there, for every port; a host name is never resolved to compare it with an
+    /// address entry, so `127.0.0.0/8` does not cover `localhost`.
+    pub exclusions: Vec<String>,
 }
 
 impl HttpProxy {
-    /// A proxy without credentials.
+    /// A proxy without credentials and without exclusions.
     pub fn new(url: String) -> HttpProxy {
         HttpProxy {
             url,
             username: None,
             password: None,
+            exclusions: Vec::new(),
         }
     }
 
-    /// The same proxy with Basic credentials.
+    /// The same proxy with credentials.
     #[must_use]
     pub fn with_credentials(mut self, username: String, password: SecretString) -> HttpProxy {
         self.username = Some(username);
         self.password = Some(password);
+        self
+    }
+
+    /// The same proxy with [`exclusions`](HttpProxy::exclusions), replacing any set before.
+    #[must_use]
+    pub fn with_exclusions(mut self, exclusions: Vec<String>) -> HttpProxy {
+        self.exclusions = exclusions;
         self
     }
 }
@@ -241,6 +294,7 @@ impl fmt::Debug for HttpProxy {
             .field("url", &url)
             .field("username", &self.username.as_ref().map(|_| "[set]"))
             .field("password", &self.password.as_ref().map(|_| "[set]"))
+            .field("exclusions", &self.exclusions)
             .finish()
     }
 }

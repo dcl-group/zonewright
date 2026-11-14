@@ -15,6 +15,8 @@
 //!   mock's state between two requests.
 //! - [`proxy::ProxyServer`]: a forward proxy (`CONNECT` tunnels and plain forwarding) with optional
 //!   Basic proxy authentication, for the tests of the transport's proxy setting.
+//! - [`socks::SocksServer`]: a SOCKS5 proxy (RFC 1928 `CONNECT`) with optional username/password
+//!   authentication (RFC 1929), for the same tests.
 //!
 //! # Writing a provider mock
 //!
@@ -90,6 +92,7 @@ mod log;
 
 pub mod dns;
 pub mod proxy;
+pub mod socks;
 
 pub mod acme_dns;
 pub mod beget;
