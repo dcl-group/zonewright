@@ -65,6 +65,10 @@
 //! }
 //! ```
 
+// A provider uses one of the two shapes. In a build without `all-providers` the other shape can be
+// unused; with all providers both are used, and nothing here may be dead (design section 9.2).
+#![cfg_attr(not(feature = "all-providers"), allow(dead_code))]
+
 use std::future::Future;
 
 use crate::error::{Error, Operation};
@@ -228,9 +232,6 @@ pub(crate) trait WholeSet: RrsetBase {
 
 /// What a [`PerRecord`] read returned.
 #[derive(Clone, Debug)]
-// No provider uses the per-record shape yet; its tests do. The first per-record client removes
-// this allowance.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct RecordsRead<H, C> {
     /// What the read learned that every write needs.
     pub(crate) context: C,
@@ -240,7 +241,6 @@ pub(crate) struct RecordsRead<H, C> {
 
 /// A change to one existing record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // Per-record shape: see `RecordsRead`.
 pub(crate) struct RecordUpdate<'a> {
     /// Enable the record (it was disabled).
     pub(crate) enable: bool,
@@ -251,7 +251,6 @@ pub(crate) struct RecordUpdate<'a> {
 }
 
 /// Individual records with identifiers.
-#[cfg_attr(not(test), allow(dead_code))] // Per-record shape: see `RecordsRead`.
 pub(crate) trait PerRecord: RrsetBase {
     /// Identifies one record (its identifier and whatever else a write back needs).
     type Handle: Send + Sync;
@@ -713,7 +712,6 @@ async fn delete_whole_set_once<B: WholeSet>(
 
 /// `get_rrset` for a [`PerRecord`] provider. Takes no lock. The TTL is the smallest of the
 /// enabled records.
-#[cfg_attr(not(test), allow(dead_code))] // Per-record shape: see `RecordsRead`.
 pub(crate) async fn get_per_record<B: PerRecord>(
     backend: &B,
     zone: &DomainName,
@@ -727,7 +725,6 @@ pub(crate) async fn get_per_record<B: PerRecord>(
 
 /// `set_rrset` for a [`PerRecord`] provider (see the module documentation for the order of the
 /// requests).
-#[cfg_attr(not(test), allow(dead_code))] // Per-record shape: see `RecordsRead`.
 pub(crate) async fn set_per_record<B: PerRecord>(
     backend: &B,
     zone: &DomainName,
@@ -904,7 +901,6 @@ async fn set_per_record_once<B: PerRecord>(
 
 /// `delete_rrset` for a [`PerRecord`] provider: every enabled record by identifier. Disabled
 /// records are not published values and stay.
-#[cfg_attr(not(test), allow(dead_code))] // Per-record shape: see `RecordsRead`.
 pub(crate) async fn delete_per_record<B: PerRecord>(
     backend: &B,
     zone: &DomainName,

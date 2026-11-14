@@ -9,12 +9,16 @@
 //! - [Domain Records]: <https://docs.digitalocean.com/reference/api/reference/domain-records/>:
 //!   list (`name` "a fully qualified record name", `type`, `per_page`, `page`; `200`, `401`,
 //!   `404`, `429`, `500`), create (`type` required, `name` and `data` required for TXT, `ttl`
-//!   optional; `201`, `401`, `404`, `429`, `500`), delete (`204`; `401`, `404`, `429`, `500`),
-//!   the error body `{id, message, request_id}` and the rate-limit headers. The same operations
-//!   in the published OpenAPI description, <https://github.com/digitalocean/openapi>
-//!   (`specification/resources/domains/`: `domains_list_records.yml`,
-//!   `domains_create_record.yml`, `domains_delete_record.yml`, `models/domain_record_types.yml`,
-//!   `examples.yml`).
+//!   optional; `201`, `401`, `404`, `429`, `500`), update by PATCH ("Any attribute valid for the
+//!   record type can be set to a new value for the record"; `200`, `401`, `404`, `429`, `500`),
+//!   delete (`204`; `401`, `404`, `429`, `500`), the record fields `data`, `priority`, `port`,
+//!   `weight`, `flags`, `tag`, `ttl` ("For attributes that are not used by a specific record type,
+//!   a value of null will be returned"), the error body `{id, message, request_id}` and the
+//!   rate-limit headers. The same operations in the published OpenAPI description,
+//!   <https://github.com/digitalocean/openapi> (read at commit `9981928`, 2026-11-14;
+//!   `specification/resources/domains/`: `domains_list_records.yml`,
+//!   `domains_create_record.yml`, `domains_patch_record.yml`, `domains_delete_record.yml`,
+//!   `models/domain_record.yml`, `models/domain_record_types.yml`, `examples.yml`).
 //! - [Account]: <https://docs.digitalocean.com/reference/api/reference/account/>:
 //!   `GET /v2/account`, scope `account:read`, answer keyed on `account`.
 //! - lego `providers/dns/digitalocean/internal/client.go` and `types.go`: `POST
@@ -32,6 +36,7 @@
 //! | list domains  | `GET /domains?per_page&page`                     | 200, page |
 //! | list records  | `GET /domains/{name}/records?type&name&per_page&page` | 200, page |
 //! | create record | `POST /domains/{name}/records`                   | 201       |
+//! | update record | `PATCH /domains/{name}/records/{id}`             | 200       |
 //! | delete record | `DELETE /domains/{name}/records/{id}`            | 204       |
 //!
 //! [Domains]: https://docs.digitalocean.com/reference/api/reference/domains/
@@ -62,8 +67,11 @@ const PAGE_SIZE: u32 = 200;
 pub(super) const TXT: &str = "TXT";
 
 /// A record as `GET /domains/{name}/records` returns it; other fields are ignored.
-// Source: Domain Records, record fields (`id` read-only, `name`, `data`, `ttl`, `type`; fields
-// that do not apply to a type are `null`); lego types.go lines 10 to 16.
+// Source: Domain Records, record fields (`id` read-only, `name`, `data`, `ttl`, `type`,
+// `priority`, `port`, `weight`, `flags`, `tag`; fields that do not apply to a type are `null`;
+// OpenAPI `models/domain_record.yml`); lego types.go lines 10 to 16. The numeric fields are kept
+// as JSON values, so that one record with an odd field is carried as non-canonical data instead
+// of failing the whole listing.
 #[derive(Debug, Deserialize)]
 pub(super) struct Record {
     /// The record's identifier.
@@ -81,6 +89,21 @@ pub(super) struct Record {
     /// TTL in seconds.
     #[serde(default)]
     pub(super) ttl: Option<u32>,
+    /// The priority of MX and SRV records.
+    #[serde(default)]
+    pub(super) priority: Option<Value>,
+    /// The port of SRV records.
+    #[serde(default)]
+    pub(super) port: Option<Value>,
+    /// The weight of SRV records.
+    #[serde(default)]
+    pub(super) weight: Option<Value>,
+    /// The flags of CAA records.
+    #[serde(default)]
+    pub(super) flags: Option<Value>,
+    /// The tag of CAA records.
+    #[serde(default)]
+    pub(super) tag: Option<String>,
 }
 
 /// A domain as `GET /domains` and `GET /domains/{name}` return it; other fields are ignored.
@@ -93,7 +116,11 @@ pub(super) struct Domain {
 
 /// The body of `POST /domains/{name}/records`.
 // Source: Domain Records, "Create a Domain Record": `type` required, `name`, `data` and `ttl`
-// (optional integer, seconds); lego types.go lines 10 to 16 sends exactly these four fields.
+// (optional integer, seconds); lego types.go lines 10 to 16 sends exactly these four fields for
+// TXT. The per-type fields `priority`, `port`, `weight`, `flags` and `tag` (OpenAPI
+// `models/domain_record.yml`, `models/domain_record_types.yml`) are sent only for the types that
+// use them, as dns-update `src/providers/digitalocean.rs` (lines 73 to 104) does; see
+// `records.rs` for the mapping per type.
 #[derive(Serialize)]
 pub(super) struct NewRecord<'a> {
     /// The record type.
@@ -112,6 +139,53 @@ pub(super) struct NewRecord<'a> {
     /// TTL in seconds; left out when the caller has none to give.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ttl: Option<u32>,
+    /// The fields of the record types that have more than `data`.
+    #[serde(flatten)]
+    pub(super) extra: Extra<'a>,
+}
+
+/// The fields beyond `data` of MX, SRV and CAA records; each left out when `None`.
+// Source: OpenAPI `models/domain_record.yml`: `priority` "for SRV and MX records", `port` and
+// `weight` "for SRV records", `flags` "An unsigned integer between 0-255 used for CAA records",
+// `tag` "The parameter tag for CAA records".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(super) struct Extra<'a> {
+    /// MX preference or SRV priority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) priority: Option<u16>,
+    /// SRV port.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) port: Option<u16>,
+    /// SRV weight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) weight: Option<u16>,
+    /// CAA flags.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) flags: Option<u8>,
+    /// CAA tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) tag: Option<&'a str>,
+}
+
+/// The body of `PATCH /domains/{name}/records/{id}`: the type and the attributes that change.
+// Source: Domain Records, "Update a Domain Record" (PATCH): "Any attribute valid for the record
+// type can be set to a new value for the record"; the request schema is
+// `models/domain_record.yml`, whose only required field is `type`; the OpenAPI example sends
+// `{"name": "blog", "type": "A"}`, that is, only the attributes that change.
+#[derive(Serialize)]
+pub(super) struct RecordPatch<'a> {
+    /// The record type, unchanged.
+    #[serde(rename = "type")]
+    pub(super) rtype: &'a str,
+    /// The new value; left out when it stays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) data: Option<&'a str>,
+    /// The new TTL; left out when it stays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ttl: Option<u32>,
+    /// The new per-type fields, with the new value.
+    #[serde(flatten)]
+    pub(super) extra: Extra<'a>,
 }
 
 /// The answer to a write.
@@ -189,9 +263,9 @@ impl Api {
         self.list(url, "domains", None).await
     }
 
-    /// Every TXT record whose name matches `name` according to the API's filter, all pages. The
-    /// filter's exactness is not documented, so the caller compares names itself. A `404` is
-    /// `Error::ZoneNotFound` for `zone`.
+    /// Every record of type `rtype` (the API's spelling) whose name matches `name` according to
+    /// the API's filters, all pages. The filters' exactness is not documented, so the caller
+    /// compares names and types itself. A `404` is `Error::ZoneNotFound` for `zone`.
     // Source: Domain Records, "List Domain Records": `name` ("A fully qualified record name",
     // example `sub.example.com`, no trailing dot) and `type`; `404` is among the documented
     // answers (OpenAPI `domains_list_records.yml`). The path names the domain only, so a `404`
@@ -200,15 +274,24 @@ impl Api {
         &self,
         zone: &DomainName,
         name: &DomainName,
+        rtype: &str,
     ) -> Result<Vec<Record>, Error> {
         let url = |page: u32| {
             let url = self
                 .domain_url(zone)
                 .path("/records")
-                .query("type", TXT)
+                .query("type", rtype)
                 .query("name", name.without_dot());
             page_query(url, page).build()
         };
+        self.list(url, "domain_records", Some(zone)).await
+    }
+
+    /// Every record of the domain, all pages, without filters. A `404` is
+    /// `Error::ZoneNotFound` for `zone`.
+    // Source: Domain Records, "List All Domain Records": `name` and `type` are optional filters.
+    pub(super) async fn all_records(&self, zone: &DomainName) -> Result<Vec<Record>, Error> {
+        let url = |page: u32| page_query(self.domain_url(zone).path("/records"), page).build();
         self.list(url, "domain_records", Some(zone)).await
     }
 
@@ -247,6 +330,44 @@ impl Api {
         }
         let _: Created =
             response.json("the provider's answer to a create is not in the expected form")?;
+        Ok(Written::Done)
+    }
+
+    /// Changes the attributes of one record that `patch` names. Sent once: design section 5.3
+    /// retries only reads and deletes by identifier. A `404` is
+    /// [`Written::NotFound`] (the record, or the domain, does not exist any more).
+    // Source: Domain Records, "Update a Domain Record" (PATCH `/v2/domains/{domain_name}/records/
+    // {domain_record_id}`): 200 with a `domain_record` object; 401, 404, 429, 500 (OpenAPI
+    // `domains_patch_record.yml`).
+    pub(super) async fn update_record(
+        &self,
+        zone: &DomainName,
+        id: u64,
+        patch: &RecordPatch<'_>,
+    ) -> Result<Written, Error> {
+        #[derive(Deserialize)]
+        struct Updated {
+            // Only the presence of the record is checked.
+            #[serde(rename = "domain_record")]
+            _record: serde::de::IgnoredAny,
+        }
+        let url = self
+            .domain_url(zone)
+            .path("/records")
+            .id(&id.to_string())
+            .build()?;
+        let response = self
+            .http
+            .send(&Request::new(Method::PATCH, url).json(patch)?)
+            .await?;
+        if response.status() == 404 {
+            return Ok(Written::NotFound);
+        }
+        if !response.is_success() {
+            return Err(self.refusal(&response));
+        }
+        let _: Updated =
+            response.json("the provider's answer to an update is not in the expected form")?;
         Ok(Written::Done)
     }
 

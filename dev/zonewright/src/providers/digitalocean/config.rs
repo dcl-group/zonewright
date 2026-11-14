@@ -79,8 +79,8 @@ pub(super) struct Settings {
 #[derive(Debug, Deserialize)]
 #[non_exhaustive]
 pub struct DigitalOceanCredentials {
-    /// A personal access token. A custom-scoped token needs domain read, create and delete,
-    /// and account read.
+    /// A personal access token. A custom-scoped token needs domain read, create, update and
+    /// delete, and account read.
     pub api_token: SecretString,
 }
 

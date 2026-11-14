@@ -9,10 +9,20 @@
 //!   (`name` is a fully qualified record name, `type`, `per_page`, `page`; `404` documented),
 //!   create (`type` required, and for TXT also `name` and `data`, per the OpenAPI description's
 //!   `domain_record_txt`; `ttl` optional; answers `201` with a `domain_record` that has the
-//!   generated `id`; `404` documented), delete (`204` with an empty body, `404` when missing),
+//!   generated `id`; `404` documented), update by PATCH (`200` with the `domain_record`, `404`
+//!   documented; the body's schema requires only `type`), delete (`204` with an empty body,
+//!   `404` when missing),
 //!   error bodies `{id, message, request_id}` with the ids `unauthorized`, `not_found`,
 //!   `too_many_requests`, `server_error`; answers state record names relative to the domain,
 //!   `@` for the apex (the reference's examples).
+//! - Record fields per type (OpenAPI `models/domain_record.yml` and
+//!   `models/domain_record_types.yml`, commit `9981928`): `data` and `name` required for A, AAAA,
+//!   CNAME, TXT, NS, SRV and CAA; `priority` required for MX and SRV, `port` for SRV, `flags`
+//!   and `tag` for CAA; `flags` "between 0-255"; `tag` "issue", "issuewild" or "iodef"; fields
+//!   that do not apply are `null` in answers. SOA "Can only have ttl changed, cannot be deleted"
+//!   (the API's record type table).
+//! - CAA (DNS limits page): neither `;` as the value nor name-value parameters after the CA name
+//!   are supported.
 //! - DNS limits: <https://docs.digitalocean.com/products/networking/dns/details/limits/>: "All
 //!   DNS records require a minimum TTL value of 30 seconds".
 //! - Account: <https://docs.digitalocean.com/reference/api/reference/account/>: `GET /v2/account`
@@ -32,9 +42,20 @@
 //!   substring instead, so that a listing returns "noisy" neighbors the client must skip;
 //! - `meta.total` counts the records under the filters; `links.pages.next` is present on every
 //!   page but the last and points at a foreign host, which a client must not request;
-//! - the status of a refused create: a record without `type`, a TXT record without `name` or
-//!   `data`, and a `ttl` that is not an integer of at least 30 are refused with `422`; a record
-//!   created without `ttl` gets 1800;
+//! - the status of a refused create or update: `422` for a record without `type`, a type outside
+//!   the documented list, a missing required field, an A or AAAA `data` that is not an address,
+//!   a CAA field outside the documented values, a `priority`, `port` or `weight` outside 0 to
+//!   65535, a `ttl` that is not an integer of at least 30, a create of SOA, an update that
+//!   changes the type or anything of an SOA record but its `ttl`; a record created without `ttl`
+//!   gets 1800;
+//! - leniency where the documentation is stricter than observed use: the OpenAPI lists `flags`
+//!   and `tag` as required (nullable) for NS, SRV and TXT too, but lego creates TXT records
+//!   without them; the mock does not require them for any type but CAA, and a test that relies
+//!   on this proves nothing about the provider;
+//! - `name` is not required for MX (its schema does not list it) and defaults to `@`;
+//! - `data` is stored and answered exactly as sent (host names keep or lack their trailing dot);
+//! - [`Control::insert_zone_defaults`] seeds an SOA record whose `data` is `1800` and three NS
+//!   records at the apex; the SOA's `data` form is not documented;
 //! - a `per_page` outside 1 to 200 or a `page` below 1 is refused with `422`;
 //! - the `ratelimit-*` headers are not sent.
 //!
@@ -101,6 +122,21 @@ pub enum NameForm {
     Absolute,
 }
 
+/// The fields of a record beyond `data`, `null` when absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fields {
+    /// MX and SRV priority.
+    pub priority: Option<u64>,
+    /// SRV port.
+    pub port: Option<u64>,
+    /// SRV weight.
+    pub weight: Option<u64>,
+    /// CAA flags.
+    pub flags: Option<u64>,
+    /// CAA tag.
+    pub tag: Option<String>,
+}
+
 /// One record as the mock holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
@@ -116,6 +152,8 @@ pub struct Record {
     pub data: String,
     /// TTL in seconds.
     pub ttl: u32,
+    /// The fields beyond `data`.
+    pub fields: Fields,
 }
 
 #[derive(Debug)]
@@ -182,7 +220,7 @@ impl DigitalOceanMock {
             )
             .route(
                 "/v2/domains/{domain}/records/{id}",
-                axum::routing::delete(record_delete),
+                axum::routing::delete(record_delete).patch(record_update),
             )
             .with_state(state.clone());
         Self {
@@ -226,6 +264,19 @@ impl Control {
             .collect()
     }
 
+    /// The records of type `rtype` at `name` (absolute or relative to the first domain), in
+    /// creation order.
+    pub fn records_at(&self, name: &str, rtype: &str) -> Vec<Record> {
+        let inner = lock(&self.state);
+        let wanted = given(name, inner.domains.first().map_or("", String::as_str));
+        inner
+            .records
+            .iter()
+            .filter(|r| r.rtype == rtype && absolute(&r.name, &r.domain) == wanted)
+            .cloned()
+            .collect()
+    }
+
     /// Adds a record directly, as another writer would. `name` is absolute or relative to the
     /// domain. Returns the record's identifier.
     pub fn insert_record(
@@ -235,6 +286,19 @@ impl Control {
         rtype: &str,
         data: &str,
         ttl: u32,
+    ) -> u64 {
+        self.insert_record_with(domain, name, rtype, data, ttl, Fields::default())
+    }
+
+    /// [`Control::insert_record`] with the fields beyond `data`.
+    pub fn insert_record_with(
+        &self,
+        domain: &str,
+        name: &str,
+        rtype: &str,
+        data: &str,
+        ttl: u32,
+        fields: Fields,
     ) -> u64 {
         let mut inner = lock(&self.state);
         inner.next_id += 1;
@@ -246,8 +310,22 @@ impl Control {
             rtype: rtype.to_owned(),
             data: data.to_owned(),
             ttl,
+            fields,
         });
         id
+    }
+
+    /// Seeds what the provider creates with a domain: an SOA record and three NS records at the
+    /// apex (the SOA's `data` is invented, see the module documentation).
+    pub fn insert_zone_defaults(&self, domain: &str) {
+        self.insert_record(domain, "@", "SOA", "1800", 1800);
+        for ns in [
+            "ns1.digitalocean.com",
+            "ns2.digitalocean.com",
+            "ns3.digitalocean.com",
+        ] {
+            self.insert_record(domain, "@", "NS", ns, 1800);
+        }
     }
 
     /// Deletes the record `id` directly, as another writer would.
@@ -460,11 +538,102 @@ fn record_json(record: &Record, form: NameForm) -> Value {
         NameForm::Relative => record.name.clone(),
         NameForm::Absolute => absolute(&record.name, &record.domain),
     };
+    let f = &record.fields;
     json!({
         "id": record.id, "type": record.rtype, "name": name, "data": record.data,
-        "priority": null, "port": null, "ttl": record.ttl, "weight": null, "flags": null,
-        "tag": null
+        "priority": f.priority, "port": f.port, "ttl": record.ttl, "weight": f.weight,
+        "flags": f.flags, "tag": f.tag
     })
+}
+
+/// The documented record types.
+const TYPES: &[&str] = &["A", "AAAA", "CAA", "CNAME", "MX", "NS", "SOA", "SRV", "TXT"];
+
+/// The documented CAA tags.
+const CAA_TAGS: &[&str] = &["issue", "issuewild", "iodef"];
+
+/// An optional integer field of a request body: `Ok(None)` when absent or `null`.
+fn integer(body: &Value, key: &str, max: u64) -> Result<Option<u64>, Response> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_u64().filter(|&n| n <= max) {
+            Some(n) => Ok(Some(n)),
+            None => Err(unprocessable(&format!("{key} is out of range"))),
+        },
+    }
+}
+
+/// An optional TTL of a request body: an integer of at least 30 (the documented minimum).
+fn ttl_field(body: &Value) -> Result<Option<u32>, Response> {
+    match body.get("ttl") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value
+            .as_u64()
+            .filter(|&t| t >= 30)
+            .and_then(|t| u32::try_from(t).ok())
+        {
+            Some(ttl) => Ok(Some(ttl)),
+            None => Err(unprocessable("ttl must be an integer of at least 30")),
+        },
+    }
+}
+
+/// The fields beyond `data` that a request body gives.
+fn body_fields(body: &Value, base: Fields) -> Result<Fields, Response> {
+    let mut fields = base;
+    if body.get("priority").is_some() {
+        fields.priority = integer(body, "priority", 65_535)?;
+    }
+    if body.get("port").is_some() {
+        fields.port = integer(body, "port", 65_535)?;
+    }
+    if body.get("weight").is_some() {
+        fields.weight = integer(body, "weight", 65_535)?;
+    }
+    if body.get("flags").is_some() {
+        fields.flags = integer(body, "flags", 255)?;
+    }
+    if let Some(tag) = body.get("tag") {
+        fields.tag = match tag {
+            Value::Null => None,
+            Value::String(tag) => Some(tag.clone()),
+            _ => return Err(unprocessable("tag must be a string")),
+        };
+    }
+    Ok(fields)
+}
+
+/// The per-type rules of the documentation for a record as it would be stored.
+fn validate(record: &Record) -> Result<(), Response> {
+    let f = &record.fields;
+    if record.data.is_empty() {
+        return Err(unprocessable("data is required"));
+    }
+    match record.rtype.as_str() {
+        "A" if record.data.parse::<std::net::Ipv4Addr>().is_err() => {
+            Err(unprocessable("data must be an IPv4 address"))
+        }
+        "AAAA" if record.data.parse::<std::net::Ipv6Addr>().is_err() => {
+            Err(unprocessable("data must be an IPv6 address"))
+        }
+        "MX" if f.priority.is_none() => Err(unprocessable("priority is required")),
+        "SRV" if f.priority.is_none() || f.port.is_none() => {
+            Err(unprocessable("priority and port are required"))
+        }
+        "CAA" => {
+            if f.flags.is_none() {
+                return Err(unprocessable("flags is required"));
+            }
+            if !f.tag.as_deref().is_some_and(|t| CAA_TAGS.contains(&t)) {
+                return Err(unprocessable("tag must be issue, issuewild or iodef"));
+            }
+            if record.data.contains(';') {
+                return Err(unprocessable("CAA values with ';' are not supported"));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 async fn records_list(
@@ -525,25 +694,28 @@ async fn record_create(
     let Some(rtype) = body["type"].as_str() else {
         return unprocessable("type is required");
     };
-    // `name` and `data` are required for TXT (OpenAPI `domain_record_txt`).
+    if !TYPES.contains(&rtype) {
+        return unprocessable("unsupported record type");
+    }
+    if rtype == "SOA" {
+        return unprocessable("SOA records cannot be created");
+    }
+    // `name` is required for every documented type but MX (OpenAPI `domain_record_types.yml`).
     let name = match body["name"].as_str().filter(|n| !n.is_empty()) {
         Some(name) => name,
-        None if rtype == "TXT" => return unprocessable("name is required"),
+        None if rtype != "MX" => return unprocessable("name is required"),
         None => "@",
     };
     let Some(data) = body["data"].as_str().filter(|d| !d.is_empty()) else {
         return unprocessable("data is required");
     };
-    let ttl = match body.get("ttl") {
-        None | Some(Value::Null) => 1800,
-        // The documented minimum is 30 seconds.
-        Some(value) => match value
-            .as_u64()
-            .filter(|&t| t >= 30 && t <= u64::from(u32::MAX))
-        {
-            Some(ttl) => ttl as u32,
-            None => return unprocessable("ttl must be an integer of at least 30"),
-        },
+    let ttl = match ttl_field(&body) {
+        Ok(ttl) => ttl.unwrap_or(1800),
+        Err(response) => return response,
+    };
+    let fields = match body_fields(&body, Fields::default()) {
+        Ok(fields) => fields,
+        Err(response) => return response,
     };
     if name.ends_with('.') {
         let absolute_name = name.to_lowercase();
@@ -552,15 +724,19 @@ async fn record_create(
             return unprocessable("name is outside the domain");
         }
     }
-    inner.next_id += 1;
     let record = Record {
-        id: inner.next_id,
+        id: inner.next_id + 1,
         domain: domain.clone(),
         name: relative(&absolute(name, &domain), &domain),
         rtype: rtype.to_owned(),
         data: data.to_owned(),
         ttl,
+        fields,
     };
+    if let Err(response) = validate(&record) {
+        return response;
+    }
+    inner.next_id += 1;
     let created = record_json(&record, inner.name_form);
     inner.records.push(record);
     (
@@ -568,6 +744,77 @@ async fn record_create(
         axum::Json(json!({"domain_record": created})),
     )
         .into_response()
+}
+
+async fn record_update(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((domain, id)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let mut inner = lock(&state);
+    let Some(index) = id.parse::<u64>().ok().and_then(|id| {
+        inner
+            .records
+            .iter()
+            .position(|r| r.domain == domain && r.id == id)
+    }) else {
+        return not_found();
+    };
+    let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+        return unprocessable("the body is not JSON");
+    };
+    let Some(current) = inner.records.get(index).cloned() else {
+        return not_found();
+    };
+    // `type` is the one required field of the update's schema.
+    let Some(rtype) = body["type"].as_str() else {
+        return unprocessable("type is required");
+    };
+    if rtype != current.rtype {
+        return unprocessable("the type of a record cannot change");
+    }
+    let ttl = match ttl_field(&body) {
+        Ok(ttl) => ttl.unwrap_or(current.ttl),
+        Err(response) => return response,
+    };
+    let given = |key: &str| body.get(key).is_some_and(|v| !v.is_null());
+    if rtype == "SOA"
+        && ["name", "data", "priority", "port", "weight", "flags", "tag"]
+            .iter()
+            .any(|k| given(k))
+    {
+        return unprocessable("only the ttl of an SOA record can change");
+    }
+    let fields = match body_fields(&body, current.fields.clone()) {
+        Ok(fields) => fields,
+        Err(response) => return response,
+    };
+    let name = match body["name"].as_str().filter(|n| !n.is_empty()) {
+        Some(name) => relative(&absolute(name, &domain), &domain),
+        None => current.name.clone(),
+    };
+    let data = body["data"]
+        .as_str()
+        .map_or(current.data.clone(), str::to_owned);
+    let updated = Record {
+        name,
+        data,
+        ttl,
+        fields,
+        ..current
+    };
+    if let Err(response) = validate(&updated) {
+        return response;
+    }
+    let answer = record_json(&updated, inner.name_form);
+    if let Some(slot) = inner.records.get_mut(index) {
+        *slot = updated;
+    }
+    axum::Json(json!({"domain_record": answer})).into_response()
 }
 
 async fn record_delete(

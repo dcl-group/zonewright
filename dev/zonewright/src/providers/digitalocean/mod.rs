@@ -5,10 +5,13 @@
 //! `DigitalOceanConfig` and credentials `DigitalOceanCredentials`, is compiled with the
 //! cargo feature `digitalocean`.
 //!
-//! This version offers `check`, `list_zones` and the TXT value operations. The TXT value
-//! operations accept plain values only. The API's unit is the individual record, so they create
-//! and delete single records and never write a foreign value (see
-//! [`ValueGuarantee::PerValue`](crate::ValueGuarantee::PerValue)).
+//! This version offers `check`, `list_zones`, the record-level operations (`list_rrsets`,
+//! `get_rrset`, `set_rrset`, `delete_rrset`) for A, AAAA, CAA, CNAME, MX, NS, SRV and TXT, with
+//! SOA read-only, and the TXT value operations on plain values. The API's unit is the individual
+//! record: the TXT value operations create and delete single records and never write a foreign
+//! value (see [`ValueGuarantee::PerValue`](crate::ValueGuarantee::PerValue)); replacing an rrset
+//! is several requests, creates before deletes, without a condition the provider checks (see
+//! [`Preconditions::ReadThenWrite`](crate::Preconditions::ReadThenWrite)).
 
 pub(crate) mod meta;
 
@@ -18,6 +21,8 @@ mod api;
 mod client;
 #[cfg(feature = "digitalocean")]
 mod config;
+#[cfg(feature = "digitalocean")]
+mod records;
 #[cfg(feature = "digitalocean")]
 mod txt;
 

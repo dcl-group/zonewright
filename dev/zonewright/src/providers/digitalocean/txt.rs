@@ -26,7 +26,7 @@ use crate::record::{Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
-use super::api::{NewRecord, TXT, Written, normalize_name};
+use super::api::{Extra, NewRecord, TXT, Written, normalize_name};
 use super::client::DigitalOcean;
 
 /// How TXT data is read.
@@ -60,7 +60,7 @@ impl PerRecord for DigitalOcean {
     ) -> Result<PerRecordRead<u64>, Error> {
         let records = self
             .api
-            .records(zone, name)
+            .records(zone, name, TXT)
             .await?
             .into_iter()
             .filter(|record| {
@@ -102,6 +102,7 @@ impl PerRecord for DigitalOcean {
             name: name.as_str(),
             data: &data,
             ttl,
+            extra: Extra::default(),
         };
         match self.api.create_record(zone, &record).await? {
             Written::Done => Ok(()),

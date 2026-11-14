@@ -2,7 +2,8 @@
 //!
 //! The module follows the layout of every provider module: `meta.rs` (static metadata),
 //! `config.rs` (settings and credentials), `api.rs` (the HTTP API), `txt.rs` (the TXT value
-//! operations over one shape of the value layer) and this file.
+//! operations over one shape of the value layer), `records.rs` (the record-level operations over
+//! one shape of the record layer, and the mapping of each record type) and this file.
 //!
 //! The domain's name is the key of every path, so there are no zone identifiers to cache and
 //! none to go stale.
@@ -18,10 +19,13 @@ use crate::http::Http;
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
-use crate::values;
+use crate::{rrsets, values};
 
 use super::api::{self, Api};
 use super::config::{self, DigitalOceanConfig, DigitalOceanCredentials};
@@ -34,6 +38,12 @@ use super::config::{self, DigitalOceanConfig, DigitalOceanCredentials};
 /// the per-name lock of the [`Context`]. Values of other writers are never part of a request
 /// (`ValueGuarantee::PerValue`); a writer outside this process can at worst cause a duplicate
 /// of our own value.
+///
+/// Record-level writes work on the same records: a replacement creates the missing values first
+/// and deletes the surplus records last, so the name never loses all its values; it is several
+/// requests and not atomic (`atomic_rrset_write` is false), and a writer outside this process
+/// that changes the rrset between the read and the writes is not detected
+/// (`Preconditions::ReadThenWrite`).
 ///
 /// A listing of records is read in full, page by page, before anything is written; the answer
 /// of a listing that ends before the total it states is `Error::Protocol`.
@@ -130,6 +140,40 @@ impl Provider for DigitalOcean {
             .filter_map(|domain| DomainName::parse(&domain.name).ok())
             .collect();
         Ok(names.into_iter().map(ZoneInfo::new).collect())
+    }
+
+    /// Every record of the domain, all pages, grouped into rrsets. Records of types outside the
+    /// record-level type list are listed too.
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_per_record(self, zone, name, rtype).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        rrsets::set_per_record(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_per_record(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(
