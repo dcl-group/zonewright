@@ -11,7 +11,9 @@ use tokio::time::Instant;
 
 use super::answer::Mode;
 use super::exchange::{Ask, Transport};
-use super::{Answer, Engine, InspectorError, NameServer, NsDiscovery, TARGET};
+use super::{
+    AddressRefusal, Answer, Engine, InspectorError, NameServer, NotAsked, NsDiscovery, TARGET,
+};
 use crate::name::{DomainName, TargetName};
 use crate::record::RecordType;
 
@@ -81,56 +83,67 @@ impl NsCache {
 ///
 /// - Always refused: blocks that are not globally reachable and are not private use, and blocks
 ///   that cannot hold a name server — unspecified, loopback, link-local, multicast, `240.0.0.0/4`
-///   with the limited broadcast address, `192.0.0.0/24` (IETF protocol assignments, its two
-///   anycast entries included), `192.88.99.0/24` (deprecated 6to4 relay anycast, RFC 7526),
-///   `198.18.0.0/15` (benchmarking, RFC 2544), every IPv6 address outside the global unicast
-///   space `2000::/3` other than the forms below (this covers `100::/64`, `100:0:0:1::/64`,
-///   `64:ff9b:1::/48` and `5f00::/16`), and the parts of `2001::/23` that the registry does not
-///   mark globally reachable (`2001:2::/48` benchmarking, `2001:10::/28` deprecated ORCHID, and
-///   the unassigned rest).
+///   with the limited broadcast address, `192.0.0.0/24` (IETF protocol assignments) except the
+///   two entries the registry marks globally reachable (`192.0.0.9`, PCP anycast, RFC 7723;
+///   `192.0.0.10`, TURN anycast, RFC 8155), `192.88.99.0/24` (deprecated 6to4 relay anycast,
+///   RFC 7526), `198.18.0.0/15` (benchmarking, RFC 2544), IPv4-mapped `::ffff:0:0/96` (the
+///   registry marks it neither a destination nor globally reachable) and IPv4-compatible `::/96`
+///   (deprecated, RFC 4291 section 2.5.5.1), whatever IPv4 address they carry, every other IPv6
+///   address outside the global unicast space `2000::/3` except the two translation prefixes
+///   below (this covers `100::/64`, `100:0:0:1::/64` and `5f00::/16`), and the parts of
+///   `2001::/23` that the registry does not mark globally reachable (`2001:2::/48`
+///   benchmarking, `2001:10::/28` deprecated ORCHID, and the unassigned rest).
 /// - Refused unless private addresses are allowed: `10.0.0.0/8`, `172.16.0.0/12`,
-///   `192.168.0.0/16` (RFC 1918), `100.64.0.0/10` (RFC 6598), `fc00::/7` (RFC 4193) and the
-///   deprecated site-local `fec0::/10` (RFC 3879).
-/// - IPv6 forms that embed an IPv4 address get the IPv4 rules for that address: IPv4-mapped
-///   `::ffff:0:0/96` and IPv4-compatible `::/96` (RFC 4291 section 2.5.5), the NAT64 well-known
-///   prefix `64:ff9b::/96` (RFC 6052), 6to4 `2002::/16` (RFC 3056) and Teredo `2001::/32` (RFC
-///   4380: both the server address and the de-obfuscated client address).
+///   `192.168.0.0/16` (RFC 1918), `100.64.0.0/10` (RFC 6598), `fc00::/7` (RFC 4193), the
+///   deprecated site-local `fec0::/10` (RFC 3879) and the local-use translation prefix
+///   `64:ff9b:1::/48` (RFC 8215; the registry marks it forwardable but not globally reachable).
+/// - IPv6 forms that route to an embedded IPv4 address get the IPv4 rules for that address: the
+///   NAT64 well-known prefix `64:ff9b::/96` (RFC 6052), 6to4 `2002::/16` (RFC 3056), Teredo
+///   `2001::/32` (RFC 4380: both the server address and the de-obfuscated client address), and
+///   an ISATAP interface identifier `0:5efe:a.b.c.d` or `200:5efe:a.b.c.d` under any global
+///   prefix (RFC 5214 section 6.1).
 /// - The documentation blocks (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`,
-///   `2001:db8::/32`, `3fff::/20`) are accepted: they are routed nowhere, so a query to them
-///   times out and satisfies nothing, and they cannot point the process at a host of its own
-///   network.
-pub(crate) fn refusal(ip: IpAddr, allow_private: bool) -> Option<&'static str> {
+///   `2001:db8::/32`, `3fff::/20`) are accepted on purpose, although the registries mark them
+///   not globally reachable: they are routed nowhere, so a query to them times out and
+///   satisfies nothing, they cannot point the process at a host of its own network, and test
+///   fixtures use them.
+pub(crate) fn refusal(ip: IpAddr, allow_private: bool) -> Option<AddressRefusal> {
     match ip {
         IpAddr::V4(v4) => refusal_v4(v4, allow_private),
         IpAddr::V6(v6) => refusal_v6(v6, allow_private),
     }
 }
 
-fn refusal_v4(ip: Ipv4Addr, allow_private: bool) -> Option<&'static str> {
-    let [a, b, c, _] = ip.octets();
+fn refusal_v4(ip: Ipv4Addr, allow_private: bool) -> Option<AddressRefusal> {
+    let [a, b, c, d] = ip.octets();
     if a == 0 {
-        Some("unspecified")
+        Some(AddressRefusal::Unspecified)
     } else if ip.is_loopback() {
-        Some("loopback")
+        Some(AddressRefusal::Loopback)
     } else if ip.is_link_local() {
-        Some("link-local")
+        Some(AddressRefusal::LinkLocal)
     } else if ip.is_multicast() {
-        Some("multicast")
+        Some(AddressRefusal::Multicast)
     } else if a >= 240 {
         // 240.0.0.0/4 is reserved and holds the limited broadcast address.
-        Some("broadcast or reserved")
+        Some(AddressRefusal::Reserved)
     } else if (a, b, c) == (192, 0, 0) {
-        Some("IETF protocol assignment")
+        // PCP anycast 192.0.0.9 and TURN anycast 192.0.0.10 are globally reachable.
+        if d == 9 || d == 10 {
+            None
+        } else {
+            Some(AddressRefusal::ProtocolAssignment)
+        }
     } else if (a, b, c) == (192, 88, 99) {
-        Some("deprecated 6to4 relay anycast")
+        Some(AddressRefusal::Relay6to4)
     } else if a == 198 && (b & 0xfe) == 18 {
-        Some("benchmarking")
+        Some(AddressRefusal::Benchmarking)
     } else if allow_private {
         None
     } else if ip.is_private() {
-        Some("private")
+        Some(AddressRefusal::Private)
     } else if a == 100 && (64..128).contains(&b) {
-        Some("shared address space")
+        Some(AddressRefusal::SharedAddressSpace)
     } else {
         None
     }
@@ -143,53 +156,78 @@ fn v4_at(segments: &[u16; 8], at: usize) -> Ipv4Addr {
     Ipv4Addr::from((u32::from(high) << 16) | u32::from(low))
 }
 
-fn refusal_v6(ip: Ipv6Addr, allow_private: bool) -> Option<&'static str> {
+fn refusal_v6(ip: Ipv6Addr, allow_private: bool) -> Option<AddressRefusal> {
     let s = ip.segments();
     let [s0, s1, s2, s3, s4, s5, _, _] = s;
     if ip.is_unspecified() {
-        return Some("unspecified");
+        return Some(AddressRefusal::Unspecified);
     }
     if ip.is_loopback() {
-        return Some("loopback");
+        return Some(AddressRefusal::Loopback);
     }
-    // IPv4-mapped (::ffff:0:0/96) and IPv4-compatible (::/96).
-    if (s0, s1, s2, s3, s4) == (0, 0, 0, 0, 0) && (s5 == 0xffff || s5 == 0) {
-        return refusal_v4(v4_at(&s, 6), allow_private);
+    if (s0, s1, s2, s3, s4) == (0, 0, 0, 0, 0) {
+        return Some(if s5 == 0xffff {
+            AddressRefusal::Ipv4Mapped
+        } else if s5 == 0 {
+            AddressRefusal::Ipv4Compatible
+        } else {
+            AddressRefusal::NotGlobalUnicast
+        });
     }
     // NAT64 well-known prefix 64:ff9b::/96.
     if (s0, s1, s2, s3, s4, s5) == (0x64, 0xff9b, 0, 0, 0, 0) {
         return refusal_v4(v4_at(&s, 6), allow_private);
     }
+    // Local-use IPv4/IPv6 translation prefix 64:ff9b:1::/48.
+    if (s0, s1, s2) == (0x64, 0xff9b, 1) {
+        return private(AddressRefusal::LocalTranslation, allow_private);
+    }
     if s0 & 0xffc0 == 0xfe80 {
-        return Some("link-local");
+        return Some(AddressRefusal::LinkLocal);
     }
     if ip.is_multicast() {
-        return Some("multicast");
+        return Some(AddressRefusal::Multicast);
     }
-    if s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfec0 {
-        let reason = if s0 & 0xfe00 == 0xfc00 {
-            "unique-local"
-        } else {
-            "site-local"
-        };
-        return if allow_private { None } else { Some(reason) };
+    if s0 & 0xfe00 == 0xfc00 {
+        return private(AddressRefusal::UniqueLocal, allow_private);
+    }
+    if s0 & 0xffc0 == 0xfec0 {
+        return private(AddressRefusal::SiteLocal, allow_private);
     }
     if s0 & 0xe000 != 0x2000 {
-        return Some("not global unicast");
+        return Some(AddressRefusal::NotGlobalUnicast);
     }
-    // 6to4: the IPv4 address follows the 16-bit prefix.
-    if s0 == 0x2002 {
-        return refusal_v4(v4_at(&s, 1), allow_private);
+    let prefix = if s0 == 0x2002 {
+        // 6to4: the IPv4 address follows the 16-bit prefix.
+        refusal_v4(v4_at(&s, 1), allow_private)
+    } else if s0 == 0x2001 && s1 < 0x0200 {
+        // 2001::/23, IETF protocol assignments: only the entries marked globally reachable.
+        refusal_2001(&s, allow_private)
+    } else {
+        None
+    };
+    prefix.or_else(|| isatap(&s, allow_private))
+}
+
+/// `reason` unless private addresses are allowed.
+fn private(reason: AddressRefusal, allow_private: bool) -> Option<AddressRefusal> {
+    if allow_private { None } else { Some(reason) }
+}
+
+/// The IPv4 rules for the address in an ISATAP interface identifier (RFC 5214 section 6.1:
+/// `00-00-5E-FE` followed by the IPv4 address, with the universal/local and group bits of the
+/// first octet free).
+fn isatap(s: &[u16; 8], allow_private: bool) -> Option<AddressRefusal> {
+    let [_, _, _, _, s4, s5, _, _] = *s;
+    if s4 & 0xfcff == 0 && s5 == 0x5efe {
+        refusal_v4(v4_at(s, 6), allow_private)
+    } else {
+        None
     }
-    // 2001::/23, IETF protocol assignments: only the entries marked globally reachable.
-    if s0 == 0x2001 && s1 < 0x0200 {
-        return refusal_2001(&s, allow_private);
-    }
-    None
 }
 
 /// An address in `2001::/23`.
-fn refusal_2001(s: &[u16; 8], allow_private: bool) -> Option<&'static str> {
+fn refusal_2001(s: &[u16; 8], allow_private: bool) -> Option<AddressRefusal> {
     let [_, s1, s2, s3, s4, s5, s6, s7] = *s;
     match s1 {
         // Teredo: server IPv4 in bits 32..64, the client IPv4 inverted in the last 32 bits.
@@ -199,6 +237,8 @@ fn refusal_2001(s: &[u16; 8], allow_private: bool) -> Option<&'static str> {
         }
         // PCP, TURN and DNS-SD SRP anycast: 2001:1::1, ::2, ::3.
         0x0001 if (s2, s3, s4, s5, s6) == (0, 0, 0, 0, 0) && (1..=3).contains(&s7) => None,
+        // Benchmarking 2001:2::/48.
+        0x0002 if s2 == 0 => Some(AddressRefusal::Benchmarking),
         // AMT 2001:3::/32.
         0x0003 => None,
         // AS112-v6 2001:4:112::/48.
@@ -206,8 +246,7 @@ fn refusal_2001(s: &[u16; 8], allow_private: bool) -> Option<&'static str> {
         // ORCHIDv2 2001:20::/28 and DETs 2001:30::/28.
         0x0020..=0x003f => None,
         // Documentation 2001:db8::/32 lies outside 2001::/23; see the policy above.
-        0x0002 => Some("benchmarking"),
-        _ => Some("IETF protocol assignment"),
+        _ => Some(AddressRefusal::ProtocolAssignment),
     }
 }
 
@@ -259,49 +298,49 @@ impl<T: Transport> Engine<T> {
         }))
         .buffered(ADDRESS_LOOKUPS_AT_ONCE);
 
+        let allow_private = self.config.allow_private_addresses;
         let mut servers: Vec<NameServer> = Vec::new();
         let mut seen: HashSet<IpAddr> = HashSet::new();
         while let Some((name, addresses)) = lookups.next().await {
             let addresses = addresses?;
-            let found = addresses.len();
-            let mut usable = 0usize;
+            // A server that cannot be asked is reported, never left out: leaving it out would
+            // make success mean "some servers" (design section 8.3, step 5). Delegation data
+            // is public and not secret (design section 8.10).
+            if addresses.is_empty() {
+                tracing::warn!(
+                    target: TARGET,
+                    zone = %zone,
+                    ns = %name,
+                    reason = NotAsked::NoAddress.as_str(),
+                    "name server not asked"
+                );
+                servers.push(NameServer::unasked(Some(name), None, NotAsked::NoAddress));
+                continue;
+            }
             for ip in addresses {
-                if let Some(reason) = refusal(ip, self.config.allow_private_addresses) {
-                    // Delegation data, public and not secret (design section 8.10).
-                    tracing::warn!(
-                        target: TARGET,
-                        zone = %zone,
-                        ns = %name,
-                        address = %ip,
-                        reason,
-                        "name-server address refused"
-                    );
+                if !seen.insert(ip) {
                     continue;
                 }
-                usable += 1;
-                if seen.insert(ip) {
-                    servers.push(NameServer::new(
-                        Some(name.clone()),
-                        SocketAddr::new(ip, DNS_PORT),
-                    ));
+                let addr = SocketAddr::new(ip, DNS_PORT);
+                match refusal(ip, allow_private) {
+                    Some(reason) => {
+                        tracing::warn!(
+                            target: TARGET,
+                            zone = %zone,
+                            ns = %name,
+                            address = %ip,
+                            reason = reason.as_str(),
+                            "name-server address refused"
+                        );
+                        servers.push(NameServer::unasked(
+                            Some(name.clone()),
+                            Some(addr),
+                            NotAsked::AddressRefused(reason),
+                        ));
+                    }
+                    None => servers.push(NameServer::new(Some(name.clone()), addr)),
                 }
             }
-            // A name server that cannot be asked would make success mean "some servers":
-            // the discovery fails instead of returning a shorter list (design section 8.3).
-            if usable == 0 {
-                let detail = if found == 0 {
-                    "no address in the configured address families"
-                } else {
-                    "every address was refused by the address policy"
-                };
-                return Err(InspectorError::without_address(zone, &name, detail));
-            }
-        }
-        if servers.is_empty() {
-            return Err(InspectorError::no_servers(
-                zone,
-                "no NS name of the zone has a usable address",
-            ));
         }
         if servers.len() > self.config.max_servers {
             return Err(InspectorError::TooManyNameServers {
@@ -465,7 +504,9 @@ mod tests {
 
     #[test]
     fn the_address_filter_follows_the_design() {
-        let refused = |text: &str, allow: bool| refusal(text.parse().unwrap(), allow);
+        let refused = |text: &str, allow: bool| {
+            refusal(text.parse().unwrap(), allow).map(AddressRefusal::as_str)
+        };
         for (ip, reason) in [
             ("0.0.0.0", "unspecified"),
             ("0.1.2.3", "unspecified"),
@@ -477,8 +518,9 @@ mod tests {
             ("::1", "loopback"),
             ("fe80::1", "link-local"),
             ("ff02::1", "multicast"),
-            ("::ffff:127.0.0.1", "loopback"),
-            ("::ffff:169.254.0.1", "link-local"),
+            ("::ffff:127.0.0.1", "IPv4-mapped"),
+            ("::ffff:169.254.0.1", "IPv4-mapped"),
+            ("::ffff:10.0.0.1", "IPv4-mapped"),
         ] {
             assert_eq!(refused(ip, false), Some(reason), "{ip}");
             assert_eq!(refused(ip, true), Some(reason), "{ip} with private allowed");
@@ -490,7 +532,6 @@ mod tests {
             ("100.64.0.1", "shared address space"),
             ("100.127.255.255", "shared address space"),
             ("fd00::1", "unique-local"),
-            ("::ffff:10.0.0.1", "private"),
         ] {
             assert_eq!(refused(ip, false), Some(reason), "{ip}");
             assert_eq!(refused(ip, true), None, "{ip} with private allowed");
@@ -502,18 +543,20 @@ mod tests {
 
     #[test]
     fn the_address_filter_covers_the_special_purpose_registries() {
-        let refused = |text: &str, allow: bool| refusal(text.parse().unwrap(), allow);
+        let refused = |text: &str, allow: bool| {
+            refusal(text.parse().unwrap(), allow).map(AddressRefusal::as_str)
+        };
         // Refused whatever the option says.
         for (ip, reason) in [
             ("192.0.0.1", "IETF protocol assignment"),
-            ("192.0.0.9", "IETF protocol assignment"),
+            ("192.0.0.8", "IETF protocol assignment"),
+            ("192.0.0.11", "IETF protocol assignment"),
             ("192.0.0.170", "IETF protocol assignment"),
             ("192.88.99.1", "deprecated 6to4 relay anycast"),
             ("198.18.0.1", "benchmarking"),
             ("198.19.255.255", "benchmarking"),
             ("100::1", "not global unicast"),
             ("100:0:0:1::1", "not global unicast"),
-            ("64:ff9b:1::1", "not global unicast"),
             ("5f00::1", "not global unicast"),
             ("4000::1", "not global unicast"),
             ("::ffff:0:808:808", "not global unicast"),
@@ -521,17 +564,18 @@ mod tests {
             ("2001:10::1", "IETF protocol assignment"),
             ("2001:100::1", "IETF protocol assignment"),
             // IPv4 embedded in IPv6: the IPv4 rules apply to the embedded address.
-            ("::127.0.0.1", "loopback"),
-            ("::169.254.0.1", "link-local"),
-            ("::2", "unspecified"),
+            ("::127.0.0.1", "IPv4-compatible"),
+            ("::169.254.0.1", "IPv4-compatible"),
+            ("::2", "IPv4-compatible"),
+            ("::10.0.0.1", "IPv4-compatible"),
             ("64:ff9b::127.0.0.1", "loopback"),
             ("64:ff9b::224.0.0.1", "multicast"),
             ("64:ff9b::198.18.0.1", "benchmarking"),
             ("2002:7f00:1::", "loopback"),
             ("2002:a9fe:101::1", "link-local"),
             ("2002:c000:1::", "IETF protocol assignment"),
-            ("::ffff:198.18.0.1", "benchmarking"),
-            ("::ffff:192.0.0.8", "IETF protocol assignment"),
+            ("::ffff:198.18.0.1", "IPv4-mapped"),
+            ("::ffff:192.0.0.8", "IPv4-mapped"),
             // Teredo: server 127.0.0.1, or client 127.0.0.1 (stored inverted).
             ("2001:0:7f00:1::808:808", "loopback"),
             ("2001:0:808:808::80ff:fffe", "loopback"),
@@ -543,7 +587,7 @@ mod tests {
         for (ip, reason) in [
             ("fec0::1", "site-local"),
             ("fc00::1", "unique-local"),
-            ("::10.0.0.1", "private"),
+            ("64:ff9b:1::1", "local-use translation"),
             ("64:ff9b::10.0.0.1", "private"),
             ("64:ff9b::100.64.0.1", "shared address space"),
             ("2002:c0a8:101::1", "private"),
@@ -556,7 +600,6 @@ mod tests {
         for ip in [
             "64:ff9b::8.8.8.8",
             "2002:808:808::1",
-            "::ffff:8.8.8.8",
             "2001:0:808:808::f7f7:f7f7",
             "2001:1::1",
             "2001:1::3",
@@ -571,6 +614,86 @@ mod tests {
             "203.0.113.1",
             "198.20.0.1",
             "192.0.1.1",
+            "192.0.0.9",
+            "192.0.0.10",
+        ] {
+            assert_eq!(refused(ip, false), None, "{ip}");
+        }
+    }
+
+    /// The cases of the sixth review: the IANA entries read wrongly before, the boundaries of
+    /// `240.0.0.0/4` and of the `2001::/23` entries, the IPv4-mapped and IPv4-compatible forms
+    /// of a global address, ISATAP, and the documentation blocks.
+    #[test]
+    fn the_address_filter_follows_the_registries_at_their_boundaries() {
+        let refused = |text: &str, allow: bool| {
+            refusal(text.parse().unwrap(), allow).map(AddressRefusal::as_str)
+        };
+        for (ip, reason) in [
+            // 240.0.0.0/4 whole, not only its top.
+            ("240.0.0.0", "broadcast or reserved"),
+            ("240.0.0.1", "broadcast or reserved"),
+            ("250.1.2.3", "broadcast or reserved"),
+            ("255.255.255.254", "broadcast or reserved"),
+            ("239.255.255.255", "multicast"),
+            // A global IPv4 address written as IPv6 is not an IPv6 destination.
+            ("::ffff:8.8.8.8", "IPv4-mapped"),
+            ("::8.8.8.8", "IPv4-compatible"),
+            // 2001::/23 around its entries.
+            ("2001:1::", "IETF protocol assignment"),
+            ("2001:1::4", "IETF protocol assignment"),
+            ("2001:1::1:1", "IETF protocol assignment"),
+            ("2001:1:1::1", "IETF protocol assignment"),
+            ("2001:2::ffff", "benchmarking"),
+            ("2001:2:0:ffff::1", "benchmarking"),
+            ("2001:2:1::1", "IETF protocol assignment"),
+            ("2001:4::1", "IETF protocol assignment"),
+            ("2001:4:113::1", "IETF protocol assignment"),
+            ("2001:5::1", "IETF protocol assignment"),
+            ("2001:10::1", "IETF protocol assignment"),
+            ("2001:1f:ffff::1", "IETF protocol assignment"),
+            ("2001:40::1", "IETF protocol assignment"),
+            ("2001:1ff:ffff::1", "IETF protocol assignment"),
+            // Next to the translation prefixes.
+            ("64:ff9b:2::1", "not global unicast"),
+            ("64:ff9b::1:0:808:808", "not global unicast"),
+            // ISATAP: the embedded IPv4 address decides, both forms of the identifier.
+            ("2a00:1450::5efe:7f00:1", "loopback"),
+            ("2a00:1450::200:5efe:a9fe:101", "link-local"),
+            ("2002:808:808::5efe:7f00:1", "loopback"),
+        ] {
+            assert_eq!(refused(ip, false), Some(reason), "{ip}");
+            assert_eq!(refused(ip, true), Some(reason), "{ip} with private allowed");
+        }
+        for (ip, reason) in [
+            ("64:ff9b:1::1", "local-use translation"),
+            ("64:ff9b:1:ffff::1", "local-use translation"),
+            ("2a00:1450::5efe:a00:1", "private"),
+        ] {
+            assert_eq!(refused(ip, false), Some(reason), "{ip}");
+            assert_eq!(refused(ip, true), None, "{ip} with private allowed");
+        }
+        for ip in [
+            // Globally reachable per the registries.
+            "192.0.0.9",
+            "192.0.0.10",
+            "2001:1::2",
+            "2001:3:ffff::1",
+            "2001:4:112:ffff::1",
+            "2001:20::1",
+            "2001:2f:ffff::1",
+            "2001:3f:ffff::1",
+            "2001:200::1",
+            "2a00:1450::5efe:808:808",
+            "2a00:1450::200:5efe:808:808",
+            "2a00:1450::1:5efe:7f00:1",
+            // Documentation, accepted on purpose.
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "2001:db8::1",
+            "3fff::1",
+            "3fff:fff::1",
         ] {
             assert_eq!(refused(ip, false), None, "{ip}");
         }
@@ -703,8 +826,20 @@ mod tests {
         ));
     }
 
+    fn ns(name: &str) -> Option<TargetName> {
+        Some(TargetName::parse(name).unwrap())
+    }
+
+    fn sock(text: &str) -> SocketAddr {
+        text.parse().unwrap()
+    }
+
+    fn refused_row(name: &str, ip: &str, reason: AddressRefusal) -> NameServer {
+        NameServer::unasked(ns(name), Some(sock(ip)), NotAsked::AddressRefused(reason))
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn refused_addresses_are_dropped_and_private_ones_need_the_option() {
+    async fn refused_addresses_are_reported_as_rows_and_private_ones_need_the_option() {
         let r1 = addr(1);
         let setup = |allow: bool| {
             let mut config = config_with(vec![r1]);
@@ -725,23 +860,33 @@ mod tests {
             );
             e
         };
-        // Without the option a.example.net has no usable address left: the discovery fails
-        // and names it instead of leaving the server out.
-        let err = setup(false).name_servers(&zone()).await.unwrap_err();
-        assert!(
-            matches!(&err, InspectorError::NameServerWithoutAddress { name, detail, .. }
-                if name.as_str() == "a.example.net." && detail.contains("refused")),
-            "{err:?}"
-        );
-        let servers = setup(true).name_servers(&zone()).await.unwrap();
-        let addrs: Vec<SocketAddr> = servers.iter().map(|s| s.addr).collect();
+        // Without the option no address of a.example.net can be asked, and b.example.net keeps
+        // one: every refused address is a row with its reason, nothing is left out, and the
+        // complete list is cached.
+        let e = setup(false);
+        let servers = e.name_servers(&zone()).await.unwrap();
         assert_eq!(
-            addrs,
+            servers,
             vec![
-                "10.0.0.1:53".parse::<SocketAddr>().unwrap(),
-                "192.0.2.7:53".parse::<SocketAddr>().unwrap()
+                refused_row("a.example.net.", "10.0.0.1:53", AddressRefusal::Private),
+                refused_row("a.example.net.", "127.0.0.1:53", AddressRefusal::Loopback),
+                refused_row(
+                    "b.example.net.",
+                    "169.254.0.1:53",
+                    AddressRefusal::LinkLocal
+                ),
+                NameServer::new(ns("b.example.net."), sock("192.0.2.7:53")),
             ]
         );
+        assert_eq!(e.cache.len(), 1);
+        let asked: Vec<SocketAddr> = servers.iter().filter_map(NameServer::query_addr).collect();
+        assert_eq!(asked, vec![sock("192.0.2.7:53")]);
+
+        // With the option the private address is asked; loopback and link-local stay refused.
+        let servers = setup(true).name_servers(&zone()).await.unwrap();
+        let asked: Vec<SocketAddr> = servers.iter().filter_map(NameServer::query_addr).collect();
+        assert_eq!(asked, vec![sock("10.0.0.1:53"), sock("192.0.2.7:53")]);
+        assert_eq!(servers.len(), 4);
     }
 
     #[tokio::test(start_paused = true)]
@@ -785,21 +930,73 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_ns_name_without_an_address_in_the_families_fails_the_discovery() {
+    async fn an_ns_name_without_an_address_in_the_families_is_a_row_not_asked() {
         let r1 = addr(1);
         let e = engine(config_with(vec![r1]));
         ns_set(
             &e.transport,
             r1,
-            &["ns1.example.net.", "v6only.example.net."],
+            &[
+                "dangling.example.net.",
+                "ns1.example.net.",
+                "v6only.example.net.",
+            ],
         );
         a(&e.transport, r1, "ns1.example.net", &["192.0.2.1"]);
         e.transport
             .reply(r1, "v6only.example.net", RecordType::A, nodata());
+        // NXDOMAIN is an answer too: the name has no address, the lookup did not fail.
+        e.transport
+            .reply(r1, "dangling.example.net", RecordType::A, nxdomain());
+        let servers = e.name_servers(&zone()).await.unwrap();
+        assert_eq!(
+            servers,
+            vec![
+                NameServer::unasked(ns("dangling.example.net."), None, NotAsked::NoAddress),
+                NameServer::new(ns("ns1.example.net."), sock("192.0.2.1:53")),
+                NameServer::unasked(ns("v6only.example.net."), None, NotAsked::NoAddress),
+            ]
+        );
+        // A complete answer: cached.
+        assert_eq!(e.cache.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zone_whose_servers_all_cannot_be_asked_is_still_a_list() {
+        let r1 = addr(1);
+        let e = engine(config_with(vec![r1]));
+        ns_set(&e.transport, r1, &["a.example.net.", "b.example.net."]);
+        a(&e.transport, r1, "a.example.net", &["127.0.0.1"]);
+        e.transport
+            .reply(r1, "b.example.net", RecordType::A, nodata());
+        let servers = e.name_servers(&zone()).await.unwrap();
+        assert_eq!(
+            servers,
+            vec![
+                refused_row("a.example.net.", "127.0.0.1:53", AddressRefusal::Loopback),
+                NameServer::unasked(ns("b.example.net."), None, NotAsked::NoAddress),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rows_not_asked_count_toward_max_servers() {
+        let r1 = addr(1);
+        let mut config = config_with(vec![r1]);
+        config.max_servers = 2;
+        let e = engine(config);
+        ns_set(
+            &e.transport,
+            r1,
+            &["a.example.net.", "b.example.net.", "c.example.net."],
+        );
+        a(&e.transport, r1, "a.example.net", &["192.0.2.1"]);
+        a(&e.transport, r1, "b.example.net", &["127.0.0.1"]);
+        e.transport
+            .reply(r1, "c.example.net", RecordType::A, nodata());
         let err = e.name_servers(&zone()).await.unwrap_err();
         assert!(
-            matches!(&err, InspectorError::NameServerWithoutAddress { name, detail, .. }
-                if name.as_str() == "v6only.example.net." && detail.contains("families")),
+            matches!(err, InspectorError::TooManyNameServers { count: 3, .. }),
             "{err:?}"
         );
         assert_eq!(e.cache.len(), 0);
@@ -869,7 +1066,7 @@ mod tests {
         );
         let servers = e.name_servers(&zone()).await.unwrap();
         assert_eq!(servers.len(), 2);
-        assert_eq!(servers[1].addr, "[2001:db8::1]:53".parse().unwrap());
+        assert_eq!(servers[1].addr, Some("[2001:db8::1]:53".parse().unwrap()));
 
         let mut config = config_with(vec![r1]);
         config.ip_families = IpFamilies::V6;

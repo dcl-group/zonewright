@@ -215,12 +215,16 @@ fn raw_id(octets: &[u8]) -> Option<u16> {
 /// True when the message answers the query: a response to a standard query with the query's ID
 /// and question (name compared case-insensitively, type, class IN). An error answer without a
 /// question section is accepted too: some servers answer `FORMERR` and `REFUSED` that way, and
-/// such an answer carries no data that could be mistaken for the zone's.
+/// such an answer carries no data that could be mistaken for the zone's. So is a truncated
+/// answer without a question section: a server may cut a message anywhere when it truncates
+/// (RFC 2181 section 9), and over UDP it only sends the question to TCP, where the answer is
+/// checked in full; over TCP a truncated answer fails the question anyway.
 fn matches(message: &Message, id: u16, ask: &Ask) -> bool {
-    let error = !matches!(
-        message.metadata.response_code,
-        ResponseCode::NoError | ResponseCode::NXDomain
-    );
+    let headless_allowed = message.metadata.truncation
+        || !matches!(
+            message.metadata.response_code,
+            ResponseCode::NoError | ResponseCode::NXDomain
+        );
     message.metadata.id == id
         && message.metadata.message_type == MessageType::Response
         && message.metadata.op_code == OpCode::Query
@@ -230,7 +234,7 @@ fn matches(message: &Message, id: u16, ask: &Ask) -> bool {
                     && query.query_class == DNSClass::IN
                     && name_to_wire(&query.name) == ask.name
             }
-            [] => error,
+            [] => headless_allowed,
             _ => false,
         }
 }

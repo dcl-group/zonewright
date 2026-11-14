@@ -53,12 +53,16 @@ impl WaitOptions {
 }
 
 /// What one server answered in the last round of a wait.
+///
+/// A server that is not asked ([`NameServer::not_asked`]) has a row too: `satisfied` is false,
+/// every answer is [`Answer::NotAsked`] with the reason, and `first_satisfied_after` is `None`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ServerReport {
     /// The server.
     pub server: NameServer,
-    /// All expectations held at this server in the last round.
+    /// All expectations held at this server in the last round. Always false for a server that
+    /// is not asked.
     pub satisfied: bool,
     /// The last round's answers, one per expectation, in the order given.
     pub answers: Vec<Answer>,
@@ -70,7 +74,8 @@ pub struct ServerReport {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Report {
-    /// One entry per name server, in the order discovery returned them.
+    /// One entry per name server, in the order discovery returned them, those that are not
+    /// asked included.
     pub servers: Vec<ServerReport>,
     /// Rounds run.
     pub rounds: u32,
@@ -172,26 +177,38 @@ fn dedup(asks: Vec<Ask>) -> (Vec<Ask>, Vec<usize>) {
 }
 
 /// The pause before the next round: `interval` varied uniformly by `jitter_percent` either
-/// way, not past `remaining`.
-pub(crate) fn pause(interval: Duration, jitter_percent: u8, remaining: Duration) -> Duration {
+/// way, cut to `remaining` when it would pass the deadline. `None` when `remaining` is shorter
+/// than the shortest pause the jitter allows: a cut pause would then fall below that floor
+/// (and below [`WaitOptions::MIN_INTERVAL`] less the jitter), so no further round runs.
+pub(crate) fn pause(
+    interval: Duration,
+    jitter_percent: u8,
+    remaining: Duration,
+) -> Option<Duration> {
     let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
     let percent = u64::from(jitter_percent.min(MAX_JITTER_PERCENT));
     let span = (interval_ns / 100).saturating_mul(percent);
     let low = interval_ns.saturating_sub(span);
+    if remaining < Duration::from_nanos(low) {
+        return None;
+    }
     let offset = fastrand::u64(0..=span.saturating_mul(2));
-    Duration::from_nanos(low.saturating_add(offset)).min(remaining)
+    Some(Duration::from_nanos(low.saturating_add(offset)).min(remaining))
 }
 
 impl<T: Transport> Engine<T> {
-    /// Every question at every server, at most [`QUESTIONS_AT_ONCE`] in flight. The answers of
-    /// a server are in the order of `asks`.
+    /// Every question at every server that is asked, at most [`QUESTIONS_AT_ONCE`] in flight.
+    /// The answers of a server are in the order of `asks`; a server that is not asked gets
+    /// [`Answer::NotAsked`] for each, without a query.
     async fn round(&self, servers: &[NameServer], asks: &[Ask]) -> Vec<Vec<Answer>> {
         // Built with loops rather than closures: a closure here makes the future's `Send`
         // bound fail to be proven for every lifetime.
         let mut pending = Vec::with_capacity(servers.len().saturating_mul(asks.len()));
         for server in servers {
-            for ask in asks {
-                pending.push(self.ask(server.addr, ask, Mode::Server));
+            if let Some(addr) = server.query_addr() {
+                for ask in asks {
+                    pending.push(self.ask(addr, ask, Mode::Server));
+                }
             }
         }
         let flat: Vec<Answer> = stream::iter(pending)
@@ -199,15 +216,24 @@ impl<T: Transport> Engine<T> {
             .collect()
             .await;
         let mut flat = flat.into_iter();
-        servers
-            .iter()
-            .map(|_| flat.by_ref().take(asks.len()).collect())
-            .collect()
+        let mut out = Vec::with_capacity(servers.len());
+        for server in servers {
+            match server.reason() {
+                None => out.push(flat.by_ref().take(asks.len()).collect()),
+                Some(reason) => out.push(vec![Answer::NotAsked(reason); asks.len()]),
+            }
+        }
+        out
     }
 
-    /// Fails when a round would hold more than 1024 questions.
-    fn check_round_size(servers: usize, questions: usize) -> Result<(), InspectorError> {
-        if servers.saturating_mul(questions) > MAX_QUESTIONS_PER_ROUND {
+    /// Fails when a round would hold more than 1024 questions. Only servers that are asked
+    /// count.
+    fn check_round_size(servers: &[NameServer], questions: usize) -> Result<(), InspectorError> {
+        let asked = servers
+            .iter()
+            .filter(|server| server.query_addr().is_some())
+            .count();
+        if asked.saturating_mul(questions) > MAX_QUESTIONS_PER_ROUND {
             return Err(InspectorError::invalid(
                 "servers times questions exceeds 1024 per round",
             ));
@@ -222,7 +248,7 @@ impl<T: Transport> Engine<T> {
     ) -> Result<Vec<(NameServer, Vec<Answer>)>, InspectorError> {
         let asks = validate_questions(zone, questions.iter())?;
         let servers = self.name_servers(zone).await?;
-        Self::check_round_size(servers.len(), asks.len())?;
+        Self::check_round_size(&servers, asks.len())?;
         let answers = self.round(&servers, &asks).await;
         Ok(servers.into_iter().zip(answers).collect())
     }
@@ -245,7 +271,7 @@ impl<T: Transport> Engine<T> {
         }
         let (asks, index) = dedup(asks);
         let servers = self.name_servers(zone).await?;
-        Self::check_round_size(servers.len(), asks.len())?;
+        Self::check_round_size(&servers, asks.len())?;
 
         let start = Instant::now();
         let mut first: Vec<Option<Duration>> = vec![None; servers.len()];
@@ -289,7 +315,10 @@ impl<T: Transport> Engine<T> {
                 return Err(InspectorError::Timeout { report });
             }
             let remaining = options.timeout.saturating_sub(elapsed);
-            tokio::time::sleep(pause(options.interval, options.jitter_percent, remaining)).await;
+            match pause(options.interval, options.jitter_percent, remaining) {
+                Some(pause) => tokio::time::sleep(pause).await,
+                None => return Err(InspectorError::Timeout { report }),
+            }
         }
     }
 }
@@ -384,26 +413,76 @@ mod tests {
     fn the_pause_varies_within_the_jitter_and_never_passes_the_deadline() {
         let interval = Duration::from_secs(10);
         for _ in 0..200 {
-            let p = pause(interval, 20, Duration::MAX);
+            let p = pause(interval, 20, Duration::MAX).unwrap();
             assert!(
                 p >= Duration::from_secs(8) && p <= Duration::from_secs(12),
                 "{p:?}"
             );
         }
-        assert_eq!(pause(interval, 0, Duration::MAX), interval);
+        assert_eq!(pause(interval, 0, Duration::MAX), Some(interval));
+        // Cut to the deadline while the cut pause stays within the jitter range.
+        for _ in 0..200 {
+            let p = pause(interval, 20, Duration::from_secs(9)).unwrap();
+            assert!(
+                p >= Duration::from_secs(8) && p <= Duration::from_secs(9),
+                "{p:?}"
+            );
+        }
         assert_eq!(
-            pause(interval, 20, Duration::from_secs(1)),
-            Duration::from_secs(1)
+            pause(interval, 20, Duration::from_secs(8)),
+            Some(Duration::from_secs(8))
         );
         // Jitter is capped at 50 and huge intervals do not overflow.
         for _ in 0..200 {
-            let p = pause(interval, 200, Duration::MAX);
+            let p = pause(interval, 200, Duration::MAX).unwrap();
             assert!(
                 p >= Duration::from_secs(5) && p <= Duration::from_secs(15),
                 "{p:?}"
             );
         }
         let _ = pause(Duration::MAX, 50, Duration::MAX);
+    }
+
+    #[test]
+    fn a_pause_is_never_cut_below_the_floor() {
+        // Less left than the shortest pause the jitter allows: no further round.
+        let interval = Duration::from_secs(10);
+        assert_eq!(pause(interval, 20, Duration::from_secs(1)), None);
+        assert_eq!(pause(interval, 20, Duration::from_millis(7_999)), None);
+        assert_eq!(pause(interval, 0, Duration::from_millis(9_999)), None);
+        // The shortest interval with the largest jitter: 500 ms is the floor.
+        let min = WaitOptions::MIN_INTERVAL;
+        assert_eq!(pause(min, 50, Duration::from_millis(499)), None);
+        assert_eq!(
+            pause(min, 50, Duration::from_millis(500)),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(pause(min, 0, Duration::from_millis(999)), None);
+        assert_eq!(pause(min, 0, Duration::ZERO), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_last_round_never_follows_the_previous_one_sooner_than_the_floor() {
+        let s1 = addr(1);
+        let e = engine(&[s1]);
+        e.transport.reply(s1, name(), RecordType::TXT, nodata());
+        let expectations = [Expectation::new(
+            question(),
+            Condition::Present(vec![txt("v")]),
+        )];
+        // Rounds at 0, 5 and 10 s; at 10 s only 1 s is left, less than the 5 s pause: the
+        // wait ends there instead of asking again after 1 s.
+        let mut options = WaitOptions::new(Duration::from_secs(11));
+        options.jitter_percent = 0;
+        let started = Instant::now();
+        let err = e.wait(&zone(), &expectations, &options).await.unwrap_err();
+        let InspectorError::Timeout { report } = err else {
+            panic!("expected a timeout");
+        };
+        assert_eq!(report.rounds, 3);
+        assert_eq!(report.elapsed, Duration::from_secs(10));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        assert_eq!(e.transport.total_calls(), 3);
     }
 
     #[tokio::test(start_paused = true)]
@@ -423,9 +502,14 @@ mod tests {
         let InspectorError::Timeout { report } = err else {
             panic!("expected a timeout");
         };
-        // The last round starts no later than the timeout; here it starts exactly at it.
-        assert_eq!(started.elapsed(), Duration::from_secs(300));
-        assert_eq!(report.elapsed, Duration::from_secs(300));
+        // The last round starts no later than the timeout: exactly at it after a cut pause, or
+        // less than one shortest pause (4 s) before it when no pause fits.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed > Duration::from_secs(296) && elapsed <= Duration::from_secs(300),
+            "{elapsed:?}"
+        );
+        assert_eq!(report.elapsed, elapsed);
         assert!((51..=76).contains(&report.rounds), "{}", report.rounds);
         let [a, b] = report.servers.as_slice() else {
             panic!("two servers");
@@ -677,7 +761,7 @@ mod tests {
         );
         assert_eq!(observed.len(), 32);
         for (s, (server, answers)) in observed.iter().enumerate() {
-            assert_eq!(server.addr, servers[s]);
+            assert_eq!(server.addr, Some(servers[s]));
             assert_eq!(answers.len(), 32);
             for (i, answer) in answers.iter().enumerate() {
                 let expected = data(RecordType::A, &format!("198.51.{}.{i}", s + 1));
@@ -723,6 +807,167 @@ mod tests {
         };
         // Rounds at 0, 1, ..., 10 s.
         assert_eq!(report.rounds, 11);
+    }
+
+    /// An engine with recursive discovery through the fake resolver `addr(1)`: the zone has
+    /// `ns1` at 192.0.2.53 (asked), `ns2` at 127.0.0.1 (refused) and `ns3` without an IPv4
+    /// address. 192.0.2.53 holds the TXT value.
+    fn engine_with_unasked_servers() -> Engine<Fake> {
+        use crate::inspector::testing::config_with;
+        let r1 = addr(1);
+        let e = Engine::new(config_with(vec![r1]), Fake::default()).unwrap();
+        e.transport.reply(
+            r1,
+            "example.org",
+            RecordType::NS,
+            ok(["ns1.example.net.", "ns2.example.net.", "ns3.example.net."]
+                .iter()
+                .map(|ns| rec("example.org", RecordType::NS, 300, ns))
+                .collect()),
+        );
+        for (host, ip) in [
+            ("ns1.example.net", "192.0.2.53"),
+            ("ns2.example.net", "127.0.0.1"),
+        ] {
+            e.transport.reply(
+                r1,
+                host,
+                RecordType::A,
+                ok(vec![rec(host, RecordType::A, 300, ip)]),
+            );
+        }
+        e.transport
+            .reply(r1, "ns3.example.net", RecordType::A, nodata());
+        e.transport
+            .reply(addr(53), name(), RecordType::TXT, txt_reply(&["v"]));
+        e
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_is_not_asked_is_a_row_that_is_never_satisfied() {
+        use crate::inspector::{AddressRefusal, NotAsked};
+        let e = engine_with_unasked_servers();
+        let expectations = [Expectation::new(
+            question(),
+            Condition::Present(vec![txt("v")]),
+        )];
+        let mut options = WaitOptions::new(Duration::from_secs(20));
+        options.jitter_percent = 0;
+        let err = e.wait(&zone(), &expectations, &options).await.unwrap_err();
+        let InspectorError::Timeout { report } = err else {
+            panic!("expected a timeout");
+        };
+        // The wait ran to its timeout: rounds at 0, 5, 10, 15 and 20 s.
+        assert_eq!(report.rounds, 5);
+        assert_eq!(report.elapsed, Duration::from_secs(20));
+        let rows: Vec<(Option<NotAsked>, bool, Vec<Answer>)> = report
+            .servers
+            .iter()
+            .map(|s| (s.server.not_asked, s.satisfied, s.answers.clone()))
+            .collect();
+        let refused = NotAsked::AddressRefused(AddressRefusal::Loopback);
+        assert_eq!(
+            rows,
+            vec![
+                (None, true, vec![records(&["v"])]),
+                (Some(refused), false, vec![Answer::NotAsked(refused)]),
+                (
+                    Some(NotAsked::NoAddress),
+                    false,
+                    vec![Answer::NotAsked(NotAsked::NoAddress)]
+                ),
+            ]
+        );
+        assert!(
+            report.servers[1..]
+                .iter()
+                .all(|s| s.first_satisfied_after.is_none())
+        );
+        assert_eq!(
+            report.servers[1].server.addr,
+            Some("127.0.0.1:53".parse().unwrap())
+        );
+        assert_eq!(report.servers[2].server.addr, None);
+        // Only the asked server was queried, once per round; discovery was cached.
+        let to_servers = e
+            .transport
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(server, _)| *server != addr(1))
+            .map(|(server, _)| *server)
+            .collect::<Vec<_>>();
+        assert_eq!(to_servers, vec![addr(53); 5]);
+
+        // observe: the same rows, one NotAsked answer per question.
+        let observed = e.observe(&zone(), &[question(), question()]).await.unwrap();
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed[0].1, vec![records(&["v"]), records(&["v"])]);
+        assert_eq!(
+            observed[1].1,
+            vec![Answer::NotAsked(refused), Answer::NotAsked(refused)]
+        );
+        assert_eq!(
+            observed[2].1,
+            vec![
+                Answer::NotAsked(NotAsked::NoAddress),
+                Answer::NotAsked(NotAsked::NoAddress)
+            ]
+        );
+    }
+
+    #[test]
+    fn not_asked_satisfies_no_condition() {
+        use crate::inspector::NotAsked;
+        let answer = Answer::NotAsked(NotAsked::NoAddress);
+        for condition in [
+            Condition::Present(vec![txt("a")]),
+            Condition::Exact(vec![txt("a")]),
+            Condition::Exact(Vec::new()),
+            Condition::Absent(vec![txt("a")]),
+        ] {
+            assert!(!holds(&condition, &answer), "{condition:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn options_and_questions_are_validated_before_discovery() {
+        let e = engine_with_unasked_servers();
+        let valid = [Expectation::new(
+            question(),
+            Condition::Present(vec![txt("v")]),
+        )];
+        let mut short = WaitOptions::new(Duration::from_secs(10));
+        short.interval = Duration::from_millis(999);
+        let mut jittery = WaitOptions::new(Duration::from_secs(10));
+        jittery.jitter_percent = 51;
+        let outside = [Expectation::new(
+            Question::new(DomainName::parse("example.net").unwrap(), RecordType::TXT),
+            Condition::Present(vec![txt("v")]),
+        )];
+        let raw = [Expectation::new(
+            question(),
+            Condition::Present(vec![RecordData::non_canonical("x y")]),
+        )];
+        let fine = WaitOptions::new(Duration::from_secs(10));
+        for (expectations, options) in [
+            (&valid[..], &short),
+            (&valid[..], &jittery),
+            (&outside[..], &fine),
+            (&raw[..], &fine),
+        ] {
+            assert!(matches!(
+                e.wait(&zone(), expectations, options).await,
+                Err(InspectorError::InvalidInput { .. })
+            ));
+        }
+        assert!(matches!(
+            e.observe(&zone(), &[]).await,
+            Err(InspectorError::InvalidInput { .. })
+        ));
+        // Not even the NS question went out.
+        assert_eq!(e.transport.total_calls(), 0);
     }
 
     #[tokio::test(start_paused = true)]

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use zonewright::dns01::{CnameError, CnameLookup, follow_cname};
 use zonewright::inspector::{
-    Answer, Condition, Expectation, Inspector, InspectorConfig, InspectorError, IpFamilies,
-    NameServer, NsDiscovery, Question, Report, WaitOptions,
+    AddressRefusal, Answer, Condition, Expectation, Inspector, InspectorConfig, InspectorError,
+    IpFamilies, NameServer, NotAsked, NsDiscovery, Question, Report, WaitOptions,
 };
 use zonewright::{DomainName, RecordData, RecordType, TargetName};
 use zonewright_mock::dns::{
@@ -675,7 +675,7 @@ async fn discovery_through_resolvers_returns_every_address_on_port_53() {
         .map(|s| {
             (
                 s.name.as_ref().unwrap().as_str().to_owned(),
-                s.addr.to_string(),
+                s.query_addr().unwrap().to_string(),
             )
         })
         .collect();
@@ -693,17 +693,51 @@ async fn discovery_through_resolvers_returns_every_address_on_port_53() {
     assert_eq!(resolver.log().len(), before);
 }
 
+/// Each server as (NS name, address, reason it is not asked).
+fn rows(servers: &[NameServer]) -> Vec<(String, Option<String>, Option<NotAsked>)> {
+    servers
+        .iter()
+        .map(|s| {
+            (
+                s.name.as_ref().unwrap().as_str().to_owned(),
+                s.addr.map(|a| a.to_string()),
+                s.not_asked,
+            )
+        })
+        .collect()
+}
+
+fn row(
+    ns: &str,
+    addr: Option<&str>,
+    reason: Option<NotAsked>,
+) -> (String, Option<String>, Option<NotAsked>) {
+    (ns.to_owned(), addr.map(str::to_owned), reason)
+}
+
 #[tokio::test]
-async fn private_and_loopback_name_servers_are_refused_by_default() {
+async fn private_and_loopback_name_servers_are_reported_not_asked_by_default() {
     // ns1: 127.0.0.1 and 192.0.2.5; ns2: 10.0.0.7.
     let resolver = delegation_resolver(&[[127, 0, 0, 1], [10, 0, 0, 7], [192, 0, 2, 5]]).await;
     let inspector = resolver_inspector(&[resolver.addr()]);
-    // ns2 is left without an address: the discovery fails and names it.
-    let err = inspector.name_servers(&name(ZONE)).await.unwrap_err();
-    assert!(
-        matches!(&err, InspectorError::NameServerWithoutAddress { name, .. }
-            if name.as_str() == "ns2.example.net."),
-        "{err:?}"
+    let refused = |reason| Some(NotAsked::AddressRefused(reason));
+    // Every refused address is a row with its reason; nothing is left out.
+    let servers = inspector.name_servers(&name(ZONE)).await.unwrap();
+    assert_eq!(
+        rows(&servers),
+        vec![
+            row(
+                "ns1.example.net.",
+                Some("127.0.0.1:53"),
+                refused(AddressRefusal::Loopback)
+            ),
+            row("ns1.example.net.", Some("192.0.2.5:53"), None),
+            row(
+                "ns2.example.net.",
+                Some("10.0.0.7:53"),
+                refused(AddressRefusal::Private)
+            ),
+        ]
     );
 
     // The option admits private addresses; loopback stays refused.
@@ -711,17 +745,81 @@ async fn private_and_loopback_name_servers_are_refused_by_default() {
     config.allow_private_addresses = true;
     let inspector = Inspector::new(config).unwrap();
     let servers = inspector.name_servers(&name(ZONE)).await.unwrap();
-    let addrs: Vec<String> = servers.iter().map(|s| s.addr.to_string()).collect();
+    let addrs: Vec<String> = servers
+        .iter()
+        .filter_map(NameServer::query_addr)
+        .map(|a| a.to_string())
+        .collect();
     assert_eq!(
         addrs,
         vec!["192.0.2.5:53".to_owned(), "10.0.0.7:53".to_owned()]
     );
+    assert_eq!(servers.len(), 3);
+}
+
+#[tokio::test]
+async fn a_wait_over_servers_that_cannot_be_asked_runs_to_its_timeout_and_says_why() {
+    // ns1 at loopback (refused), ns2 without an IPv4 address (NODATA), dangling without any
+    // record (NXDOMAIN). No query goes to a name server: none can be asked.
+    let resolver = DnsMock::start(Role::Recursive).await;
+    for ns in ["ns1.example.net", "ns2.example.net", "dangling.example.net"] {
+        resolver.add(ZONE, TYPE_NS, 300, Data::name(ns));
+    }
+    resolver.add("ns1.example.net", TYPE_A, 300, Data::a([127, 0, 0, 1]));
+    resolver.add(
+        "ns2.example.net",
+        TYPE_AAAA,
+        300,
+        Data::aaaa("2001:db8::53".parse().unwrap()),
+    );
+    let inspector = resolver_inspector(&[resolver.addr()]);
+    let mut options = WaitOptions::new(Duration::from_millis(1500));
+    options.interval = WaitOptions::MIN_INTERVAL;
+    options.jitter_percent = 0;
+    let started = Instant::now();
+    let result = inspector
+        .wait(
+            &name(ZONE),
+            &[Expectation::new(
+                question(CHALLENGE, RecordType::TXT),
+                Condition::Exact(Vec::new()),
+            )],
+            &options,
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let Err(InspectorError::Timeout { report }) = result else {
+        panic!("expected a timeout, got {result:?}");
+    };
+    assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(report.rounds, 2);
+    let servers: Vec<NameServer> = report.servers.iter().map(|s| s.server.clone()).collect();
+    let loopback = NotAsked::AddressRefused(AddressRefusal::Loopback);
+    assert_eq!(
+        rows(&servers),
+        vec![
+            row("dangling.example.net.", None, Some(NotAsked::NoAddress)),
+            row("ns1.example.net.", Some("127.0.0.1:53"), Some(loopback)),
+            row("ns2.example.net.", None, Some(NotAsked::NoAddress)),
+        ]
+    );
+    for server in &report.servers {
+        assert!(!server.satisfied);
+        assert_eq!(server.first_satisfied_after, None);
+        assert_eq!(
+            server.answers,
+            vec![Answer::NotAsked(server.server.not_asked.unwrap())]
+        );
+    }
+    // The resolver saw discovery only, once (cached for the second round).
+    assert_eq!(resolver.count(ZONE, TYPE_NS), 1);
+    assert_eq!(resolver.count(CHALLENGE, TYPE_TXT), 0);
 }
 
 #[tokio::test]
 async fn discovery_moves_on_to_the_next_resolver_and_is_bounded_in_time() {
     let silent = silent_socket().await;
-    // One address per NS name: a name without one would fail the discovery.
+    // One address per NS name.
     let good = delegation_resolver(&[[192, 0, 2, 1], [198, 51, 100, 2]]).await;
     let inspector = resolver_inspector(&[silent.local_addr().unwrap(), good.addr()]);
     let servers = inspector.name_servers(&name(ZONE)).await.unwrap();
@@ -822,6 +920,17 @@ fn invalid_configurations_are_refused() {
     c.max_servers = 1;
     c.discovery = NsDiscovery::Static(vec![server.clone(), server.clone()]);
     assert!(refused(c));
+    // A static list names servers to ask.
+    let mut unasked = server.clone();
+    unasked.not_asked = Some(NotAsked::NoAddress);
+    let mut c = InspectorConfig::default();
+    c.discovery = NsDiscovery::Static(vec![server.clone(), unasked]);
+    assert!(refused(c));
+    let mut no_address = server.clone();
+    no_address.addr = None;
+    let mut c = InspectorConfig::default();
+    c.discovery = NsDiscovery::Static(vec![no_address]);
+    assert!(refused(c));
     let mut c = InspectorConfig::default();
     c.resolvers.clear();
     c.discovery = NsDiscovery::Static(vec![server]);
@@ -879,10 +988,11 @@ async fn run(case: &Case, scenario: Scenario) -> (Result<Report, InspectorError>
         question(CHALLENGE, RecordType::TXT),
         case.condition.clone(),
     )];
-    // The shortest interval; the pause is cut at the deadline, so the second round starts at
-    // 600 ms.
-    let mut options = WaitOptions::new(Duration::from_millis(600));
+    // The shortest interval without jitter: the second round starts 1 s after the first, and
+    // no third round fits.
+    let mut options = WaitOptions::new(Duration::from_millis(1500));
     options.interval = WaitOptions::MIN_INTERVAL;
+    options.jitter_percent = 0;
     let zone = name(ZONE);
     let wait = inspector.wait(&zone, &expectations, &options);
     let catch_up = async {
@@ -900,7 +1010,11 @@ async fn check(case: Case) {
     let report = result.unwrap();
     assert!(report.servers.iter().all(|s| s.satisfied));
     assert_eq!(report.rounds, 1);
-    let addrs: Vec<SocketAddr> = report.servers.iter().map(|s| s.server.addr).collect();
+    let addrs: Vec<SocketAddr> = report
+        .servers
+        .iter()
+        .map(|s| s.server.query_addr().unwrap())
+        .collect();
     assert_eq!(addrs, servers);
     assert!(
         report
@@ -929,7 +1043,8 @@ async fn check(case: Case) {
         assert!(!report.servers[2].satisfied);
         assert_eq!(report.servers[2].answers, vec![expected], "{scenario:?}");
         assert_eq!(report.servers[2].first_satisfied_after, None);
-        assert!(report.elapsed >= Duration::from_millis(600));
+        assert_eq!(report.rounds, 2, "{scenario:?}");
+        assert!(report.elapsed >= Duration::from_secs(1));
     }
 }
 
@@ -985,8 +1100,11 @@ async fn the_total_wait_is_bounded_by_timeout_plus_one_query() {
         question(CHALLENGE, RecordType::TXT),
         Condition::Present(vec![txt("v")]),
     )];
-    let mut options = WaitOptions::new(Duration::from_millis(500));
+    // Rounds of 200 ms (the query timeout) 1 s apart: the second starts at about 1.2 s, ends
+    // at about 1.4 s, and then less than one pause is left.
+    let mut options = WaitOptions::new(Duration::from_millis(1500));
     options.interval = WaitOptions::MIN_INTERVAL;
+    options.jitter_percent = 0;
     let started = Instant::now();
     let err = inspector
         .wait(&name(ZONE), &expectations, &options)
@@ -996,12 +1114,12 @@ async fn the_total_wait_is_bounded_by_timeout_plus_one_query() {
     let InspectorError::Timeout { report } = err else {
         panic!("expected a timeout");
     };
-    assert!(elapsed >= Duration::from_millis(500), "{elapsed:?}");
+    assert!(elapsed >= Duration::from_millis(1400), "{elapsed:?}");
     assert!(
-        elapsed < Duration::from_millis(500 + 200 + 400),
+        elapsed < Duration::from_millis(1500 + 200 + 400),
         "{elapsed:?}"
     );
-    assert!(report.rounds >= 2);
+    assert_eq!(report.rounds, 2);
     assert_eq!(report.servers[0].answers, vec![Answer::Timeout]);
 }
 
@@ -1031,7 +1149,7 @@ async fn a_round_asks_all_servers_and_questions_concurrently() {
     assert!(elapsed < Duration::from_millis(1200), "{elapsed:?}");
     assert_eq!(observed.len(), 4);
     for (server, answers) in &observed {
-        assert!(servers.contains(&server.addr));
+        assert!(servers.contains(&server.addr.unwrap()));
         assert_eq!(answers.len(), 3);
         assert_eq!(records(&answers[0]), &[parse(RecordType::A, "192.0.2.1")]);
         assert_eq!(answers[1], Answer::NoData);
@@ -1362,6 +1480,23 @@ async fn a_truncated_udp_answer_that_does_not_decode_goes_to_tcp() {
 }
 
 #[tokio::test]
+async fn a_truncated_udp_answer_without_a_question_section_goes_to_tcp() {
+    let mock = authoritative().await;
+    mock.add(CHALLENGE, TYPE_TXT, 60, Data::txt(&[b"v"]));
+    // QR, AA and TC, NOERROR, every count zero: decodable, but without the question.
+    let header = vec![0, 0, 0x86, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    mock.push(Fault::new(Action::Raw(header)).proto(Proto::Udp));
+    let inspector =
+        Inspector::new(static_config(&[mock.addr()], Duration::from_millis(300))).unwrap();
+    let answer = inspector
+        .query_server(mock.addr(), &question(CHALLENGE, RecordType::TXT))
+        .await;
+    assert_eq!(records(&answer), &[txt("v")]);
+    let protos: Vec<Proto> = mock.log().iter().map(|q| q.proto).collect();
+    assert_eq!(protos, vec![Proto::Udp, Proto::Tcp]);
+}
+
+#[tokio::test]
 async fn a_stalled_tcp_retry_is_bounded_by_the_query_timeout() {
     let mock = authoritative().await;
     mock.add(CHALLENGE, TYPE_TXT, 60, Data::txt(&[b"v"]));
@@ -1463,7 +1598,7 @@ async fn an_ns_name_whose_address_no_resolver_answers_fails_the_discovery_uncach
 }
 
 #[tokio::test]
-async fn an_ns_name_without_an_address_in_the_families_is_named_in_the_error() {
+async fn an_ns_name_without_an_address_in_the_families_is_a_row_not_asked() {
     let resolver = DnsMock::start(Role::Recursive).await;
     resolver.add(ZONE, TYPE_NS, 300, Data::name("ns1.example.net"));
     resolver.add(ZONE, TYPE_NS, 300, Data::name("v6only.example.net"));
@@ -1475,18 +1610,23 @@ async fn an_ns_name_without_an_address_in_the_families_is_named_in_the_error() {
         Data::aaaa("2001:db8::53".parse().unwrap()),
     );
     let inspector = resolver_inspector(&[resolver.addr()]);
-    let err = inspector.name_servers(&name(ZONE)).await.unwrap_err();
-    assert!(
-        matches!(&err, InspectorError::NameServerWithoutAddress { name, detail, .. }
-            if name.as_str() == "v6only.example.net." && detail.contains("families")),
-        "{err:?}"
+    let servers = inspector.name_servers(&name(ZONE)).await.unwrap();
+    assert_eq!(
+        rows(&servers),
+        vec![
+            row("ns1.example.net.", Some("192.0.2.1:53"), None),
+            row("v6only.example.net.", None, Some(NotAsked::NoAddress)),
+        ]
     );
     // With both families every NS name has an address.
     let mut config = resolver_config(&[resolver.addr()]);
     config.ip_families = IpFamilies::Both;
     let inspector = Inspector::new(config).unwrap();
     let servers = inspector.name_servers(&name(ZONE)).await.unwrap();
-    let addrs: Vec<String> = servers.iter().map(|s| s.addr.to_string()).collect();
+    let addrs: Vec<String> = servers
+        .iter()
+        .map(|s| s.query_addr().unwrap().to_string())
+        .collect();
     assert_eq!(
         addrs,
         vec!["192.0.2.1:53".to_owned(), "[2001:db8::53]:53".to_owned()]

@@ -24,10 +24,11 @@
 //!
 //! Events go to the `tracing` target `zonewright::inspector`: one `DEBUG` event per question
 //! with the server address, the record type, the recursion flag, the kind of answer and the
-//! duration — no question name and no record value — and one `WARN` event per name-server
-//! address discovery refused, with the zone, the NS name, the address and the reason. NS names
-//! and their addresses are public delegation data, not secrets; no event carries a value of a
-//! record the application asks about.
+//! duration — no question name and no record value — and one `WARN` event per discovered
+//! name server that is not asked (an address the policy refuses, or an NS name without an
+//! address in the configured families), with the zone, the NS name, the address when there is
+//! one and the reason. NS names and their addresses are public delegation data, not secrets; no
+//! event carries a value of a record the application asks about.
 
 mod answer;
 mod cname;
@@ -45,7 +46,10 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use tokio::time::Instant;
 
-pub use config::{InspectorConfig, IpFamilies, NameServer, NsDiscovery, PUBLIC_RESOLVERS};
+pub use config::{
+    AddressRefusal, InspectorConfig, IpFamilies, NameServer, NotAsked, NsDiscovery,
+    PUBLIC_RESOLVERS,
+};
 pub use wait::{Report, ServerReport, WaitOptions};
 
 use answer::{Mode, classify};
@@ -120,6 +124,9 @@ pub enum Answer {
     /// Anything else: another response code, a malformed message, a network error. The text is
     /// at most 512 bytes without control characters and quotes no record data.
     Failed(String),
+    /// The server was not asked, for this reason (see [`NameServer`]). Appears only in the
+    /// results of [`Inspector::observe`] and [`Inspector::wait`]; it satisfies nothing.
+    NotAsked(NotAsked),
 }
 
 impl Answer {
@@ -135,6 +142,7 @@ impl Answer {
             Answer::NotAuthoritative => "not_authoritative",
             Answer::Timeout => "timeout",
             Answer::Failed(_) => "failed",
+            Answer::NotAsked(_) => "not_asked",
         }
     }
 }
@@ -189,27 +197,14 @@ pub enum InspectorError {
         detail: String,
     },
     /// Discovery could not establish the complete list of servers: no resolver returned an NS
-    /// set for the zone, no resolver answered an address question for one of its NS names, a
-    /// resolver returned an unreadable value, or the discovery timeout passed. Usually
-    /// transient; nothing is cached.
+    /// set for the zone, no resolver answered an address question for one of its NS names (a
+    /// lookup failure, as opposed to an answer that there is no address), a resolver returned
+    /// an unreadable value, or the discovery timeout passed. Usually transient; nothing is
+    /// cached.
     #[error("no usable name servers for zone {zone}: {detail}")]
     NoNameServers {
         /// The zone.
         zone: DomainName,
-        /// Why.
-        detail: String,
-    },
-    /// An NS name of the zone has no address that can be asked: the resolvers answered that it
-    /// has none in the configured address families, or every address it has is refused by the
-    /// address policy. The server list would be incomplete, so discovery fails rather than
-    /// leave the server out. Another [`IpFamilies`] choice, `allow_private_addresses` or a
-    /// static list may help.
-    #[error("name server {name} of zone {zone} has no usable address: {detail}")]
-    NameServerWithoutAddress {
-        /// The zone.
-        zone: DomainName,
-        /// The NS name.
-        name: TargetName,
         /// Why.
         detail: String,
     },
@@ -219,8 +214,8 @@ pub enum InspectorError {
         /// The zone.
         zone: DomainName,
         /// The number found at the step that exceeded a limit: NS names (more than 16),
-        /// addresses of one NS name and family (more than 8), or addresses in all (more than
-        /// `max_servers`).
+        /// addresses of one NS name and family (more than 8), or servers in all, those that are
+        /// not asked included (more than `max_servers`).
         count: usize,
     },
     /// The expectations were not met within the timeout.
@@ -250,14 +245,6 @@ impl InspectorError {
             detail: bounded(detail),
         }
     }
-
-    fn without_address(zone: &DomainName, name: &TargetName, detail: &str) -> InspectorError {
-        InspectorError::NameServerWithoutAddress {
-            zone: zone.clone(),
-            name: name.clone(),
-            detail: bounded(detail),
-        }
-    }
 }
 
 impl Inspector {
@@ -273,14 +260,17 @@ impl Inspector {
         })
     }
 
-    /// The authoritative servers of `zone`, by the configured discovery.
+    /// The authoritative servers of `zone`, by the configured discovery. With recursive
+    /// discovery the list also holds the servers that are not asked, with the reason
+    /// ([`NameServer::not_asked`]); a static list is returned as given.
     pub async fn name_servers(&self, zone: &DomainName) -> Result<Vec<NameServer>, InspectorError> {
         self.engine.name_servers(zone).await
     }
 
     /// One question to one server, recursion not desired. A type that cannot be asked
     /// (ALIAS, ANAME, OPT, the query and meta types) is answered [`Answer::Failed`] without a
-    /// query.
+    /// query. The address is the caller's choice: no address policy applies, as for a static
+    /// list. A [`NameServer`] that is not asked has no [`NameServer::query_addr`] to pass.
     pub async fn query_server(&self, server: SocketAddr, question: &Question) -> Answer {
         match ask_for(question, false) {
             Ok(ask) => self.engine.ask(server, &ask, Mode::Server).await,
@@ -296,8 +286,9 @@ impl Inspector {
     }
 
     /// One round: every question at every name server of the zone, at most 128 questions in
-    /// flight at a time. The answers of a server are in the order of `questions`. 1 to 32
-    /// questions, every name within the zone, at most 1,024 questions in all.
+    /// flight at a time. The answers of a server are in the order of `questions`; a server that
+    /// is not asked has an [`Answer::NotAsked`] for each. 1 to 32 questions, every name within
+    /// the zone, at most 1,024 questions in all.
     pub async fn observe(
         &self,
         zone: &DomainName,
@@ -307,10 +298,13 @@ impl Inspector {
     }
 
     /// Polls until every name server of the zone satisfies every expectation in the same round
-    /// (design section 8.6). At least one round runs; the last round starts no later than
-    /// `options.timeout` after the start. An `options.interval` below
-    /// [`WaitOptions::MIN_INTERVAL`] is [`InspectorError::InvalidInput`]. Dropping the future
-    /// cancels every query it started.
+    /// (design section 8.6). A server that is not asked never satisfies anything, so with one
+    /// the wait ends in [`InspectorError::Timeout`], whose report names the reason. At least
+    /// one round runs; the last round starts no later than `options.timeout` after the start.
+    /// A pause is cut to the deadline but never below `options.interval` less the jitter: when
+    /// less time than that is left, the wait ends without a further round. An
+    /// `options.interval` below [`WaitOptions::MIN_INTERVAL`] is
+    /// [`InspectorError::InvalidInput`]. Dropping the future cancels every query it started.
     pub async fn wait(
         &self,
         zone: &DomainName,

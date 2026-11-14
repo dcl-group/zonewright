@@ -880,15 +880,38 @@ pub struct ContextOptions {
     /// DER-encoded certificates trusted in addition to the platform's roots.
     pub extra_root_certificates: Vec<Vec<u8>>,
     /// Refuse to connect to anything but loopback addresses. For tests. Default false.
+    /// With a proxy, the proxy must be a loopback IP literal too.
     pub loopback_only: bool,
+    /// The HTTP proxy of every HTTP provider request. Default None. Section 5.1.
+    pub proxy: Option<HttpProxy>,
 }
 impl Default for ContextOptions {}
+
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct HttpProxy {
+    /// "http://host:port" or "https://host:port"; no user info, path, query or fragment.
+    pub url: String,
+    /// Basic proxy authentication: not empty, no ':' and no control characters.
+    pub username: Option<String>,
+    /// No control characters; requires `username`.
+    pub password: Option<secrecy::SecretString>,
+}
+impl HttpProxy {
+    pub fn new(url: String) -> HttpProxy;
+    pub fn with_credentials(self, username: String, password: secrecy::SecretString) -> HttpProxy;
+}
+impl std::fmt::Debug for HttpProxy {}  // the URL (withheld if it contains '@'), whether credentials are set
 ```
 
 `Context::new` checks the options and fails with `Error::Config` for an empty or longer user agent
 suffix or one outside printable ASCII, a zero timeout, and, when an HTTP provider is compiled in, an
-extra root certificate that is not a usable DER trust anchor. It makes no connection and needs no
-`tokio` runtime.
+extra root certificate that is not a usable DER trust anchor or a proxy setting that section 5.1
+refuses. It makes no connection and needs no `tokio` runtime.
+
+The proxy setting is a struct rather than a URL string so that the proxy password lives in a
+`SecretString` like every other credential: a URL with embedded user info would carry it as plain
+text, and is refused for that reason with a fixed text that does not repeat the URL.
 
 The application creates one `Context` per process and builds every client from it. Per-name
 serialization (hard rule 2) holds between clients that share a `Context` and not between clients
@@ -1708,11 +1731,49 @@ helper used by three clients and nine hand-written variants of it.)
 - Timeouts: `connect_timeout` (default 10 s) and `request_timeout` (default 30 s, whole request
   including the body).
 - User agent: `zonewright/<crate version>`, plus a space and the application's suffix if given.
-- No proxy: the client is built with `no_proxy()`. `reqwest` reads `HTTP_PROXY`, `HTTPS_PROXY` and
-  `ALL_PROXY` from the environment even without its `system-proxy` feature; left alone, a variable
-  set for some other purpose would route provider credentials through a proxy, plain-HTTP loopback
-  requests included, and `loopback_only` would not mean what it says. Neither earlier implementation
-  had a proxy setting, so none is offered (open point 15).
+- No proxy from the environment: the client is built with `no_proxy()`. `reqwest` reads
+  `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` from the environment even without its `system-proxy`
+  feature; left alone, a variable set for some other purpose would route provider credentials
+  through a proxy, plain-HTTP loopback requests included, and `loopback_only` would not mean what it
+  says.
+- An explicit proxy, `ContextOptions::proxy` (decided by the maintainer on 2026-11-14, item 15 of
+  section 13.4), is the only way to configure one. It is added with `ClientBuilder::proxy` after
+  `no_proxy()` as one `Proxy::all`, which in `reqwest` 0.13.5 also turns off reading the environment
+  (`auto_sys_proxy = false`) and has an empty exclusion list: the environment, `NO_PROXY` included,
+  stays ignored with the setting as without it, and every HTTP request of the context goes through
+  the proxy. Without the setting the client is exactly the one described above.
+  - Schemes: `http://` and `https://` proxies. SOCKS needs `reqwest`'s `socks` feature, which is not
+    enabled (section 9.3); `socks*` and every other scheme are refused with `Error::Config`, also
+    because `hyper-util`'s matcher silently ignores a scheme it does not know and the request would
+    go out directly.
+  - An `https://` target goes through a `CONNECT` tunnel. The proxy sees the target's host and port
+    and nothing else; the TLS session with the provider runs inside the tunnel with the crate's
+    `ClientConfig`, so the provider's certificate is verified exactly as without a proxy, and ALPN
+    is the crate's `http/1.1`. For an `https://` proxy, `reqwest` uses a clone of the same
+    `ClientConfig` with ALPN cleared for the TLS connection to the proxy (`connect.rs`,
+    `new_rustls_tls`): the proxy's certificate is verified with the context's trust anchors and the
+    explicit `aws-lc-rs` provider. A client with a TLS client certificate (reg.ru) presents it to an
+    `https://` proxy that asks for one, since the clone carries it.
+  - A plain-HTTP loopback target (tests) is forwarded in absolute form. It is refused before any
+    connection when the proxy is not itself a loopback IP literal: plain HTTP is accepted only
+    because it never leaves the host, and a proxy elsewhere would carry it over the network (and
+    reach its own loopback, not this host's).
+  - Checks at `Context::new`, each `Error::Config` with a fixed text that names the setting and
+    quotes nothing: the URL parses and has a host; no user info; scheme `http` or `https`; no path,
+    query or fragment; with `loopback_only`, a loopback IP literal; a password requires a user name;
+    the user name is not empty and has no `:` or control character, the password no control
+    character (RFC 7617).
+  - Credentials: `Proxy-Authorization: Basic` (RFC 7617), built in a zeroizing buffer and marked
+    sensitive, set with `Proxy::custom_http_auth`. `Proxy::basic_auth` is not used: it writes the
+    password into the proxy URL, which `reqwest` keeps as an ordinary string and prints in its
+    `Debug`. The header goes to the proxy only: in the `CONNECT` request, or as a hop-by-hop header
+    of a forwarded request. With an `http://` proxy it travels unencrypted to the proxy; provider
+    traffic is still TLS inside the tunnel. Limit: `hyper-util` writes the `CONNECT` request into an
+    ordinary buffer that is not wiped.
+  - The URL policy, `loopback_only`, the endpoint binding of section 5.2 and the certificate checks
+    apply to the request URL as before; the proxy changes none of them. `connect_timeout` covers the
+    whole connector: TCP to the proxy, the `CONNECT` exchange and both TLS handshakes.
+  - RFC 2136 (DNS over TCP) and the inspector (DNS over UDP and TCP) do not use the proxy.
 - No cookie store, no automatic decompression, no HTTP caching.
 
 URL policy for every configurable endpoint (`*_url` settings), enforced in the client constructor:
@@ -1799,12 +1860,28 @@ a whole rrset, which can hold values another writer added after the read: it is 
   headers it returns are inserted last. Route 53 signs with it, so every attempt carries its own
   `x-amz-date` and a signature over what is sent. A finisher that fails is the request's error and
   nothing is sent.
+- With the context's proxy: a `407` from the proxy is `Error::Config` ("the proxy refused the proxy
+  credentials") and is never retried, idempotent or not. The kind is not `Auth`, which means the
+  provider's credentials; the proxy credentials are part of the context's configuration, and the
+  next attempt would be refused the same way, as with a refused certificate. For `CONNECT`,
+  `hyper-util` reports it as `TunnelError::ProxyAuthRequired`, a type in a private module that
+  cannot be named, so the transport compares the error's text with that library's constant; the
+  proxy cannot choose the text, and the `407` body is never read. A `407` answer to a forwarded
+  request is recognized by its status before the client's kept statuses. Any other failure to get
+  through the proxy (refused or closed `CONNECT`, unreachable or stalled proxy) is a connection
+  failure: `Error::Transient` ("could not connect to the provider through the proxy"), retried only
+  for an idempotent request. A refused certificate, the provider's or an `https://` proxy's, is
+  `Error::Config` as above.
 - `Http::try_send` returns, with the error, whether the request certainly never reached the
   provider: refused before any connection (the URL policy, a header value, a failed token fetch or
   finisher), or every attempt failed while its connection was being established (TCP connect or TLS
   handshake, a connect timeout included). A timeout or broken connection after the connection was
-  established, any answer, and a refused certificate are never "certainly unsent". acme-dns uses it
-  to tell a refused write from one whose outcome is unknown (section 11.3). The public `Error`
+  established, any answer, and a refused certificate are never "certainly unsent". With a proxy,
+  establishing the connection includes the connection to the proxy and the `CONNECT` exchange: a
+  proxy that cannot be reached, stalls, closes, refuses the tunnel or answers `407` to `CONNECT`
+  leaves the request certainly unsent. A forwarded plain-HTTP request is written to the proxy once
+  the TCP connection stands, so anything after that, a `407` answer included, is not. acme-dns uses
+  it to tell a refused write from one whose outcome is unknown (section 11.3). The public `Error`
   carries no such flag.
 
 ### 5.4 Responses
@@ -1833,15 +1910,16 @@ a whole rrset, which can hold values another writer added after the read: it is 
 Each client owns a `Scrubber` (private), created in its constructor from every secret the client
 holds. It is the only way to make a `Detail` from dynamic text.
 
-- Registered at construction: every field of the credentials, each also in its form-encoded and
-  percent-encoded forms, so that a value the client sent encoded and the API echoes encoded once
-  more is replaced in place. Private key material (a TLS client key, a signing key) is not
-  registered: it is never sent, so no API can echo it, and a multi-line PEM document makes needles
-  that match nothing. Registered at run time: every token the client obtains (Keystone, IAM, OAuth)
-  and every signed assertion it sends (JWT), each under the slot of its source (a token cache, a
-  signer). A slot keeps its current and its previous secret, so a client with several token sources
-  never loses the coverage of a live token. The transport registers each token it sends; registering
-  the slot's current token again costs a comparison.
+- Registered at construction: every field of the credentials, and the context's proxy password and
+  base64 Basic credentials (a forwarding proxy's error answer can echo them), each also in its
+  form-encoded and percent-encoded forms, so that a value the client sent encoded and the API echoes
+  encoded once more is replaced in place. Private key material (a TLS client key, a signing key) is
+  not registered: it is never sent, so no API can echo it, and a multi-line PEM document makes
+  needles that match nothing. Registered at run time: every token the client obtains (Keystone, IAM,
+  OAuth) and every signed assertion it sends (JWT), each under the slot of its source (a token
+  cache, a signer). A slot keeps its current and its previous secret, so a client with several token
+  sources never loses the coverage of a live token. The transport registers each token it sends;
+  registering the slot's current token again costs a comparison.
 - Encoded needles, replaced in place: for each secret, the spellings in which an API most often
   echoes it — verbatim; form-urlencoded with `+` and with `%20` for a space; RFC 3986
   percent-encoding (the crate's own URL encoding); as the inside of a JSON string; JSON with `\/`
@@ -1880,7 +1958,10 @@ fields `provider` (the ID), `method`, `path` (URL path, no query string), `statu
 there was no answer), `attempt` and `elapsed_ms`. Nothing else in a provider client logs a request.
 
 Never written to `tracing`, at any level: request or response bodies, any header, query strings,
-`Detail` text (it is derived from a body), TXT values.
+`Detail` text (it is derived from a body), TXT values. The proxy setting adds nothing to the event:
+neither the proxy's address nor its credentials are written. (`reqwest` itself writes the proxy's
+host and port, never its credentials, to the `log` crate at `DEBUG`; the crate does not forward
+`log` records.)
 
 `WARN` events exist for conditions an operator should see and carry no request data: no system CA
 certificates; acme-dns about to evict an older value; an inspector name server skipped by the
@@ -2182,7 +2263,7 @@ pub struct InspectorConfig {
     pub max_servers: usize,
     /// Limit for the whole discovery of one zone's servers. Default 10 s.
     pub discovery_timeout: std::time::Duration,
-    /// Accept discovered name-server addresses in private ranges (section 8.3). Default false.
+    /// Ask discovered name servers at private addresses (section 8.3). Default false.
     pub allow_private_addresses: bool,
 }
 impl Default for InspectorConfig {}
@@ -2208,9 +2289,36 @@ pub enum IpFamilies { V4, V6, Both }
 pub struct NameServer {
     /// The NS name, when known.
     pub name: Option<TargetName>,
-    pub addr: std::net::SocketAddr,
+    /// For a server that is not asked: the refused address, or None (no address in the families).
+    pub addr: Option<std::net::SocketAddr>,
+    /// Why the server is not asked; None for a server that is asked.
+    pub not_asked: Option<NotAsked>,
 }
-impl NameServer { pub fn new(name: Option<TargetName>, addr: std::net::SocketAddr) -> NameServer; }
+impl NameServer {
+    /// A server that is asked.
+    pub fn new(name: Option<TargetName>, addr: std::net::SocketAddr) -> NameServer;
+    /// `addr` when the server is asked, None otherwise.
+    pub fn query_addr(&self) -> Option<std::net::SocketAddr>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NotAsked {
+    /// The resolvers answered NODATA or NXDOMAIN for every configured family.
+    NoAddress,
+    AddressRefused(AddressRefusal),
+}
+
+/// Why the address policy refuses an address (section 8.3, step 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AddressRefusal {
+    Unspecified, Loopback, LinkLocal, Multicast, Reserved, ProtocolAssignment, Relay6to4,
+    Benchmarking, NotGlobalUnicast, Ipv4Mapped, Ipv4Compatible,
+    // lifted by allow_private_addresses:
+    Private, SharedAddressSpace, UniqueLocal, SiteLocal, LocalTranslation,
+}
+// NotAsked and AddressRefusal have `as_str` and `Display`.
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Question { pub name: DomainName, pub rtype: RecordType }
@@ -2233,6 +2341,8 @@ pub enum Answer {
     Timeout,
     /// Anything else: another response code, a malformed message, a network error.
     Failed(String),
+    /// The server was not asked (only in `observe` and `wait` results).
+    NotAsked(NotAsked),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2269,7 +2379,7 @@ impl WaitOptions {
 #[non_exhaustive]
 pub struct ServerReport {
     pub server: NameServer,
-    /// All expectations held at this server in the last round.
+    /// All expectations held at this server in the last round. Always false when not asked.
     pub satisfied: bool,
     /// The last round's answers, one per expectation, in the order given.
     pub answers: Vec<Answer>,
@@ -2295,9 +2405,6 @@ pub enum InspectorError {
     /// The complete server list could not be established; transient, nothing cached.
     #[error("no usable name servers for zone {zone}: {detail}")]
     NoNameServers { zone: DomainName, detail: String },
-    /// An NS name has no address that can be asked (none in the families, or all refused).
-    #[error("name server {name} of zone {zone} has no usable address: {detail}")]
-    NameServerWithoutAddress { zone: DomainName, name: TargetName, detail: String },
     #[error("zone {zone} has {count} name server addresses, more than the configured limit")]
     TooManyNameServers { zone: DomainName, count: usize },
     #[error("expectations not met within the timeout")]
@@ -2307,10 +2414,10 @@ pub enum InspectorError {
 impl Inspector {
     pub fn new(config: InspectorConfig) -> Result<Inspector, InspectorError>;
 
-    /// The authoritative servers of `zone`, by the configured discovery.
+    /// The authoritative servers of `zone`, by the configured discovery, those not asked included.
     pub async fn name_servers(&self, zone: &DomainName) -> Result<Vec<NameServer>, InspectorError>;
 
-    /// One question to one server, recursion not desired.
+    /// One question to one server, recursion not desired. No address policy applies.
     pub async fn query_server(&self, server: std::net::SocketAddr, question: &Question) -> Answer;
 
     /// One question to every configured resolver, recursion desired.
@@ -2338,6 +2445,16 @@ impl crate::dns01::CnameLookup for Inspector {}
 All durations are `std::time::Duration`. Strings in `Answer::Failed` and in the error details are at
 most 512 bytes without control characters.
 
+A server that is not asked is a row, not an omission. `observe` gives it an `Answer::NotAsked` per
+question and sends nothing to it; `wait` gives it a `ServerReport` whose answers are
+`Answer::NotAsked`, whose `satisfied` is false and whose `first_satisfied_after` is `None`, so
+"every server agrees" cannot hold while it exists: the wait runs to its timeout and the report in
+`InspectorError::Timeout` says why. There is no switch to ignore such servers: success would then
+need a further rule for a zone none of whose servers can be asked, and the timeout report already
+gives the caller everything it needs to decide on its own. `query_server` takes a socket address,
+not a `NameServer`; a server that is not asked has no `query_addr` to pass, and an address given to
+`query_server` is the caller's choice, like a static list.
+
 ### 8.3 Name-server discovery
 
 `NsDiscovery::Recursive`, for a zone:
@@ -2351,51 +2468,69 @@ most 512 bytes without control characters.
 3. For each NS name, ask for `A` and/or `AAAA` according to `ip_families`, taking the answers of the
    first resolver that answers; a negative answer (NODATA, NXDOMAIN) is an answer. At most 8 of
    these lookups run at a time. At most 8 addresses per name and family are used; more is
-   `TooManyNameServers`. When no resolver answers for a name and family, the addresses of that name
-   are not established: `NoNameServers`, naming the NS name. An NS value or an address that cannot
-   be read makes that resolver's NS answer unusable (step 1) or fails the discovery with
-   `NoNameServers` (step 3); nothing is skipped.
+   `TooManyNameServers`. When no resolver answers for a name and family (a lookup failure, as
+   opposed to an answer that there is no address), the addresses of that name are not established:
+   `NoNameServers`, naming the NS name. An NS value or an address that cannot be read makes that
+   resolver's NS answer unusable (step 1) or fails the discovery with `NoNameServers` (step 3);
+   nothing is skipped.
 4. Apply the address policy. It follows the IANA special-purpose address registries for IPv4 and
-   IPv6 and the IPv6 address space registry:
+   IPv6 (both as updated 2025-10-09) and the IPv6 address space registry; the reason is an
+   `AddressRefusal`:
    - Always refused: unspecified (`0.0.0.0/8`, `::`), loopback, link-local, multicast, `240.0.0.0/4`
-     with the limited broadcast address, `192.0.0.0/24` (IETF protocol assignments, its two anycast
-     entries included), `192.88.99.0/24` (deprecated 6to4 relay anycast), `198.18.0.0/15`
-     (benchmarking), every IPv6 address outside the global unicast space `2000::/3` other than the
-     embedding forms below (this covers `100::/64`, `100:0:0:1::/64`, `64:ff9b:1::/48`,
+     with the limited broadcast address, `192.0.0.0/24` (IETF protocol assignments) except
+     `192.0.0.9` (PCP anycast, RFC 7723) and `192.0.0.10` (TURN anycast, RFC 8155), which the
+     registry marks globally reachable, `192.88.99.0/24` (deprecated 6to4 relay anycast),
+     `198.18.0.0/15` (benchmarking), IPv4-mapped `::ffff:0:0/96` and IPv4-compatible `::/96`
+     whatever IPv4 address they carry, every other IPv6 address outside the global unicast space
+     `2000::/3` except the two translation prefixes below (this covers `100::/64`, `100:0:0:1::/64`,
      `5f00::/16`), and the parts of `2001::/23` the registry does not mark globally reachable
-     (`2001:2::/48`, `2001:10::/28` and the unassigned rest).
+     (`2001:2::/48`, `2001:10::/28` and the unassigned rest; `2001:1::1` to `::3`, `2001:3::/32`,
+     `2001:4:112::/48`, `2001:20::/28` and `2001:30::/28` are accepted). The IPv4-mapped block is
+     marked neither a destination nor globally reachable: an AAAA record holding one names an IPv4
+     host as if it were an IPv6 server, which a dual-stack socket would reach over IPv4 outside the
+     configured families. The IPv4-compatible form is deprecated (RFC 4291 section 2.5.5.1). Both
+     are refused also for a global IPv4 address.
    - Refused unless `allow_private_addresses` is set: private use (RFC 1918), shared (RFC 6598),
-     unique-local (RFC 4193) and the deprecated site-local `fec0::/10`.
-   - IPv6 forms that embed an IPv4 address get the IPv4 rules for that address: IPv4-mapped
-     `::ffff:0:0/96`, IPv4-compatible `::/96`, the NAT64 well-known prefix `64:ff9b::/96`, 6to4
-     `2002::/16`, and Teredo `2001::/32` (the server address and the de-obfuscated client address).
-   - Accepted: the documentation blocks (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`,
-     `2001:db8::/32`, `3fff::/20`). They are routed nowhere, so a query to them times out and
-     satisfies nothing, and they cannot point the process at a host of its own network.
+     unique-local (RFC 4193), the deprecated site-local `fec0::/10`, and the local-use translation
+     prefix `64:ff9b:1::/48` (RFC 8215), which the registry marks forwardable but not globally
+     reachable.
+   - IPv6 forms that route to an embedded IPv4 address get the IPv4 rules for that address: the
+     NAT64 well-known prefix `64:ff9b::/96`, 6to4 `2002::/16`, Teredo `2001::/32` (the server
+     address and the de-obfuscated client address), and an ISATAP interface identifier
+     (`0:5efe:a.b.c.d` or `200:5efe:a.b.c.d`, RFC 5214 section 6.1) under any global prefix.
+   - Accepted on purpose, although the registries mark them not globally reachable: the
+     documentation blocks (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32`,
+     `3fff::/20`). They are routed nowhere, so a query to them times out and satisfies nothing; they
+     cannot point the process at a host of its own network; and test fixtures use them.
 
-   Each refused address is logged at `WARN`. The default is to refuse private addresses: the answers
-   of a discovered server end up in reports, and a zone's NS records should not be able to point
-   this process at hosts inside its own network. A deployment whose authoritative servers are
-   internal sets the option or uses a static list (open point 16).
+   The default is to refuse private addresses: the answers of a discovered server end up in reports,
+   and a zone's NS records should not be able to point this process at hosts inside its own network.
+   A deployment whose authoritative servers are internal sets the option or uses a static list (open
+   point 16).
 
-5. Each remaining address becomes a `NameServer` on port 53. An NS name left without an address,
-   because the resolvers answered that it has none in the configured families or because the policy
-   refused every address it has, fails the discovery with `NameServerWithoutAddress`, which names
-   it: that server could not be asked, and leaving it out would let a wait succeed without it.
-   Another `ip_families` choice, the option or a static list resolves it. More than `max_servers`:
+5. Each usable address becomes a `NameServer` on port 53; an address seen under an earlier NS name
+   is not repeated. A server that cannot be asked is kept as a `NameServer` with `not_asked` set,
+   because leaving it out would let a wait succeed without it: each refused address is one entry
+   with its address and `NotAsked::AddressRefused(reason)`, also when the same name has other,
+   usable addresses; an NS name for which the resolvers answered that it has no address in the
+   configured families (NODATA or NXDOMAIN for every family asked) is one entry without an address
+   and with `NotAsked::NoAddress`. Each such entry is logged at `WARN`. This holds also when no
+   server of the zone can be asked. Another `ip_families` choice, the option or a static list makes
+   such a server askable. More than `max_servers` entries, those not asked included:
    `TooManyNameServers`. The list is never truncated, because success means "every server", and a
    silently shortened list would turn that into "some servers".
 6. Steps 1 to 5 together are bounded by `discovery_timeout`; when it passes, the result is
    `NoNameServers` with a detail that says so. With the defaults that is at most 3 + 16 × 2 × 3
    questions, each bounded by `query_timeout` as well.
 7. The result is cached per zone for `ns_cache_ttl`, at most 256 zones (the oldest entry is
-   evicted). Only a complete list is cached; failures, and whatever a failed discovery found before
-   it failed, are not. Concurrent discoveries of one zone are not merged; each is bounded on its
-   own.
+   evicted). Only a complete list is cached, entries that are not asked included; failures, and
+   whatever a failed discovery found before it failed, are not. Concurrent discoveries of one zone
+   are not merged; each is bounded on its own.
 
 `NsDiscovery::Static` uses the given list as is, without the address filter and without the cache:
 the application chose those addresses. It serves hidden primaries, split-horizon setups and tests.
-More entries than `max_servers` is `InspectorError::Config`.
+More entries than `max_servers`, or an entry that is not asked (no address, or `not_asked` set), is
+`InspectorError::Config`.
 
 ### 8.4 Queries
 
@@ -2411,7 +2546,9 @@ More entries than `max_servers` is `InspectorError::Config`.
   thread-local generator, a cryptographically strong generator seeded from the operating system.
   `fastrand` is not used for anything an off-path attacker would have to guess.
 - A UDP datagram is accepted only from the queried address and only if its ID and question match the
-  query (name compared case-insensitively); others are ignored until the timeout.
+  query (name compared case-insensitively); others are ignored until the timeout. A decodable answer
+  with the query's ID and the TC flag but without a question section is accepted too: over UDP it
+  only sends the question to TCP, where the answer is checked in full.
 - `query_timeout` bounds the whole question to one server, all of the above included.
 - To a name server: recursion not desired. The answer is classified as follows. Response code
   REFUSED or SERVFAIL: the variant of that name. Any other code than NOERROR and NXDOMAIN: `Failed`.
@@ -2447,28 +2584,35 @@ An expectation holds at a server according to its answer:
 | `Exact([])`                | `NoData` or `NxDomain`                                           |
 | `Absent(values)`           | `NoData`, `NxDomain`, or `Records` containing none of the values |
 
-`Cname`, `Refused`, `ServFail`, `NotAuthoritative`, `Timeout` and `Failed` satisfy nothing. In
-particular an unreachable server never counts as "the value is absent", and it is not skipped: a
-resolver elsewhere may ask exactly that server. Expected values must be canonical; a non-canonical
-value is `InvalidInput`. `Present` and `Absent` need at least one value.
+`Cname`, `Refused`, `ServFail`, `NotAuthoritative`, `Timeout`, `Failed` and `NotAsked` satisfy
+nothing. In particular an unreachable server never counts as "the value is absent", and it is not
+skipped: a resolver elsewhere may ask exactly that server. Expected values must be canonical; a
+non-canonical value is `InvalidInput`. `Present` and `Absent` need at least one value.
 
 `wait`:
 
 1. Validate: 1 to 32 expectations, every name within the zone, `interval` at least
    `WaitOptions::MIN_INTERVAL` (1 s; with the largest jitter the shortest pause is 500 ms; a round
-   can ask up to 1,024 questions of servers the application does not run). Discover the servers.
-2. A round asks every server every question, at most 128 questions at a time (each bounded by
-   `query_timeout`, each holding one socket), evaluates the expectations and builds the report.
+   can ask up to 1,024 questions of servers the application does not run), jitter at most 50, the
+   expected values valid. All of this happens before discovery, so an invalid request sends nothing.
+   Discover the servers.
+2. A round asks every server that is asked every question, at most 128 questions at a time (each
+   bounded by `query_timeout`, each holding one socket), evaluates the expectations and builds the
+   report, with a row for every server that is not asked (section 8.2).
 3. If every server satisfies every expectation in this round: `Ok(report)`.
 4. If the time since the start is at least `timeout`: `Err(Timeout { report })`.
-5. Sleep `interval`, varied uniformly by ±`jitter_percent`, but not past the deadline; go to 2.
+5. Sleep `interval`, varied uniformly by ±`jitter_percent`, but not past the deadline; go to 2. If
+   less time is left than the shortest pause the jitter allows (`interval` less `jitter_percent`),
+   the pause is not cut below it: no further round runs, and the result is `Err(Timeout { report })`
+   with this round's report.
 
-Properties: at least one round runs even with a zero timeout; the last round starts no later than
-`timeout` after the start, so the call returns within `timeout` plus one round (at most
-`ceil(servers × questions / 128) × query_timeout`) plus discovery; every round asks every server
-again, so a server that had the value and lost it is seen (the earlier implementation stopped asking
-a server once it was satisfied, which is acceptable only for a value that is about to be consumed).
-A wait for several zones is several calls, which the application may run concurrently.
+Properties: at least one round runs even with a zero timeout; no pause is shorter than `interval`
+less the jitter, so never shorter than 500 ms; the last round starts no later than `timeout` after
+the start (possibly up to one shortest pause earlier), so the call returns within `timeout` plus one
+round (at most `ceil(servers × questions / 128) × query_timeout`) plus discovery; every round asks
+every server again, so a server that had the value and lost it is seen (the earlier implementation
+stopped asking a server once it was satisfied, which is acceptable only for a value that is about to
+be consumed). A wait for several zones is several calls, which the application may run concurrently.
 
 ### 8.7 CNAME lookup by quorum
 
@@ -2488,11 +2632,11 @@ written at; it is reported as a lookup error.
 | ------------------------------------------- | ------------------------------------------ |
 | NS names of one zone                        | 16                                         |
 | Addresses per NS name and family            | 8                                          |
-| Servers (addresses) per zone                | `max_servers`, default 32                  |
+| Servers per zone, those not asked included  | `max_servers`, default 32                  |
 | Time for one discovery                      | `discovery_timeout`, default 10 s          |
 | Concurrent address lookups during discovery | 8                                          |
 | Expectations or questions per call          | 32                                         |
-| Questions per round                         | servers × questions ≤ 1024                 |
+| Questions per round                         | asked servers × questions ≤ 1024           |
 | Questions of a round in flight at once      | 128                                        |
 | Pause between rounds                        | `interval` ≥ 1 s, ± up to 50 % jitter      |
 | Network exchanges per question              | 3 (UDP, UDP without EDNS, TCP)             |
@@ -2509,7 +2653,8 @@ Points this section left open, as implemented:
 - An NXDOMAIN answer that carries a CNAME for the asked name is reported as a CNAME answer, not as
   absence (RFC 6604): the name exists. `Absent` and an empty exact set therefore never hold for it.
 - An error answer without a question section is accepted when its ID matches the query; otherwise a
-  FORMERR answer to an EDNS query could never trigger the retry without EDNS.
+  FORMERR answer to an EDNS query could never trigger the retry without EDNS. The same holds for a
+  NOERROR answer with the TC flag, which otherwise would end in a timeout instead of the TCP retry.
 - A UDP reply that cannot be decoded or exceeds the size bound is a failed query when it carries the
   query's ID and is ignored otherwise. A TCP reply that does not match the query, and a failed TCP
   retry after a truncated UDP answer, are failed queries.
@@ -2530,8 +2675,8 @@ Events, target `zonewright::inspector`:
 
 - `DEBUG`, one per query: server address, record type, recursion flag, answer kind and duration. No
   question name and no record value.
-- `WARN`, one per name-server address the policy refuses: the zone, the NS name, the address and the
-  reason.
+- `WARN`, one per discovered name server that is not asked: the zone, the NS name, the address when
+  there is one, and the reason.
 
 NS names and their addresses are public delegation data, not secrets (hard rule 1 concerns secrets).
 No event carries a value of a record the application asks about, and none carries a question name
@@ -2676,7 +2821,7 @@ Why each is there, and what is deliberately absent:
 - `reqwest` with `default-features = false` and `rustls-no-provider` only, as `AGENTS.md` requires.
   Not enabled: `json` (bodies are built and parsed by the transport so that secret-bearing bodies
   stay in zeroizing buffers and every response goes through the size cap), `http2`, `charset`,
-  `gzip`, `cookies`, `system-proxy`, `form`, `query`.
+  `gzip`, `cookies`, `system-proxy`, `socks` (SOCKS proxies, section 5.1), `form`, `query`.
 - `rustls` is a direct dependency only to build the `ClientConfig` of section 5.1; its `aws_lc_rs`
   feature provides the provider the crate passes explicitly. It must stay on the same `0.23` line as
   the `rustls` inside `reqwest`: `tls_backend_preconfigured` recognizes the configuration by type,
@@ -3532,9 +3677,13 @@ open until a live check or a concrete need settles them.
     lock closes the gap; outside it nothing can. The capability `txt_values == ReadThenWrite` states
     this. The accepted reading of hard rule 2 is: guaranteed within a process, best effort beyond it
     where the API gives no means.
-15. **No proxy support.** The HTTP client ignores proxy environment variables on purpose (section
-    5.1). A deployment that can reach providers only through a proxy cannot use the crate until an
-    explicit `ContextOptions` proxy setting is added; say if that is needed.
+15. **Proxy: decided by the maintainer on 2026-11-14 — an explicit setting; implemented.**
+    `ContextOptions::proxy` takes an `HttpProxy` (URL, optional user name, password as
+    `SecretString`). Supported: `http://` and `https://` proxies, `CONNECT` tunnels for HTTPS
+    providers, Basic proxy authentication. Not supported: SOCKS (needs `reqwest`'s `socks` feature),
+    other authentication schemes, an exclusion list. Environment variables stay ignored (section
+    5.1). A `407` from the proxy is `Error::Config`, other proxy failures `Error::Transient`
+    (section 5.3). Open: whether SOCKS or a per-host exclusion list is wanted.
 16. **Private name-server addresses are refused by default** in the inspector. Deployments whose
     authoritative servers are internal must set `allow_private_addresses` or use
     `NsDiscovery::Static`. The earlier implementation accepted them by default.

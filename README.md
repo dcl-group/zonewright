@@ -107,13 +107,15 @@ an application can map to its own error codes.
 With the `inspector` feature, `zonewright::inspector::Inspector` discovers the authoritative name
 servers of a zone, asks any record type at one server or at every server of the zone, and waits
 until an expectation holds (a value is present, the rrset is exactly a given set, or a value is
-absent) at all of them, reporting per name server. Discovery fails rather than return an incomplete
-list when a name server has no usable address. It needs a `tokio` runtime with the I/O and time
+absent) at all of them, reporting per name server. A name server that cannot be asked is reported,
+with the reason, and never counts as agreeing. It needs a `tokio` runtime with the I/O and time
 drivers enabled and holds no secrets.
 
 ```rust,no_run
 use std::time::Duration;
-use zonewright::inspector::{Condition, Expectation, Inspector, InspectorConfig, Question, WaitOptions};
+use zonewright::inspector::{
+    Condition, Expectation, Inspector, InspectorConfig, InspectorError, Question, WaitOptions,
+};
 use zonewright::{DomainName, RecordType, Txt};
 
 async fn wait_for_txt() -> Result<(), Box<dyn std::error::Error>> {
@@ -126,11 +128,20 @@ let expectation = Expectation::new(
     Question::new(name, RecordType::TXT),
     Condition::Present(vec![value]),
 );
-let report = inspector
+match inspector
     .wait(&zone, &[expectation], &WaitOptions::new(Duration::from_secs(120)))
-    .await?;
-for server in &report.servers {
-    println!("{}: satisfied = {}", server.server.addr, server.satisfied);
+    .await
+{
+    Ok(report) => println!("every name server agrees after {:?}", report.elapsed),
+    Err(InspectorError::Timeout { report }) => {
+        for server in &report.servers {
+            match server.server.not_asked {
+                Some(reason) => println!("{:?}: not asked: {reason}", server.server.name),
+                None => println!("{:?}: satisfied = {}", server.server.addr, server.satisfied),
+            }
+        }
+    }
+    Err(err) => return Err(err.into()),
 }
 Ok(())
 }
@@ -142,9 +153,11 @@ HTTP clients use `reqwest` with `rustls` and `aws-lc-rs`. The crate builds its o
 for its requests and never installs a process-wide crypto provider; if the application needs one for
 its own TLS, the application installs it. Server certificates are verified against the platform's
 trust store plus any DER-encoded certificates the application passes in
-`ContextOptions::extra_root_certificates`. `ring`, OpenSSL and `native-tls` are not in the
-dependency tree. Building needs a C compiler (for `aws-lc-rs`) when an HTTP provider or `rfc2136` is
-enabled.
+`ContextOptions::extra_root_certificates`. Proxy environment variables are ignored; an HTTP or HTTPS
+proxy is used only when set in `ContextOptions::proxy`, and requests to HTTPS endpoints go through
+it in a `CONNECT` tunnel with the provider's certificate verified as without it. `ring`, OpenSSL and
+`native-tls` are not in the dependency tree. Building needs a C compiler (for `aws-lc-rs`) when an
+HTTP provider or `rfc2136` is enabled.
 
 ## Secrets and logging
 

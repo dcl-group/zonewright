@@ -34,7 +34,12 @@ The first version, 0.1.0. Not tagged yet.
 - `AnyProvider`, an enum that dispatches to the clients compiled into the build, built from a
   provider ID and JSON settings and credentials (`AnyProvider::from_json`).
 - `Context` and `ContextOptions`: the state shared by the clients of a process (HTTP client,
-  per-name locks, timeouts, user agent suffix, extra root certificates).
+  per-name locks, timeouts, user agent suffix, extra root certificates, proxy).
+- `HttpProxy`, the explicit proxy of `ContextOptions::proxy`: an `http://` or `https://` proxy that
+  every HTTP provider request goes through (`CONNECT` tunnels for HTTPS endpoints), with optional
+  Basic proxy authentication whose password is a `SecretString`. Proxy environment variables are
+  ignored with and without it; SOCKS and URLs with user info are refused. A `407` from the proxy is
+  `Error::Config`. RFC 2136 and the inspector do not use it.
 - `Error` with `ErrorKind` (stable snake_case identifiers), `Operation`, `Error::is_retryable`, and
   `Detail`, the redacted text an error carries.
 - DNS-01 helpers in the module `dns01`: `challenge_name` and `CHALLENGE_LABEL`; `follow_cname` over
@@ -46,8 +51,10 @@ The first version, 0.1.0. Not tagged yet.
   server or through recursive resolvers (`Answer`), and waits (`WaitOptions`, with a pause between
   rounds of at least `WaitOptions::MIN_INTERVAL`, 1 s) until an `Expectation` with a `Condition`
   (value present, exact set, absent) holds, with a `Report` and a `ServerReport` per name server.
-  Discovery fails with `InspectorError::NameServerWithoutAddress` instead of returning a shortened
-  server list when an NS name has no usable address. It also implements `CnameLookup`.
+  Discovery never shortens the server list: a name server without an address in the configured
+  families, or at an address the policy refuses, is returned with `NameServer::not_asked`
+  (`NotAsked`, `AddressRefusal`) and reported as a row that never satisfies (`Answer::NotAsked`). It
+  also implements `CnameLookup`.
 - Features: one per provider, named like its ID; `all-providers`, which enables every provider;
   `inspector`. No feature is enabled by default.
 - Configuration types per provider, in `providers::<id>`: a settings type and a credentials type,
