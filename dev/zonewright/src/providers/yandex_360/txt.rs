@@ -25,7 +25,9 @@
 //! challenge/dns01/domain.go lines 15 to 17, refuses a name equal to the zone, and
 //! providers/dns/yandex360/yandex360.go lines 120 to 123 stop on that error). An add at the apex
 //! is refused with `Error::InvalidInput` before any request (design section 3.1, check 4); a
-//! value found there can still be removed, by its identifier.
+//! value found there can still be removed, by its identifier. (The record level writes the apex
+//! as `@` on the strength of the console's help page, see `api::write_name`; the value
+//! operations keep the refusal until the live API confirms that spelling.)
 
 use crate::error::Error;
 use crate::id::ProviderId;
@@ -36,7 +38,9 @@ use crate::record::{Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
-use super::api::{NewRecord, TXT, Written, names_match};
+use serde_json::Value;
+
+use super::api::{Fields, NewRecord, TXT, Written, names_match};
 use super::client::Yandex360;
 
 /// How TXT data is read.
@@ -77,7 +81,7 @@ impl PerRecord for Yandex360 {
                 record.rtype.eq_ignore_ascii_case(TXT) && names_match(&record.name, zone, name)
             })
             .map(|record| TxtRecord {
-                value: record.text.as_deref().and_then(|text| READ.read(text)),
+                value: record.text().and_then(|text| READ.read(text)),
                 ttl: record.ttl.and_then(|secs| Ttl::from_secs(secs).ok()),
                 handle: record.record_id,
             })
@@ -110,8 +114,11 @@ impl PerRecord for Yandex360 {
         let record = NewRecord {
             rtype: TXT,
             name: relative,
-            text: &text,
             ttl,
+            fields: Fields {
+                text: Some(Value::String(text)),
+                ..Fields::default()
+            },
         };
         match self.api.create_record(zone, &record).await? {
             Written::Done => Ok(()),

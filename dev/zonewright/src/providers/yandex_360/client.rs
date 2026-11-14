@@ -2,7 +2,8 @@
 //!
 //! The module follows the layout of every provider module: `meta.rs` (static metadata),
 //! `config.rs` (settings and credentials), `api.rs` (the HTTP API), `txt.rs` (the TXT value
-//! operations over one shape of the value layer) and this file.
+//! operations over one shape of the value layer), `records.rs` (the record-level operations over
+//! one shape of the record layer) and this file.
 //!
 //! The domain's name is the key of every path, so there are no zone identifiers to cache and
 //! none to go stale.
@@ -19,10 +20,13 @@ use crate::http::Http;
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
-use crate::values;
+use crate::{rrsets, values};
 
 use super::api::{self, Api, Domain};
 use super::config::{self, Yandex360Config, Yandex360Credentials};
@@ -35,6 +39,10 @@ use super::config::{self, Yandex360Config, Yandex360Credentials};
 /// removed, under the per-name lock of the [`Context`]. Values of other writers are never part
 /// of a request (`ValueGuarantee::PerValue`); a writer outside this process can at worst cause
 /// a duplicate of our own value.
+///
+/// The record-level operations work on the same records: replacing an rrset creates the missing
+/// records before it deletes the surplus ones, after a read and without a condition the provider
+/// checks. They cover A, AAAA, CAA, CNAME, MX, SRV and TXT.
 ///
 /// Only domains delegated to Yandex name servers can be managed through the API: `list_zones`
 /// leaves the others out, and `check` reports them as not found, with a detail saying why.
@@ -141,6 +149,40 @@ impl Provider for Yandex360 {
             .filter_map(|domain| DomainName::parse(&domain.name).ok())
             .collect();
         Ok(names.into_iter().map(ZoneInfo::new).collect())
+    }
+
+    /// Every record of the domain, all pages, grouped into rrsets. Records of types outside the
+    /// record-level type list are reported too (NS among them, as skipped sets).
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_per_record(self, zone, name, rtype).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        rrsets::set_per_record(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_per_record(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(

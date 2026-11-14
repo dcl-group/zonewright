@@ -28,6 +28,7 @@ pub use rrset::RrSet;
     feature = "yandex_cloud",
     feature = "hetzner",
     feature = "vk_cloud",
+    feature = "yandex_360",
     feature = "route53",
     feature = "rfc2136",
     feature = "cloud_ru"

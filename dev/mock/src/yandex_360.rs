@@ -3,14 +3,24 @@
 //! Shapes follow the provider's documentation, the same sources the client cites:
 //!
 //! - Create: <https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_Create>:
-//!   `POST /directory/v1/org/{orgId}/domains/{domain}/dns` with `type`, `name` and `ttl`
-//!   required (and `text` for a TXT record); `200` with the record and its `recordId`; `400`,
-//!   `401`, `403`, `404`, `500` with the body `{code, message, details}`.
+//!   `POST /directory/v1/org/{orgId}/domains/{domain}/dns` with `type` (one of `A`, `AAAA`,
+//!   `CNAME`, `MX`, `TXT`, `SRV`, `NS`, `CAA`), `name` and `ttl` required, and the fields of the
+//!   types: `address` (A, AAAA), `target` (CNAME, SRV), `exchange` and `preference` (MX), `text`
+//!   (TXT), `port`, `priority`, `weight` (SRV), `flag`, `tag` and `value` (CAA, the value
+//!   "enclosed in double quotes"); `200` with the record and its `recordId`; `400`, `401`, `403`,
+//!   `404`, `500` with the body `{code, message, details}`.
 //! - List: <https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_List>:
 //!   `GET` on the same path with `page` (default 1) and `perPage` (default 50); the answer holds
-//!   `records`, `page`, `pages`, `perPage`, `total`.
+//!   `records`, `page`, `pages`, `perPage`, `total`; a record has `recordId`, `type`, `name`,
+//!   `ttl` and the type's fields.
+//! - Edit: <https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_Edit.md>:
+//!   `POST …/dns/{recordId}` with `type`, `name` and `ttl` required and the fields above except
+//!   the CAA fields, which the request does not have; `200` with the record.
 //! - Delete: <https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_Delete>:
 //!   `DELETE …/dns/{recordId}`, `200` with `{}`.
+//! - The apex: the help page of the console's DNS editor,
+//!   <https://yandex.ru/support/yandex-360/business/admin/ru/domains/dns/a.md>, writes the main
+//!   domain as `@`.
 //! - Domains: <https://yandex.ru/dev/api360/doc/ru/ref/DomainService/DomainService_List>:
 //!   `GET /directory/v1/org/{orgId}/domains` with `page` and `perPage` (maximum 10); the answer
 //!   holds `domains` (each with `name` and `delegated`), `page`, `pages`, `perPage`, `total`.
@@ -25,13 +35,23 @@
 //!   when);
 //! - the DNS endpoints refuse a domain that is not delegated with `400` (the documentation does
 //!   not say what they answer);
-//! - the `name` of a created record is read as relative to the domain, as lego sends it; `@` and
-//!   an empty name are refused with `400`, since nothing documents the spelling of the apex; a
-//!   record the test inserts at the apex is stated as `@` ([`NameForm::Relative`]) or as the
-//!   domain's full name ([`NameForm::Full`]), and the full form is the one the listing page's
-//!   field description names;
+//! - the `name` of a created or edited record is read as relative to the domain, as lego sends
+//!   it, and `@` as the apex (the help page above, which describes the console, not the API); an
+//!   empty name and a name with a trailing dot are refused with `400`; a record at the apex is
+//!   stated as `@` ([`NameForm::Relative`]) or as the domain's full name ([`NameForm::Full`]),
+//!   and the full form is the one the listing page's field description names;
 //! - a `ttl` that is not a positive integer is refused with `400`; no range is enforced, as
 //!   none is documented;
+//! - the fields a create or an edit requires per type, and their checks, all refused with `400`:
+//!   A `address` an IPv4 address, AAAA `address` an IPv6 address, CNAME a non-empty `target`, MX
+//!   a non-empty `exchange` and `preference` 0 to 65535, TXT a non-empty `text`, SRV a non-empty
+//!   `target` and `priority`, `weight`, `port` 0 to 65535 each, CAA `flag` 0 to 255, a non-empty
+//!   `tag` and a `value` that starts and ends with `"`; a field of another type than the
+//!   record's; NS (no page names the field of its value); in an edit, a CAA type or a CAA field;
+//! - host names (`target`, `exchange`) are stored and answered exactly as sent, with or without
+//!   a trailing dot;
+//! - an edit replaces the record's type, name, TTL and fields with those of the body, and keeps
+//!   its identifier; an unknown identifier is `404`;
 //! - the listing has no filter, so `type` and `name` in the query are ignored;
 //! - a `page` or `perPage` below 1 is refused with `400`; the records listing has no maximum
 //!   `perPage` here, the domain listing has the documented 10;
@@ -59,8 +79,8 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use serde_json::{Value, json};
+use axum::routing::{get, post};
+use serde_json::{Map, Value, json};
 
 use crate::MockServer;
 
@@ -116,11 +136,55 @@ pub struct Record {
     pub name: String,
     /// The record type.
     pub rtype: String,
-    /// The value.
+    /// The `text` field; empty when the record has none.
     pub text: String,
+    /// Every other field of the type (`address`, `target`, `exchange`, `preference`, `port`,
+    /// `priority`, `weight`, `flag`, `tag`, `value`), as sent.
+    pub fields: Map<String, Value>,
     /// TTL in seconds.
     pub ttl: u32,
 }
+
+impl Record {
+    /// A string field other than `text`.
+    pub fn field(&self, key: &str) -> Option<&str> {
+        self.fields.get(key).and_then(Value::as_str)
+    }
+
+    /// A number field.
+    pub fn number(&self, key: &str) -> Option<u64> {
+        self.fields.get(key).and_then(Value::as_u64)
+    }
+}
+
+/// The fields of each type, as the create page names them.
+const TYPE_FIELDS: &[(&str, &[&str])] = &[
+    ("A", &["address"]),
+    ("AAAA", &["address"]),
+    ("CNAME", &["target"]),
+    ("MX", &["exchange", "preference"]),
+    ("TXT", &["text"]),
+    ("SRV", &["target", "priority", "weight", "port"]),
+    ("CAA", &["flag", "tag", "value"]),
+];
+
+/// Every type field of the create page.
+const ALL_FIELDS: &[&str] = &[
+    "address",
+    "target",
+    "exchange",
+    "preference",
+    "text",
+    "port",
+    "priority",
+    "weight",
+    "flag",
+    "tag",
+    "value",
+];
+
+/// The CAA fields, which an edit does not have.
+const CAA_FIELDS: &[&str] = &["flag", "tag", "value"];
 
 #[derive(Debug)]
 struct Inner {
@@ -184,7 +248,7 @@ impl Yandex360Mock {
             )
             .route(
                 "/directory/v1/org/{org}/domains/{domain}/dns/{id}",
-                axum::routing::delete(record_delete),
+                post(record_edit).delete(record_delete),
             )
             .with_state(state.clone());
         Self {
@@ -229,14 +293,61 @@ impl Control {
             .collect()
     }
 
-    /// Adds a record directly, as another writer would. `name` is absolute or relative to the
-    /// domain. Returns the record's identifier.
+    /// The records of `rtype` at `name` (absolute or relative to the first domain), in creation
+    /// order.
+    pub fn records_at(&self, name: &str, rtype: &str) -> Vec<Record> {
+        let inner = lock(&self.state);
+        let domain = inner.domains.first().map_or("", |d| d.0.as_str());
+        let wanted = relative(name, domain);
+        inner
+            .records
+            .iter()
+            .filter(|r| r.rtype == rtype && r.domain == domain && r.name == wanted)
+            .cloned()
+            .collect()
+    }
+
+    /// Adds a record with a `text` field and no other, as another writer would, without any
+    /// check. `name` is absolute or relative to the domain. Returns the record's identifier.
     pub fn insert_record(
         &self,
         domain: &str,
         name: &str,
         rtype: &str,
         text: &str,
+        ttl: u32,
+    ) -> u64 {
+        self.insert(domain, name, rtype, text.to_owned(), Map::new(), ttl)
+    }
+
+    /// Adds a record with the given fields (a JSON object; `text` among them or not), as another
+    /// writer would, without any check. Returns the record's identifier.
+    pub fn insert_fields(
+        &self,
+        domain: &str,
+        name: &str,
+        rtype: &str,
+        fields: Value,
+        ttl: u32,
+    ) -> u64 {
+        let mut fields = match fields {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        let text = match fields.remove("text") {
+            Some(Value::String(text)) => text,
+            _ => String::new(),
+        };
+        self.insert(domain, name, rtype, text, fields, ttl)
+    }
+
+    fn insert(
+        &self,
+        domain: &str,
+        name: &str,
+        rtype: &str,
+        text: String,
+        fields: Map<String, Value>,
         ttl: u32,
     ) -> u64 {
         let mut inner = lock(&self.state);
@@ -247,7 +358,8 @@ impl Control {
             domain: domain.to_owned(),
             name: relative(name, domain),
             rtype: rtype.to_owned(),
-            text: text.to_owned(),
+            text,
+            fields,
             ttl,
         });
         id
@@ -421,9 +533,118 @@ fn record_json(record: &Record, form: NameForm) -> Value {
         (NameForm::Full, "@") => record.domain.clone(),
         (NameForm::Full, name) => format!("{name}.{}", record.domain),
     };
-    json!({
-        "recordId": record.id, "type": record.rtype, "name": name, "ttl": record.ttl,
-        "text": record.text
+    let mut body = json!({
+        "recordId": record.id, "type": record.rtype, "name": name, "ttl": record.ttl
+    });
+    if let Some(object) = body.as_object_mut() {
+        if !record.text.is_empty() {
+            object.insert("text".to_owned(), Value::String(record.text.clone()));
+        }
+        for (key, value) in &record.fields {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    body
+}
+
+/// What a create or an edit body describes, after the checks.
+struct Written {
+    name: String,
+    rtype: String,
+    text: String,
+    fields: Map<String, Value>,
+    ttl: u32,
+}
+
+fn is_u16(value: &Value) -> bool {
+    value.as_u64().is_some_and(|n| n <= u64::from(u16::MAX))
+}
+
+fn non_empty(value: &Value) -> bool {
+    value.as_str().is_some_and(|s| !s.is_empty())
+}
+
+/// The checks of one type field (see the inventions at the top of the file).
+fn field_ok(rtype: &str, key: &str, value: &Value) -> bool {
+    match (rtype, key) {
+        ("A", "address") => value
+            .as_str()
+            .is_some_and(|s| s.parse::<std::net::Ipv4Addr>().is_ok()),
+        ("AAAA", "address") => value
+            .as_str()
+            .is_some_and(|s| s.parse::<std::net::Ipv6Addr>().is_ok()),
+        (_, "preference" | "priority" | "weight" | "port") => is_u16(value),
+        ("CAA", "flag") => value.as_u64().is_some_and(|n| n <= 255),
+        ("CAA", "value") => value
+            .as_str()
+            .is_some_and(|s| s.len() >= 2 && s.starts_with('"') && s.ends_with('"')),
+        _ => non_empty(value),
+    }
+}
+
+/// Checks a create (`edit` false) or an edit body; `Err` is the answer to give.
+fn check_body(body: &[u8], edit: bool) -> Result<Written, Response> {
+    let Ok(body) = serde_json::from_slice::<Value>(body) else {
+        return Err(bad_request("the body is not JSON"));
+    };
+    let Some(object) = body.as_object() else {
+        return Err(bad_request("the body is not an object"));
+    };
+    let Some(rtype) = object.get("type").and_then(Value::as_str) else {
+        return Err(bad_request("type is required"));
+    };
+    if rtype == "NS" {
+        return Err(bad_request("the mock does not know the fields of NS"));
+    }
+    let Some(&(_, own)) = TYPE_FIELDS.iter().find(|(t, _)| *t == rtype) else {
+        return Err(bad_request("type is not a known record type"));
+    };
+    if edit && rtype == "CAA" {
+        return Err(bad_request("an edit has no CAA fields"));
+    }
+    let Some(name) = object.get("name").and_then(Value::as_str) else {
+        return Err(bad_request("name is required"));
+    };
+    if name.is_empty() || name.ends_with('.') {
+        return Err(bad_request("the name is empty or absolute"));
+    }
+    let Some(ttl) = object
+        .get("ttl")
+        .and_then(Value::as_u64)
+        .filter(|&t| t >= 1 && t <= u64::from(u32::MAX))
+    else {
+        return Err(bad_request(
+            "ttl is required and must be a positive integer",
+        ));
+    };
+    let mut fields = Map::new();
+    for &key in ALL_FIELDS {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        if !own.contains(&key) || (edit && CAA_FIELDS.contains(&key)) {
+            return Err(bad_request("a field of another record type"));
+        }
+        if !field_ok(rtype, key, value) {
+            return Err(bad_request("a field is not valid"));
+        }
+        fields.insert(key.to_owned(), value.clone());
+    }
+    if own.iter().any(|key| !fields.contains_key(*key)) {
+        return Err(bad_request("a field of the type is missing"));
+    }
+    let text = match fields.remove("text") {
+        Some(Value::String(text)) => text,
+        _ => String::new(),
+    };
+    Ok(Written {
+        // Relative to the domain, as lego sends it, or `@`: stored as given.
+        name: name.to_lowercase(),
+        rtype: rtype.to_owned(),
+        text,
+        fields,
+        // `ttl` was checked to fit.
+        ttl: u32::try_from(ttl).unwrap_or(u32::MAX),
     })
 }
 
@@ -463,41 +684,56 @@ async fn record_create(
     if let Err(response) = domain_of(&inner, &headers, &org, &domain) {
         return response;
     }
-    let Ok(body) = serde_json::from_slice::<Value>(&body) else {
-        return bad_request("the body is not JSON");
-    };
-    // `type`, `name` and `ttl` are required; `text` carries a TXT record's value.
-    let Some(rtype) = body["type"].as_str() else {
-        return bad_request("type is required");
-    };
-    let Some(name) = body["name"].as_str() else {
-        return bad_request("name is required");
-    };
-    if name.is_empty() || name == "@" {
-        return bad_request("the name is empty");
-    }
-    let Some(ttl) = body["ttl"]
-        .as_u64()
-        .filter(|&t| t >= 1 && t <= u64::from(u32::MAX))
-    else {
-        return bad_request("ttl is required and must be a positive integer");
-    };
-    let Some(text) = body["text"].as_str().filter(|t| !t.is_empty()) else {
-        return bad_request("text is required for a TXT record");
+    let written = match check_body(&body, false) {
+        Ok(written) => written,
+        Err(response) => return response,
     };
     inner.next_id += 1;
     let record = Record {
         id: inner.next_id,
         domain: domain.clone(),
-        // Relative to the domain, as lego sends it: stored as given.
-        name: name.to_lowercase(),
-        rtype: rtype.to_owned(),
-        text: text.to_owned(),
-        ttl: ttl as u32,
+        name: written.name,
+        rtype: written.rtype,
+        text: written.text,
+        fields: written.fields,
+        ttl: written.ttl,
     };
     let created = record_json(&record, inner.name_form);
     inner.records.push(record);
     axum::Json(created).into_response()
+}
+
+async fn record_edit(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((org, domain, id)): Path<(String, String, String)>,
+    body: axum::body::Bytes,
+) -> Response {
+    let mut inner = lock(&state);
+    if let Err(response) = domain_of(&inner, &headers, &org, &domain) {
+        return response;
+    }
+    let Ok(id) = id.parse::<u64>() else {
+        return bad_request("recordId is not a number");
+    };
+    let written = match check_body(&body, true) {
+        Ok(written) => written,
+        Err(response) => return response,
+    };
+    let form = inner.name_form;
+    let Some(record) = inner
+        .records
+        .iter_mut()
+        .find(|r| r.domain == domain && r.id == id)
+    else {
+        return not_found();
+    };
+    record.name = written.name;
+    record.rtype = written.rtype;
+    record.text = written.text;
+    record.fields = written.fields;
+    record.ttl = written.ttl;
+    axum::Json(record_json(record, form)).into_response()
 }
 
 async fn record_delete(

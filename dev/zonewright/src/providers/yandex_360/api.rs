@@ -1,20 +1,27 @@
 //! The Yandex 360 API as this client uses it: one function per endpoint, the wire types, paging
-//! and the classification of answers. Nothing here knows the value layer; `client.rs` and
-//! `txt.rs` build on these calls.
+//! and the classification of answers. Nothing here knows the value layer or the record layer;
+//! `client.rs`, `txt.rs` and `records.rs` build on these calls.
 //!
 //! Sources (hard rule 3):
 //!
 //! - [Create]: <https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_Create>:
 //!   `POST /directory/v1/org/{orgId}/domains/{domain}/dns`; `orgId` an integer, `domain` the full
-//!   domain name (Punycode for Cyrillic names); the body fields `type`, `name` ("record name"),
-//!   `ttl` (all three required) and `text` ("content for a TXT record"); `200` with the record
-//!   and its `recordId`; `400`, `401`, `403`, `404`, `500` with the error body
-//!   `{code, message, details}`. The page states no range for `ttl`.
+//!   domain name (Punycode for Cyrillic names); the body fields `type` (enum `A`, `AAAA`,
+//!   `CNAME`, `MX`, `TXT`, `SRV`, `NS`, `CAA`), `name` ("record name", example `example`), `ttl`
+//!   (all three required) and the optional fields of the types: `address`, `target`,
+//!   `exchange`, `preference`, `text`, `port`, `priority`, `weight`, `flag`, `tag`, `value`;
+//!   `200` with the record and its `recordId`; `400`, `401`, `403`, `404`, `500` with the error
+//!   body `{code, message, details}`. The page states no range for `ttl`.
 //! - [List]: <https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_List>:
 //!   `GET` on the same path with `page` (default 1) and `perPage` (default 50, no maximum
-//!   stated); `200` with `records`, `page`, `pages`, `perPage`, `total`; a record has
-//!   `recordId`, `type`, `name`, `ttl`, `text` and the fields of the other types; the same
+//!   stated); `200` with `records`, `page`, `pages`, `perPage`, `total`; a record (`v1Record`)
+//!   has `recordId`, `type`, `name`, `ttl` and the fields of the types listed above; the same
 //!   error statuses.
+//! - [Edit]: <https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_Edit.md>:
+//!   `POST /directory/v1/org/{orgId}/domains/{domain}/dns/{recordId}`; the body has `type`,
+//!   `name`, `ttl` (required) and `address`, `target`, `exchange`, `preference`, `text`, `port`,
+//!   `priority`, `weight` (the CAA fields `flag`, `tag`, `value` are not part of the request);
+//!   `200` with the record; the same error statuses.
 //! - [Delete]: <https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_Delete>:
 //!   `DELETE /directory/v1/org/{orgId}/domains/{domain}/dns/{recordId}`; `200` with `{}`; the
 //!   same error statuses.
@@ -34,9 +41,11 @@
 //! | list domains  | `GET /directory/v1/org/{org}/domains?page&perPage`      | 200     |
 //! | list records  | `GET /directory/v1/org/{org}/domains/{domain}/dns?page&perPage` | 200 |
 //! | create record | `POST /directory/v1/org/{org}/domains/{domain}/dns`     | 200     |
+//! | edit record   | `POST /directory/v1/org/{org}/domains/{domain}/dns/{id}` | 200    |
 //! | delete record | `DELETE /directory/v1/org/{org}/domains/{domain}/dns/{id}` | 200  |
 //!
 //! [Create]: https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_Create
+//! [Edit]: https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_Edit.md
 //! [List]: https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_List
 //! [Delete]: https://yandex.ru/dev/api360/doc/ru/ref/DomainDNSService/DomainDNSService_Delete
 //! [Domains]: https://yandex.ru/dev/api360/doc/ru/ref/DomainService/DomainService_List
@@ -69,10 +78,80 @@ const DOMAINS_PER_PAGE: u32 = 10;
 /// The record type name as the API spells it.
 pub(super) const TXT: &str = "TXT";
 
+/// The type-specific fields of a record, as the API names them, in a create, an edit and a
+/// listing. Each is kept as the JSON value the API stated, so that a field of an unexpected
+/// shape makes one value unreadable (non-canonical data) instead of the whole listing, and so
+/// that a record can be written back exactly as it was read.
+// Source: Create, request body; List, `v1Record`; Edit, request body. The fields per type, as the
+// pages describe them: `address` for A and AAAA, `target` for CNAME and SRV, `exchange` and
+// `preference` for MX, `text` for TXT, `port`, `priority` and `weight` for SRV, `flag`, `tag` and
+// `value` for CAA. lego providers/dns/yandex360/internal/types.go lines 5 to 21 name the same
+// fields.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub(crate) struct Fields {
+    /// A, AAAA: the address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) address: Option<Value>,
+    /// CNAME, SRV: the target name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) target: Option<Value>,
+    /// MX: the exchange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) exchange: Option<Value>,
+    /// MX: the preference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) preference: Option<Value>,
+    /// TXT: the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) text: Option<Value>,
+    /// SRV: the port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) port: Option<Value>,
+    /// SRV: the priority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) priority: Option<Value>,
+    /// SRV: the weight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) weight: Option<Value>,
+    /// CAA: the flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) flag: Option<Value>,
+    /// CAA: the tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) tag: Option<Value>,
+    /// CAA: the value, "enclosed in double quotes".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) value: Option<Value>,
+}
+
+impl Fields {
+    /// A string field as text; `None` when absent or not a string.
+    pub(super) fn text_of(field: Option<&Value>) -> Option<&str> {
+        field.and_then(Value::as_str)
+    }
+
+    /// A non-negative integer field; `None` when absent or not such a number.
+    pub(super) fn number_of(field: Option<&Value>) -> Option<u64> {
+        field.and_then(Value::as_u64)
+    }
+
+    /// The fields an edit may carry: these, without the CAA fields, which the edit request does
+    /// not have.
+    // Source: Edit, request body (no `flag`, `tag` or `value`).
+    pub(super) fn for_edit(&self) -> Fields {
+        Fields {
+            flag: None,
+            tag: None,
+            value: None,
+            ..self.clone()
+        }
+    }
+}
+
 /// A record as the listing returns it; other fields are ignored.
-// Source: List, record fields (`recordId`, `type`, `name`, `ttl`, `text`).
-#[derive(Debug, Deserialize)]
-pub(super) struct Record {
+// Source: List, record fields (`recordId`, `type`, `name`, `ttl` and the type's fields).
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct Record {
     /// The record's identifier.
     #[serde(rename = "recordId")]
     pub(super) record_id: u64,
@@ -80,15 +159,22 @@ pub(super) struct Record {
     #[serde(default, rename = "type")]
     pub(super) rtype: String,
     /// The owner name as the API states it. Its form is not settled by the documentation (see
-    /// [`names_match`]).
+    /// [`names_match`] and [`owner_name`]).
     #[serde(default)]
     pub(super) name: String,
-    /// The value of a TXT record.
-    #[serde(default)]
-    pub(super) text: Option<String>,
     /// TTL in seconds.
     #[serde(default)]
     pub(super) ttl: Option<u32>,
+    /// The type's fields.
+    #[serde(flatten)]
+    pub(super) fields: Fields,
+}
+
+impl Record {
+    /// The value of a TXT record, when `text` is a string.
+    pub(super) fn text(&self) -> Option<&str> {
+        Fields::text_of(self.fields.text.as_ref())
+    }
 }
 
 /// A domain of the organization as the domain listing returns it; other fields are ignored.
@@ -102,21 +188,22 @@ pub(super) struct Domain {
     pub(super) delegated: bool,
 }
 
-/// The body of the create request.
-// Source: Create, request body: `type`, `name`, `ttl` required, `text` for a TXT record; lego
-// internal/client.go sends a `Record` with the same four fields.
+/// The body of the create and the edit request.
+// Source: Create and Edit, request body: `type`, `name`, `ttl` required, plus the type's fields;
+// lego internal/client.go sends a `Record` with `type`, `name`, `ttl` and `text` for a TXT record.
 #[derive(Serialize)]
 pub(super) struct NewRecord<'a> {
     /// The record type.
     #[serde(rename = "type")]
     pub(super) rtype: &'a str,
     /// The owner name relative to the domain, the form lego sends (yandex360.go lines 120 and
-    /// 128 pass `ExtractSubDomain`).
+    /// 128 pass `ExtractSubDomain`); see [`write_name`] for the apex.
     pub(super) name: &'a str,
-    /// The value.
-    pub(super) text: &'a str,
     /// TTL in seconds; required by the API.
     pub(super) ttl: u32,
+    /// The type's fields.
+    #[serde(flatten)]
+    pub(super) fields: Fields,
 }
 
 /// The answer to a write.
@@ -227,6 +314,31 @@ impl Api {
         }
         let _: Created =
             response.json("the provider's answer to a create is not in the expected form")?;
+        Ok(Written::Done)
+    }
+
+    /// Edits one record by its identifier: the body replaces its type, name, TTL and the type's
+    /// fields. Sent once, as every write but a delete by identifier (design section 5.3). A
+    /// `404` is [`Written::NotFound`].
+    // Source: Edit: `POST …/dns/{recordId}` with `type`, `name`, `ttl` required; `200` with the
+    // record; `404` among the documented answers.
+    pub(super) async fn edit_record(
+        &self,
+        zone: &DomainName,
+        record_id: u64,
+        record: &NewRecord<'_>,
+    ) -> Result<Written, Error> {
+        let url = self.dns_url(zone).id(&record_id.to_string()).build()?;
+        let response = self
+            .http
+            .send(&Request::new(Method::POST, url).json(record)?)
+            .await?;
+        if response.status() == 404 {
+            return Ok(Written::NotFound);
+        }
+        if !response.is_success() {
+            return Err(self.refusal(&response));
+        }
         Ok(Written::Done)
     }
 
@@ -379,6 +491,50 @@ pub(super) fn names_match(stated: &str, zone: &DomainName, name: &DomainName) ->
     stated.eq_ignore_ascii_case(relative) || stated.eq_ignore_ascii_case(name.without_dot())
 }
 
+/// The owner name a record states, as a name, for the record level: `@` or an empty name is the
+/// zone; a name with a trailing dot is absolute; a name without one is the full name when it is
+/// the zone's name or ends with it, else relative to the zone. `None` when the text is not a
+/// valid name.
+// Assumption (not documented): the same forms as [`names_match`] accepts, read the same way (the
+// full name when the text ends with the zone's name). A wrong reading files a record under a name
+// that is not its own: a listing shows it there, and a write to that name compares against it,
+// deletes it by identifier, or keeps it as a value already present. Only a record at a lookalike
+// name (a relative name that repeats the zone, such as `www.example.org` meant inside
+// `example.org`) can be read wrongly this way.
+pub(super) fn owner_name(stated: &str, zone: &DomainName) -> Option<DomainName> {
+    if let Some(absolute) = stated.strip_suffix('.')
+        && !absolute.is_empty()
+    {
+        return DomainName::parse(absolute).ok();
+    }
+    if stated.is_empty() || stated == "@" {
+        return Some(zone.clone());
+    }
+    if let Ok(full) = DomainName::parse(stated)
+        && full.is_within(zone)
+    {
+        return Some(full);
+    }
+    DomainName::from_relative(stated, zone).ok()
+}
+
+/// `name` as a create or an edit states it: relative to `zone`, `@` for the zone itself.
+///
+/// Relative names: lego sends the name relative to the zone (providers/dns/yandex360/yandex360.go
+/// lines 120 and 128), as the API's example `example` shows.
+// Source for `@`: the help page of the DNS editor of Yandex 360 for domains delegated to Yandex,
+// <https://yandex.ru/support/yandex-360/business/admin/ru/domains/dns/a.md> ("to point the main
+// domain, for example `example.org`, at the site's address, enter `@`"; a subdomain is entered as
+// its part left of the domain). The API reference itself does not say how the apex is written;
+// the help page describes the same records through the administrator's console. To be confirmed
+// against the live API.
+pub(super) fn write_name<'a>(name: &'a DomainName, zone: &DomainName) -> Option<&'a str> {
+    match name.relative_to(zone)? {
+        "" => Some("@"),
+        relative => Some(relative),
+    }
+}
+
 /// The provider's error message: the `message` of the documented error body.
 // Source: Create, error body `{code, message, details}`.
 pub(super) fn error_message(body: &str) -> Option<String> {
@@ -393,8 +549,45 @@ pub(super) fn error_message(body: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_message, names_match};
+    use super::{error_message, names_match, owner_name, write_name};
     use crate::name::DomainName;
+
+    #[test]
+    fn owner_names_are_read_in_every_form() {
+        let zone = DomainName::parse("example.org").unwrap();
+        let read = |stated: &str| owner_name(stated, &zone).map(|n| n.as_str().to_owned());
+        for (stated, expected) in [
+            ("@", Some("example.org.")),
+            ("", Some("example.org.")),
+            ("example.org", Some("example.org.")),
+            ("example.org.", Some("example.org.")),
+            ("www", Some("www.example.org.")),
+            ("WWW", Some("www.example.org.")),
+            ("www.example.org", Some("www.example.org.")),
+            ("www.example.org.", Some("www.example.org.")),
+            ("_sip._tcp", Some("_sip._tcp.example.org.")),
+            ("*", Some("*.example.org.")),
+            ("xn--bcher-kva", Some("xn--bcher-kva.example.org.")),
+            ("example.org.sub", Some("example.org.sub.example.org.")),
+            ("other.net.", Some("other.net.")),
+            ("bad name", None),
+        ] {
+            assert_eq!(read(stated).as_deref(), expected, "{stated:?}");
+        }
+    }
+
+    #[test]
+    fn names_are_written_relative_with_the_apex_as_at() {
+        let zone = DomainName::parse("example.org").unwrap();
+        let write = |name: &str| {
+            let name = DomainName::parse(name).unwrap();
+            write_name(&name, &zone).map(str::to_owned)
+        };
+        assert_eq!(write("example.org").as_deref(), Some("@"));
+        assert_eq!(write("www.example.org").as_deref(), Some("www"));
+        assert_eq!(write("a.b.example.org").as_deref(), Some("a.b"));
+        assert_eq!(write("example.net"), None);
+    }
 
     #[test]
     fn error_messages_are_the_message_field() {

@@ -4,15 +4,16 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and
-//! the TXT value operations on plain values. The record-level operations are not written yet,
-//! so their flags are false and `record_types` is empty.
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones`, the
+//! record-level operations for the types whose fields the API reference documents (see the
+//! client's `records.rs`), and the TXT value operations on plain values.
 
 use crate::id::ProviderId;
 use crate::meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
     ValueGuarantee,
 };
+use crate::record::RecordType;
 
 /// The metadata of Yandex 360.
 pub(crate) static META: ProviderMeta = ProviderMeta {
@@ -74,13 +75,23 @@ const FIELDS: &[ConfigField] = &[
 /// What this version of the crate implements for Yandex 360.
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: true,
-    list_rrsets: false,
-    get_rrset: false,
-    set_rrset: false,
-    delete_rrset: false,
+    list_rrsets: true,
+    get_rrset: true,
+    set_rrset: true,
+    delete_rrset: true,
     add_txt_value: true,
     remove_txt_value: true,
-    record_types: TypeSet::Listed(&[]),
+    // The types of the API's type enum whose fields the API reference documents (Create, List,
+    // Edit). NS is in the enum, but no page names the field of its value.
+    record_types: TypeSet::Listed(&[
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::CAA,
+        RecordType::CNAME,
+        RecordType::MX,
+        RecordType::SRV,
+        RecordType::TXT,
+    ]),
     read_only_types: &[],
     // The encoding of values with spaces, quotes, backslashes or non-ASCII bytes is not
     // established for this API (design section 4.4).
@@ -91,6 +102,8 @@ const CAPABILITIES: Capabilities = Capabilities {
     preconditions: Preconditions::ReadThenWrite,
     // Individual records with IDs: a replacement is several requests.
     atomic_rrset_write: false,
+    // Every record carries its own `ttl` (Create, List). The range is an assumption, see
+    // `config.rs`.
     ttl: TtlSupport::PerRecord {
         min: 60,
         max: 86_400,

@@ -62,6 +62,8 @@ All notable changes to this crate are recorded in this file. The format follows
   updated in place: the documented update cannot change a TTL.
 - Record-level operations for Cloud.ru: A, AAAA, CAA, CNAME, MX, NS, SPF, SRV and TXT, including
   wildcard names. Records with GSLB links are reported as skipped and never written.
+- Record-level operations for Yandex 360: A, AAAA, CAA, CNAME, MX, SRV and TXT. NS records are
+  listed as skipped: the API documentation names no value field for them.
 
 ### Changed
 

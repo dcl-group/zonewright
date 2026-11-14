@@ -32,7 +32,7 @@ None yet.
 | DigitalOcean  | `digitalocean`  | TXT values, records   |                                                                                                  |
 | VK Cloud      | `vk_cloud`      | TXT values, records   |                                                                                                  |
 | RFC 2136      | `rfc2136`       | TXT values, records   | Dynamic update has no operation that lists the records of a zone.                                |
-| Yandex 360    | `yandex_360`    | TXT values            |                                                                                                  |
+| Yandex 360    | `yandex_360`    | TXT values, records   |                                                                                                  |
 | Timeweb Cloud | `timeweb_cloud` | TXT values            |                                                                                                  |
 | Cloud.ru      | `cloud_ru`      | TXT values, records   |                                                                                                  |
 | Hetzner       | `hetzner`       | TXT values, records   |                                                                                                  |
