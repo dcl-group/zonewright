@@ -9,12 +9,13 @@
 //! output and `ZoneCheck::detail` to [`assert_clean`].
 
 use std::fmt::{self, Write as _};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing::field::{Field, Visit};
+use tracing::level_filters::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
-use tracing::subscriber::DefaultGuard;
-use tracing::{Event, Level, Subscriber};
+use tracing::subscriber::{DefaultGuard, Interest};
+use tracing::{Dispatch, Event, Level, Metadata, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;
 use zonewright_mock::echo::{self as echo_mock, Echo, Render, Spelling};
@@ -322,7 +323,6 @@ impl Visit for Fields {
 /// Keeps a [`LogCapture`] installed; dropping it ends the capture.
 pub struct CaptureGuard {
     _default: DefaultGuard,
-    _second: tracing::Dispatch,
 }
 
 /// Captures every `tracing` event and span, at every level, from every target.
@@ -331,27 +331,76 @@ pub struct LogCapture {
     entries: Arc<Mutex<Vec<Captured>>>,
 }
 
+/// A subscriber that is never anybody's default and only takes part in the interest of every
+/// callsite, answering "always". See [`pin_interest`].
+struct AlwaysInterested;
+
+impl Subscriber for AlwaysInterested {
+    fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+        Interest::always()
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::TRACE)
+    }
+
+    fn enabled(&self, _: &Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+    fn event(&self, _: &Event<'_>) {}
+
+    fn enter(&self, _: &Id) {}
+
+    fn exit(&self, _: &Id) {}
+}
+
+/// Makes the cached interest of every callsite in this process "always" or "sometimes", never
+/// "never", for the rest of the process.
+///
+/// `tracing-core` (0.1.36, `callsite.rs`) caches in each callsite the combined interest of the
+/// registered dispatchers. While at most one live dispatcher is registered (`has_just_one`),
+/// it computes that interest without a lock from the default dispatcher of whichever thread
+/// registers the callsite, which on a test thread without a capture is the no-op dispatcher:
+/// "never". That computation can store its "never" after a capture's registration has rebuilt
+/// the callsite, and the capture then misses every event of the callsite. Two dispatchers that
+/// stay registered for the whole process keep `has_just_one` false, so every interest is
+/// computed under the dispatcher lock from every live dispatcher; since these two answer
+/// "always", the combination is never "never", and the macros ask the current thread's default
+/// (the capture, or the no-op dispatcher) whether the event is enabled. They also keep the
+/// global maximum level at `TRACE`.
+fn pin_interest() {
+    static PINNED: OnceLock<[Dispatch; 2]> = OnceLock::new();
+    PINNED.get_or_init(|| {
+        [
+            Dispatch::new(AlwaysInterested),
+            Dispatch::new(AlwaysInterested),
+        ]
+    });
+}
+
 impl LogCapture {
     /// Installs a capturing subscriber as the default of the current thread until the guard
     /// drops. Use it with a current-thread runtime, so that the code under test runs on this
     /// thread.
     pub fn install() -> (LogCapture, CaptureGuard) {
+        pin_interest();
         let capture = LogCapture::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         let default = tracing::subscriber::set_default(subscriber);
-        // While exactly one dispatcher is registered, `tracing-core` computes the interest of a
-        // callsite registered later from the default of the thread that hits it first. Tests on
-        // other threads, without a subscriber, would then switch the transport's callsites off
-        // for this capture too. A second registered dispatcher makes the interest consider
-        // every registered dispatcher.
-        let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        (
-            capture,
-            CaptureGuard {
-                _default: default,
-                _second: second,
-            },
-        )
+        // A "never" computed before the dispatchers above were registered, by a thread that
+        // was preempted in the middle of it, may have landed after their rebuild; this one runs
+        // under the dispatcher lock and corrects it.
+        tracing::callsite::rebuild_interest_cache();
+        (capture, CaptureGuard { _default: default })
     }
 
     /// Everything captured so far.
