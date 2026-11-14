@@ -12,9 +12,13 @@ use crate::http::{Http, ZoneCache, path_id, poll_interval};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
+use crate::rrsets;
 use crate::values;
 
 use super::api::{self, Api, Zone};
@@ -27,12 +31,13 @@ const ZONE_READ_ONLY: &str = "the zone is read-only at the provider";
 ///
 /// Authenticates with an access key, exchanged for a bearer token that lives one hour. The
 /// service keeps one record per name and type, holding all values of that name and type, and
-/// replaces its values whole with no condition: TXT value operations read the record, read it
-/// again immediately before the write and refuse with `Error::Conflict` if it changed, then
-/// write the values back with the value added or removed, under the per-name lock of the
-/// [`Context`]. A writer outside this process that changes the record between that second read
-/// and the write can lose its change (`ValueGuarantee::ReadThenWrite`). Every write completes
-/// through a provider-side operation that the client polls.
+/// replaces its values whole with no condition: TXT value operations and record-level writes
+/// read the record, read it again immediately before the write and refuse with
+/// `Error::Conflict` if it changed, then write the values back whole, under the per-name lock of
+/// the [`Context`]. A writer outside this process that changes the record between that second
+/// read and the write can lose its change (`ValueGuarantee::ReadThenWrite`,
+/// `Preconditions::ReadThenWrite`). Every write completes through a provider-side operation that
+/// the client polls.
 ///
 /// Zone identifiers are cached for the life of the client; a stale one is detected and resolved
 /// again. A record listing reads the whole zone; the service allows 500 records per zone by
@@ -219,6 +224,39 @@ impl Provider for CloudRu {
             names.insert(name);
         }
         Ok(names.into_iter().map(ZoneInfo::new).collect())
+    }
+
+    /// Every record of the zone, all pages (see `records.rs`).
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_whole_set(self, zone, name, rtype).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        rrsets::set_whole_set(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_whole_set(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(

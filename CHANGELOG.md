@@ -60,6 +60,8 @@ All notable changes to this crate are recorded in this file. The format follows
   only. A protected rrset is refused; record comments are kept.
 - Record-level operations for VK Cloud: A, AAAA, CNAME, MX, NS, SRV and TXT. A record is never
   updated in place: the documented update cannot change a TTL.
+- Record-level operations for Cloud.ru: A, AAAA, CAA, CNAME, MX, NS, SPF, SRV and TXT, including
+  wildcard names. Records with GSLB links are reported as skipped and never written.
 
 ### Changed
 

@@ -4,15 +4,16 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and
-//! the TXT value operations on plain values. The record-level operations are not written yet, so
-//! their flags are false and `record_types` is empty.
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones`, the
+//! record-level operations for the types whose value form the provider documents (see the
+//! client's `content.rs`), and the TXT value operations on plain values.
 
 use crate::id::ProviderId;
 use crate::meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
     ValueGuarantee,
 };
+use crate::record::RecordType;
 
 /// The metadata of Cloud.ru.
 pub(crate) static META: ProviderMeta = ProviderMeta {
@@ -107,21 +108,36 @@ const FIELDS: &[ConfigField] = &[
 /// What this version of the crate implements for Cloud.ru.
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: true,
-    list_rrsets: false,
-    get_rrset: false,
-    set_rrset: false,
-    delete_rrset: false,
+    list_rrsets: true,
+    get_rrset: true,
+    set_rrset: true,
+    delete_rrset: true,
     add_txt_value: true,
     remove_txt_value: true,
-    record_types: TypeSet::Listed(&[]),
+    // The types of the API (`v1CreatePublicRecordSoleRequest.type`) whose value form the
+    // provider's record types page documents; SPF is type code 99 (see the client's
+    // `content.rs`). SOA is not among the API's types and is not offered.
+    record_types: TypeSet::Listed(&[
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::CAA,
+        RecordType::CNAME,
+        RecordType::MX,
+        RecordType::NS,
+        RecordType::from_code(99),
+        RecordType::SRV,
+        RecordType::TXT,
+    ]),
     read_only_types: &[],
     // The encoding of values with spaces, quotes, backslashes or non-ASCII bytes is not
     // established for this API (design section 4.4).
     txt_plain_only: true,
     // The record is replaced whole by PATCH, which carries no condition; the client re-reads it
-    // immediately before the write (design section 3.5).
+    // immediately before every write, at the TXT value level and at record level (design
+    // section 3.5).
     txt_values: ValueGuarantee::ReadThenWrite,
     preconditions: Preconditions::ReadThenWrite,
+    // One create or update request carries the whole record.
     atomic_rrset_write: true,
     ttl: TtlSupport::PerRrset {
         min: 60,

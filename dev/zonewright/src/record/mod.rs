@@ -29,7 +29,8 @@ pub use rrset::RrSet;
     feature = "hetzner",
     feature = "vk_cloud",
     feature = "route53",
-    feature = "rfc2136"
+    feature = "rfc2136",
+    feature = "cloud_ru"
 ))]
 pub(crate) use rrset::singleton;
 pub use rtype::RecordType;

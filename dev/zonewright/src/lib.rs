@@ -72,7 +72,8 @@ mod values;
     feature = "hetzner",
     feature = "vk_cloud",
     feature = "route53",
-    feature = "rfc2136"
+    feature = "rfc2136",
+    feature = "cloud_ru"
 ))]
 mod rrsets;
 

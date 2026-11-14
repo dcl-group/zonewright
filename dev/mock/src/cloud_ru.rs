@@ -17,6 +17,22 @@
 //!   (3600) and `token_type` `Bearer`; requests carry `Authorization: Bearer <access_token>`.
 //! - Limitations (<https://cloud.ru/docs/evolution-dns/ug/topics/overview__limitations>): one
 //!   record per name and type in a zone, holding several values; TTL 60 to 86400 seconds.
+//! - Record types (<https://cloud.ru/docs/evolution-dns/ug/topics/concepts__record-types>): the
+//!   value of each type, checked on every create and update: `a` an IPv4 address, `aaaa` an IPv6
+//!   address, `cname` and `ns` a domain name, `mx` `<preference> <exchange>` (a 16-bit
+//!   preference; `.` for no mail), `srv` `<priority> <weight> <port> <target>` (0 to 65535 each),
+//!   `caa` `<flags> <tag> "<value>"` (flags 0 or 128; tag `issue`, `issuewild` or `iodef`; the
+//!   value in double quotes), `spf` text starting with `v=spf1`, `txt` at most 65 000
+//!   characters; a CNAME cannot share its name with records of other types; NS records only below
+//!   the zone's own name.
+//! - Adding a record (<https://cloud.ru/docs/evolution-dns/ug/topics/guides__add-record>) and
+//!   wildcard records
+//!   (<https://cloud.ru/docs/evolution-dns/ug/topics/concepts__record-types-wildcard>): the
+//!   `wildcard` flag makes the record apply to the names below its `name` (`@` for the names
+//!   below the zone); not offered for NS. The OpenAPI's create body has `wildcard`, its update
+//!   body does not.
+//! - The OpenAPI, `v1GslbData`: a record may carry `gslbData` with `links` and a
+//!   `balancingPolicy` ([`Control::set_gslb`]).
 //! - Proto3 JSON (<https://protobuf.dev/programming-guides/json/>): an int64 (`ttl`) is written
 //!   as a string.
 //!
@@ -32,8 +48,15 @@
 //! - the form of a record's `name`: the mock accepts the name relative to the zone, `@` for the
 //!   zone itself, or absolute with a trailing dot, and returns it relative (or absolute with or
 //!   without the trailing dot, with [`Control::set_name_style`]);
-//! - an update replaces the description and the tags with the ones it carries (none when
-//!   absent), the values with the ones it carries (which are required), and the TTL when it
+//! - names inside values: refused with a trailing dot (every documented example is written
+//!   without one; whether the service accepts one is not documented, and refusing it makes a
+//!   client that sends one fail); a name is labels of letters, digits, `-` and `_`; a CNAME holds
+//!   one value; a refused value is `400` (code 3), as is a CNAME next to other types, an NS
+//!   record at the zone's own name and a wildcard NS record;
+//! - a wildcard record and a record without the flag at the same name are different records
+//!   (the uniqueness of name and type is checked per flag);
+//! - an update replaces the description, the tags and `gslbData` with the ones it carries (none
+//!   when absent), the values with the ones it carries (which are required), and the TTL when it
 //!   carries one;
 //! - a write is applied when it is accepted (unless the operation is set to fail, see
 //!   [`Control::fail_next_operation`]); its operation reports `done: false` in the answer and
@@ -142,6 +165,10 @@ pub struct Record {
     pub description: Option<String>,
     /// The tags.
     pub tags: Vec<String>,
+    /// The wildcard flag: the record applies to the names below `owner`.
+    pub wildcard: bool,
+    /// The `gslbData` object, if any; an update replaces it with the one it carries.
+    pub gslb: Option<Value>,
 }
 
 /// How the mock spells a record's `name`.
@@ -368,18 +395,20 @@ impl Control {
         lock(&self.state).records.clone()
     }
 
-    /// The record of owner `name` and type `rtype` (lowercase), if any.
+    /// The record of owner `name` and type `rtype` (lowercase), if any. A name that starts with
+    /// `*.` stands for the wildcard record below the rest of the name.
     pub fn record(&self, name: &str, rtype: &str) -> Option<Record> {
-        let owner = fqdn(name);
+        let (owner, wildcard) = key(name);
         lock(&self.state)
             .records
             .iter()
-            .find(|r| r.owner == owner && r.rtype == rtype)
+            .find(|r| r.owner == owner && r.wildcard == wildcard && r.rtype == rtype)
             .cloned()
     }
 
-    /// Creates a record in zone `zone` directly, as another writer would. Returns its
-    /// identifier.
+    /// Creates a record in zone `zone` directly, as another writer would, without checking its
+    /// values. A name that starts with `*.` creates the wildcard record below the rest of the
+    /// name. Returns its identifier.
     ///
     /// # Panics
     ///
@@ -393,18 +422,21 @@ impl Control {
         values: &[&str],
     ) -> String {
         let zone_id = self.zone_id(zone);
+        let (owner, wildcard) = key(name);
         let mut inner = lock(&self.state);
         let id = inner.new_id();
         inner.records.push(Record {
             id: id.clone(),
             zone_id,
-            owner: fqdn(name),
+            owner,
             rtype: rtype.to_owned(),
             values: values.iter().map(|v| (*v).to_owned()).collect(),
             ttl,
             read_only: false,
             description: None,
             tags: Vec::new(),
+            wildcard,
+            gslb: None,
         });
         id
     }
@@ -422,7 +454,7 @@ impl Control {
             if let Some(record) = inner
                 .records
                 .iter_mut()
-                .find(|r| r.owner == owner && r.rtype == "txt")
+                .find(|r| r.owner == owner && !r.wildcard && r.rtype == "txt")
             {
                 record.values.push(value.to_owned());
                 return;
@@ -456,12 +488,25 @@ impl Control {
         });
     }
 
+    /// Sets the `gslbData` object of the record of `name` and `rtype`.
+    pub fn set_gslb(&self, name: &str, rtype: &str, gslb: Option<Value>) {
+        self.edit(name, rtype, |r| r.gslb = gslb.clone());
+    }
+
+    /// Replaces the values of the record of `name` and `rtype` directly, as another writer
+    /// would.
+    pub fn set_values(&self, name: &str, rtype: &str, values: &[&str]) {
+        self.edit(name, rtype, |r| {
+            r.values = values.iter().map(|v| (*v).to_owned()).collect();
+        });
+    }
+
     fn edit(&self, name: &str, rtype: &str, change: impl Fn(&mut Record)) {
-        let owner = fqdn(name);
+        let (owner, wildcard) = key(name);
         for record in lock(&self.state)
             .records
             .iter_mut()
-            .filter(|r| r.owner == owner && r.rtype == rtype)
+            .filter(|r| r.owner == owner && r.wildcard == wildcard && r.rtype == rtype)
         {
             change(record);
         }
@@ -469,10 +514,10 @@ impl Control {
 
     /// Deletes the record of `name` and `rtype` directly, as another writer would.
     pub fn delete_record(&self, name: &str, rtype: &str) {
-        let owner = fqdn(name);
+        let (owner, wildcard) = key(name);
         lock(&self.state)
             .records
-            .retain(|r| !(r.owner == owner && r.rtype == rtype));
+            .retain(|r| !(r.owner == owner && r.wildcard == wildcard && r.rtype == rtype));
     }
 
     /// The values of the TXT record of `name`, in order; empty when there is none.
@@ -525,6 +570,15 @@ impl Control {
     /// Caps the page size of every listing, to force several pages.
     pub fn set_page_size_cap(&self, cap: usize) {
         lock(&self.state).page_size_cap = Some(cap.max(1));
+    }
+}
+
+/// The owner and the wildcard flag of a test's name: `*.rest` is the wildcard record below
+/// `rest`.
+fn key(name: &str) -> (String, bool) {
+    match name.trim().strip_prefix("*.") {
+        Some(rest) => (fqdn(rest), true),
+        None => (fqdn(name), false),
     }
 }
 
@@ -712,11 +766,14 @@ fn record_json(record: &Record, zone: &Zone, style: NameStyle) -> Value {
         // Proto3 JSON writes an int64 as a string.
         "ttl": record.ttl.to_string(),
         "readOnly": record.read_only,
-        "wildcard": false,
+        "wildcard": record.wildcard,
         "tags": record.tags,
     });
     if let Some(description) = &record.description {
         value["description"] = json!(description);
+    }
+    if let Some(gslb) = &record.gslb {
+        value["gslbData"] = gslb.clone();
     }
     value
 }
@@ -789,6 +846,58 @@ fn string_list(value: Option<&Value>) -> Option<Vec<String>> {
     strings.filter(|s| !s.is_empty())
 }
 
+/// The values of a record of `rtype`, checked against the forms of the record types page: `400`
+/// (code 3) for the first that does not match.
+fn check_values(rtype: &str, values: &[String]) -> Result<(), Response> {
+    if rtype == "cname" && values.len() != 1 {
+        return Err(bad_request("a CNAME record holds exactly one value"));
+    }
+    match values.iter().find(|v| !valid_value(rtype, v)) {
+        None => Ok(()),
+        Some(_) => Err(bad_request("a value does not match the record type")),
+    }
+}
+
+fn valid_value(rtype: &str, value: &str) -> bool {
+    let fields: Vec<&str> = value.split(' ').collect();
+    let u16_field = |s: &str| {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u16>().is_ok()
+    };
+    match rtype {
+        "a" => value.parse::<std::net::Ipv4Addr>().is_ok(),
+        "aaaa" => value.parse::<std::net::Ipv6Addr>().is_ok(),
+        "cname" | "ns" => host(value),
+        "mx" => matches!(fields.as_slice(), [preference, exchange]
+            if u16_field(preference) && (*exchange == "." || host(exchange))),
+        "srv" => matches!(fields.as_slice(), [priority, weight, port, target]
+            if u16_field(priority) && u16_field(weight) && u16_field(port) && host(target)),
+        "caa" => {
+            let mut parts = value.splitn(3, ' ');
+            let (flags, tag, quoted) = (parts.next(), parts.next(), parts.next().unwrap_or(""));
+            let inner = quoted.strip_prefix('"').and_then(|q| q.strip_suffix('"'));
+            matches!(flags, Some("0" | "128"))
+                && matches!(tag, Some("issue" | "issuewild" | "iodef"))
+                && inner.is_some_and(|i| !i.contains('"'))
+        }
+        "spf" => value.starts_with("v=spf1"),
+        "txt" => !value.is_empty() && value.chars().count() <= 65_000,
+        _ => false,
+    }
+}
+
+/// A domain name as the record types page writes one: labels of letters, digits, `-` and `_`,
+/// without the final dot.
+fn host(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
 /// An int64 as a number or a decimal string (Proto3 JSON accepts both on input), within the TTL
 /// range.
 fn ttl_of(value: Option<&Value>) -> Result<u64, Response> {
@@ -827,21 +936,43 @@ async fn record_create(State(state): State<Shared>, headers: HeaderMap, body: By
     let Some(values) = string_list(request.get("values")) else {
         return bad_request("values are required");
     };
+    if let Err(response) = check_values(rtype, &values) {
+        return response;
+    }
     let ttl = match ttl_of(request.get("ttl")) {
         Ok(ttl) => ttl,
         Err(response) => return response,
     };
+    let wildcard = match request.get("wildcard") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return bad_request("wildcard must be a boolean"),
+    };
+    if rtype == "ns" && (wildcard || owner == zone.domain) {
+        return bad_request("NS records are created for a subdomain only, without wildcard");
+    }
     let mut inner = lock(&state);
+    let same_name =
+        |r: &&Record| r.zone_id == zone.id && r.owner == owner && r.wildcard == wildcard;
     if inner
         .records
         .iter()
-        .any(|r| r.zone_id == zone.id && r.owner == owner && r.rtype == rtype)
+        .filter(same_name)
+        .any(|r| r.rtype == rtype)
     {
         return error(
             StatusCode::CONFLICT,
             6,
             "a record with this name and type already exists",
         );
+    }
+    if inner
+        .records
+        .iter()
+        .filter(same_name)
+        .any(|r| (r.rtype == "cname") != (rtype == "cname"))
+    {
+        return bad_request("a CNAME record cannot share its name with records of other types");
     }
     let fail = inner.fail_next.take();
     if fail.is_none() {
@@ -856,6 +987,8 @@ async fn record_create(State(state): State<Shared>, headers: HeaderMap, body: By
             read_only: false,
             description: request["description"].as_str().map(str::to_owned),
             tags: Vec::new(),
+            wildcard,
+            gslb: request.get("gslbData").cloned(),
         });
     }
     axum::Json(inner.operation(fail)).into_response()
@@ -899,6 +1032,9 @@ async fn record_update(
     if inner.records[index].read_only {
         return error(StatusCode::BAD_REQUEST, 9, "the record is read-only");
     }
+    if let Err(response) = check_values(&inner.records[index].rtype, &values) {
+        return response;
+    }
     let fail = inner.fail_next.take();
     if fail.is_none() {
         let record = &mut inner.records[index];
@@ -911,6 +1047,7 @@ async fn record_update(
             .and_then(Value::as_str)
             .map(str::to_owned);
         record.tags = string_list(request.get("tags")).unwrap_or_default();
+        record.gslb = request.get("gslbData").cloned();
     }
     axum::Json(inner.operation(fail)).into_response()
 }

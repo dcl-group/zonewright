@@ -5,13 +5,15 @@
 //! `CloudRuConfig` and credentials `CloudRuCredentials`, is compiled with the cargo feature
 //! `cloud_ru`.
 //!
-//! This version offers `check`, `list_zones` and the TXT value operations. The TXT value
-//! operations accept plain values only. They read the record that holds every value of the name,
-//! read it again immediately before the write and refuse with `Error::Conflict` if it changed,
-//! and write it back whole: a concurrent writer outside this process can still lose its change
-//! in the remaining window (see
-//! [`ValueGuarantee::ReadThenWrite`](crate::ValueGuarantee::ReadThenWrite)). Every write waits
-//! for the provider-side operation it starts.
+//! This version offers `check`, `list_zones`, the record-level operations for A, AAAA, CAA,
+//! CNAME, MX, NS, SPF, SRV and TXT, and the TXT value operations, which accept plain values only.
+//! Every write reads the record that holds every value of the name and type, reads it again
+//! immediately before the write and refuses with `Error::Conflict` if it changed, and writes it
+//! back whole: a concurrent writer outside this process can still lose its change in the
+//! remaining window (see
+//! [`ValueGuarantee::ReadThenWrite`](crate::ValueGuarantee::ReadThenWrite) and
+//! [`Preconditions::ReadThenWrite`](crate::Preconditions::ReadThenWrite)). Every write waits for
+//! the provider-side operation it starts.
 
 pub(crate) mod meta;
 
@@ -21,6 +23,12 @@ mod api;
 mod client;
 #[cfg(feature = "cloud_ru")]
 mod config;
+#[cfg(feature = "cloud_ru")]
+mod content;
+#[cfg(feature = "cloud_ru")]
+mod records;
+#[cfg(feature = "cloud_ru")]
+mod rrset;
 #[cfg(feature = "cloud_ru")]
 mod txt;
 

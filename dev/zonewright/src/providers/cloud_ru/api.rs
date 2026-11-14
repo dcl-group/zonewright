@@ -66,7 +66,7 @@ const PAGE_SIZE: &str = "100";
 /// Most polls of one provider-side operation (design section 3.7).
 const MAX_POLLS: u32 = 60;
 
-/// Record type names as the API spells them: lowercase.
+/// The TXT type as the API spells it: lowercase. The other type names are in `content.rs`.
 // Source: the OpenAPI, `v1CreatePublicRecordSoleRequest.type` ("Возможные значения: a, aaaa,
 // srv, cname, mx, ns, spf, txt, caa").
 pub(super) const TXT: &str = "txt";
@@ -144,14 +144,25 @@ fn page_of<T: DeserializeOwned>(
 /// A record of a public zone, one per name and type, holding all values of that name and type.
 /// Other fields are ignored.
 // Source: the OpenAPI, `v1PublicRecordSole` (`publicZoneId`, `name`, `type`, `values`, `ttl`
-// required; `id`, `readOnly`, `description`, `tags`, `wildcard`, `gslbData` optional). `id` and
-// `values` are required here: a record without them cannot be changed or compared.
+// required; `id`, `readOnly`, `description`, `tags`, `wildcard`, `gslbData` optional). `id` is
+// required here: a record without it cannot be changed. `values` may be absent: Proto3 JSON
+// omits an empty repeated field, and a record without values publishes nothing.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Record {
     /// The record's identifier.
     pub(super) id: String,
+    /// The zone the record belongs to.
+    #[serde(default)]
+    pub(super) public_zone_id: Option<String>,
+    /// The owner name as the API spells it (see `rrset.rs`).
+    #[serde(default)]
+    pub(super) name: Option<String>,
+    /// The type as the API spells it.
+    #[serde(default, rename = "type")]
+    pub(super) rtype: Option<String>,
     /// The values in the API's text form.
+    #[serde(default)]
     pub(super) values: Vec<String>,
     /// TTL in seconds; an int64, which Proto3 JSON may write as a string.
     #[serde(deserialize_with = "int64")]
@@ -171,6 +182,23 @@ pub(crate) struct Record {
     /// Kept on every update.
     #[serde(default)]
     pub(super) gslb_data: Option<Value>,
+}
+
+impl Record {
+    /// The record balances between GSLB links: its answers come from `gslbData.links`, not from
+    /// a plain list of values, so it is not an rrset the model can hold. A `gslbData` without
+    /// links (or none at all) is an attribute that travels back unchanged.
+    // Source: the OpenAPI, `v1GslbData` (`links` of `v1GslbLink`: `fqdn`, `weight`, `priority`,
+    // `isEnabled`; `balancingPolicy`); GSLB records
+    // (https://cloud.ru/docs/evolution-dns/ug/topics/concepts__record-types-gslb): a GSLB record
+    // holds server names and priorities and is answered by a balancing algorithm.
+    pub(super) fn is_gslb(&self) -> bool {
+        self.gslb_data
+            .as_ref()
+            .and_then(|data| data.get("links"))
+            .and_then(Value::as_array)
+            .is_some_and(|links| !links.is_empty())
+    }
 }
 
 /// Two reads of a record are the same when nothing a write would carry differs. The values are
@@ -227,6 +255,14 @@ pub(super) struct NewRecord<'a> {
     pub(super) values: &'a [String],
     /// TTL in seconds.
     pub(super) ttl: u64,
+    /// The wildcard flag: the record applies to the names below `name`. Sent only when set.
+    // Source: the OpenAPI, `v1CreatePublicRecordSoleRequest.wildcard` (optional boolean).
+    #[serde(skip_serializing_if = "is_false")]
+    pub(super) wildcard: bool,
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// The body of `PATCH /v1/publicRecordsSole/{id}`: no name and no type.

@@ -34,7 +34,7 @@ None yet.
 | RFC 2136      | `rfc2136`       | TXT values, records   | Dynamic update has no operation that lists the records of a zone.                                |
 | Yandex 360    | `yandex_360`    | TXT values            |                                                                                                  |
 | Timeweb Cloud | `timeweb_cloud` | TXT values            |                                                                                                  |
-| Cloud.ru      | `cloud_ru`      | TXT values            |                                                                                                  |
+| Cloud.ru      | `cloud_ru`      | TXT values, records   |                                                                                                  |
 | Hetzner       | `hetzner`       | TXT values, records   |                                                                                                  |
 | nic.ru        | `nicru`         | TXT values            |                                                                                                  |
 | reg.ru        | `regru`         | TXT values            | An earlier version of this client was proven against the live API.                               |
