@@ -203,8 +203,11 @@ impl Nicru {
     }
 
     /// Commits `zone`, up to [`COMMIT_ATTEMPTS`] times, and clears its mark after a successful
-    /// commit. When every attempt fails, the mark stays and the result is `Error::Transient`:
-    /// the next operation in the zone commits the staged changes.
+    /// commit. When every attempt fails, the result is `Error::Transient`, and the zone is
+    /// listed once more: an attempt may have been applied with its answer lost, so a zone
+    /// without staged changes has its mark cleared (nothing of ours is pending, and a foreign
+    /// edit staged later must not be committed as ours). With staged changes, or when the
+    /// listing fails, the mark stays and the next operation in the zone commits them.
     pub(super) async fn commit_own(&self, zone: &DomainName, service: &str) -> Result<(), Error> {
         let mut last = None;
         for attempt in 0..COMMIT_ATTEMPTS {
@@ -218,6 +221,12 @@ impl Nicru {
                 }
                 Err(e) => last = Some(e),
             }
+        }
+        if let Ok(zones) = self.api.zones().await
+            && let Lookup::Found(found) = lookup(zones, zone)
+            && !found.has_changes
+        {
+            self.unmark(zone);
         }
         let cause = last.map(|e| e.to_string()).unwrap_or_default();
         Err(Error::Transient {
@@ -433,13 +442,15 @@ impl Provider for Nicru {
         values::remove_per_record(&Op::new(self), zone, name, value).await
     }
 
-    /// Every record of the zone. Refused (`Error::Rejected`) while the zone has staged changes:
-    /// the listing would show them as if they were published.
+    /// Every record of the zone. Staged changes this process left behind are committed or
+    /// rolled back first, as their mark says; refused (`Error::Rejected`) while the zone has
+    /// other staged changes: the listing would show them as if they were published.
     async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
         self.list_zone(zone).await
     }
 
-    /// Refused (`Error::Rejected`) while the zone has staged changes, as `list_rrsets`.
+    /// Settles this process's own staged changes first and refuses (`Error::Rejected`) a zone
+    /// with other staged changes, as `list_rrsets`.
     async fn get_rrset(
         &self,
         zone: &DomainName,

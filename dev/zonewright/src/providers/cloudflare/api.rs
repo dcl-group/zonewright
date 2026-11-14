@@ -279,8 +279,11 @@ impl Api {
     /// Every record in zone `zone_id`, all pages, of type `rtype` and at `name` where they are
     /// given. The caller compares names and types exactly. A `404` means the zone does not
     /// exist (a stale identifier) and is `Error::ZoneNotFound` for `zone`.
-    // Source: the schema, `GET /zones/{zone_id}/dns_records` with `type`, `name` ("Exact value of
-    // the DNS record name. This is a convenience alias for `name.exact`"), `per_page`, `page`.
+    // Source: the schema, `GET /zones/{zone_id}/dns_records` with `type`, `name`, `per_page`,
+    // `page`. The description of the query parameter `name` ("Exact value of the DNS record
+    // name. This is a convenience alias for `name.exact`") is in the published OpenAPI file,
+    // <https://github.com/cloudflare/api-schemas/blob/main/openapi.json> (read 2026-11-14),
+    // not on the rendered API reference page.
     // Assumption (not documented): a missing zone is answered `404`; the schema names the
     // failure class `4XX` only. If the API answers otherwise, the read phase in `txt.rs` and
     // `records.rs` still looks the zone up again after any refusal under a cached identifier;

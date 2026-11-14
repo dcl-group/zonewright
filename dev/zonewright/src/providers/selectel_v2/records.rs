@@ -30,9 +30,14 @@
 //! | CAA   | `<flag> <tag> <value>`, value "wrapped in `\"`": `128 issue "…"`      |
 //!
 //! Every one of these is the type's presentation format (RFC 1035 section 5) with absolute names,
-//! which is what the canonical text of design section 4.3 is. So a value is read with
-//! `RecordData::from_provider` (the strict parser, names absolute, TXT with the `Auto` rule) and
-//! written as its canonical text. Two limits keep the client within what the sources establish:
+//! which is what the canonical text of design section 4.3 is. So a value is written as its
+//! canonical text and read with `RecordData::from_provider`, held to the stated format: names
+//! "with a dot at the end" and TXT "wrapped in `\"`". No source says what a name without the
+//! trailing dot inside a value, or unquoted TXT text, means (relative to the zone or absolute;
+//! one string or several), so such a value is kept as non-canonical data (design section 4.9):
+//! it never compares equal to an absolute name or to a quoted value, and a `set_rrset` that asks
+//! for one replaces it rather than answering `Unchanged`. Two limits keep the client within what
+//! the sources establish:
 //!
 //! - Escapes. No source says how the API treats a backslash escape (`\"`, `\\`, `\DDD`) in
 //!   content. Canonical text needs one for a TXT or CAA value with `"`, `\` or a byte outside
@@ -80,12 +85,35 @@ use super::client::SelectelV2;
 // Source: the OpenAPI, `RRSetCreateForm` and `RRSetUpdateForm` (`records`: 1 to 100 items).
 pub(super) const MAX_RECORDS: usize = 100;
 
-/// How TXT content is read: quoted text as presentation format, anything else as the value.
+/// How the TXT value operations read content: quoted text as presentation format, anything else
+/// as the value. The record level holds TXT to the stated quoted form ([`read_content`]).
 pub(super) const TXT_READ: TxtDialect = TxtDialect::Auto;
 
-/// A value as the API returned it (see the module documentation).
-pub(super) fn read_content(rtype: RecordType, content: &str) -> RecordData {
-    RecordData::from_provider(rtype, content, None, TXT_READ)
+/// A value as the API returned it, held to the documented form (see the module documentation):
+/// unquoted TXT text, and a value with a name that lacks the trailing dot (one that reads
+/// differently relative to `zone` than absolute), are non-canonical data.
+// Source: Terraform docs (module documentation): CNAME, ALIAS and SRV targets and MX hosts
+// "with a dot at the end"; TXT "Any text wrapped in `\"`". Neither the Terraform docs nor
+// https://docs.selectel.ru/en/networks-services/dns/records/add-record/ (read 2026-11-14) say
+// what a name without the dot or unquoted text means.
+pub(super) fn read_content(zone: &DomainName, rtype: RecordType, content: &str) -> RecordData {
+    if rtype == RecordType::TXT {
+        if !content.trim_start().starts_with('"') {
+            return RecordData::non_canonical(content);
+        }
+        return RecordData::from_provider(rtype, content, None, TxtDialect::Presentation);
+    }
+    let absolute = RecordData::from_provider(rtype, content, None, TXT_READ);
+    // A dotless name (or `@`) is the only text the two readings take differently.
+    if absolute.is_canonical()
+        && RecordData::parse_relative(rtype, content, zone)
+            .ok()
+            .as_ref()
+            != Some(&absolute)
+    {
+        return RecordData::non_canonical(content);
+    }
+    absolute
 }
 
 /// The API's text for a value, or `None` when the client cannot send it: non-canonical data,
@@ -117,12 +145,12 @@ impl RrsetBase for SelectelV2 {
 }
 
 /// The record layer's view of an rrset the API returned.
-fn found(rtype: RecordType, rrset: Rrset) -> Found<Record, Rrset> {
+fn found(zone: &DomainName, rtype: RecordType, rrset: Rrset) -> Found<Record, Rrset> {
     let records = rrset
         .records
         .iter()
         .map(|record| Stored {
-            data: read_content(rtype, &record.content),
+            data: read_content(zone, rtype, &record.content),
             enabled: !record.disabled,
             ttl: None,
             handle: record.clone(),
@@ -150,7 +178,7 @@ impl WholeSet for SelectelV2 {
         let (zone_id, rrset) = self.read_rrset(zone, name, &rtype.to_string()).await?;
         Ok(Current {
             context: zone_id,
-            found: rrset.map(|rrset| found(rtype, rrset)),
+            found: rrset.map(|rrset| found(zone, rtype, rrset)),
         })
     }
 
@@ -241,7 +269,7 @@ impl SelectelV2 {
             let records = match rrset.rtype.parse::<RecordType>() {
                 Ok(rtype) => enabled
                     .iter()
-                    .map(|content| read_content(rtype, content))
+                    .map(|content| read_content(zone, rtype, content))
                     .collect(),
                 Err(_) => enabled
                     .iter()

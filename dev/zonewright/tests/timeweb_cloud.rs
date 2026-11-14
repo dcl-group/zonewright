@@ -27,7 +27,9 @@ use zonewright_mock::axum;
 use zonewright_mock::axum::http::{Method, StatusCode};
 use zonewright_mock::axum::response::IntoResponse as _;
 use zonewright_mock::echo::{EchoServer, Echoed, Render};
-use zonewright_mock::timeweb_cloud::{ListingScope, Seed, SubdomainForm, TimewebCloudMock};
+use zonewright_mock::timeweb_cloud::{
+    Addressing, ListingScope, Seed, SubdomainForm, TimewebCloudMock,
+};
 
 use common::echo::{CANARY_KEY, CANARY_TOKEN, LogCapture, REDACTED, assert_clean, dialects};
 use common::{context, dn};
@@ -150,8 +152,8 @@ fn page(key: &str, items: serde_json::Value) -> Render {
 }
 
 /// A renderer that answers the reads named by `normal` like the API and every other request
-/// with `errors`. `normal` has the `GET` paths: the domain listing (`domains`), and the record
-/// listing, which `existing` fills.
+/// with `errors`. `normal` has the `GET` paths: the domain listing (`domains`), and, when
+/// `records` is given, the domain's answer and every record listing, which `records` fills.
 fn answering(errors: Render, domains: bool, records: Option<Existing>) -> Render {
     let domain_page = page(
         "domains",
@@ -176,10 +178,21 @@ fn answering(errors: Render, domains: bool, records: Option<Existing>) -> Render
         page("dns_records", items)
     };
     let record_page = records.map(record_page);
+    // The domain's answer, with the name the record pages show as its subdomain.
+    let domain: Render = Arc::new(|_: &Echoed| {
+        let body = serde_json::json!({"domain": {
+            "fqdn": "example.org",
+            "subdomains": [{"id": 1, "fqdn": NAME}],
+        }});
+        (StatusCode::OK, axum::Json(body)).into_response()
+    });
     Arc::new(move |e: &Echoed| {
         if e.method == Method::GET {
             if domains && e.path.ends_with("/v1/domains") {
                 return domain_page(e);
+            }
+            if record_page.is_some() && e.path.ends_with("/v1/domains/example.org") {
+                return domain(e);
             }
             if let Some(records) = &record_page
                 && e.path.ends_with("/dns-records")
@@ -748,7 +761,7 @@ async fn timeweb_cloud_delete_by_id_is_retried() {
 // ---- Names and subdomains ----------------------------------------------------------------------
 
 /// The client keeps no memory: a client of another context removes a record it did not create,
-/// found in the listing of the name.
+/// found in the listings it reads.
 #[tokio::test]
 async fn timeweb_cloud_a_client_of_another_context_removes_the_record() {
     let mock = TimewebCloudMock::start(Seed::standard()).await;
@@ -779,9 +792,9 @@ async fn timeweb_cloud_a_record_changed_in_place_is_not_removed() {
     assert_eq!(control.txt_values(NAME), ["foreign"]);
 }
 
-/// A name that is not a subdomain yet: its listing is answered 404, the zone is looked up and
-/// exists, so the name has no records. An add creates the record at the name; a removal sends no
-/// write.
+/// A name that is not a subdomain yet: the domain's answer does not state it, so its listing
+/// is not read; the zone's listing has no record at the name. An add creates the record at the
+/// name; a removal sends no write.
 #[tokio::test]
 async fn timeweb_cloud_a_name_that_is_not_a_subdomain_yet_has_no_records() {
     let (mock, client) = setup().await;
@@ -798,11 +811,9 @@ async fn timeweb_cloud_a_name_that_is_not_a_subdomain_yet_has_no_records() {
         .collect();
     assert_eq!(
         paths,
-        [
-            (NAME_LISTING.to_owned(), "limit=100&offset=0".to_owned()),
-            (ZONE_LISTING.to_owned(), "limit=1&offset=0".to_owned()),
-        ]
+        [(ZONE_LISTING.to_owned(), "limit=100&offset=0".to_owned())]
     );
+    assert_eq!(mock.log().count(Some("GET"), DOMAIN), 1);
     assert!(mock.control().subdomains().is_empty());
     assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
     assert_eq!(mock.control().subdomains(), [NAME]);
@@ -839,6 +850,7 @@ async fn timeweb_cloud_a_create_answered_not_found_is_told_apart() {
 #[tokio::test]
 async fn timeweb_cloud_a_subdomain_listing_without_names_is_protocol() {
     let (mock, client) = setup().await;
+    mock.control().insert_subdomain("example.org", NAME);
     for stated in ["null", r#""""#, r#""@""#] {
         let body = format!(
             r#"{{"meta":{{"total":1}},"dns_records":[{{"id":7,"type":"TXT","ttl":60,"data":{{"subdomain":{stated},"value":"AAA"}}}}]}}"#
@@ -850,6 +862,20 @@ async fn timeweb_cloud_a_subdomain_listing_without_names_is_protocol() {
         mock.faults()
             .push(Fault::on("GET", NAME_LISTING).respond(200, body.clone()));
         let e = remove(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{stated}: {e:?}");
+        // The record-level read of any name, and the zone listing, use the same listings.
+        for owner in [name(), zone()] {
+            mock.faults()
+                .push(Fault::on("GET", NAME_LISTING).respond(200, body.clone()));
+            let e = client
+                .get_rrset(&zone(), &owner, RecordType::TXT)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Protocol, "{stated} {owner}: {e:?}");
+        }
+        mock.faults()
+            .push(Fault::on("GET", NAME_LISTING).respond(200, body.clone()));
+        let e = client.list_rrsets(&zone()).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Protocol, "{stated}: {e:?}");
         assert_eq!(writes(&mock), 0);
 
@@ -869,7 +895,7 @@ async fn timeweb_cloud_a_subdomain_listing_without_names_is_protocol() {
 // ---- Requests, names and TTLs ------------------------------------------------------------------
 
 /// The requests as the documentation and lego describe them: the token in `Authorization`, the
-/// listing of the name with its paging, the `v2` create at the name with `type` and `value` and
+/// domain's answer and the listings with their paging, the `v2` create at the name with `type` and `value` and
 /// nothing else, the `v2` delete by identifier at the name. The apex is written at the domain.
 /// The deprecated `v1` writes are never sent.
 #[tokio::test]
@@ -877,9 +903,19 @@ async fn timeweb_cloud_request_shapes() {
     let (mock, client) = setup().await;
     add(&client, "AAA").await.unwrap();
     let log = mock.log();
+    let reads: Vec<String> = log
+        .matching(Some("GET"), "/api/**")
+        .iter()
+        .map(|r| format!("{}?{}", r.path, r.query.clone().unwrap_or_default()))
+        .collect();
+    assert_eq!(
+        reads,
+        [
+            "/api/v1/domains/example.org?".to_owned(),
+            format!("{ZONE_LISTING}?limit=100&offset=0"),
+        ]
+    );
     let list = log.matching(Some("GET"), RECORDS).remove(0);
-    assert_eq!(list.path, NAME_LISTING);
-    assert_eq!(list.query.as_deref(), Some("limit=100&offset=0"));
     assert_eq!(list.header("authorization"), Some("Bearer test-only-token"));
     let post = log.matching(Some("POST"), CREATE).pop().unwrap();
     assert_eq!(
@@ -900,12 +936,18 @@ async fn timeweb_cloud_request_shapes() {
     );
     assert!(delete.body.is_empty());
 
+    // The subdomain the create made stays, so a read now lists it after the zone.
+    log.clear();
     client
         .add_txt_value(&zone(), &zone(), &txt("AAA"), None)
         .await
         .unwrap();
-    let list = log.matching(Some("GET"), RECORDS).pop().unwrap();
-    assert_eq!(list.path, ZONE_LISTING);
+    let lists: Vec<String> = log
+        .matching(Some("GET"), RECORDS)
+        .iter()
+        .map(|r| r.path.clone())
+        .collect();
+    assert_eq!(lists, [ZONE_LISTING, NAME_LISTING]);
     let post = log.matching(Some("POST"), CREATE).pop().unwrap();
     assert_eq!(post.path, "/api/v2/domains/example.org/dns-records");
     let id = mock.control().records()[0].id;
@@ -926,13 +968,14 @@ async fn timeweb_cloud_request_shapes() {
 }
 
 /// Records are read back whatever the form of the stated name: relative, or the full name. The
-/// apex is the zone's own name.
+/// apex is the zone's own name; the name's own listing proves the form of the full names (see
+/// `timeweb_cloud_ambiguous_names_are_never_guessed` for a zone where nothing proves it).
 #[tokio::test]
 async fn timeweb_cloud_names_in_either_form() {
     for form in [SubdomainForm::Relative, SubdomainForm::Full] {
         let (mock, client) = setup().await;
         mock.control().set_subdomain_form(form);
-        for (owner, stored) in [(zone(), ""), (name(), "_acme-challenge")] {
+        for (owner, stored) in [(name(), "_acme-challenge"), (zone(), "")] {
             let add = |value: &'static str| {
                 let (client, owner) = (&client, owner.clone());
                 async move {
@@ -1129,17 +1172,28 @@ async fn timeweb_cloud_listing_pages_by_offset() {
         add(&client, "AAA").await.unwrap(),
         AddOutcome::AlreadyPresent
     );
+    // Each listing, page by page: the zone's (four records), the name's (its three and the
+    // one below it), the name below it.
     let gets = mock.log().matching(Some("GET"), RECORDS);
-    let queries: Vec<_> = gets.iter().map(|r| r.query.clone().unwrap()).collect();
-    assert_eq!(
-        queries,
-        [
-            "limit=100&offset=0",
-            "limit=100&offset=1",
-            "limit=100&offset=2",
-            "limit=100&offset=3"
-        ]
-    );
+    let queries: Vec<_> = gets
+        .iter()
+        .map(|r| format!("{} {}", r.path, r.query.clone().unwrap()))
+        .collect();
+    let pages = |path: &str, n: usize| {
+        (0..n)
+            .map(|i| format!("{path} limit=100&offset={i}"))
+            .collect::<Vec<_>>()
+    };
+    let expected = [
+        pages(ZONE_LISTING, 4),
+        pages(NAME_LISTING, 4),
+        pages(
+            "/api/v1/domains/x._acme-challenge.example.org/dns-records",
+            1,
+        ),
+    ]
+    .concat();
+    assert_eq!(queries, expected);
     assert_eq!(
         remove(&client, "AAA").await.unwrap(),
         RemoveOutcome::Removed
@@ -1312,14 +1366,17 @@ async fn timeweb_cloud_zone_not_found() {
         .await
         .unwrap_err();
     assert!(matches!(e, Error::ZoneNotFound { .. }), "{e:?}");
-    // The zone itself as the name: no second lookup.
-    let before = mock.log().count(Some("GET"), RECORDS);
+    // The zone itself as the name. Each operation sends one request: the domain's answer.
     let e = client
         .add_txt_value(&other, &other, &txt("v"), None)
         .await
         .unwrap_err();
     assert!(matches!(e, Error::ZoneNotFound { .. }), "{e:?}");
-    assert_eq!(mock.log().count(Some("GET"), RECORDS), before + 1);
+    assert_eq!(
+        mock.log().count(Some("GET"), "/api/v1/domains/example.net"),
+        3
+    );
+    assert_eq!(mock.log().len(), 3);
     assert_eq!(writes(&mock), 0);
 }
 
@@ -1329,8 +1386,8 @@ async fn timeweb_cloud_rate_limit() {
     mock.faults()
         .push(Fault::on("GET", RECORDS).rate_limited("1"));
     add(&client, "AAA").await.unwrap();
-    // The listing of the name: the refused request and its repeat.
-    assert_eq!(mock.log().count(Some("GET"), NAME_LISTING), 2);
+    // The listing of the zone: the refused request and its repeat.
+    assert_eq!(mock.log().count(Some("GET"), ZONE_LISTING), 2);
     mock.faults()
         .push(Fault::on("GET", RECORDS).rate_limited("120"));
     let e = add(&client, "BBB").await.unwrap_err();
@@ -1349,8 +1406,8 @@ async fn timeweb_cloud_server_errors_are_retried_then_transient() {
     let e = add(&client, "BBB").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
     assert!(e.is_retryable());
-    // The listing of the name: two requests for the first add, three for the second.
-    assert_eq!(mock.log().count(Some("GET"), NAME_LISTING), 5);
+    // The listing of the zone: two requests for the first add, three for the second.
+    assert_eq!(mock.log().count(Some("GET"), ZONE_LISTING), 5);
 }
 
 /// The provider's refusals are `Rejected` with the status and its message; a status the client
@@ -2379,6 +2436,280 @@ async fn timeweb_cloud_listing_agrees_with_reads_on_ambiguous_names() {
     let listing = client.list_rrsets(&zone()).await.unwrap();
     assert_eq!(listing.rrsets, [plain, odd]);
     assert!(listing.skipped.is_empty(), "{:?}", listing.skipped);
+}
+
+// ---- Owner names that read two ways (relative to the zone, or as full names) -----------------
+
+/// Every rrset `list_rrsets` shows is exactly what `get_rrset` returns for its name and type.
+async fn assert_listing_matches_reads(client: &TimewebCloud, label: &str) {
+    let listing = client.list_rrsets(&zone()).await.unwrap();
+    for set in &listing.rrsets {
+        assert_eq!(
+            client
+                .get_rrset(&zone(), set.name(), set.rtype())
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(set),
+            "{label}"
+        );
+    }
+}
+
+/// A record at `example.org.example.org.` is stated `example.org` relative to the zone, which is
+/// also the zone's own name: it is never part of the apex rrset, in reads, in the listing, in
+/// deletes (with a mock that deletes by identifier whatever name the path holds, and with one
+/// that answers `404` for another name) and in the TXT value operations. Its own listing proves
+/// the relative form; with full names a listing of another subdomain proves it.
+#[tokio::test]
+async fn timeweb_cloud_lookalike_of_the_apex_is_kept_apart() {
+    for form in [SubdomainForm::Relative, SubdomainForm::Full] {
+        for addressing in [Addressing::RecordId, Addressing::OwnName] {
+            let label = format!("{form:?} {addressing:?}");
+            let (mock, client) = setup().await;
+            let control = mock.control();
+            control.set_subdomain_form(form);
+            control.set_addressing(addressing);
+            let odd = "example.org.example.org";
+            control.insert_record("example.org", "example.org", "A", "192.0.2.1", Some(300));
+            control.insert_record("example.org", odd, "A", "192.0.2.2", Some(300));
+            control.insert_record("example.org", odd, "TXT", "odd", Some(300));
+            if form == SubdomainForm::Full {
+                control.insert_record("example.org", "www.example.org", "A", "192.0.2.3", None);
+            }
+            let apex = rr("example.org", RecordType::A, Some(300), &["192.0.2.1"]);
+            let lookalike = rr(odd, RecordType::A, Some(300), &["192.0.2.2"]);
+            assert_eq!(
+                client
+                    .get_rrset(&zone(), &zone(), RecordType::A)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(&apex),
+                "{label}"
+            );
+            assert_eq!(
+                client
+                    .get_rrset(&zone(), &dn(odd), RecordType::A)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(&lookalike),
+                "{label}"
+            );
+            let listing = client.list_rrsets(&zone()).await.unwrap();
+            assert!(listing.skipped.is_empty(), "{label}: {:?}", listing.skipped);
+            assert!(listing.rrsets.contains(&apex), "{label}");
+            assert!(listing.rrsets.contains(&lookalike), "{label}");
+            assert_listing_matches_reads(&client, &label).await;
+
+            // The TXT value operations at the apex leave the lookalike's value alone.
+            assert_eq!(
+                client
+                    .add_txt_value(&zone(), &zone(), &txt("odd"), None)
+                    .await
+                    .unwrap(),
+                AddOutcome::Created,
+                "{label}"
+            );
+            assert_eq!(
+                client
+                    .remove_txt_value(&zone(), &zone(), &txt("odd"))
+                    .await
+                    .unwrap(),
+                RemoveOutcome::RrsetDeleted,
+                "{label}"
+            );
+            assert_eq!(control.txt_values(odd), ["odd"], "{label}");
+
+            // Deleting the apex rrset deletes the apex record only, and a repeat finds nothing.
+            for outcome in [DeleteOutcome::Deleted, DeleteOutcome::NotPresent] {
+                assert_eq!(
+                    client
+                        .delete_rrset(&zone(), &zone(), RecordType::A, Expect::Any)
+                        .await
+                        .unwrap(),
+                    outcome,
+                    "{label}"
+                );
+            }
+            assert!(stored(&mock, "example.org", "A").is_empty(), "{label}");
+            assert_eq!(stored(&mock, odd, "A"), ["192.0.2.2"], "{label}");
+            // Replacing the apex rrset neither reads nor deletes the lookalike either.
+            let new = rr("example.org", RecordType::A, None, &["192.0.2.9"]);
+            assert_eq!(
+                client
+                    .set_rrset(&zone(), &new, Expect::Absent)
+                    .await
+                    .unwrap(),
+                SetOutcome::Created,
+                "{label}"
+            );
+            assert_eq!(stored(&mock, odd, "A"), ["192.0.2.2"], "{label}");
+        }
+    }
+}
+
+/// Where nothing proves the form of the stated names, a name that reads two ways is not
+/// guessed: every operation that would read, write or delete a record of its type at either
+/// name fails with `Protocol` and writes nothing, and the listing reports the record and every
+/// rrset it may belong to in `skipped`. A record of another type at the name counts as data of
+/// an unknown type. Once a record proves the form, the same records are placed.
+#[tokio::test]
+async fn timeweb_cloud_ambiguous_names_are_never_guessed() {
+    // Relative names: the lookalike's subdomain is gone, so only the zone's listing shows it,
+    // and nothing else is in the zone. Full names: only the apex has records.
+    for form in [SubdomainForm::Relative, SubdomainForm::Full] {
+        let label = format!("{form:?}");
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        control.set_subdomain_form(form);
+        let odd = "example.org.example.org";
+        control.insert_record("example.org", "example.org", "A", "192.0.2.1", Some(300));
+        control.insert_record("example.org", "example.org", "TXT", "apex", Some(300));
+        if form == SubdomainForm::Relative {
+            control.insert_record("example.org", odd, "A", "192.0.2.2", Some(300));
+            control.remove_subdomain("example.org", odd);
+        }
+        let before = control.records();
+        let apex_a = rr("example.org", RecordType::A, None, &["192.0.2.7"]);
+        let odd_a = rr(odd, RecordType::A, None, &["192.0.2.7"]);
+        for owner in [zone(), dn(odd)] {
+            let e = client
+                .get_rrset(&zone(), &owner, RecordType::A)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Protocol, "{label} {owner}: {e:?}");
+            let e = client
+                .delete_rrset(&zone(), &owner, RecordType::A, Expect::Any)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Protocol, "{label} {owner}: {e:?}");
+        }
+        for set in [&apex_a, &odd_a] {
+            let e = client
+                .set_rrset(&zone(), set, Expect::Any)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Protocol, "{label}: {e:?}");
+        }
+        if form == SubdomainForm::Full {
+            // The apex TXT record reads two ways as well.
+            for result in [
+                client
+                    .add_txt_value(&zone(), &zone(), &txt("apex"), None)
+                    .await,
+                client
+                    .remove_txt_value(&zone(), &zone(), &txt("apex"))
+                    .await
+                    .map(|_| AddOutcome::Created),
+            ] {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::Protocol, "{label}");
+            }
+        } else {
+            // Another type at the apex: the TXT records are certain, the A record next to them
+            // is data of an unknown type, so a CNAME there cannot be ruled out or in.
+            assert_eq!(
+                client
+                    .get_rrset(&zone(), &zone(), RecordType::TXT)
+                    .await
+                    .unwrap(),
+                Some(rr("example.org", RecordType::TXT, Some(300), &["\"apex\""])),
+                "{label}"
+            );
+            assert_eq!(
+                client
+                    .add_txt_value(&zone(), &zone(), &txt("apex"), None)
+                    .await
+                    .unwrap(),
+                AddOutcome::AlreadyPresent
+            );
+        }
+        assert_eq!(writes(&mock) + record_writes(&mock), 0, "{label}");
+        assert_eq!(control.records(), before, "{label}");
+
+        let listing = client.list_rrsets(&zone()).await.unwrap();
+        let mut skipped: Vec<(String, String, SkipReason)> = listing
+            .skipped
+            .iter()
+            .map(|s| (s.name.to_string(), s.type_name.clone(), s.reason))
+            .collect();
+        skipped.sort_by_key(|s| format!("{s:?}"));
+        let mut expected = vec![
+            // The ambiguous record, under the zone's name.
+            (
+                "example.org.".to_owned(),
+                "A".to_owned(),
+                SkipReason::UnsupportedName,
+            ),
+        ];
+        if form == SubdomainForm::Relative {
+            // The apex A rrset it may belong to.
+            expected.push((
+                "example.org.".to_owned(),
+                "A".to_owned(),
+                SkipReason::NotPlainRecords,
+            ));
+        } else {
+            expected.push((
+                "example.org.".to_owned(),
+                "TXT".to_owned(),
+                SkipReason::UnsupportedName,
+            ));
+        }
+        expected.sort_by_key(|s| format!("{s:?}"));
+        assert_eq!(skipped, expected, "{label}");
+        assert!(
+            listing.rrsets.iter().all(|s| s.rtype() != RecordType::A),
+            "{label}: {:?}",
+            listing.rrsets
+        );
+        assert_listing_matches_reads(&client, &label).await;
+
+        // A record at a name that reads one way proves the form: the records are placed.
+        let www = "www.example.org";
+        control.insert_record("example.org", www, "A", "192.0.2.3", Some(300));
+        assert_eq!(
+            client
+                .get_rrset(&zone(), &zone(), RecordType::A)
+                .await
+                .unwrap(),
+            Some(rr("example.org", RecordType::A, Some(300), &["192.0.2.1"])),
+            "{label}"
+        );
+        let listing = client.list_rrsets(&zone()).await.unwrap();
+        assert!(listing.skipped.is_empty(), "{label}: {:?}", listing.skipped);
+        assert_listing_matches_reads(&client, &label).await;
+    }
+}
+
+/// A record that only the zone's own listing shows (its name is no stated subdomain) is read at
+/// its name exactly as the listing shows it, so a `set_rrset` of the same set converges
+/// (`Unchanged`, nothing written) instead of adding a copy beside it, and a delete removes it.
+#[tokio::test]
+async fn timeweb_cloud_a_record_only_the_zone_listing_shows_is_read() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let hidden = "hidden.example.org";
+    control.insert_record("example.org", hidden, "A", "192.0.2.1", Some(300));
+    control.remove_subdomain("example.org", hidden);
+    let set = rr(hidden, RecordType::A, Some(300), &["192.0.2.1"]);
+    let listing = client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(listing.rrsets, std::slice::from_ref(&set));
+    assert_listing_matches_reads(&client, "hidden").await;
+    assert_eq!(
+        client.set_rrset(&zone(), &set, Expect::Any).await.unwrap(),
+        SetOutcome::Unchanged
+    );
+    assert_eq!(record_writes(&mock), 0);
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(hidden), RecordType::A, Expect::Matches(&set))
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(control.records().is_empty());
 }
 
 /// A listing or a read that stops short is an error, never a shorter result, and nothing is

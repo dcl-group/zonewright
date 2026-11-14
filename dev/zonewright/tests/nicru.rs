@@ -2399,11 +2399,12 @@ async fn nicru_staged_changes_block_record_operations() {
     );
     mock.faults().clear();
 
-    // Staged while the operation reads.
-    let (mock, client) = setup().await;
-    let control = mock.control();
-    control.insert_record("example.org", "www", "A", "192.0.2.1", None);
-    for _ in 0..2 {
+    // Staged while the operation reads (between its zone lookup and its record listing), for a
+    // write and for a listing, each on a zone that was clean when it was looked up.
+    for listing in [false, true] {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        control.insert_record("example.org", "www", "A", "192.0.2.1", None);
         let hook = control.clone();
         mock.faults().push(
             Fault::on("GET", RECORDS)
@@ -2412,16 +2413,18 @@ async fn nicru_staged_changes_block_record_operations() {
                 })
                 .pass(),
         );
+        let e = if listing {
+            client.list_rrsets(&zone()).await.unwrap_err()
+        } else {
+            client
+                .set_rrset(&zone(), &set, Expect::Any)
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{listing}: {e:?}");
+        assert_eq!(writes(&mock) + rollbacks(&mock), 0);
+        assert_eq!(published(&mock, "www", "A"), ["192.0.2.1"]);
     }
-    let e = client
-        .set_rrset(&zone(), &set, Expect::Any)
-        .await
-        .unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
-    let e = client.list_rrsets(&zone()).await.unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
-    assert_eq!(writes(&mock) + rollbacks(&mock), 0);
-    assert_eq!(published(&mock, "www", "A"), ["192.0.2.1"]);
 }
 
 /// A replacement that fails part-way is never published: its staged edits are rolled back, the
@@ -2594,17 +2597,222 @@ async fn nicru_failed_commit_and_rollback_are_settled_by_the_next_operation() {
     assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
     assert_eq!(rollbacks(&mock), 3);
     assert!(control.has_changes("example.org"));
-    // Reads refuse the zone meanwhile.
-    assert_eq!(
-        client.list_rrsets(&zone()).await.unwrap_err().kind(),
-        ErrorKind::Rejected
-    );
     mock.faults().clear();
+    // A read settles this process's own leftovers first, as a write does: here it rolls the
+    // half-applied replacement back and then lists the published records.
+    let listing = client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(rollbacks(&mock), 4);
+    assert!(settled(&mock));
+    assert!(listing.rrsets.contains(&with_default_ttl(&rr(
+        www,
+        RecordType::A,
+        Some(300),
+        &["192.0.2.2"]
+    ))));
     add(&client, "AAA").await.unwrap();
     assert_eq!((commits(&mock), rollbacks(&mock)), (5, 4));
     assert_eq!(published(&mock, "www", "A"), ["192.0.2.2"]);
     assert_eq!(control.published_txt(REL), ["AAA"]);
     assert!(settled(&mock));
+}
+
+/// `get_rrset` and `list_rrsets` settle this process's own staged changes before they read:
+/// a complete change whose commit failed is committed, a half-applied one rolled back. Staged
+/// changes this process did not make are still refused.
+#[tokio::test]
+async fn nicru_reads_settle_own_leftovers() {
+    let www = "www.example.org";
+    let wanted = rr(www, RecordType::A, None, &["192.0.2.2"]);
+    for read_with_get in [true, false] {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        control.insert_record("example.org", "www", "A", "192.0.2.1", Some("300"));
+        mock.faults()
+            .push(Fault::on("POST", COMMIT).always().status(502));
+        let e = client
+            .set_rrset(&zone(), &wanted, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+        assert_eq!(commits(&mock), 3);
+        mock.faults().clear();
+        let expected = rr(www, RecordType::A, Some(300), &["192.0.2.2"]);
+        if read_with_get {
+            assert_eq!(
+                client
+                    .get_rrset(&zone(), &dn(www), RecordType::A)
+                    .await
+                    .unwrap(),
+                Some(expected)
+            );
+        } else {
+            let listing = client.list_rrsets(&zone()).await.unwrap();
+            assert!(listing.rrsets.contains(&expected), "{listing:?}");
+        }
+        assert_eq!((commits(&mock), rollbacks(&mock)), (4, 0));
+        assert!(settled(&mock));
+
+        // A foreign staged edit is refused by both reads and never committed.
+        control.stage_record("example.org", "foreign-edit", "A", "192.0.2.9", None);
+        assert_eq!(
+            client
+                .get_rrset(&zone(), &dn(www), RecordType::A)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Rejected
+        );
+        assert_eq!(
+            client.list_rrsets(&zone()).await.unwrap_err().kind(),
+            ErrorKind::Rejected
+        );
+        assert_eq!((commits(&mock), rollbacks(&mock)), (4, 0));
+        assert!(published(&mock, "foreign-edit", "A").is_empty());
+    }
+}
+
+/// When every commit attempt fails but one of them was applied (its answer lost), the zone is
+/// listed once more and, being clean, loses its mark: a foreign edit staged before the next
+/// operation is refused, not committed as ours.
+#[tokio::test]
+async fn nicru_lost_commit_answer_clears_the_mark() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let hook = control.clone();
+    mock.faults().push(
+        Fault::on("POST", COMMIT)
+            .always()
+            .run(move || hook.commit("example.org"))
+            .status(502),
+    );
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(commits(&mock), 3);
+    assert_eq!(control.published_txt(REL), ["AAA"]);
+    assert!(!control.has_changes("example.org"));
+    mock.faults().clear();
+    control.stage_record("example.org", "foreign-edit", "TXT", "pending", None);
+    let e = add(&client, "BBB").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(commits(&mock), 3);
+    assert!(control.published_txt("foreign-edit").is_empty());
+}
+
+/// The first edit of a record-level operation whose outcome is unknown (here applied, its
+/// answer lost) is not taken for refused: the operation rolls the zone back, so the staged
+/// edit is neither published nor left behind unmarked.
+#[tokio::test]
+async fn nicru_unknown_first_edit_is_rolled_back() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let hook = control.clone();
+    mock.faults().push(
+        Fault::on("PUT", RECORDS)
+            .run(move || {
+                hook.stage_record("example.org", "www", "A", "192.0.2.1", Some("30"));
+            })
+            .status(502),
+    );
+    let wanted = rr("www.example.org", RecordType::A, None, &["192.0.2.1"]);
+    let e = client
+        .set_rrset(&zone(), &wanted, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!((commits(&mock), rollbacks(&mock)), (0, 1));
+    assert!(published(&mock, "www", "A").is_empty());
+    assert!(settled(&mock));
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &wanted, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    assert_eq!(published(&mock, "www", "A"), ["192.0.2.1"]);
+}
+
+/// A TTL change of a CNAME stages the deletion of the old record before the record with the
+/// new TTL, so that two CNAME records are never staged at the name; for other types the new
+/// record goes first.
+#[tokio::test]
+async fn nicru_singleton_ttl_change_stages_the_delete_first() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_record(
+        "example.org",
+        "alias",
+        "CNAME",
+        "a.example.net.",
+        Some("300"),
+    );
+    control.insert_record("example.org", "www", "A", "192.0.2.1", Some("300"));
+    let edits = |mock: &NicruMock| -> Vec<String> {
+        mock.log()
+            .entries()
+            .iter()
+            .filter(|r| r.matches(Some("PUT"), RECORDS) || r.matches(Some("DELETE"), RECORD))
+            .map(|r| r.method.to_string())
+            .collect()
+    };
+    let cname = rr(
+        "alias.example.org",
+        RecordType::CNAME,
+        Some(120),
+        &["a.example.net."],
+    );
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &cname, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(edits(&mock), ["DELETE", "PUT"]);
+    assert_eq!(published(&mock, "alias", "CNAME"), ["a.example.net."]);
+    assert_eq!(
+        control.published("alias", "CNAME")[0].ttl.as_deref(),
+        Some("120")
+    );
+    mock.log().clear();
+    let a = rr("www.example.org", RecordType::A, Some(120), &["192.0.2.1"]);
+    assert_eq!(
+        client.set_rrset(&zone(), &a, Expect::Any).await.unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(edits(&mock), ["PUT", "DELETE"]);
+    assert_eq!(commits(&mock), 1);
+}
+
+/// A listed record whose TTL is present but does not parse makes the read fail
+/// (`Error::Protocol`); it is never read as a record without a TTL.
+#[tokio::test]
+async fn nicru_unparsable_ttl_is_protocol() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_record("example.org", "www", "A", "192.0.2.1", Some("12x"));
+    assert_eq!(
+        client
+            .get_rrset(&zone(), &dn("www.example.org"), RecordType::A)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Protocol
+    );
+    assert_eq!(
+        client.list_rrsets(&zone()).await.unwrap_err().kind(),
+        ErrorKind::Protocol
+    );
+    let e = client
+        .set_rrset(
+            &zone(),
+            &rr("www.example.org", RecordType::A, None, &["192.0.2.2"]),
+            Expect::Any,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    assert_eq!(writes(&mock), 0);
 }
 
 /// Record operations change their own rrset only: other types at the same name and other names

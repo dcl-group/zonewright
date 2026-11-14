@@ -112,10 +112,11 @@ const CAPABILITIES: Capabilities = Capabilities {
     txt_values: ValueGuarantee::PerValue,
     // No write carries a condition on the rrset as read (the reference has none).
     preconditions: Preconditions::ReadThenWrite,
-    // The records of an rrset are replaced by one request: `set_records` for an existing rrset,
-    // `POST /zones/{id}/rrsets` for a new one. A TTL change is a separate `change_ttl` action
-    // and does not touch the records.
-    atomic_rrset_write: true,
+    // Not in every case: the records of an rrset are replaced by one request (`set_records`
+    // for an existing rrset, `POST /zones/{id}/rrsets` for a new one), but a replacement that
+    // also changes the TTL of an existing rrset is two, `set_records` and then the separate
+    // `change_ttl` action, and the first can be applied while the second fails.
+    atomic_rrset_write: false,
     // Source: the reference, Zone RRSets, `ttl`: 60 to 2147483647 seconds, one per rrset.
     ttl: TtlSupport::PerRrset {
         min: 60,

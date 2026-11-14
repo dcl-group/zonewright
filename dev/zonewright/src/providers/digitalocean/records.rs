@@ -16,7 +16,8 @@
 //!   (a TTL, or the value of a CNAME replaced in place). A `404` means the record went away after
 //!   the read: nothing was written, `Error::Conflict`, and the caller's repeat reads again;
 //! - delete: `DELETE …/records/{id}`, repeated by the transport (idempotent). A `404` counts as
-//!   done (the layer's rule for a per-record API).
+//!   done only when a new read finds no record with the value at the name: the domain may have
+//!   been deleted and created again with the value under a new identifier.
 //!
 //! # Fields per type
 //!
@@ -56,9 +57,10 @@
 //! states `ns1.digitalocean.com`), which is how `RecordData::parse` reads it. Assumption (not
 //! documented): that the API never states a host name in `data` relative to the domain; such a
 //! name would be read as absolute, which can only make a value compare unequal to the one a
-//! caller expects, never delete a record that was not read. Text the parser refuses — `@`, a
-//! missing `priority`, a field out of range — is kept as non-canonical data (design section
-//! 4.9): listed, compared by text, written back only as it is.
+//! caller expects, never delete a record that was not read. A host name stated as exactly `@`
+//! is the domain itself (see `stated_host`). Text the parser refuses — a missing `priority`, a
+//! field out of range — is kept as non-canonical data (design section 4.9): listed, compared by
+//! text, written back only as it is.
 //!
 //! Writing stays within what the sources show, and [`RrsetBase::can_send`] refuses everything
 //! else with `Error::InvalidInput` before any write:
@@ -118,19 +120,35 @@ const CAA_TAGS: &[&str] = &["issue", "issuewild", "iodef"];
 
 /// A value as the API returned it: canonical where the type's fields parse, non-canonical
 /// otherwise (see the module documentation).
-pub(super) fn read_record(rtype: RecordType, record: &Record) -> RecordData {
+pub(super) fn read_record(rtype: RecordType, record: &Record, zone: &DomainName) -> RecordData {
     let data = record.data.as_deref().unwrap_or_default();
     match rtype {
         RecordType::A => read_a(data),
         RecordType::AAAA => read_aaaa(data),
-        RecordType::CNAME => read_cname(data),
-        RecordType::NS => read_ns(data),
-        RecordType::MX => read_mx(record, data),
-        RecordType::SRV => read_srv(record, data),
+        RecordType::CNAME => read_cname(stated_host(data, zone)),
+        RecordType::NS => read_ns(stated_host(data, zone)),
+        RecordType::MX => read_mx(record, stated_host(data, zone)),
+        RecordType::SRV => read_srv(record, stated_host(data, zone)),
         RecordType::CAA => read_caa(record, data),
         RecordType::TXT => read_txt(data),
         other => read_other(other, data),
     }
+}
+
+/// The host name in the `data` of a CNAME, NS, MX or SRV record: exactly `@` is the domain
+/// itself, anything else is read as it is.
+// Source: DigitalOcean's own Terraform provider,
+// github.com/digitalocean/terraform-provider-digitalocean,
+// `digitalocean/domain/resource_record.go` at commit `5c5eea1`: the read appends a trailing dot
+// to the `data` of CNAME, MX, NS, SRV and CAA records "if rec.Data != "@"" (lines 218 to 222),
+// and the `value` attribute treats a stated `@` as equal to "<domain>." (lines 88 to 96), so the
+// API answers `@` for a target that is the domain. The control panel's guide,
+// <https://docs.digitalocean.com/products/networking/dns/how-to/manage-records/>, offers "the apex
+// of a domain (@)" as the target of CNAME, MX, NS and SRV records. Both opened 2026-11-14. Only
+// the exact text `@` is mapped; it is not a host name in any other reading, so the mapping cannot
+// make one name read as another.
+fn stated_host<'a>(data: &'a str, zone: &'a DomainName) -> &'a str {
+    if data == "@" { zone.as_str() } else { data }
 }
 
 /// A: the IPv4 address in `data`.
@@ -450,7 +468,7 @@ impl PerRecord for DigitalOcean {
                         == Some(name)
             })
             .map(|record| Stored {
-                data: read_record(rtype, &record),
+                data: read_record(rtype, &record, zone),
                 // The API has no disabled records.
                 enabled: true,
                 ttl: record.ttl.and_then(|secs| Ttl::from_secs(secs).ok()),
@@ -588,7 +606,7 @@ impl DigitalOcean {
                 rtype.map_or_else(|| format!("raw:{}", record.rtype), |t| t.to_string()),
             );
             let data = match rtype {
-                Some(rtype) => read_record(rtype, record),
+                Some(rtype) => read_record(rtype, record, zone),
                 // A type name that maps to no record type is skipped by the listing whatever
                 // the record holds; the data is then never parsed.
                 None => RecordData::non_canonical(record.data.as_deref().unwrap_or_default()),
@@ -619,6 +637,7 @@ impl DigitalOcean {
 #[cfg(test)]
 mod tests {
     use super::{Encoded, encode, read_record};
+    use crate::name::DomainName;
     use crate::providers::digitalocean::api::Record;
     use crate::record::{RecordData, RecordType};
 
@@ -636,7 +655,8 @@ mod tests {
     }
 
     fn read(rtype: RecordType, data: &str, fields: serde_json::Value) -> RecordData {
-        read_record(rtype, &record(&rtype.to_string(), data, fields))
+        let zone = DomainName::parse("example.org").unwrap();
+        read_record(rtype, &record(&rtype.to_string(), data, fields), &zone)
     }
 
     fn data(rtype: RecordType, text: &str) -> RecordData {
@@ -708,6 +728,20 @@ mod tests {
                 none.clone(),
                 "\"quotedtwo\"",
             ),
+            (RecordType::CNAME, "@", none.clone(), "example.org."),
+            (RecordType::NS, "@", none.clone(), "example.org."),
+            (
+                RecordType::MX,
+                "@",
+                serde_json::json!({"priority": 10}),
+                "10 example.org.",
+            ),
+            (
+                RecordType::SRV,
+                "@",
+                serde_json::json!({"priority": 1, "weight": 5, "port": 5060}),
+                "1 5 5060 example.org.",
+            ),
         ] {
             let got = read(rtype, api, fields);
             assert!(got.is_canonical(), "{rtype} {api}");
@@ -724,7 +758,8 @@ mod tests {
                 serde_json::json!({}),
                 "not an address",
             ),
-            (RecordType::CNAME, "@", serde_json::json!({}), "@"),
+            // `@` is the domain only where a host name is expected.
+            (RecordType::A, "@", serde_json::json!({}), "@"),
             (
                 RecordType::MX,
                 "mail.example.org",

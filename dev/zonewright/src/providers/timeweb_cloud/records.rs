@@ -9,9 +9,11 @@
 //! the requests; this file turns them into the API's calls, all addressed to the owner name
 //! itself (the zone, or the full name below it), as the TXT value operations are (`txt.rs`):
 //!
-//! - read: `GET /v1/domains/{name}/dns-records`, every page, then the records of exactly the
-//!   requested type at exactly the requested name, selected on the client's side. A listing of a
-//!   name below the zone that states a record without a name is `Error::Protocol`;
+//! - read: the listings of the zone and of every subdomain the domain's answer states, every
+//!   page (`api::Api::zone_listings`), each record placed at its owner name (`names.rs`), then
+//!   the records of exactly the requested type at exactly the requested name. A record of the
+//!   requested type that may be at the name, or may be at another one, is `Error::Protocol`:
+//!   nothing is read, written or deleted on a guess;
 //! - create: `POST /v2/domains/{name}/dns-records`, sent once, with the type's fields and the
 //!   TTL the layer chose. A `404` is told apart by a lookup of the zone (`Error::ZoneNotFound`,
 //!   or the provider's refusal of the name);
@@ -77,33 +79,38 @@
 //! requires a record below the domain to be at a subdomain created beforehand, and the domain's
 //! answer (`GET /v1/domains/{zone}`, `domain.subdomains`, required) states every subdomain with
 //! its full name. `list_rrsets` therefore reads the zone's listing and the listing of every
-//! stated subdomain, and takes each record once (by its identifier), the subdomains' listings
-//! first: a record in the listing of the name it can denote is at that name, the same selection
-//! a read makes, and any other record is at the reading of its stated name that lies within the
-//! zone (see `api::owner`). A
-//! record at a name that is neither the zone nor a stated subdomain, and that the zone's listing
-//! does not show either, cannot be found: the description rules such a record out, while lego
-//! creates records without creating a subdomain first (see `api.rs`); only a live run tells
-//! whether the provider then creates the subdomain. The provider's "default DNS records"
-//! (`GET /v1/domains/{fqdn}/default-dns-records`) are a separate listing whose relation to the
-//! published zone is not described; they are not part of what this client reads or writes.
+//! stated subdomain, takes each record once (by its identifier) and places it at its owner name
+//! (`names.rs`); a read of one name reads and places exactly the same way, so `get_rrset` of a
+//! name returns exactly the rrset the listing shows there. A record whose name is ambiguous is
+//! in `skipped` (`SkipReason::UnsupportedName`, under the zone's name), and so is every rrset
+//! such a record may belong to (`SkipReason::NotPlainRecords`, under its name): `get_rrset`
+//! answers `Error::Protocol` for those. A record at a name that is neither the zone nor a
+//! stated subdomain, and that the zone's listing does not show either, cannot be found: the
+//! description rules such a record out, while lego creates records without creating a
+//! subdomain first (see `api.rs`); only a live run tells whether the provider then creates the
+//! subdomain. The provider's "default DNS records" (`GET /v1/domains/{fqdn}/default-dns-records`)
+//! are a separate listing whose relation to the published zone is not described; they are not
+//! part of what this client reads or writes.
+//!
+//! Every read costs the domain's answer plus one listing per subdomain (and per page).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::Error;
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::{DomainName, TargetName};
-use crate::provider::ZoneListing;
+use crate::provider::{SkipReason, ZoneListing};
 use crate::record::{Mx, RecordData, RecordType, Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
     self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
 };
 
-use super::api::{Created, Deleted, NewRecord, Record, Updated, check_named, owner, stated_names};
+use super::api::{Created, Deleted, NewRecord, Record, Updated};
 use super::client::TimewebCloud;
+use super::names::{self, Owner};
 
 /// How TXT data is read: quoted text as presentation format, anything else as the value
 /// (design section 11.2).
@@ -312,6 +319,14 @@ fn protocol(text: &'static str) -> Error {
     }
 }
 
+/// A record of the operation's type whose stated name may be the operation's name or another.
+pub(super) fn ambiguous() -> Error {
+    protocol(
+        "the provider states a record's name in a form that reads as two different names, and \
+         its listings do not tell which; the record cannot be placed",
+    )
+}
+
 /// The identifier of a record the layer wants to change or delete.
 fn identifier(record: &Stored<Handle>) -> Result<u64, Error> {
     record.handle.id.ok_or_else(|| {
@@ -331,24 +346,33 @@ impl PerRecord for TimewebCloud {
         name: &DomainName,
         rtype: RecordType,
     ) -> Result<RecordsRead<Handle, Neighbors>, Error> {
-        let listed = self.api.records(zone, name).await?;
-        check_named(&listed, name == zone)?;
-        let (records, others): (Vec<Record>, Vec<Record>) = listed
-            .into_iter()
-            .filter(|record| stated_names(record.subdomain(), zone).contains(name))
-            .partition(|record| record.rtype.parse::<RecordType>().ok() == Some(rtype));
-        // The listing holds the records of the name of every type, and the API documents no
+        let listings = self.api.zone_listings(zone).await?;
+        let mut records = Vec::new();
+        let mut others = Vec::new();
+        for placed in names::place(zone, &listings)? {
+            let stated = placed.record.rtype.parse::<RecordType>().ok();
+            if placed.owner == Owner::At(name.clone()) {
+                if stated == Some(rtype) {
+                    records.push(placed.record);
+                } else {
+                    others.push(stated);
+                }
+            } else if placed.owner.may_be(name) {
+                if stated == Some(rtype) {
+                    return Err(ambiguous());
+                }
+                // Data of another type that may or may not be at the name: of an unknown type,
+                // as far as the name is concerned.
+                others.push(None);
+            }
+        }
+        // The listings hold the records of the name of every type, and the API documents no
         // disabled records: the other records are all the data there besides this type.
-        let neighbors = Neighbors::of(
-            rtype,
-            others
-                .iter()
-                .map(|record| record.rtype.parse::<RecordType>().ok()),
-        );
+        let neighbors = Neighbors::of(rtype, others);
         let records = records
             .into_iter()
             .map(|record| Stored {
-                data: read_record(rtype, &record),
+                data: read_record(rtype, record),
                 // The API documents no disabled records.
                 enabled: true,
                 ttl: record.ttl().and_then(|secs| Ttl::from_secs(secs).ok()),
@@ -508,85 +532,62 @@ impl TimewebCloud {
     /// documentation).
     pub(super) async fn list_zone(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
         rrsets::check_list(self, zone)?;
-        let subdomains = self.api.subdomains(zone).await?;
-        let mut listings: Vec<(Option<DomainName>, Vec<Record>)> =
-            vec![(Some(zone.clone()), self.api.records(zone, zone).await?)];
-        let mut listed: HashSet<String> = HashSet::new();
-        for stated in &subdomains {
-            let text = stated.trim();
-            let text = text.strip_suffix('.').unwrap_or(text);
-            let parsed = DomainName::parse(text)
-                .ok()
-                .filter(|name| name.is_within(zone));
-            match parsed {
-                Some(name) if &name == zone => {}
-                Some(name) => {
-                    if listed.insert(name.as_str().to_owned()) {
-                        let records = self.api.records(zone, &name).await?;
-                        listings.push((Some(name), records));
-                    }
-                }
-                // A name the client cannot hold, or one outside the zone: its listing is read
-                // by the text as stated, and its records are placed by their own stated names,
-                // or skipped when they have none the model can hold.
-                None => {
-                    if listed.insert(format!("raw:{text}"))
-                        && let Some(records) = self.api.records_of(text).await?
-                    {
-                        listings.push((None, records));
-                    }
-                }
-            }
-        }
-
-        let mut seen: HashSet<u64> = HashSet::new();
+        let listings = self.api.zone_listings(zone).await?;
         let mut groups: BTreeMap<(String, String), Group> = BTreeMap::new();
-        // The subdomains' listings first: a record they show is placed at the listed name, as a
-        // read of that name places it, before the zone's listing could place it by a reading
-        // of its stated name alone.
-        for (listed, records) in listings.iter().rev() {
-            check_named(records, listed.as_ref() == Some(zone))?;
-            for record in records {
-                // A record shown by two listings (the zone's and a subdomain's) is one record.
-                if let Some(id) = record.id()
-                    && !seen.insert(id)
-                {
-                    continue;
+        // The rrsets an ambiguous record may belong to: (name, type key).
+        let mut uncertain: BTreeSet<(DomainName, String)> = BTreeSet::new();
+        for placed in names::place(zone, &listings)? {
+            let record = placed.record;
+            let rtype = record.rtype.parse::<RecordType>().ok();
+            // Spellings of one type that mean the same land in one group.
+            let type_key = rtype.map_or_else(|| format!("raw:{}", record.rtype), |t| t.to_string());
+            let (name, name_key) = match placed.owner {
+                Owner::At(name) => {
+                    let key = name.as_str().to_owned();
+                    (Some(name), key)
                 }
-                let stated = record.subdomain().unwrap_or_default();
-                let name = owner(listed.as_ref(), record.subdomain(), zone);
-                let rtype = record.rtype.parse::<RecordType>().ok();
-                // Spellings of one name or type that mean the same land in one group.
-                let key = (
-                    name.as_ref()
-                        .map_or_else(|| format!("raw:{stated}"), |n| n.as_str().to_owned()),
-                    rtype.map_or_else(|| format!("raw:{}", record.rtype), |t| t.to_string()),
-                );
-                let data = match rtype {
-                    Some(rtype) => read_record(rtype, record),
-                    // A type name that maps to no record type is skipped by the listing whatever
-                    // the record holds; the data is then never parsed.
-                    None => RecordData::non_canonical(record.value().unwrap_or_default()),
-                };
-                let ttl = record.ttl().and_then(|secs| Ttl::from_secs(secs).ok());
-                let group = groups.entry(key).or_insert_with(|| Group {
-                    name,
-                    type_name: record.rtype.clone(),
-                    rtype,
-                    ttl: None,
-                    records: Vec::new(),
-                });
-                // The smallest TTL of the set (design section 3.6, `TtlSupport::PerRecord`).
-                group.ttl = Listing::smallest_ttl([group.ttl, ttl]);
-                group.records.push(data);
-            }
+                Owner::Ambiguous(relative, full) => {
+                    let key = format!("ambiguous:{relative}|{full}");
+                    uncertain.insert((relative, type_key.clone()));
+                    uncertain.insert((full, type_key.clone()));
+                    (None, key)
+                }
+                Owner::Unplaced => (
+                    None,
+                    format!("raw:{}", record.subdomain().unwrap_or_default()),
+                ),
+            };
+            let data = match rtype {
+                Some(rtype) => read_record(rtype, record),
+                // A type name that maps to no record type is skipped by the listing whatever
+                // the record holds; the data is then never parsed.
+                None => RecordData::non_canonical(record.value().unwrap_or_default()),
+            };
+            let ttl = record.ttl().and_then(|secs| Ttl::from_secs(secs).ok());
+            let group = groups.entry((name_key, type_key)).or_insert_with(|| Group {
+                name,
+                type_name: record.rtype.clone(),
+                rtype,
+                ttl: None,
+                records: Vec::new(),
+            });
+            // The smallest TTL of the set (design section 3.6, `TtlSupport::PerRecord`).
+            group.ttl = Listing::smallest_ttl([group.ttl, ttl]);
+            group.records.push(data);
         }
         let mut listing = Listing::new(zone);
-        for group in groups.into_values() {
+        for ((_, type_key), group) in groups {
             let type_name = group
                 .rtype
                 .map_or(group.type_name, |rtype| rtype.to_string());
-            listing.push(group.name, &type_name, group.ttl, group.records);
+            match group.name {
+                // An ambiguous record may belong to this rrset: what the rrset holds is not
+                // known, and `get_rrset` answers `Error::Protocol` for it.
+                Some(name) if uncertain.contains(&(name.clone(), type_key)) => {
+                    listing.skip(name, &type_name, SkipReason::NotPlainRecords);
+                }
+                name => listing.push(name, &type_name, group.ttl, group.records),
+            }
         }
         listing.finish(ProviderId::TimewebCloud)
     }

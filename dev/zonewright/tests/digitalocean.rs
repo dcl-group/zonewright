@@ -2804,3 +2804,124 @@ async fn live_digitalocean_record_round_trip() {
     }
     assert!(cleanup.is_ok(), "cleanup failed: {cleanup:?}");
 }
+
+// ---- Targets stated as `@`, listings that change ------------------------------------------------
+
+/// The API may state a CNAME, MX, NS or SRV target that is the domain itself as `@` (the form
+/// DigitalOcean's Terraform provider expects). It reads as the domain's name: a set pointing at
+/// the apex reads back canonical and equal to what was written, a repeat is `Unchanged` without
+/// a write, `Expect::Matches` holds, and the listing carries the same sets.
+#[tokio::test]
+async fn digitalocean_apex_target_stated_as_at_reads_as_the_domain() {
+    let (mock, client) = setup().await;
+    mock.control().set_apex_target_as_at(true);
+    let sets = [
+        rr(
+            "www.example.org",
+            RecordType::CNAME,
+            Some(1800),
+            &["example.org."],
+        ),
+        rr(
+            "example.org",
+            RecordType::MX,
+            Some(1800),
+            &["10 example.org."],
+        ),
+        rr(
+            "_sip._tcp.example.org",
+            RecordType::SRV,
+            Some(1800),
+            &["1 5 5060 example.org."],
+        ),
+        rr(
+            "sub.example.org",
+            RecordType::NS,
+            Some(1800),
+            &["example.org."],
+        ),
+    ];
+    for set in &sets {
+        assert_eq!(
+            client
+                .set_rrset(&zone(), set, Expect::Absent)
+                .await
+                .unwrap(),
+            SetOutcome::Created,
+            "{set:?}"
+        );
+        let before = record_writes(&mock);
+        assert_eq!(
+            client.set_rrset(&zone(), set, Expect::Any).await.unwrap(),
+            SetOutcome::Unchanged,
+            "{set:?}"
+        );
+        assert_eq!(
+            client
+                .set_rrset(&zone(), set, Expect::Matches(set))
+                .await
+                .unwrap(),
+            SetOutcome::Unchanged,
+            "{set:?}"
+        );
+        assert_eq!(record_writes(&mock), before, "{set:?}");
+        let got = client
+            .get_rrset(&zone(), set.name(), set.rtype())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            got.records().iter().all(RecordData::is_canonical),
+            "{got:?}"
+        );
+        assert_eq!(&got, set);
+    }
+    mock.control()
+        .insert_record("example.org", "alias", "CNAME", "example.org", 1800);
+    let listing = client.list_rrsets(&zone()).await.unwrap();
+    assert!(listing.skipped.is_empty(), "{:?}", listing.skipped);
+    for set in &sets {
+        assert!(listing.rrsets.contains(set), "{set:?} {:?}", listing.rrsets);
+    }
+    let alias = rr(
+        "alias.example.org",
+        RecordType::CNAME,
+        Some(1800),
+        &["example.org."],
+    );
+    assert!(listing.rrsets.contains(&alias), "{:?}", listing.rrsets);
+    for set in &sets {
+        assert_eq!(
+            client
+                .delete_rrset(&zone(), set.name(), set.rtype(), Expect::Matches(set))
+                .await
+                .unwrap(),
+            DeleteOutcome::Deleted,
+            "{set:?}"
+        );
+    }
+}
+
+/// A listing whose `meta.total` changes between pages may have passed over a record: an
+/// error, not a shorter listing.
+#[tokio::test]
+async fn digitalocean_listing_whose_total_changes_is_protocol() {
+    let (mock, client) = setup().await;
+    let record = |id: u32, name: &str| {
+        format!(
+            r#"{{"id":{id},"type":"A","name":"{name}","data":"192.0.2.1","priority":null,"port":null,"ttl":1800,"weight":null,"flags":null,"tag":null}}"#
+        )
+    };
+    let first = format!(
+        r#"{{"domain_records":[{},{}],"links":{{"pages":{{"next":"https://api.example.net/v2/domains/example.org/records?page=2"}}}},"meta":{{"total":3}}}}"#,
+        record(1, "a"),
+        record(2, "b")
+    );
+    let second = r#"{"domain_records":[],"links":{},"meta":{"total":2}}"#;
+    mock.faults()
+        .push(Fault::on("GET", RECORDS).respond(200, first));
+    mock.faults()
+        .push(Fault::on("GET", RECORDS).respond(200, second));
+    let e = client.list_rrsets(&zone()).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+}

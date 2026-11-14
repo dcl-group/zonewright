@@ -3036,3 +3036,126 @@ async fn live_regru_add_and_remove() {
     }
     assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
 }
+
+/// A record-level round trip on its own: creates, reads, replaces, lists and deletes an A rrset
+/// and a TXT rrset at a generated name in the zone the maintainer names, and deletes exactly
+/// those two rrsets afterwards, also when the body failed. The name is new, so nothing else lives
+/// there. The API sets no TTL, so every set is written without one.
+#[tokio::test]
+#[ignore = "live API: run only by the maintainer"]
+async fn live_regru_record_round_trip() {
+    let settings = live_env("ZONEWRIGHT_LIVE_REGRU_SETTINGS");
+    let credentials = live_env("ZONEWRIGHT_LIVE_REGRU_CREDENTIALS");
+    let zone = dn(&live_env("ZONEWRIGHT_LIVE_REGRU_ZONE"));
+    let ctx = Context::new(zonewright::ContextOptions::default()).unwrap();
+    let client = Arc::new(
+        AnyProvider::from_json(
+            ProviderId::Regru,
+            &settings,
+            &SecretString::from(credentials),
+            &ctx,
+        )
+        .unwrap(),
+    );
+    let tag = random_u64();
+    let name = zone
+        .prepend(&format!("zw-live-{tag:016x}-records"))
+        .unwrap();
+    let set = |rtype: RecordType, data: Vec<RecordData>| {
+        RrSet::new(name.clone(), rtype, None, data).unwrap()
+    };
+    let a1 = set(
+        RecordType::A,
+        vec![
+            rdata(RecordType::A, "192.0.2.1"),
+            rdata(RecordType::A, "192.0.2.2"),
+        ],
+    );
+    let a2 = set(
+        RecordType::A,
+        vec![
+            rdata(RecordType::A, "192.0.2.2"),
+            rdata(RecordType::A, "192.0.2.3"),
+        ],
+    );
+    // The API accepts only alphanumeric characters in the text of a TXT record.
+    let text = set(
+        RecordType::TXT,
+        vec![txt(&format!("zwlive{tag:016x}r")).to_data().unwrap()],
+    );
+
+    let body = {
+        let (client, zone, name) = (client.clone(), zone.clone(), name.clone());
+        let (a1, a2, text) = (a1.clone(), a2.clone(), text.clone());
+        tokio::spawn(async move {
+            assert_eq!(
+                client.set_rrset(&zone, &a1, Expect::Absent).await.unwrap(),
+                SetOutcome::Created
+            );
+            let read = client
+                .get_rrset(&zone, &name, RecordType::A)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read, a1);
+            assert_eq!(
+                client.set_rrset(&zone, &a1, Expect::Any).await.unwrap(),
+                SetOutcome::Unchanged
+            );
+            assert_eq!(
+                client
+                    .set_rrset(&zone, &a2, Expect::Matches(&read))
+                    .await
+                    .unwrap(),
+                SetOutcome::Replaced
+            );
+            let read = client
+                .get_rrset(&zone, &name, RecordType::A)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read, a2);
+            assert_eq!(
+                client
+                    .set_rrset(&zone, &text, Expect::Absent)
+                    .await
+                    .unwrap(),
+                SetOutcome::Created
+            );
+            let listing = client.list_rrsets(&zone).await.unwrap();
+            assert!(listing.rrsets.contains(&a2), "{:?}", listing.rrsets);
+            assert!(listing.rrsets.contains(&text), "{:?}", listing.rrsets);
+            assert_eq!(
+                client
+                    .delete_rrset(&zone, &name, RecordType::A, Expect::Matches(&read))
+                    .await
+                    .unwrap(),
+                DeleteOutcome::Deleted
+            );
+            assert_eq!(
+                client.get_rrset(&zone, &name, RecordType::A).await.unwrap(),
+                None
+            );
+            assert_eq!(
+                client
+                    .delete_rrset(&zone, &name, RecordType::TXT, Expect::Matches(&text))
+                    .await
+                    .unwrap(),
+                DeleteOutcome::Deleted
+            );
+        })
+    };
+    let outcome = body.await;
+
+    // Cleanup: the two rrsets of the generated name, which only this test wrote to.
+    let mut cleanup = Vec::new();
+    for rtype in [RecordType::A, RecordType::TXT] {
+        if let Err(e) = client.delete_rrset(&zone, &name, rtype, Expect::Any).await {
+            cleanup.push(format!("{e}"));
+        }
+    }
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+    assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
+}

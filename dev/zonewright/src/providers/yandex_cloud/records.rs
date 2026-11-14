@@ -48,11 +48,17 @@
 //! | TXT         | text; spaces separate strings, so a value with spaces is quoted: `"v=spf1 … -all"` |
 //! | SOA         | created automatically: `ns1.yandexcloud.net. mx.cloud.yandex.net. 1 10800 …`      |
 //!
-//! These are the presentation formats of the types (RFC 1035 section 5) with absolute names,
-//! which is what the canonical text of design section 4.3 is. A value is read with
-//! `RecordData::from_provider` (the strict parser, names without a trailing dot taken as
-//! absolute, TXT with the `Auto` rule, so the unquoted values the TXT value operations write
-//! read back as themselves) and written as its canonical text, with these limits, each checked by
+//! These are the presentation formats of the types (RFC 1035 section 5), which is what the
+//! canonical text of design section 4.3 is. The page states the format of the whole: "The
+//! service uses MASTER FILES format." In that format (RFC 1035 section 5.1) a domain name
+//! without the trailing dot is relative to the origin, here the zone, and spaces separate
+//! character-strings. A value is therefore read with `RecordData::from_provider` with the zone as
+//! the origin (`www` inside a CNAME is `www.<zone>.`, never the absolute `www.`), and TXT with the
+//! `Auto` rule except that unquoted text with whitespace is read as presentation format, several
+//! strings (the page: "The space character serves as a separator. If an input string has spaces,
+//! it will be perceived as multiple strings."). Unquoted text without whitespace, which is what
+//! the TXT value operations write, reads back as itself. A value is written as its canonical
+//! text, names absolute with the trailing dot, with these limits, each checked by
 //! [`write_content`]:
 //!
 //! - Escapes. No source says how the API treats a backslash escape. A value whose canonical text
@@ -71,18 +77,18 @@
 //!   digits, `-`, `.`, `_` and `/` only; other identifiers would need the quoted or escaped form,
 //!   which the page does not show. `ech` (the page names an older `echconfig`) and numbered keys
 //!   are not sent.
-//! - ANAME. The page's example has no trailing dot; the client writes the canonical name with
-//!   one, the absolute form of the master file format that the page uses for CNAME, which ANAME
-//!   "works like".
+//! - ANAME. The page's example (`example.com.website.yandexcloud.net`) has no trailing dot, which
+//!   in the master file format the page names would be relative to the zone; the client writes
+//!   the canonical name with the dot, the absolute form the page uses for CNAME, which ANAME
+//!   "works like", and reads a dotless name as relative, by the stated format.
 //! - SOA is read only (design section 3.4); TLSA is not accepted by the API (it is not on the
 //!   page) and is not in `record_types`. A type the API lists that is outside `record_types` is
 //!   still listed, canonical where its text parses.
 //!
-//! Assumption (not documented): data elements the API returns use the same forms, with names
-//! absolute whether or not they end with a dot (the ANAME example). If the API returns a relative
-//! name, it reads as an absolute name of its own: the value then compares unequal to the record's
-//! canonical form, a write keeps it verbatim as it was read, and the strict condition still
-//! protects the set, so nothing is overwritten.
+//! Data elements the API returns are read by the same format. A value read this way that the
+//! caller asks for again is `Unchanged`, and the provider's text is left as it is; a write keeps
+//! every element it does not change verbatim as it was read, and the strict condition protects the
+//! set.
 //!
 //! # Attributes the model does not carry
 //!
@@ -101,7 +107,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
 use crate::provider::ZoneListing;
-use crate::record::{Caa, RecordData, RecordType, SvcParam, Svcb, Ttl, TxtDialect};
+use crate::record::{Caa, RecordData, RecordType, SvcParam, Svcb, Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{self, Current, Found, Listing, Member, RrsetBase, SetTtl, Stored, WholeSet};
 
@@ -109,9 +115,33 @@ use super::client::YandexCloud;
 use super::rrset::{RecordSet, data_of, relative, ttl_of};
 use super::txt::MAX_DATA;
 
-/// How TXT data is read at record level: quoted text as presentation format, anything else as
-/// the value (design section 11.2).
+/// How TXT data is read at record level: quoted text as presentation format, other text as the
+/// value (design section 11.2), except unquoted text with whitespace (see [`unquoted_strings`]).
 const TXT_READ: TxtDialect = TxtDialect::Auto;
+
+/// Unquoted TXT text with whitespace: several character-strings separated by the whitespace,
+/// whose value is their concatenation (the canonical TXT value joins its strings, design section
+/// 4.3). `None` for text this rule does not cover: quoted text, text without whitespace, and
+/// text with a character the master file format gives a meaning (`"`, `\`, `;`, `(`, `)`),
+/// which then stays non-canonical.
+// Source: https://yandex.cloud/en/docs/dns/concepts/resource-record, TXT ("The service uses
+// MASTER FILES format", "The space character serves as a separator. If an input string has
+// spaces, it will be perceived as multiple strings."), read 2026-11-14.
+fn unquoted_strings(content: &str) -> Option<RecordData> {
+    let text = content.trim();
+    if text.starts_with('"') || !text.contains(|c: char| c.is_ascii_whitespace()) {
+        return None;
+    }
+    if text.contains(['"', '\\', ';', '(', ')']) {
+        return Some(RecordData::non_canonical(text));
+    }
+    let joined: String = text.split_ascii_whitespace().collect();
+    Some(
+        Txt::new(joined)
+            .and_then(|value| value.to_data())
+            .unwrap_or_else(|_| RecordData::non_canonical(text)),
+    )
+}
 
 /// Longest data element.
 // Source: https://yandex.cloud/en/docs/dns/api-ref/DnsZone/listRecordSets (`data[]`: "The
@@ -128,9 +158,17 @@ const CAA_TAGS: &[&str] = &[
     "contactphone",
 ];
 
-/// A value as the API returned it (see the module documentation).
-pub(super) fn read_content(rtype: RecordType, content: &str) -> RecordData {
-    RecordData::from_provider(rtype, content, None, TXT_READ)
+/// A value as the API returned it, in the master file format with `zone` as the origin (see the
+/// module documentation).
+// Source: https://yandex.cloud/en/docs/dns/concepts/resource-record ("The service uses MASTER
+// FILES format"), read 2026-11-14; RFC 1035 section 5.1 (relative names and the origin).
+pub(super) fn read_content(zone: &DomainName, rtype: RecordType, content: &str) -> RecordData {
+    if rtype == RecordType::TXT
+        && let Some(data) = unquoted_strings(content)
+    {
+        return data;
+    }
+    RecordData::from_provider(rtype, content, Some(zone), TXT_READ)
 }
 
 /// The API's text for a value, or `None` when the client cannot send it (see the module
@@ -232,11 +270,15 @@ impl RrsetBase for YandexCloud {
 }
 
 /// The record layer's view of a record set the API returned.
-fn found(rtype: RecordType, set: Value) -> Result<Found<String, RecordSet>, Error> {
+fn found(
+    zone: &DomainName,
+    rtype: RecordType,
+    set: Value,
+) -> Result<Found<String, RecordSet>, Error> {
     let records = data_of(&set)?
         .into_iter()
         .map(|text| Stored {
-            data: read_content(rtype, text),
+            data: read_content(zone, rtype, text),
             enabled: true,
             ttl: None,
             handle: text.to_owned(),
@@ -265,7 +307,7 @@ impl WholeSet for YandexCloud {
         let (zone_id, set) = self.read_set(zone, name, &rtype.to_string()).await?;
         Ok(Current {
             context: zone_id,
-            found: set.map(|set| found(rtype, set)).transpose()?,
+            found: set.map(|set| found(zone, rtype, set)).transpose()?,
         })
     }
 
@@ -373,7 +415,7 @@ fn replaced(prior: &RecordSet, data: Vec<Value>, ttl: SetTtl) -> Value {
 // Source: https://yandex.cloud/en/docs/dns/api-ref/DnsZone/listRecordSets (`name`: "Domain
 // name"; the filter example `name="works.on.my.machine."` spells a name absolute with the
 // dot); lego yandexcloud.go:136 (names relative to the zone).
-fn owner_name(zone: &DomainName, text: &str) -> Option<DomainName> {
+pub(super) fn owner_name(zone: &DomainName, text: &str) -> Option<DomainName> {
     if text.ends_with('.') {
         return DomainName::parse(text).ok();
     }
@@ -419,7 +461,10 @@ impl YandexCloud {
             // A type name that maps to no record type is skipped by the listing, whatever the
             // data hold; the data are then never parsed.
             let records = match type_name.parse::<RecordType>() {
-                Ok(rtype) => data.iter().map(|text| read_content(rtype, text)).collect(),
+                Ok(rtype) => data
+                    .iter()
+                    .map(|text| read_content(zone, rtype, text))
+                    .collect(),
                 Err(_) => data
                     .iter()
                     .map(|text| RecordData::non_canonical(text))

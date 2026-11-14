@@ -605,11 +605,20 @@ impl Api {
                 None
             };
             let fields = shape(&rtype).map_or_else(Vec::new, |shape| read_fields(node, shape));
+            // `ttl` is optional (Docs 4.6): a record without one has the zone's default. One
+            // that is present but does not parse is not read as "no TTL".
+            let ttl = match child_text(node, "ttl") {
+                None => None,
+                Some(text) => Some(
+                    parse_ttl(&text)
+                        .ok_or_else(|| protocol("a listed record has a TTL that does not parse"))?,
+                ),
+            };
             records.push(Rr {
                 id: id.trim().to_owned(),
                 owner: owner(&name, zone),
                 rtype,
-                ttl: child_text(node, "ttl").and_then(|t| parse_ttl(&t)),
+                ttl,
                 txt,
                 fields,
             });

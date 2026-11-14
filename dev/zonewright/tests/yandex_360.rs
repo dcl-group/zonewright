@@ -788,11 +788,12 @@ async fn yandex_360_request_shapes() {
     assert!(delete.body.is_empty());
 }
 
-/// Names read back in either form the documentation allows: relative to the zone, or the full
-/// name.
+/// Names read back in the forms the client can place: relative to the zone, or the full name
+/// with a trailing dot. The full name without a trailing dot, which a listing cannot tell from a
+/// relative name that repeats the zone, is `yandex_360_ambiguous_names_are_refused_not_guessed`.
 #[tokio::test]
 async fn yandex_360_names_in_either_form() {
-    for form in [NameForm::Relative, NameForm::Full] {
+    for form in [NameForm::Relative, NameForm::Absolute] {
         let (mock, client) = setup().await;
         mock.control().set_name_form(form);
         for (owner, stored) in [
@@ -840,7 +841,7 @@ async fn yandex_360_names_in_either_form() {
 /// there already; a value found there (`@` or the full name) can be removed.
 #[tokio::test]
 async fn yandex_360_apex_is_read_but_not_written() {
-    for form in [NameForm::Relative, NameForm::Full] {
+    for form in [NameForm::Relative, NameForm::Absolute] {
         let (mock, client) = setup().await;
         let control = mock.control();
         control.set_name_form(form);
@@ -1583,7 +1584,7 @@ async fn yandex_360_record_round_trips() {
         );
         assert_eq!(record_writes(&mock), before, "{label}");
     }
-    for form in [NameForm::Relative, NameForm::Full] {
+    for form in [NameForm::Relative, NameForm::Absolute] {
         mock.control().set_name_form(form);
         let listing = client.list_rrsets(&zone()).await.unwrap();
         assert!(listing.skipped.is_empty(), "{form:?} {:?}", listing.skipped);
@@ -2172,9 +2173,9 @@ async fn yandex_360_listing_reports_skipped_sets() {
     assert_eq!(skipped, expected);
     assert_eq!(listing.rrsets.len(), 3);
 
-    // The listing reads every page by number, and the full name form reads the same.
+    // The listing reads every page by number, and the absolute name form reads the same.
     control.set_page_cap(2);
-    control.set_name_form(NameForm::Full);
+    control.set_name_form(NameForm::Absolute);
     let paged = client.list_rrsets(&zone()).await.unwrap();
     assert_eq!(paged.rrsets, listing.rrsets);
     let gets = mock.log().matching(Some("GET"), RECORDS);
@@ -2226,7 +2227,7 @@ async fn yandex_360_truncated_rrset_listing_is_protocol() {
 /// an A record at the apex next to an A set at a name.
 #[tokio::test]
 async fn yandex_360_record_operations_touch_only_their_rrset() {
-    for form in [NameForm::Relative, NameForm::Full] {
+    for form in [NameForm::Relative, NameForm::Absolute] {
         let (mock, client) = setup().await;
         let control = mock.control();
         control.set_name_form(form);
@@ -3114,4 +3115,274 @@ async fn live_yandex_360_record_round_trip() {
         std::panic::resume_unwind(e.into_panic());
     }
     assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
+}
+
+// ---- Name forms (relative, full, lookalike) ------------------------------------------------------
+
+/// An A record whose relative name repeats the zone (owner `www.example.org.example.org`), next
+/// to an MX record stated as `@`, which proves that the listing states names relative to the
+/// zone. Returns the lookalike's identifier.
+fn lookalike_in_relative_listing(mock: &Yandex360Mock) -> u64 {
+    let control = mock.control();
+    control.insert_fields(
+        "example.org",
+        "@",
+        "MX",
+        serde_json::json!({"exchange": "mx.example.net.", "preference": 10}),
+        300,
+    );
+    control.insert_relative(
+        "example.org",
+        "www.example.org",
+        "A",
+        serde_json::json!({"address": "192.0.2.9"}),
+        300,
+    )
+}
+
+/// In a listing that states names relative to the zone, a record whose name repeats the zone
+/// belongs to the name below it: get, set, delete and the zone listing at `www.example.org`
+/// neither see nor touch it, and it is read back at its own name.
+#[tokio::test]
+async fn yandex_360_lookalike_name_is_its_own_rrset() {
+    let (mock, client) = setup().await;
+    let lookalike = lookalike_in_relative_listing(&mock);
+    let www = dn("www.example.org");
+    let deep = dn("www.example.org.example.org");
+    assert_eq!(
+        client
+            .get_rrset(&zone(), &www, RecordType::A)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        client
+            .get_rrset(&zone(), &deep, RecordType::A)
+            .await
+            .unwrap(),
+        Some(rr(
+            &deep.to_string(),
+            RecordType::A,
+            Some(300),
+            &["192.0.2.9"]
+        ))
+    );
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &www, RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::NotPresent
+    );
+    assert_eq!(record_writes(&mock), 0);
+    let set = rr("www.example.org", RecordType::A, Some(300), &["192.0.2.1"]);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &set, Expect::Absent)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    let listing = client.list_rrsets(&zone()).await.unwrap();
+    assert!(listing.skipped.is_empty(), "{:?}", listing.skipped);
+    assert!(listing.rrsets.contains(&set), "{:?}", listing.rrsets);
+    let theirs = rr(&deep.to_string(), RecordType::A, Some(300), &["192.0.2.9"]);
+    assert!(listing.rrsets.contains(&theirs), "{:?}", listing.rrsets);
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &www, RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    let left: Vec<u64> = mock
+        .control()
+        .records()
+        .iter()
+        .filter(|r| r.rtype == "A")
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(left, [lookalike]);
+}
+
+/// The TXT value operations follow the same rule: a TXT record whose relative name repeats the
+/// zone, holding our value, is not ours; the add creates our own, and the removes never delete
+/// the lookalike.
+#[tokio::test]
+async fn yandex_360_txt_lookalike_name_is_not_ours() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_fields(
+        "example.org",
+        "@",
+        "MX",
+        serde_json::json!({"exchange": "mx.example.net.", "preference": 10}),
+        300,
+    );
+    let lookalike = control.insert_relative(
+        "example.org",
+        "_acme-challenge.example.org",
+        "TXT",
+        serde_json::json!({"text": "AAA"}),
+        300,
+    );
+    assert_eq!(
+        remove(&client, "AAA").await.unwrap(),
+        RemoveOutcome::NotPresent
+    );
+    assert_eq!(writes(&mock), 0);
+    assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
+    assert_eq!(
+        remove(&client, "AAA").await.unwrap(),
+        RemoveOutcome::RrsetDeleted
+    );
+    let txt: Vec<u64> = control
+        .records()
+        .iter()
+        .filter(|r| r.rtype == "TXT")
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(txt, [lookalike]);
+}
+
+/// A listing in which every dotless name is also a name within the zone does not say whether
+/// its names are relative or full. A record whose name reads as the operated name in one form
+/// is then refused with `Protocol` before any write, for every operation that matches records
+/// to that name; the zone listing reports it in `skipped` and never places it at a guessed
+/// name. An operation on a name neither reading gives is unaffected.
+#[tokio::test]
+async fn yandex_360_ambiguous_names_are_refused_not_guessed() {
+    // A relative name that repeats the zone, alone: it cannot be told from a full name.
+    let (mock, client) = setup().await;
+    mock.control().insert_relative(
+        "example.org",
+        "www.example.org",
+        "A",
+        serde_json::json!({"address": "192.0.2.9"}),
+        300,
+    );
+    let before = mock.control().records();
+    let set = rr("www.example.org", RecordType::A, Some(300), &["192.0.2.1"]);
+    for owner in ["www.example.org", "www.example.org.example.org"] {
+        let e = client
+            .get_rrset(&zone(), &dn(owner), RecordType::A)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{owner} {e:?}");
+        let e = client
+            .delete_rrset(&zone(), &dn(owner), RecordType::A, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{owner} {e:?}");
+    }
+    for expect in [Expect::Any, Expect::Absent] {
+        let e = client.set_rrset(&zone(), &set, expect).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    }
+    assert_eq!(
+        client
+            .get_rrset(&zone(), &dn("mail.example.org"), RecordType::A)
+            .await
+            .unwrap(),
+        None
+    );
+    let listing = client.list_rrsets(&zone()).await.unwrap();
+    assert!(listing.rrsets.is_empty(), "{:?}", listing.rrsets);
+    let skipped: Vec<_> = listing
+        .skipped
+        .iter()
+        .map(|s| (s.name.to_string(), s.type_name.clone(), s.reason))
+        .collect();
+    assert_eq!(
+        skipped,
+        [(
+            "example.org.".to_owned(),
+            "A".to_owned(),
+            SkipReason::UnsupportedName
+        )]
+    );
+    assert_eq!(record_writes(&mock), 0);
+    assert_eq!(mock.control().records(), before);
+
+    // Full names without a trailing dot: the same, for the record level and the TXT values,
+    // the apex included. Stated relative, the same records are placed.
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.set_name_form(NameForm::Full);
+    control.insert_fields(
+        "example.org",
+        "www",
+        "A",
+        serde_json::json!({"address": "192.0.2.1"}),
+        300,
+    );
+    control.insert_record("example.org", "@", "TXT", "foreign", 300);
+    control.insert_record("example.org", NAME, "TXT", "AAA", 300);
+    let before = control.records();
+    let e = client
+        .get_rrset(&zone(), &dn("www.example.org"), RecordType::A)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    for e in [
+        add(&client, "AAA").await.unwrap_err(),
+        add(&client, "BBB").await.unwrap_err(),
+    ] {
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    }
+    let e = remove(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    let e = client
+        .remove_txt_value(&zone(), &zone(), &txt("foreign"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    let listing = client.list_rrsets(&zone()).await.unwrap();
+    assert!(listing.rrsets.is_empty(), "{:?}", listing.rrsets);
+    // One per stated name and type: two TXT names and one A name.
+    assert_eq!(listing.skipped.len(), 3, "{:?}", listing.skipped);
+    assert!(
+        listing
+            .skipped
+            .iter()
+            .all(|s| s.reason == SkipReason::UnsupportedName && s.name == zone())
+    );
+    assert_eq!(writes(&mock) + record_writes(&mock), 0);
+    assert_eq!(control.records(), before);
+    control.set_name_form(NameForm::Relative);
+    assert_eq!(
+        client
+            .get_rrset(&zone(), &dn("www.example.org"), RecordType::A)
+            .await
+            .unwrap(),
+        Some(rr(
+            "www.example.org",
+            RecordType::A,
+            Some(300),
+            &["192.0.2.1"]
+        ))
+    );
+}
+
+/// A listing whose `total` changes between pages may have passed over a record: an error, not
+/// a shorter listing.
+#[tokio::test]
+async fn yandex_360_listing_whose_total_changes_is_protocol() {
+    let (mock, client) = setup().await;
+    let record = |id: u32, name: &str| {
+        format!(r#"{{"recordId":{id},"type":"A","name":"{name}","address":"192.0.2.1","ttl":300}}"#)
+    };
+    let first = format!(
+        r#"{{"records":[{},{}],"page":1,"pages":2,"perPage":2,"total":3}}"#,
+        record(1, "a"),
+        record(2, "b")
+    );
+    let second = r#"{"records":[],"page":2,"pages":2,"perPage":2,"total":2}"#;
+    mock.faults()
+        .push(Fault::on("GET", RECORDS).respond(200, first));
+    mock.faults()
+        .push(Fault::on("GET", RECORDS).respond(200, second));
+    let e = client.list_rrsets(&zone()).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
 }

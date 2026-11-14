@@ -270,6 +270,12 @@ fn classify(code: &str) -> Class {
         "TEXT_NOT_FOUND" | "TEXT_TOOLONG" | "TEXT_CONTAINS_INVALID_CHARACTERS" => {
             Class::InvalidInput
         }
+        // DOMAIN_NOT_FOUND and the SERVICE_* codes name a zone the account does not have.
+        // Assumption, not documented or observed: INVALID_DOMAIN_NAME_FORMAT is classed with
+        // them. The documentation lists the code without saying when it is returned. The zone
+        // names the client sends are valid `DomainName`s, so the code is taken to mean that
+        // reg.ru does not accept the name as one of the account's domains, which for the caller
+        // is a zone it cannot find.
         "DOMAIN_NOT_FOUND"
         | "SERVICE_NOT_FOUND"
         | "SERVICE_ID_NOT_FOUND"

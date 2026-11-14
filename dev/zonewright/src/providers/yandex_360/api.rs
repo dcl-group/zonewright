@@ -159,7 +159,7 @@ pub(crate) struct Record {
     #[serde(default, rename = "type")]
     pub(super) rtype: String,
     /// The owner name as the API states it. Its form is not settled by the documentation (see
-    /// [`names_match`] and [`owner_name`]).
+    /// [`NameForm`]).
     #[serde(default)]
     pub(super) name: String,
     /// TTL in seconds.
@@ -370,8 +370,9 @@ impl Api {
     ///
     /// Complete or an error. The listing states `pages` and `total`: another page follows while
     /// `page < pages`, and at the last page the items received must reach `total`. Fewer, an
-    /// absent `pages` or `total`, an absent list field, or an empty page before the last is
-    /// `Error::Protocol`.
+    /// absent `pages` or `total`, a `total` that changes between pages (items moved while the
+    /// pages were read, so one may have been passed over), an absent list field, or an empty
+    /// page before the last is `Error::Protocol`.
     // Source: List and Domains, answer fields `pages` and `total`. Assumption (not documented):
     // that `total` counts every item of the listing and `pages` is at least the number of
     // pages that hold them. Being wrong makes a listing fail, never come back shorter.
@@ -386,9 +387,12 @@ impl Api {
         U: Fn(u32) -> Result<Url, Error>,
     {
         let received = AtomicU64::new(0);
+        // The `total` of the first page; `u64::MAX` until it is read.
+        let first_total = AtomicU64::new(u64::MAX);
         pager::collect(1u32, |page| {
             let url = url(page);
             let received = &received;
+            let first_total = &first_total;
             async move {
                 let response = self.http.send(&Request::get(url?)).await?;
                 if response.status() == 404
@@ -411,6 +415,17 @@ impl Api {
                         "the provider's listing states no page or item count",
                     ));
                 };
+                if let Err(first) = first_total.compare_exchange(
+                    u64::MAX,
+                    total,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) && first != total
+                {
+                    return Err(protocol(
+                        "the provider's listing changed its number of items between pages",
+                    ));
+                }
                 let count = u64::try_from(items.len()).unwrap_or(u64::MAX);
                 let so_far = received
                     .fetch_add(count, Ordering::Relaxed)
@@ -465,57 +480,117 @@ fn page_query(url: UrlBuilder, page: u32, per_page: u32) -> UrlBuilder {
         .query("perPage", &per_page.to_string())
 }
 
-/// Whether the owner name a record states is `name`, a name within `zone`.
+/// The form in which a listing states owner names without a trailing dot, decided once per
+/// listing from every record of the domain.
 ///
 /// The documentation is not explicit about the form: the create page calls the field "record
-/// name" and lego sends the name relative to the domain, while the list page describes the
-/// field as the "full domain name". Both forms are accepted, with or without a trailing dot,
-/// and `@` or an empty name for the zone itself.
-// Assumption (not documented): the forms above, and that a stated name equal to the full name
-// is the full name rather than a name relative to the zone. A wrong reading can only make one
-// owner name look like another, and the client deletes only records whose value equals the value
-// being removed, so a foreign value is never taken for ours. The worst cases need a record at a
-// lookalike name (a relative name that repeats the zone, such as `_acme-challenge.example.org`
-// inside `example.org`) holding exactly our value: an add then reports `AlreadyPresent` without
-// writing, or a remove deletes that copy of our value too.
-pub(super) fn names_match(stated: &str, zone: &DomainName, name: &DomainName) -> bool {
-    let Some(relative) = name.relative_to(zone) else {
-        return false;
-    };
-    let stated = stated.strip_suffix('.').unwrap_or(stated);
-    if relative.is_empty() {
-        return stated.is_empty()
-            || stated == "@"
-            || stated.eq_ignore_ascii_case(zone.without_dot());
-    }
-    stated.eq_ignore_ascii_case(relative) || stated.eq_ignore_ascii_case(name.without_dot())
+/// name" (example `example`) and lego sends the name relative to the domain, while the list page
+/// describes the field as the "full domain name". A dotless name such as `www.example.org` is the
+/// full name in one reading and `www.example.org.example.org` in the other, and guessing wrong
+/// files a record under a name that is not its own, where a write to that name would change or
+/// delete it. So the client never guesses: a name that only one reading allows decides the form
+/// for the whole listing, and a name that both readings allow, in a listing that decides nothing,
+/// is refused or skipped.
+// Assumption (not documented): one listing states every name in one form. Being wrong makes a
+// record at a lookalike name read as relative in a listing that also holds a relative name,
+// which is the documented create form; it never makes a name that only the full reading allows
+// read as relative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NameForm {
+    /// Proven relative: the listing states `@`, or a dotless name that is not within the zone
+    /// and therefore cannot be a full name of it.
+    Relative,
+    /// Nothing in the listing tells the forms apart.
+    Undecided,
 }
 
-/// The owner name a record states, as a name, for the record level: `@` or an empty name is the
-/// zone; a name with a trailing dot is absolute; a name without one is the full name when it is
-/// the zone's name or ends with it, else relative to the zone. `None` when the text is not a
-/// valid name.
-// Assumption (not documented): the same forms as [`names_match`] accepts, read the same way (the
-// full name when the text ends with the zone's name). A wrong reading files a record under a name
-// that is not its own: a listing shows it there, and a write to that name compares against it,
-// deletes it by identifier, or keeps it as a value already present. Only a record at a lookalike
-// name (a relative name that repeats the zone, such as `www.example.org` meant inside
-// `example.org`) can be read wrongly this way.
-pub(super) fn owner_name(stated: &str, zone: &DomainName) -> Option<DomainName> {
-    if let Some(absolute) = stated.strip_suffix('.')
-        && !absolute.is_empty()
-    {
-        return DomainName::parse(absolute).ok();
+impl NameForm {
+    /// The form of a listing of `zone`.
+    pub(super) fn of(records: &[Record], zone: &DomainName) -> NameForm {
+        let proves_relative = |stated: &str| {
+            let stated = stated.trim();
+            stated == "@"
+                || (!stated.is_empty()
+                    && !stated.ends_with('.')
+                    && DomainName::parse(stated).is_ok_and(|full| !full.is_within(zone)))
+        };
+        if records.iter().any(|record| proves_relative(&record.name)) {
+            NameForm::Relative
+        } else {
+            NameForm::Undecided
+        }
     }
+}
+
+/// The owner a record states, read in the listing's form.
+#[derive(Debug, PartialEq, Eq)]
+enum Owner {
+    /// One reading only.
+    Name(DomainName),
+    /// A dotless name that reads both as relative and as the full name, in an undecided listing.
+    Ambiguous {
+        relative: DomainName,
+        full: DomainName,
+    },
+    /// Not a valid name in any reading.
+    Invalid,
+}
+
+/// Reads the owner a record states: `@` or an empty name is the zone; a name with a trailing dot
+/// is absolute; a dotless name is relative to the zone in a relative listing, and in an
+/// undecided one it is ambiguous when it is also a name within the zone.
+fn read_owner(stated: &str, zone: &DomainName, form: NameForm) -> Owner {
+    let stated = stated.trim();
     if stated.is_empty() || stated == "@" {
-        return Some(zone.clone());
+        return Owner::Name(zone.clone());
     }
-    if let Ok(full) = DomainName::parse(stated)
-        && full.is_within(zone)
-    {
-        return Some(full);
+    if stated.ends_with('.') {
+        return DomainName::parse(stated).map_or(Owner::Invalid, Owner::Name);
     }
-    DomainName::from_relative(stated, zone).ok()
+    let relative = DomainName::from_relative(stated, zone).ok();
+    let full = match form {
+        NameForm::Relative => None,
+        NameForm::Undecided => DomainName::parse(stated)
+            .ok()
+            .filter(|full| full.is_within(zone)),
+    };
+    match (relative, full) {
+        (Some(relative), Some(full)) => Owner::Ambiguous { relative, full },
+        (None, Some(full)) => Owner::Name(full),
+        (Some(relative), None) => Owner::Name(relative),
+        (None, None) => Owner::Invalid,
+    }
+}
+
+/// Whether the owner name a record states is `name`, in a listing of `zone` of the form `form`.
+/// A name that may or may not be `name` (ambiguous, and `name` in one of its readings) is
+/// `Error::Protocol`: the record cannot be placed, and an operation on `name` that ignored it or
+/// took it for its own could miss or destroy data.
+pub(super) fn is_owner(
+    stated: &str,
+    zone: &DomainName,
+    form: NameForm,
+    name: &DomainName,
+) -> Result<bool, Error> {
+    match read_owner(stated, zone, form) {
+        Owner::Name(owner) => Ok(&owner == name),
+        Owner::Ambiguous { relative, full } if &relative == name || &full == name => Err(protocol(
+            "the provider stated a record name without a trailing dot that reads both as a \
+             relative and as a full name, and nothing in the listing tells the forms apart; \
+             the record cannot be placed",
+        )),
+        Owner::Ambiguous { .. } | Owner::Invalid => Ok(false),
+    }
+}
+
+/// The owner of a listed record, for the zone listing: `None` for a name that is not valid and
+/// for an ambiguous one, which the listing reports in `skipped` instead of placing it at a
+/// guessed name.
+pub(super) fn listed_owner(stated: &str, zone: &DomainName, form: NameForm) -> Option<DomainName> {
+    match read_owner(stated, zone, form) {
+        Owner::Name(owner) => Some(owner),
+        Owner::Ambiguous { .. } | Owner::Invalid => None,
+    }
 }
 
 /// `name` as a create or an edit states it: relative to `zone`, `@` for the zone itself.
@@ -549,30 +624,90 @@ pub(super) fn error_message(body: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_message, names_match, owner_name, write_name};
+    use super::{NameForm, Record, error_message, is_owner, listed_owner, write_name};
+    use crate::error::ErrorKind;
     use crate::name::DomainName;
+
+    fn listed(names: &[&str]) -> Vec<Record> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| {
+                serde_json::from_value(serde_json::json!({
+                    "recordId": id, "type": "TXT", "name": name, "ttl": 300
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_name_form_is_decided_by_a_name_only_one_reading_allows() {
+        let zone = DomainName::parse("example.org").unwrap();
+        let form = |names: &[&str]| NameForm::of(&listed(names), &zone);
+        assert_eq!(form(&["@"]), NameForm::Relative);
+        assert_eq!(form(&["www.example.org", "www"]), NameForm::Relative);
+        assert_eq!(form(&["_sip._tcp"]), NameForm::Relative);
+        assert_eq!(form(&["*"]), NameForm::Relative);
+        assert_eq!(form(&["example.org.sub"]), NameForm::Relative);
+        assert_eq!(form(&[]), NameForm::Undecided);
+        assert_eq!(
+            form(&["www.example.org", "example.org"]),
+            NameForm::Undecided
+        );
+        assert_eq!(
+            form(&["www.example.org.", "", "bad name"]),
+            NameForm::Undecided
+        );
+    }
 
     #[test]
     fn owner_names_are_read_in_every_form() {
         let zone = DomainName::parse("example.org").unwrap();
-        let read = |stated: &str| owner_name(stated, &zone).map(|n| n.as_str().to_owned());
-        for (stated, expected) in [
-            ("@", Some("example.org.")),
-            ("", Some("example.org.")),
-            ("example.org", Some("example.org.")),
-            ("example.org.", Some("example.org.")),
-            ("www", Some("www.example.org.")),
-            ("WWW", Some("www.example.org.")),
-            ("www.example.org", Some("www.example.org.")),
-            ("www.example.org.", Some("www.example.org.")),
-            ("_sip._tcp", Some("_sip._tcp.example.org.")),
-            ("*", Some("*.example.org.")),
-            ("xn--bcher-kva", Some("xn--bcher-kva.example.org.")),
-            ("example.org.sub", Some("example.org.sub.example.org.")),
-            ("other.net.", Some("other.net.")),
-            ("bad name", None),
+        let read = |stated: &str, form: NameForm| {
+            listed_owner(stated, &zone, form).map(|n| n.as_str().to_owned())
+        };
+        for (stated, relative, undecided) in [
+            ("@", Some("example.org."), Some("example.org.")),
+            ("", Some("example.org."), Some("example.org.")),
+            ("example.org", Some("example.org.example.org."), None),
+            ("example.org.", Some("example.org."), Some("example.org.")),
+            ("www", Some("www.example.org."), Some("www.example.org.")),
+            ("WWW", Some("www.example.org."), Some("www.example.org.")),
+            (
+                "www.example.org",
+                Some("www.example.org.example.org."),
+                None,
+            ),
+            (
+                "www.example.org.",
+                Some("www.example.org."),
+                Some("www.example.org."),
+            ),
+            (
+                "_sip._tcp",
+                Some("_sip._tcp.example.org."),
+                Some("_sip._tcp.example.org."),
+            ),
+            ("*", Some("*.example.org."), Some("*.example.org.")),
+            (
+                "example.org.sub",
+                Some("example.org.sub.example.org."),
+                Some("example.org.sub.example.org."),
+            ),
+            ("other.net.", Some("other.net."), Some("other.net.")),
+            ("bad name", None, None),
         ] {
-            assert_eq!(read(stated).as_deref(), expected, "{stated:?}");
+            assert_eq!(
+                read(stated, NameForm::Relative).as_deref(),
+                relative,
+                "{stated:?}"
+            );
+            assert_eq!(
+                read(stated, NameForm::Undecided).as_deref(),
+                undecided,
+                "{stated:?}"
+            );
         }
     }
 
@@ -605,22 +740,49 @@ mod tests {
     }
 
     #[test]
-    fn stated_names_are_compared_in_both_forms() {
+    fn stated_names_are_compared_in_the_listing_form() {
         let zone = DomainName::parse("example.org").unwrap();
         let name = DomainName::parse("_acme-challenge.example.org").unwrap();
-        let ok = |stated: &str, name: &DomainName| names_match(stated, &zone, name);
-        assert!(ok("_acme-challenge", &name));
-        assert!(ok("_ACME-challenge", &name));
-        assert!(ok("_acme-challenge.example.org", &name));
-        assert!(ok("_acme-challenge.example.org.", &name));
-        assert!(!ok("_acme-challenge.www", &name));
-        assert!(!ok("other", &name));
-        assert!(!ok("@", &name));
-        assert!(ok("@", &zone));
-        assert!(ok("", &zone));
-        assert!(ok("example.org", &zone));
-        assert!(!ok("_acme-challenge", &zone));
+        let lookalike = DomainName::parse("_acme-challenge.example.org.example.org").unwrap();
+        let is = |stated: &str, form: NameForm, name: &DomainName| {
+            is_owner(stated, &zone, form, name).map_err(|e| e.kind())
+        };
+        for form in [NameForm::Relative, NameForm::Undecided] {
+            assert_eq!(is("_acme-challenge", form, &name), Ok(true));
+            assert_eq!(is("_ACME-challenge", form, &name), Ok(true));
+            assert_eq!(is("_acme-challenge.example.org.", form, &name), Ok(true));
+            assert_eq!(is("_acme-challenge.www", form, &name), Ok(false));
+            assert_eq!(is("other", form, &name), Ok(false));
+            assert_eq!(is("@", form, &name), Ok(false));
+            assert_eq!(is("@", form, &zone), Ok(true));
+            assert_eq!(is("", form, &zone), Ok(true));
+            assert_eq!(is("_acme-challenge", form, &zone), Ok(false));
+            assert_eq!(is("www.example.org", form, &name), Ok(false));
+        }
+        // A relative listing reads a name that repeats the zone as a name below it.
+        let relative = NameForm::Relative;
+        assert_eq!(
+            is("_acme-challenge.example.org", relative, &name),
+            Ok(false)
+        );
+        assert_eq!(
+            is("_acme-challenge.example.org", relative, &lookalike),
+            Ok(true)
+        );
+        assert_eq!(is("example.org", relative, &zone), Ok(false));
+        // An undecided listing refuses to place it for either of its readings.
+        let undecided = NameForm::Undecided;
+        for target in [&name, &lookalike] {
+            assert_eq!(
+                is("_acme-challenge.example.org", undecided, target),
+                Err(ErrorKind::Protocol)
+            );
+        }
+        assert_eq!(
+            is("example.org", undecided, &zone),
+            Err(ErrorKind::Protocol)
+        );
         let outside = DomainName::parse("example.net").unwrap();
-        assert!(!ok("example.net", &outside));
+        assert_eq!(is("example.net", undecided, &outside), Ok(false));
     }
 }

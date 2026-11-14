@@ -14,7 +14,12 @@
 //!   update without them clears them is not established (design section 11.3).
 //! - delete: `DELETE …/rrset/{id}`, sent once. A `404` is success only when a new read under a
 //!   freshly looked-up zone finds no rrset: the zone may have been recreated with the rrset in
-//!   it, and then its values are still published (`Error::Conflict`).
+//!   it, and then its values are still published (`Error::Conflict`). An rrset that a web
+//!   resource manages (`managed_by` read) is not deleted: the delete would drop what the update
+//!   preserves, the managing resource (design section 3.4: preserve what was read, or refuse).
+//!   Both layers get `Error::InvalidInput` before any write (`delete_rrset`, and the removal of
+//!   the last value of such a TXT rrset). So `X-Managed-By`, documented for `DELETE` as well,
+//!   never has a value to carry there.
 //!
 //! An update or a delete answered `404` drops the cached zone ID: the zone or the rrset changed
 //! after the read and nothing was written; the caller's repeat starts with a fresh read.
@@ -143,6 +148,9 @@ impl SelectelV2 {
         zone_id: &str,
         prior: &Rrset,
     ) -> Result<(), Error> {
+        if prior.managed_by.is_some() {
+            return Err(managed());
+        }
         match self.api.delete_rrset(zone_id, &prior.id).await? {
             Written::Done => Ok(()),
             // The rrset is gone, or the zone identifier is (a zone recreated with the rrset in
@@ -161,6 +169,19 @@ impl SelectelV2 {
             }
             Written::Refused(e) => Err(e),
         }
+    }
+}
+
+/// The delete of an rrset a web resource manages (see the module documentation).
+// Source: the OpenAPI, `RRSetSchemaResponse.managed_by` ("The identifier of the web resource
+// that manages this record set (if applicable)"); `DELETE /zones/{zone_id}` answers 409 "Cannot
+// be deleted. Zone is managed by web resource." for a zone. What a delete does to a managed
+// rrset is not documented.
+fn managed() -> Error {
+    Error::InvalidInput {
+        detail: Detail::constant(
+            "the rrset is managed by a web resource; deleting it would drop that association",
+        ),
     }
 }
 

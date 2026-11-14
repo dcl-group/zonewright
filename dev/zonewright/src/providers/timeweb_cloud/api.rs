@@ -66,13 +66,16 @@
 //! | list domains  | `GET /v1/domains?limit&offset`                         | 200, page |
 //! | zone exists   | `GET /v1/domains/{zone}/dns-records?limit=1&offset=0`  | 200       |
 //! | subdomains    | `GET /v1/domains/{zone}`                               | 200       |
-//! | list records  | `GET /v1/domains/{name}/dns-records?limit&offset`      | 200, page |
+//! | list records  | `GET /v1/domains/{fqdn}/dns-records?limit&offset`      | 200, page |
 //! | create record | `POST /v2/domains/{name}/dns-records`                  | 201       |
 //! | update record | `PATCH /v2/domains/{name}/dns-records/{id}`            | 200       |
 //! | delete record | `DELETE /v2/domains/{name}/dns-records/{id}`           | 204       |
 //!
-//! `{name}` is the record's owner name: the zone itself, or the full name below it.
+//! `{name}` is the record's owner name: the zone itself, or the full name below it. `{fqdn}` is
+//! the zone, or a subdomain the domain's answer states: every read lists the zone and all its
+//! subdomains (see [`Api::zone_listings`]).
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -119,8 +122,7 @@ pub(super) struct Record {
 /// The `data` object of a record.
 #[derive(Debug, Deserialize)]
 struct RecordData {
-    /// The owner name as the API states it. Its form is not documented (see
-    /// [`stated_names`]).
+    /// The owner name as the API states it, in one of two forms (see `names.rs`).
     #[serde(default)]
     subdomain: Option<String>,
     /// The value.
@@ -181,6 +183,16 @@ impl Record {
 pub(super) struct Domain {
     /// The domain name.
     pub(super) fqdn: String,
+}
+
+/// One listing a read gathered: the name it is the listing of and its records.
+#[derive(Debug)]
+pub(super) struct Listed {
+    /// The zone or the subdomain; `None` for a stated subdomain whose name the client cannot
+    /// hold, listed by its name as stated.
+    pub(super) of: Option<DomainName>,
+    /// Its records, all pages.
+    pub(super) records: Vec<Record>,
 }
 
 /// The body of `POST /v2/domains/{fqdn}/dns-records` and of `PATCH
@@ -294,36 +306,54 @@ impl Api {
         listed.ok_or_else(|| protocol("the provider answered \"not found\" to its domain listing"))
     }
 
-    /// Every record the API lists for `name`, of every type, all pages: `GET
-    /// /v1/domains/{name}/dns-records`, the listing of the domain when `name` is the zone and
-    /// the listing of the subdomain otherwise, the same name the create and the delete are
-    /// addressed to. The API has no filter by type, so the caller selects.
+    /// Every listing a read of the zone needs, in this order: the zone's own listing, then the
+    /// listing of every subdomain the domain's answer states (`GET /v1/domains/{zone}`), each
+    /// once, all pages. A read of one name and a listing of the zone use the same listings, so
+    /// they place every record the same way (`names.rs`).
     ///
-    /// A `404` for the zone is `Error::ZoneNotFound`. A `404` for a name below the zone says
-    /// that the provider has no subdomain of that name; then the zone is looked up, and the
-    /// answer is no records when it exists and `Error::ZoneNotFound` when it does not.
+    /// A `404` for the domain's answer or for the zone's listing is `Error::ZoneNotFound`. A
+    /// subdomain whose name the client cannot hold (or that lies outside the zone) is listed by
+    /// its name as stated.
     // Source: the listing's `fqdn` is the full name of a domain or subdomain, and it lists all
-    // the records of that domain or subdomain; its parameters are the path, `limit` and
-    // `offset` only.
-    // Assumption (not documented): that `404` for a name below an existing domain means that
-    // no record exists at that name. Being wrong can make an add create a second copy of our own
-    // value, or a removal report `NotPresent` while our record stays; it never deletes or
-    // overwrites anything.
-    pub(super) async fn records(
-        &self,
-        zone: &DomainName,
-        name: &DomainName,
-    ) -> Result<Vec<Record>, Error> {
-        match self.records_of(name.without_dot()).await? {
-            Some(records) => Ok(records),
-            None if name != zone && self.zone_exists(zone).await? => Ok(Vec::new()),
-            None => Err(Error::zone_not_found(zone.clone())),
+    // the records of that domain or subdomain; `getDomain` states every subdomain with its full
+    // name; a record below the domain is created at a subdomain (the `v2` create's `fqdn`).
+    // Whether the zone's listing includes the records of its subdomains is not stated, hence
+    // the subdomains' own listings.
+    // Assumption (not documented): that `404` for the listing of a subdomain the domain's answer
+    // stated means that the subdomain was deleted after that answer, with its records. Being
+    // wrong can make an add create a second copy of our own value, or a removal report
+    // `NotPresent` while our record stays; it never deletes or overwrites anything.
+    pub(super) async fn zone_listings(&self, zone: &DomainName) -> Result<Vec<Listed>, Error> {
+        let subdomains = self.subdomains(zone).await?;
+        let own = self
+            .records_of(zone.without_dot())
+            .await?
+            .ok_or_else(|| Error::zone_not_found(zone.clone()))?;
+        let mut listings = vec![Listed {
+            of: Some(zone.clone()),
+            records: own,
+        }];
+        let mut listed: HashSet<String> = HashSet::new();
+        for stated in &subdomains {
+            let text = stated.trim();
+            let text = text.strip_suffix('.').unwrap_or(text);
+            let of = DomainName::parse(text)
+                .ok()
+                .filter(|name| name.is_within(zone));
+            if of.as_ref() == Some(zone) || !listed.insert(text.to_ascii_lowercase()) {
+                continue;
+            }
+            let path = of.as_ref().map_or(text, DomainName::without_dot);
+            if let Some(records) = self.records_of(path).await? {
+                listings.push(Listed { of, records });
+            }
         }
+        Ok(listings)
     }
 
     /// Every record the API lists for the domain or subdomain spelled `fqdn` (without a
     /// trailing dot), all pages; `None` when the first page is answered `404`.
-    pub(super) async fn records_of(&self, fqdn: &str) -> Result<Option<Vec<Record>>, Error> {
+    async fn records_of(&self, fqdn: &str) -> Result<Option<Vec<Record>>, Error> {
         self.list(
             |offset| paging(self.records_path(fqdn), PAGE_SIZE, offset).build(),
             "dns_records",
@@ -611,71 +641,6 @@ fn whole(value: &Value) -> Option<u64> {
     })
 }
 
-/// The names a record's stated `subdomain` can denote in `zone`.
-///
-/// The listing's schema describes `data.subdomain` only as the subdomain, with the example
-/// `sub.somedomain.ru` (a full name); the `v2` record schema describes it as the name relative
-/// to the main domain (`sub` for `sub.example.com`), absent for a record at the domain itself.
-/// Both readings are accepted: the full name, and a name relative to the zone (zone-file rules,
-/// where an absent or `@` name is the zone itself).
-// Assumption (not documented): that a listing states one of these two forms. A name read
-// wrongly is never taken for ours unless the same text is also the name asked for, and a value
-// is removed only when its text equals ours as well.
-pub(super) fn stated_names(stated: Option<&str>, zone: &DomainName) -> Vec<DomainName> {
-    let stated = stated.map_or("", str::trim);
-    let mut names = Vec::with_capacity(2);
-    if stated.is_empty() || stated == "@" {
-        names.push(zone.clone());
-        return names;
-    }
-    if let Ok(name) = DomainName::parse(stated) {
-        names.push(name);
-    }
-    if let Ok(name) = DomainName::from_relative(stated, zone)
-        && !names.contains(&name)
-    {
-        names.push(name);
-    }
-    names
-}
-
-/// Refuses the listing of a name below the zone (`of_zone` false) when it states a record
-/// without a name (absent, empty or `@`): in the listing of the zone that is the zone itself,
-/// but in the listing of a subdomain such a record could be at the subdomain or at the zone.
-pub(super) fn check_named(records: &[Record], of_zone: bool) -> Result<(), Error> {
-    let unnamed = |record: &Record| {
-        record
-            .subdomain()
-            .map(str::trim)
-            .is_none_or(|stated| stated.is_empty() || stated == "@")
-    };
-    if !of_zone && records.iter().any(unnamed) {
-        return Err(protocol(
-            "the provider's listing of a subdomain states a record without its name",
-        ));
-    }
-    Ok(())
-}
-
-/// The owner name of a record found in the listing of `listed` (`None`: a name the client could
-/// not parse), for a zone listing: `listed` itself when the record's stated name can denote it,
-/// which is how [`stated_names`] selects the records of one name for a read, so a listing and a
-/// read agree; otherwise the first reading of the stated name that lies within the zone, the
-/// full name before the relative one. `None` when no reading lies within the zone.
-pub(super) fn owner(
-    listed: Option<&DomainName>,
-    stated: Option<&str>,
-    zone: &DomainName,
-) -> Option<DomainName> {
-    let names = stated_names(stated, zone);
-    if let Some(listed) = listed
-        && names.contains(listed)
-    {
-        return Some(listed.clone());
-    }
-    names.into_iter().find(|name| name.is_within(zone))
-}
-
 /// The provider's error message: `error_code` and `message` of the documented error body.
 // Source: the error schema; `message` is a string or an array of strings.
 pub(super) fn error_message(body: &str) -> Option<String> {
@@ -710,45 +675,7 @@ pub(super) fn error_message(body: &str) -> Option<String> {
 mod tests {
     use serde_json::json;
 
-    use super::{error_message, owner, stated_names, whole};
-    use crate::name::DomainName;
-
-    #[test]
-    fn owners_prefer_the_listed_name() {
-        let zone = DomainName::parse("example.org").unwrap();
-        let sub = DomainName::parse("sub.example.org").unwrap();
-        let odd = DomainName::parse("sub.example.org.example.org").unwrap();
-        let of = |listed: Option<&DomainName>, s: Option<&str>| {
-            owner(listed, s, &zone).map(|n| n.as_str().to_owned())
-        };
-        assert_eq!(of(Some(&zone), None).as_deref(), Some("example.org."));
-        assert_eq!(
-            of(Some(&zone), Some("sub")).as_deref(),
-            Some("sub.example.org.")
-        );
-        assert_eq!(
-            of(Some(&zone), Some("sub.example.org")).as_deref(),
-            Some("sub.example.org.")
-        );
-        assert_eq!(
-            of(Some(&sub), Some("sub")).as_deref(),
-            Some("sub.example.org.")
-        );
-        assert_eq!(
-            of(Some(&sub), Some("x.sub.example.org")).as_deref(),
-            Some("x.sub.example.org.")
-        );
-        // The relative reading wins only where the listing is of that name.
-        assert_eq!(
-            of(Some(&odd), Some("sub.example.org")).as_deref(),
-            Some("sub.example.org.example.org.")
-        );
-        assert_eq!(
-            of(None, Some("other.net")).as_deref(),
-            Some("other.net.example.org.")
-        );
-        assert_eq!(of(None, Some("bad name")), None);
-    }
+    use super::{error_message, whole};
 
     #[test]
     fn error_messages_join_code_and_message() {
@@ -776,30 +703,5 @@ mod tests {
         assert_eq!(whole(&json!(42.5)), None);
         assert_eq!(whole(&json!(-1)), None);
         assert_eq!(whole(&json!("42")), None);
-    }
-
-    #[test]
-    fn stated_names_are_read_in_both_forms() {
-        let zone = DomainName::parse("example.org").unwrap();
-        let names = |s: Option<&str>| -> Vec<String> {
-            stated_names(s, &zone)
-                .iter()
-                .map(|n| n.as_str().to_owned())
-                .collect()
-        };
-        assert_eq!(names(None), ["example.org."]);
-        assert_eq!(names(Some("")), ["example.org."]);
-        assert_eq!(names(Some("@")), ["example.org."]);
-        assert_eq!(
-            names(Some("_acme-challenge")),
-            ["_acme-challenge.", "_acme-challenge.example.org."]
-        );
-        assert_eq!(
-            names(Some("_acme-challenge.example.org")),
-            [
-                "_acme-challenge.example.org.",
-                "_acme-challenge.example.org.example.org."
-            ]
-        );
     }
 }

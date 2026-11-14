@@ -2665,10 +2665,77 @@ async fn vk_cloud_replacement_creates_before_it_deletes() {
     assert_eq!(methods, ["POST", "DELETE", "DELETE"]);
 }
 
-/// A CNAME is replaced by a delete followed by a create (the API has no documented update of
-/// the value with its TTL), never by a second record next to the first; no `PUT` is sent.
+/// A CNAME is replaced by one in-place update of its target (`PUT …/cname/{record}` with
+/// `content`), never by a delete and a create and never by a second record next to the first.
+/// The record keeps its identifier and its TTL.
 #[tokio::test]
-async fn vk_cloud_cname_is_replaced_by_delete_then_create() {
+async fn vk_cloud_cname_is_changed_in_place() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let uuid = control.insert_record(
+        ZONE,
+        "cname",
+        "www",
+        serde_json::json!({"content": "old.example.net"}),
+        300,
+    );
+    for requested in [None, Some(300)] {
+        let new = rr(
+            "www.example.org",
+            RecordType::CNAME,
+            requested,
+            &[if requested.is_none() {
+                "new.example.net."
+            } else {
+                "newer.example.net."
+            }],
+        );
+        mock.log().clear();
+        assert_eq!(
+            client.set_rrset(&zone(), &new, Expect::Any).await.unwrap(),
+            SetOutcome::Replaced
+        );
+        let records = control.records_of(ZONE, "cname", "www");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].uuid, uuid);
+        assert_eq!(records[0].ttl, 300);
+        let writes: Vec<(String, String, serde_json::Value)> = mock
+            .log()
+            .entries()
+            .into_iter()
+            .filter(|r| r.method != "GET" && r.path != TOKENS)
+            .map(|r| {
+                (
+                    r.method.to_string(),
+                    r.path.clone(),
+                    serde_json::from_slice(&r.body).unwrap(),
+                )
+            })
+            .collect();
+        let target = new.records()[0].as_str().trim_end_matches('.').to_owned();
+        assert_eq!(
+            writes,
+            [(
+                "PUT".to_owned(),
+                format!("/public-dns/v2/dns/{}/cname/{uuid}", control.zone_id(ZONE)),
+                serde_json::json!({ "content": target }),
+            )]
+        );
+        assert_eq!(
+            records[0].field("content").unwrap(),
+            target,
+            "{requested:?}"
+        );
+    }
+}
+
+/// Replacing a CNAME never leaves the name without it (the reviewer's case: the old target
+/// replaced by a one-label target the API refuses). A target that breaks the documented
+/// structure of `content-cname` is refused before any write; a change the API refuses is one
+/// request, after which the old record is as it was; a TTL change, which the update cannot
+/// carry, is refused before any write. Each repeat ends the same way.
+#[tokio::test]
+async fn vk_cloud_refused_cname_change_keeps_the_old_record() {
     let (mock, client) = setup().await;
     let control = mock.control();
     control.insert_record(
@@ -2678,29 +2745,62 @@ async fn vk_cloud_cname_is_replaced_by_delete_then_create() {
         serde_json::json!({"content": "old.example.net"}),
         300,
     );
-    let new = rr(
-        "www.example.org",
-        RecordType::CNAME,
-        None,
-        &["new.example.net."],
-    );
+    let old = control.all_records();
+    let www = "www.example.org";
+    for _ in 0..2 {
+        for target in ["intranet.", "-x.example.net.", "x.example-."] {
+            mock.log().clear();
+            let set = rr(www, RecordType::CNAME, None, &[target]);
+            let e = client
+                .set_rrset(&zone(), &set, Expect::Any)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidInput, "{target}: {e:?}");
+            assert_eq!(record_writes(&mock), 0, "{target}");
+            assert_eq!(control.all_records(), old, "{target}");
+        }
+
+        mock.log().clear();
+        mock.faults().push(Fault::on("PUT", MEMBERS).status(400));
+        let set = rr(www, RecordType::CNAME, None, &["new.example.net."]);
+        let e = client
+            .set_rrset(&zone(), &set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+        assert_eq!(mock.log().count(Some("PUT"), MEMBERS), 1);
+        assert_eq!(record_writes(&mock), 1);
+        assert_eq!(control.all_records(), old);
+
+        mock.log().clear();
+        let set = rr(www, RecordType::CNAME, Some(600), &["new.example.net."]);
+        let e = client
+            .set_rrset(&zone(), &set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+        assert_eq!(record_writes(&mock), 0);
+        assert_eq!(control.all_records(), old);
+    }
+
+    // A record removed after the read: the update answers 404, nothing is written, and the
+    // repeat creates the record.
+    let hook = control.clone();
+    let uuid = old[0].uuid.clone();
+    mock.faults()
+        .push(Fault::on("PUT", MEMBERS).run(move || hook.delete_record(&uuid)));
+    let set = rr(www, RecordType::CNAME, None, &["new.example.net."]);
+    let e = client
+        .set_rrset(&zone(), &set, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+    assert!(control.all_records().is_empty());
     assert_eq!(
-        client.set_rrset(&zone(), &new, Expect::Any).await.unwrap(),
-        SetOutcome::Replaced
+        client.set_rrset(&zone(), &set, Expect::Any).await.unwrap(),
+        SetOutcome::Created
     );
-    let records = control.records_of(ZONE, "cname", "www");
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].field("content").unwrap(), "new.example.net");
-    // The record's TTL as read is kept.
-    assert_eq!(records[0].ttl, 300);
-    let methods: Vec<String> = mock
-        .log()
-        .entries()
-        .into_iter()
-        .filter(|r| r.method != "GET" && r.path != TOKENS)
-        .map(|r| r.method.to_string())
-        .collect();
-    assert_eq!(methods, ["DELETE", "POST"]);
+    assert_eq!(stored(&mock, "cname", "www"), ["new.example.net"]);
 }
 
 /// Two clients sharing a `Context` write one name at once, the first create delayed: the second
@@ -2783,6 +2883,41 @@ async fn vk_cloud_record_writes_are_sent_once() {
         client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
     }
     assert_eq!(mock.log().count(Some("PUT"), MEMBERS), 0);
+
+    // The in-place update of a CNAME is sent once whatever the answer.
+    control.insert_record(
+        ZONE,
+        "cname",
+        "alias",
+        serde_json::json!({"content": "old.example.net"}),
+        300,
+    );
+    let before = control.records_of(ZONE, "cname", "alias");
+    let cname = rr(
+        "alias.example.org",
+        RecordType::CNAME,
+        None,
+        &["new.example.net."],
+    );
+    for (fault, kind) in [
+        (Fault::on("PUT", MEMBERS).status(502), ErrorKind::Transient),
+        (
+            Fault::on("PUT", MEMBERS).rate_limited("1"),
+            ErrorKind::RateLimited,
+        ),
+        (Fault::on("PUT", MEMBERS).status(401), ErrorKind::Transient),
+    ] {
+        mock.log().clear();
+        mock.faults().push(fault);
+        let e = client
+            .set_rrset(&zone(), &cname, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), kind, "{e:?}");
+        assert_eq!(mock.log().count(Some("PUT"), MEMBERS), 1);
+        assert_eq!(record_writes(&mock), 1);
+        assert_eq!(control.records_of(ZONE, "cname", "alias"), before);
+    }
 }
 
 /// The record-level requests as the OpenAPI describes them: one listing of the type, the create
@@ -3064,6 +3199,8 @@ enum RecordRequest {
     Create,
     /// A delete: TXT records at the name.
     Delete,
+    /// An in-place update: one CNAME record at the name.
+    Update,
     /// A record listing of the zone listing: the type listings are the echo.
     List,
 }
@@ -3081,8 +3218,30 @@ fn record_listings_then(errors: Render, records_echo: bool) -> Render {
     })
 }
 
-/// The record-level requests against an echo, for every dialect: the create, the delete and the
-/// per-type listing. No canary and no issued token in any error or `Debug`, and the error shows
+/// A renderer that answers the zone listing like the API and the CNAME listing with one record
+/// at [`REL`]; every other request gets `errors`.
+fn cname_listing_then(errors: Render) -> Render {
+    let listings = listings_then(errors.clone(), false);
+    Arc::new(move |e: &Echoed| {
+        if e.method == Method::GET && e.path.ends_with("/cname/") {
+            let body = serde_json::json!([{
+                "uuid": "00000000-0000-4000-8000-000000000012",
+                "name": REL,
+                "dns": "/v2/dns/00000000-0000-4000-8000-000000000001",
+                "content": "old.example.net",
+                "ttl": 60
+            }]);
+            return (StatusCode::OK, axum::Json(body)).into_response();
+        }
+        if e.method == Method::GET && e.path.ends_with("/dns/") {
+            return listings(e);
+        }
+        errors(e)
+    })
+}
+
+/// The record-level requests against an echo, for every dialect: the create, the delete, the
+/// in-place update and the per-type listing. No canary and no issued token in any error or `Debug`, and the error shows
 /// the redaction.
 #[tokio::test]
 async fn vk_cloud_secret_echo_record_level() {
@@ -3099,17 +3258,24 @@ async fn vk_cloud_secret_echo_record_level() {
             // A 5xx to a delete by identifier or a listing is repeated by the transport with
             // back-off: it adds time and no coverage.
             (RecordRequest::Delete, [400, 403, 409].as_slice()),
+            // An update is sent once, like a create.
+            (RecordRequest::Update, [400, 403, 409, 500].as_slice()),
             (RecordRequest::List, [400, 401, 403].as_slice()),
         ] {
             for &status in statuses {
                 let label = format!("{} {:?} {status} {kind:?}", dialect.name, dialect.spelling);
-                echo.reset(dialect.echo(status).render_under(
-                    "/public-dns/v2/dns",
-                    record_listings_then(
+                let render = match kind {
+                    RecordRequest::Update => cname_listing_then(dialect.render.clone()),
+                    _ => record_listings_then(
                         dialect.render.clone(),
                         matches!(kind, RecordRequest::List),
                     ),
-                ));
+                };
+                echo.reset(
+                    dialect
+                        .echo(status)
+                        .render_under("/public-dns/v2/dns", render),
+                );
                 let client = echo_client(&echo, &echo.token_url(), &ctx);
                 let result = match kind {
                     RecordRequest::Create => {
@@ -3123,6 +3289,13 @@ async fn vk_cloud_secret_echo_record_level() {
                         .delete_rrset(&zone(), &name(), RecordType::TXT, Expect::Any)
                         .await
                         .map(|o| format!("{o:?}")),
+                    RecordRequest::Update => {
+                        let set = rr(NAME, RecordType::CNAME, None, &["new.example.net."]);
+                        client
+                            .set_rrset(&zone(), &set, Expect::Any)
+                            .await
+                            .map(|o| format!("{o:?}"))
+                    }
                     RecordRequest::List => client
                         .list_rrsets(&zone())
                         .await
@@ -3140,6 +3313,7 @@ async fn vk_cloud_secret_echo_record_level() {
                 let (method, path) = match kind {
                     RecordRequest::Create => ("POST", COLLECTIONS),
                     RecordRequest::Delete => ("DELETE", MEMBERS),
+                    RecordRequest::Update => ("PUT", MEMBERS),
                     RecordRequest::List => ("GET", "/public-dns/v2/dns/*/a/"),
                 };
                 assert!(

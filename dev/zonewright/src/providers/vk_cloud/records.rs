@@ -21,11 +21,19 @@
 //! - delete: `DELETE …/{zone}/{type}/{record}`, repeated by the transport (idempotent). A `404`
 //!   is success only when a new read under a freshly looked-up zone no longer finds the value,
 //!   as in `txt.rs`: the answer can also mean that the zone identifier went stale;
-//! - update: not used. The OpenAPI's `PUT` bodies (`…_Update`) carry no TTL, and those of A,
-//!   AAAA and SRV carry only `name`; so a CNAME is replaced by a delete and a create
-//!   ([`PerRecord::updates_in_place`] is false), and a TTL change of a record that stays is
-//!   refused with `Error::InvalidInput` before any write (design section 3.4: refuse what cannot
-//!   be carried out; the layer asks for TTL changes before it creates or deletes anything).
+//! - update: only the CNAME target, in place: `PUT …/{zone}/cname/{record}` with `content`
+//!   (`CnameRecord_Update`), sent once. A CNAME is a singleton, so the record layer replaces it
+//!   by this one update ([`PerRecord::updates_in_place`]) and never by a delete and a create: a
+//!   refused update leaves the old record as it was, where a refused create after the delete
+//!   would leave the name without its CNAME. A `404` means the record went away after the read
+//!   (`Error::Conflict`, nothing written). The OpenAPI's `PUT` bodies (`…_Update`) carry no TTL,
+//!   and those of A, AAAA and SRV carry only `name`, so a TTL change of a record that stays (a
+//!   CNAME changed in place included) is refused with `Error::InvalidInput` by `check_plan`,
+//!   before any write (design section 3.4: refuse what cannot be carried out).
+//!
+//! `check_plan` also refuses, with `Error::Protocol` and before any write, a plan that deletes a
+//! CNAME and then creates one: the record layer never sends that order to a client whose API
+//! changes a record in place, and the client does not carry it out if it ever did.
 //!
 //! # Fields per type
 //!
@@ -53,7 +61,10 @@
 //! with or without its trailing dot is absolute. (2) Written without the trailing dot: the
 //! OpenAPI says of `content-cname`, `content-mx` and `content-ns` that the value "cannot start or
 //! end with a hyphen or a dot"; `host` follows its example. The root (a null MX, an SRV "no
-//! service") and names that need a backslash escape are not sent. (3) TXT dialect `Raw` on write
+//! service") and names that need a backslash escape are not sent. A CNAME target must also meet
+//! the other rules of `content-cname` that a host name can break: "two or more" labels, and no
+//! hyphen at its start or end; a target that does not is refused with `Error::InvalidInput`
+//! before any request (its character rule is discussed below). (3) TXT dialect `Raw` on write
 //! and `Auto` on read, plain values only (`Txt::is_plain`), as the TXT value operations
 //! (`txt.rs`); `content-txt` allows at most 255 characters, which every plain value meets.
 //!
@@ -93,10 +104,10 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::{DomainName, TargetName};
 use crate::provider::ZoneListing;
-use crate::record::{Mx, RecordData, RecordType, Srv, Ttl, Txt, TxtDialect};
+use crate::record::{Mx, RecordData, RecordType, Srv, Ttl, Txt, TxtDialect, singleton};
 use crate::redact::Detail;
 use crate::rrsets::{
-    self, Listing, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
+    self, Listing, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Step, Stored,
 };
 
 use super::api::{ApiRecord, Kind, NewRecord, Written};
@@ -297,13 +308,20 @@ fn write_aaaa(data: &RecordData) -> Option<Encoded> {
     })
 }
 
-/// CNAME: the target without its trailing dot as `content`.
+/// CNAME: the target without its trailing dot as `content`; `None` for a target that breaks a
+/// structural rule of `content-cname`.
 // Source: the OpenAPI, `CnameRecord_Create` (`name`, `content`, `ttl` required) and
-// `content-cname` ("cannot start or end with a hyphen or a dot", example `example.com`).
+// `content-cname` ("Должен состоять из двух или более поддоменов. Максимальная длина поддомена —
+// 63 символа. ... Не может начинаться и заканчиваться на дефис или точку", example
+// `example.com`). Labels of at most 63 characters are a property of every `TargetName`; the
+// dots at the ends are taken off by `host`.
 fn write_cname(data: &RecordData) -> Option<Encoded> {
     let target = TargetName::parse(data.as_str()).ok()?;
-    Some(Encoded {
-        content: Some(host(&target)?),
+    let content = host(&target)?;
+    let fits =
+        content.split('.').count() >= 2 && !content.starts_with('-') && !content.ends_with('-');
+    fits.then(|| Encoded {
+        content: Some(content),
         ..Encoded::default()
     })
 }
@@ -496,31 +514,40 @@ impl PerRecord for VkCloud {
 
     async fn update(
         &self,
-        _zone: &DomainName,
+        zone: &DomainName,
         _name: &DomainName,
-        _rtype: RecordType,
-        _context: &String,
-        _record: &Stored<String>,
+        rtype: RecordType,
+        context: &String,
+        record: &Stored<String>,
         update: &RecordUpdate<'_>,
     ) -> Result<(), Error> {
-        if update.enable || update.data.is_some() {
-            // The API has no disabled records, and `updates_in_place` is false: the layer never
-            // asks for either.
-            return Err(Error::Protocol {
-                detail: Detail::constant(
-                    "the client was asked for a record update the provider's API does not offer",
-                ),
-            });
+        // `check_plan` refused every other update before the first write; checked again so that
+        // no request is ever sent for one.
+        check_update(rtype, record, update)?;
+        let Some(data) = update.data else {
+            return Err(no_such_update());
+        };
+        let encoded = encode(rtype, data).ok_or_else(not_sendable)?;
+        let content = encoded.content.as_deref().ok_or_else(not_sendable)?;
+        match self
+            .api
+            .update_cname(context, &record.handle, content)
+            .await?
+        {
+            Written::Done => Ok(()),
+            // The record, or the zone with it, went away after the read; nothing was written,
+            // and the caller's repeat reads again under a freshly looked-up zone.
+            Written::NotFound => {
+                self.forget_zone(zone);
+                Err(Error::Conflict {
+                    detail: Detail::constant(
+                        "the record was removed between the read and the update",
+                    ),
+                })
+            }
+            // Refused: one request, so the record is as it was.
+            Written::Refused(e) => Err(e),
         }
-        // A TTL change of a record that stays. No documented call changes the TTL of an existing
-        // record (the OpenAPI's `…_Update` bodies have no `ttl`), and replacing the record by a
-        // delete and a create would leave the name without the value in between.
-        Err(Error::InvalidInput {
-            detail: Detail::constant(
-                "the provider's API cannot change the TTL of an existing record; delete the \
-                 rrset and set it again with the new TTL",
-            ),
-        })
     }
 
     async fn delete(
@@ -554,8 +581,80 @@ impl PerRecord for VkCloud {
         }
     }
 
+    /// A CNAME's target is changed in place (`PUT …/cname/{record}`); the layer asks for no
+    /// other in-place change (it changes content in place for singleton types only).
     fn updates_in_place(&self) -> bool {
-        false
+        true
+    }
+
+    /// Refuses, before any write, every update the API cannot carry out (a TTL change, an
+    /// enable, new content of a type other than CNAME) and a plan that deletes a CNAME before it
+    /// creates one (see the module documentation).
+    fn check_plan(
+        &self,
+        _zone: &DomainName,
+        _name: &DomainName,
+        rtype: RecordType,
+        _context: &String,
+        steps: &[Step<'_, String>],
+    ) -> Result<(), Error> {
+        check_steps(rtype, steps)
+    }
+}
+
+/// [`PerRecord::check_plan`] of this client.
+fn check_steps(rtype: RecordType, steps: &[Step<'_, String>]) -> Result<(), Error> {
+    let mut deleted = false;
+    for step in steps {
+        match step {
+            Step::Update { record, update } => check_update(rtype, record, update)?,
+            Step::Delete(_) => deleted = true,
+            Step::Create { .. } if deleted && singleton(rtype) => {
+                return Err(Error::Protocol {
+                    detail: Detail::constant(
+                        "the plan deletes the record of a single-record type before it creates \
+                         its replacement; a refused create would leave the name without the \
+                         record",
+                    ),
+                });
+            }
+            Step::Create { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// The update of `record` the API can carry out: new CNAME content, with no TTL change.
+fn check_update(
+    rtype: RecordType,
+    record: &Stored<String>,
+    update: &RecordUpdate<'_>,
+) -> Result<(), Error> {
+    if let Some(ttl) = update.ttl
+        && record.ttl != Some(ttl)
+    {
+        // No documented call changes the TTL of an existing record (the OpenAPI's `…_Update`
+        // bodies have no `ttl`), and replacing the record by a delete and a create would leave
+        // the name without the value in between.
+        return Err(Error::InvalidInput {
+            detail: Detail::constant(
+                "the provider's API cannot change the TTL of an existing record; delete the \
+                 rrset and set it again with the new TTL",
+            ),
+        });
+    }
+    if update.enable || update.data.is_none() || rtype != RecordType::CNAME {
+        // The API has no disabled records, and content is changed in place for CNAME only.
+        return Err(no_such_update());
+    }
+    Ok(())
+}
+
+fn no_such_update() -> Error {
+    Error::Protocol {
+        detail: Detail::constant(
+            "the client was asked for a record update the provider's API does not offer",
+        ),
     }
 }
 
@@ -652,9 +751,11 @@ struct Group {
 
 #[cfg(test)]
 mod tests {
-    use super::{Encoded, encode, read_record, read_ttl, srv_name_fits};
+    use super::{Encoded, check_steps, encode, read_record, read_ttl, srv_name_fits};
+    use crate::error::ErrorKind;
     use crate::providers::vk_cloud::api::{ApiRecord, Kind};
     use crate::record::{RecordData, RecordType, Ttl};
+    use crate::rrsets::{RecordUpdate, SetTtl, Step, Stored};
 
     fn record(fields: serde_json::Value) -> ApiRecord {
         let mut json = serde_json::json!({"uuid": "u", "name": "www", "ttl": 60});
@@ -851,6 +952,106 @@ mod tests {
             );
         }
         assert!(encode(RecordType::A, &RecordData::non_canonical("x")).is_none());
+    }
+
+    #[test]
+    fn cname_targets_follow_the_documented_structure() {
+        for (text, content) in [
+            ("t.example.net.", Some("t.example.net")),
+            ("a-b.example.net.", Some("a-b.example.net")),
+            ("intranet.", None),
+            ("-t.example.net.", None),
+            ("t.example-.", None),
+        ] {
+            let encoded = RecordData::parse(RecordType::CNAME, text)
+                .ok()
+                .and_then(|data| encode(RecordType::CNAME, &data));
+            assert_eq!(
+                encoded.and_then(|e| e.content).as_deref(),
+                content,
+                "{text}"
+            );
+        }
+    }
+
+    fn stored(text: &str, ttl: u32) -> Stored<String> {
+        Stored {
+            data: data(RecordType::CNAME, text),
+            enabled: true,
+            ttl: Ttl::from_secs(ttl).ok(),
+            handle: "u".to_owned(),
+        }
+    }
+
+    #[test]
+    fn plans_the_api_cannot_carry_out_are_refused() {
+        let old = stored("old.example.net.", 300);
+        let new = data(RecordType::CNAME, "new.example.net.");
+        let same = Ttl::from_secs(300).ok();
+        let other = Ttl::from_secs(600).ok();
+        let change = |ttl, data| Step::Update {
+            record: &old,
+            update: RecordUpdate {
+                enable: false,
+                ttl,
+                data,
+            },
+        };
+        let create = Step::Create {
+            data: &new,
+            ttl: SetTtl::Existing(same),
+        };
+        let kind = |steps: &[Step<'_, String>]| {
+            check_steps(RecordType::CNAME, steps).map_err(|e| e.kind())
+        };
+        assert_eq!(kind(&[change(None, Some(&new))]), Ok(()));
+        assert_eq!(kind(&[change(same, Some(&new))]), Ok(()));
+        assert_eq!(
+            kind(&[change(other, Some(&new))]),
+            Err(ErrorKind::InvalidInput)
+        );
+        assert_eq!(kind(&[change(other, None)]), Err(ErrorKind::InvalidInput));
+        assert_eq!(kind(&[change(None, None)]), Err(ErrorKind::Protocol));
+        // A singleton is never deleted before its replacement is created.
+        assert_eq!(
+            kind(&[Step::Delete(&old), create]),
+            Err(ErrorKind::Protocol)
+        );
+        let create = Step::Create {
+            data: &new,
+            ttl: SetTtl::Default,
+        };
+        assert_eq!(kind(&[create]), Ok(()));
+        // Other types: creates before deletes, as the layer orders them; new content in place
+        // only for a CNAME.
+        let a = Stored {
+            data: data(RecordType::A, "192.0.2.1"),
+            ..stored("old.example.net.", 300)
+        };
+        let new_a = data(RecordType::A, "192.0.2.2");
+        let steps = [
+            Step::Delete(&a),
+            Step::Create {
+                data: &new_a,
+                ttl: SetTtl::Default,
+            },
+        ];
+        assert_eq!(
+            check_steps(RecordType::A, &steps).map_err(|e| e.kind()),
+            Ok(())
+        );
+        let in_place = [Step::Update {
+            record: &a,
+            update: RecordUpdate {
+                enable: false,
+                ttl: None,
+                data: Some(&new_a),
+            },
+        }];
+        assert_eq!(
+            check_steps(RecordType::A, &in_place).map_err(|e| e.kind()),
+            Err(ErrorKind::Protocol)
+        );
     }
 
     #[test]

@@ -9,7 +9,11 @@
 //! the requests; this file turns them into the API's calls:
 //!
 //! - read: `GET …/dns`, every page (the listing has no filter by name or type), an exact name and
-//!   type match on the client's side;
+//!   type match on the client's side. The form of the stated names (relative or full) is decided
+//!   once per listing (`api::NameForm`); a record of the type whose dotless name reads as this
+//!   name in one form and as another name in the other, in a listing that does not decide the
+//!   form, is `Error::Protocol` before any write, and the zone listing reports such a record in
+//!   `skipped` instead of placing it at a guessed name;
 //! - create: `POST …/dns`, sent once, with the name relative to the domain (`@` for the apex,
 //!   see `api::write_name`), the type's fields and the TTL the layer chose (the API requires a
 //!   TTL, so the configured one stands in when the set's TTL was not reported);
@@ -18,7 +22,8 @@
 //!   replaced in place. A `404` means the record went away after the read: nothing was written,
 //!   `Error::Conflict`, and the caller's repeat reads again;
 //! - delete: `DELETE …/dns/{recordId}`, repeated by the transport (idempotent). A `404` counts as
-//!   done (the record layer's rule for a per-record API).
+//!   done only when a new read finds no record with the value at the name: the domain may have
+//!   been deleted and created again with the value under a new identifier.
 //!
 //! # Fields per type
 //!
@@ -92,7 +97,9 @@ use crate::rrsets::{
     self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
 };
 
-use super::api::{Fields, NewRecord, Record, Written, owner_name, write_name};
+use super::api::{
+    Fields, NameForm, NewRecord, Record, Written, is_owner, listed_owner, write_name,
+};
 use super::client::Yandex360;
 
 /// How TXT data is read: quoted text as presentation format, anything else as the value
@@ -393,21 +400,27 @@ impl PerRecord for Yandex360 {
         name: &DomainName,
         rtype: RecordType,
     ) -> Result<RecordsRead<Record, Neighbors>, Error> {
-        let (records, others): (Vec<Record>, Vec<Record>) = self
-            .api
-            .records(zone)
-            .await?
-            .into_iter()
-            .filter(|record| owner_name(&record.name, zone).as_ref() == Some(name))
-            .partition(|record| record.rtype.parse::<RecordType>().ok() == Some(rtype));
+        let all = self.api.records(zone).await?;
+        // The name form is decided once for the whole listing (see `api::NameForm`).
+        let form = NameForm::of(&all, zone);
+        let mut records = Vec::new();
+        let mut others = Vec::new();
+        for record in all {
+            let stated = record.rtype.parse::<RecordType>().ok();
+            match is_owner(&record.name, zone, form, name) {
+                Ok(false) => {}
+                Ok(true) if stated == Some(rtype) => records.push(record),
+                Ok(true) => others.push(stated),
+                // A record of this type that may or may not be at this name: the rrset cannot
+                // be read, and a write could change or delete a record of another name.
+                Err(e) if stated == Some(rtype) => return Err(e),
+                // Another type that may be at this name counts as data of an unknown type.
+                Err(_) => others.push(None),
+            }
+        }
         // Every record of the domain is listed, and the API has no disabled records: the other
         // records of the name are all the data there besides this type.
-        let neighbors = Neighbors::of(
-            rtype,
-            others
-                .iter()
-                .map(|record| record.rtype.parse::<RecordType>().ok()),
-        );
+        let neighbors = Neighbors::of(rtype, others);
         let records = records
             .into_iter()
             .map(|record| Stored {
@@ -568,9 +581,12 @@ impl Yandex360 {
     pub(super) async fn list_zone(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
         rrsets::check_list(self, zone)?;
         let all = self.api.records(zone).await?;
+        let form = NameForm::of(&all, zone);
         let mut groups: BTreeMap<(String, String), Group> = BTreeMap::new();
         for record in &all {
-            let name = owner_name(&record.name, zone);
+            // `None` for a name that is not valid and for an ambiguous one: skipped as
+            // `UnsupportedName`, never placed at a guessed name.
+            let name = listed_owner(&record.name, zone, form);
             let rtype = record.rtype.parse::<RecordType>().ok();
             // Spellings of one name or type that mean the same land in one group.
             let key = (

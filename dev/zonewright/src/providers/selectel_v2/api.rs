@@ -440,19 +440,27 @@ fn page_query(url: UrlBuilder, offset: u64) -> UrlBuilder {
 
 /// The offset of the page after the one at `offset`, or `None` when the listing is complete.
 ///
-/// `count` decides: the listing is complete once the items received reach it. Before that, a
-/// positive `next_offset` is followed (or the end of what was received, if further). A listing
-/// that stops short of its `count` without a next offset is `Error::Protocol`, never a shorter
-/// result: the documentation does not say what `next_offset` holds on the last page, so `count`
-/// is the only reliable end.
+/// Neither `count` nor `next_offset` is described beyond being required integers, and what
+/// `next_offset` holds on the last page is not documented, so both are taken as stated and the
+/// listing ends only where they agree:
+///
+/// - Before `count` is reached, a positive `next_offset` is followed (or the end of what was
+///   received, if further). A page without one, or one that would not move on (no items and no
+///   next offset beyond this one), is `Error::Protocol`, never a shorter result.
+/// - Once the items received reach `count`, a page that brought items and names a next offset at
+///   or beyond its end is followed all the same: the `count` of an earlier page may be stale
+///   (items added while paging), and the next offset says there is more. The listing ends at a
+///   `next_offset` of `0` (or one behind the end of what was received) or at an empty page.
 fn next_offset<T>(offset: u64, listing: &Listing<T>) -> Result<Option<u64>, Error> {
     let received = u64::try_from(listing.result.len()).unwrap_or(u64::MAX);
     let after = offset.saturating_add(received);
+    let next = listing.next_offset;
     if after >= listing.count {
-        return Ok(None);
+        return Ok((received > 0 && next >= after).then_some(after.max(next)));
     }
-    if listing.next_offset > 0 {
-        return Ok(Some(after.max(listing.next_offset)));
+    let further = after.max(next);
+    if next > 0 && further > offset {
+        return Ok(Some(further));
     }
     Err(Error::Protocol {
         detail: Detail::constant(
@@ -530,9 +538,21 @@ mod tests {
             Some(1000)
         );
         assert_eq!(next_offset(2000, &listing(2500, 0, 500)).unwrap(), None);
-        // The count is reached, whatever the next offset says.
-        assert_eq!(next_offset(0, &listing(1000, 1000, 1000)).unwrap(), None);
+        // The count is reached and the last page says so (`0`, or an offset behind its end).
+        assert_eq!(next_offset(0, &listing(1000, 0, 1000)).unwrap(), None);
+        assert_eq!(next_offset(1000, &listing(1500, 500, 500)).unwrap(), None);
         assert_eq!(next_offset(0, &listing(0, 0, 0)).unwrap(), None);
+        // The count is reached, but the page names a next offset: the count may be stale, the
+        // next page is read, and an empty page ends the listing.
+        assert_eq!(
+            next_offset(0, &listing(1000, 1000, 1000)).unwrap(),
+            Some(1000)
+        );
+        assert_eq!(
+            next_offset(1000, &listing(1000, 2000, 1000)).unwrap(),
+            Some(2000)
+        );
+        assert_eq!(next_offset(1000, &listing(1000, 2000, 0)).unwrap(), None);
         // A next offset beyond the items received is followed.
         assert_eq!(
             next_offset(0, &listing(3000, 1500, 1000)).unwrap(),
@@ -551,6 +571,9 @@ mod tests {
             (0, listing(3, 0, 1)),
             (1000, listing(2500, 0, 0)),
             (2000, listing(2500, 0, 499)),
+            // An empty page whose next offset does not move on.
+            (1000, listing(2500, 1000, 0)),
+            (1000, listing(2500, 500, 0)),
         ] {
             let e = next_offset(offset, &page).unwrap_err();
             assert_eq!(e.kind(), crate::error::ErrorKind::Protocol);

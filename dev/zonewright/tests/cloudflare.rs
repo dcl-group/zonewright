@@ -2208,6 +2208,34 @@ async fn cloudflare_record_ttl_policy() {
     }
 }
 
+/// Records that disagree on their attributes, and a requested TTL: the plan holds a TTL change
+/// of the record that stays (allowed on its own) and a create (refused). The refusal comes before
+/// the first request, so not even the TTL change is sent.
+#[tokio::test]
+async fn cloudflare_refusals_come_before_any_write_of_the_plan() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_json(
+        "example.org",
+        &serde_json::json!({"type": "A", "name": REC, "content": "192.0.2.1", "ttl": 1,
+            "proxied": true}),
+    );
+    control.insert_record("example.org", REC, "A", "192.0.2.5", 600);
+    let before = control.records_of(REC, "A");
+    mock.log().clear();
+    let e = client
+        .set_rrset(
+            &zone(),
+            &rrset(REC, RecordType::A, Some(300), &["192.0.2.5", "192.0.2.7"]),
+            Expect::Any,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    assert_eq!(record_writes(&mock), 0);
+    assert_eq!(control.records_of(REC, "A"), before);
+}
+
 /// Attributes the model does not carry: a record that keeps its value is never written; a new
 /// record of a proxied set is proxied (with the automatic TTL), and takes over private routing
 /// and settings; a requested TTL on a proxied set, and a create into a set whose records

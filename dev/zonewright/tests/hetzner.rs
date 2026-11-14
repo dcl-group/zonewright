@@ -2040,7 +2040,7 @@ fn hetzner_config_keys_match_metadata() {
     );
     assert_eq!(caps.read_only_types, [RecordType::SOA]);
     assert_eq!(caps.preconditions, Preconditions::ReadThenWrite);
-    assert!(caps.atomic_rrset_write);
+    assert!(!caps.atomic_rrset_write);
     assert!(caps.asynchronous && caps.provider_default_ttl && caps.txt_plain_only);
     assert_eq!(
         caps.ttl,
@@ -3415,10 +3415,7 @@ fn random_u64() -> u64 {
 }
 
 /// Adds and removes two values under a generated label in the zone the maintainer names, and
-/// removes exactly the values it added afterwards, also when the body failed. Then a
-/// record-level round trip on an A rrset under another generated label (documentation
-/// addresses of RFC 5737): create, read, replace with a new TTL, list, delete; the cleanup
-/// deletes that rrset, the only one the test created there.
+/// removes exactly the values it added afterwards, also when the body failed.
 #[tokio::test]
 #[ignore = "live API: run only by the maintainer"]
 async fn live_hetzner_add_and_remove() {
@@ -3477,7 +3474,41 @@ async fn live_hetzner_add_and_remove() {
         })
     };
     let outcome = body.await;
-    let rec_name = zone.prepend(&format!("zw-live-rec-{tag:016x}")).unwrap();
+    // Cleanup: exactly the values this test added, with the value operations.
+    let mut cleanup = Vec::new();
+    for value in &values {
+        if let Err(e) = client.remove_txt_value(&zone, &name, value).await {
+            cleanup.push(format!("{e}"));
+        }
+    }
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+    assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
+}
+
+/// A record-level round trip on an A rrset under a generated label (documentation addresses of
+/// RFC 5737): create, read, replace with new records and a new TTL (`set_records` and then
+/// `change_ttl`), unchanged repeat, list, delete. The cleanup deletes that rrset, the only one
+/// the test wrote, also when the body failed.
+#[tokio::test]
+#[ignore = "live API: run only by the maintainer"]
+async fn live_hetzner_record_round_trip() {
+    let settings = live_env("ZONEWRIGHT_LIVE_HETZNER_SETTINGS");
+    let credentials = live_env("ZONEWRIGHT_LIVE_HETZNER_CREDENTIALS");
+    let zone = dn(&live_env("ZONEWRIGHT_LIVE_HETZNER_ZONE"));
+    let ctx = Context::new(zonewright::ContextOptions::default()).unwrap();
+    let client = Arc::new(
+        AnyProvider::from_json(
+            ProviderId::Hetzner,
+            &settings,
+            &SecretString::from(credentials),
+            &ctx,
+        )
+        .unwrap(),
+    );
+    let tag = random_u64();
+    let rec_name = zone.prepend(&format!("_zw-live-{tag:016x}")).unwrap();
     let records = {
         let (client, zone, rec_name) = (client.clone(), zone.clone(), rec_name.clone());
         tokio::spawn(async move {
@@ -3544,25 +3575,14 @@ async fn live_hetzner_add_and_remove() {
         .await
     };
 
-    // Cleanup: exactly the values this test added, with the value operations, and the A rrset
-    // under the generated label.
-    let mut cleanup = Vec::new();
-    for value in &values {
-        if let Err(e) = client.remove_txt_value(&zone, &name, value).await {
-            cleanup.push(format!("{e}"));
-        }
-    }
-    if let Err(e) = client
+    // Cleanup: the A rrset under the generated label, the only one the test wrote.
+    let cleanup = client
         .delete_rrset(&zone, &rec_name, RecordType::A, Expect::Any)
-        .await
-    {
-        cleanup.push(format!("{e}"));
-    }
+        .await;
     if let Err(e) = records {
         std::panic::resume_unwind(e.into_panic());
     }
-    if let Err(e) = outcome {
-        std::panic::resume_unwind(e.into_panic());
+    if let Err(e) = cleanup {
+        panic!("cleanup failed: {e}");
     }
-    assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
 }

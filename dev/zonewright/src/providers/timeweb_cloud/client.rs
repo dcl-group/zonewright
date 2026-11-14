@@ -39,17 +39,20 @@ use super::config::{self, TimewebCloudConfig, TimewebCloudCredentials};
 /// (`ValueGuarantee::PerValue`); a writer outside this process can at worst cause a duplicate
 /// of our own value.
 ///
-/// Records are created and deleted with the `v2` calls, addressed to the record's owner name,
-/// and read with the listing of that name (the domain's, or the subdomain's), page by page;
-/// every operation reads it in full before it writes. A listing that ends before the total it
-/// states is `Error::Protocol`. The client keeps no state between operations.
+/// Records are created and deleted with the `v2` calls, addressed to the record's owner name.
+/// Every operation first reads the zone's listing and the listing of every subdomain the
+/// provider states for the zone, page by page and in full, the same reads `list_rrsets` makes,
+/// so that a read of a name and the zone's listing always agree; a read therefore costs one
+/// request more than the zone has subdomains. A listing that ends before the total it states is
+/// `Error::Protocol`. The provider states a record's name either relative to the zone or as the
+/// full name; a record whose name reads both ways and whose listings do not tell which is never
+/// read, written or deleted on a guess (`Error::Protocol`; `skipped` in a zone listing). The
+/// client keeps no state between operations.
 ///
 /// Record-level operations work on the same individual records: a replacement creates the
 /// missing records, changes TTLs in place and deletes the surplus records last, in several
 /// requests (`atomic_rrset_write` is false), and a writer outside this process that changes the
-/// rrset between the read and the writes is not detected (`Preconditions::ReadThenWrite`). A
-/// zone's listing reads the zone's records and those of every subdomain the provider states for
-/// it.
+/// rrset between the read and the writes is not detected (`Preconditions::ReadThenWrite`).
 pub struct TimewebCloud {
     config: TimewebCloudConfig,
     /// The API.

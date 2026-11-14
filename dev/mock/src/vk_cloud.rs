@@ -11,7 +11,10 @@
 //!   `{uuid, name, dns, ttl, <the type's fields>}` or `404`; `POST /v2/dns/{zone}/{type}/` takes
 //!   the type's `…_Create` fields and answers `201` with the new record, `400` for a validation
 //!   error, `409` for a duplicate; `DELETE /v2/dns/{zone}/{type}/{record}` answers `204`, or
-//!   `404` when the record is not found; a request without a valid token answers `401`. The
+//!   `404` when the record is not found; `PUT /v2/dns/{zone}/{type}/{record}` takes the type's
+//!   `…_Update` fields (`name` for A, AAAA and SRV, `content` for CNAME, MX, NS and TXT) and
+//!   answers `200` with the changed record, `400` for a validation error, `404` when the record
+//!   is not found; a request without a valid token answers `401`. The
 //!   fields per type: A `name`, `ipv4`, `ttl`; AAAA `name`, `ipv6`, `ttl`; CNAME, NS and TXT
 //!   `name`, `content`, `ttl`; MX `name`, `content`, `priority`, `ttl`; SRV `name`, `priority`,
 //!   `weight`, `port`, `host` and an optional `ttl` (the OpenAPI's `required` lists). `ttl` is
@@ -46,6 +49,10 @@
 //!   range); an `ipv4` or `ipv6` that does not parse as an address is refused with `400`;
 //! - zones of another project are not listed, and requests into them answer `404`;
 //! - a record name ending in a dot is refused with `400` (names are relative to the zone);
+//! - an update changes exactly the fields its body names and keeps the record's identifier and
+//!   TTL; an update body without any of the type's `…_Update` fields, or with a field the schema
+//!   does not have, is refused with `400` (the OpenAPI requires no field and does not forbid
+//!   extra ones); its values are checked as a create's are;
 //! - error bodies are `{"error": {"code", "message"}}`; error texts are invented.
 //!
 //! One documented rule is deliberately not enforced: the OpenAPI describes record names and the
@@ -316,7 +323,7 @@ impl VkCloudMock {
             )
             .route(
                 "/public-dns/v2/dns/{zone}/{kind}/{record}",
-                get(record_get).delete(record_delete),
+                get(record_get).put(record_update).delete(record_delete),
             )
             .with_state(state.clone());
         Self {
@@ -868,6 +875,73 @@ async fn record_create(
     };
     inner.records.push(record.clone());
     (StatusCode::CREATED, axum::Json(record_json(&record))).into_response()
+}
+
+/// The fields of a type's `…_Update` schema.
+fn update_fields(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "a" | "aaaa" | "srv" => &["name"],
+        _ => &["content"],
+    }
+}
+
+async fn record_update(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((zone_id, kind, record_id)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Response {
+    let project = match authorize(&state, &headers) {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    let kind = match kind_of(&kind) {
+        Ok(kind) => kind,
+        Err(response) => return response,
+    };
+    if let Err(response) = own_zone(&state, &zone_id, &project) {
+        return response;
+    }
+    let Ok(Value::Object(request)) = serde_json::from_slice::<Value>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "malformed request body");
+    };
+    let allowed = update_fields(kind);
+    if request.is_empty() || request.keys().any(|k| !allowed.contains(&k.as_str())) {
+        return error(StatusCode::BAD_REQUEST, "invalid update fields");
+    }
+    let mut changes = Map::new();
+    for (key, value) in &request {
+        let valid = match (key.as_str(), kind) {
+            ("name", _) => value
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && !s.ends_with('.')),
+            (_, "txt") => value
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && s.chars().count() <= MAX_CONTENT),
+            _ => value.as_str().is_some_and(valid_fqdn),
+        };
+        if !valid {
+            return error(StatusCode::BAD_REQUEST, "invalid field value");
+        }
+        changes.insert(key.clone(), value.clone());
+    }
+    let mut inner = lock(&state);
+    let Some(record) = inner
+        .records
+        .iter_mut()
+        .find(|r| r.zone_id == zone_id && r.kind == kind && r.uuid == record_id)
+    else {
+        return error(StatusCode::NOT_FOUND, "record not found");
+    };
+    for (key, value) in changes {
+        match (key.as_str(), value) {
+            ("name", Value::String(name)) => record.name = name,
+            (_, value) => {
+                record.fields.insert(key, value);
+            }
+        }
+    }
+    axum::Json(record_json(record)).into_response()
 }
 
 async fn record_delete(

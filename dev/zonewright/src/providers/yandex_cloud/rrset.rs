@@ -45,6 +45,30 @@ fn normalized(set: &Value) -> Value {
     set
 }
 
+/// The record set `getRecordSet` returned is the one asked for: its `name` denotes `name` and its
+/// `type` is `rtype`. A name without the trailing dot that ends with the zone's name could be
+/// spelled either way and is accepted when either reading gives `name`.
+// Source: https://yandex.cloud/en/docs/dns/api-ref/DnsZone/getRecordSet (the answer is a
+// `RecordSet` with `name` and `type`).
+fn answers(zone: &DomainName, name: &DomainName, rtype: &str, set: &Value) -> bool {
+    let Some(text) = set.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    let same_type = set
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|stated| stated.eq_ignore_ascii_case(rtype));
+    let same_name = match super::records::owner_name(zone, text) {
+        Some(owner) => owner == *name,
+        None => {
+            !text.ends_with('.')
+                && (DomainName::parse(text).ok().as_ref() == Some(name)
+                    || DomainName::from_relative(text, zone).ok().as_ref() == Some(name))
+        }
+    };
+    same_type && same_name
+}
+
 impl YandexCloud {
     /// The record set of `name` and type `rtype` (the API's spelling), with the zone identifier
     /// the read ended with.
@@ -79,7 +103,12 @@ impl YandexCloud {
             .record_set(&id.id, relative(zone, name)?, rtype)
             .await?
         {
-            Found::Set(set) => Ok(Attempt::Done(Some(set))),
+            Found::Set(set) if answers(zone, name, rtype, &set) => Ok(Attempt::Done(Some(set))),
+            Found::Set(_) => Err(Error::Protocol {
+                detail: Detail::constant(
+                    "the provider answered with a record set of another name or type",
+                ),
+            }),
             // Resolved during this call: the zone exists, so the record set does not.
             Found::NotFound if id.fresh => Ok(Attempt::Done(None)),
             // Cached: the same status answers a missing zone. Confirm the zone first.

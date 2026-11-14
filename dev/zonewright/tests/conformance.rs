@@ -321,9 +321,10 @@ const ATOMIC_RRSET_WRITE: &[(ProviderId, bool)] = &[
     // Individual records: a replacement is several requests.
     (ProviderId::Cloudflare, false),
     (ProviderId::DigitalOcean, false),
-    // `set_records` replaces the records of an rrset in one request; `POST …/rrsets` creates it
-    // with its records.
-    (ProviderId::Hetzner, true),
+    // `set_records` replaces the records of an rrset in one request and `POST …/rrsets` creates
+    // it with its records, but a replacement that also changes the TTL of an existing rrset is
+    // `set_records` and then `change_ttl`: two requests.
+    (ProviderId::Hetzner, false),
     // Individual records, staged and committed: several requests.
     (ProviderId::Nicru, false),
     (ProviderId::Regru, false),

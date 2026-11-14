@@ -40,6 +40,15 @@
 //! changes, creates, and a failure between the deletes and the create leaves the name without the
 //! record until the call is repeated.
 //!
+//! A per-record provider can hold several published records of a singleton type at one name (a
+//! state the model cannot hold, so `get_rrset` answers `Error::Protocol` for it). `set_rrset`
+//! and `delete_rrset` repair such a name instead of refusing it: the rrset counts as present
+//! and as equal to no requested or expected set, and the plan above applies unchanged, so the
+//! surplus records are deleted first and the number of published records only goes down until
+//! one is left. A record that holds the requested value is the one kept (the first of them in
+//! the order of the read); otherwise the last record is changed in place where the API can. A
+//! record whose value an earlier record of the read already holds is surplus as well.
+//!
 //! # A CNAME and other data at one name
 //!
 //! A CNAME owner has no other data (RFC 1034 section 3.6.2; RRSIG and NSEC are the exceptions
@@ -651,7 +660,8 @@ pub(crate) fn check_list<B: RrsetBase>(backend: &B, zone: &DomainName) -> Result
 // ---- Evaluation ----------------------------------------------------------------------------------
 
 /// The published rrset: the enabled records, with `ttl`. `None` when no record is enabled. A set
-/// the model cannot hold (two records of a singleton type) is `Error::Protocol`.
+/// the model cannot hold (two records of a singleton type) is `Error::Protocol`; a per-record
+/// write sees it through [`published_for_write`] instead.
 pub(crate) fn published<H>(
     name: &DomainName,
     rtype: RecordType,
@@ -671,6 +681,69 @@ pub(crate) fn published<H>(
         .map_err(|_| Error::Protocol {
             detail: Detail::constant("the provider returned an rrset the record model cannot hold"),
         })
+}
+
+/// The published records as a per-record write sees them (module documentation, "Order of a
+/// per-record replacement").
+#[derive(Debug)]
+enum Seen {
+    /// No enabled record.
+    Absent,
+    /// The published rrset.
+    Set(RrSet),
+    /// Several enabled records of a singleton type, each valid on its own: present, and equal
+    /// to no rrset the model can hold.
+    Surplus,
+}
+
+impl Seen {
+    fn exists(&self) -> bool {
+        !matches!(self, Seen::Absent)
+    }
+
+    fn rrset(&self) -> Option<&RrSet> {
+        match self {
+            Seen::Set(set) => Some(set),
+            Seen::Absent | Seen::Surplus => None,
+        }
+    }
+}
+
+/// [`published`] for a per-record `set_rrset` or `delete_rrset`, which can repair a singleton
+/// type held by several published records instead of failing on it.
+fn published_for_write<H>(
+    name: &DomainName,
+    rtype: RecordType,
+    ttl: Option<Ttl>,
+    records: &[Stored<H>],
+) -> Result<Seen, Error> {
+    let mut enabled = records.iter().filter(|record| record.enabled);
+    if singleton(rtype) && enabled.clone().nth(1).is_some() {
+        // Each record must be one the model could hold alone; anything else stays a read the
+        // client cannot interpret.
+        enabled.try_for_each(|record| {
+            published(name, rtype, ttl, std::slice::from_ref(record)).map(|_| ())
+        })?;
+        return Ok(Seen::Surplus);
+    }
+    Ok(match published(name, rtype, ttl, records)? {
+        Some(set) => Seen::Set(set),
+        None => Seen::Absent,
+    })
+}
+
+/// Step 2 for a per-record write: an rrset with surplus records exists and matches no
+/// expectation.
+fn evaluate_seen(expect: Expect<'_>, seen: &Seen) -> Result<(), Error> {
+    match (expect, seen) {
+        (Expect::Absent, Seen::Surplus) => Err(precondition_failed(
+            "the rrset exists, and the operation expected none",
+        )),
+        (Expect::Matches(_), Seen::Surplus) => Err(precondition_failed(
+            "the records of the rrset differ from the expected ones",
+        )),
+        _ => evaluate(expect, seen.rrset()),
+    }
 }
 
 /// The smallest TTL among the enabled records (design section 3.6, `TtlSupport::PerRecord`).
@@ -1064,8 +1137,13 @@ fn per_record_plan<'a, B: RrsetBase, H>(
         create: Vec::new(),
         delete: Vec::new(),
     };
+    let one_record = singleton(rtype);
     for record in records.iter().filter(|r| r.enabled) {
         match position(&record.data) {
+            // A second record of a singleton with a value already kept is surplus.
+            Some(index) if one_record && covered.get(index) == Some(&true) => {
+                plan.delete.push(record);
+            }
             Some(index) => {
                 if let Some(slot) = covered.get_mut(index) {
                     *slot = true;
@@ -1110,9 +1188,9 @@ async fn set_per_record_once<B: PerRecord>(
     let read = backend.read(zone, name, rtype).await?;
     let context = &read.context;
     let current_ttl = smallest_ttl(&read.records);
-    let published = published(name, rtype, current_ttl, &read.records)?;
-    evaluate(expect, published.as_ref())?;
-    if unchanged(published.as_ref(), wanted, &read.records, true) {
+    let seen = published_for_write(name, rtype, current_ttl, &read.records)?;
+    evaluate_seen(expect, &seen)?;
+    if unchanged(seen.rrset(), wanted, &read.records, true) {
         return Ok(SetOutcome::Unchanged);
     }
     check_coexistence(
@@ -1123,13 +1201,13 @@ async fn set_per_record_once<B: PerRecord>(
     let plan = per_record_plan(backend, rtype, &read.records, wanted)?;
     let ttl = match wanted.ttl() {
         Some(ttl) => SetTtl::Requested(ttl),
-        None if published.is_some() => SetTtl::Existing(current_ttl),
+        None if seen.exists() => SetTtl::Existing(current_ttl),
         None => SetTtl::Default,
     };
     let steps = plan.steps(rtype, wanted.ttl(), ttl, backend.updates_in_place());
     backend.check_plan(zone, name, rtype, context, &steps)?;
     send_steps(backend, zone, name, rtype, context, &steps).await?;
-    Ok(if published.is_some() {
+    Ok(if seen.exists() {
         SetOutcome::Replaced
     } else {
         SetOutcome::Created
@@ -1251,9 +1329,9 @@ pub(crate) async fn delete_per_record<B: PerRecord>(
     check_delete(backend, zone, name, rtype, expect)?;
     let _guard = backend.locks().lock(name).await;
     let read = backend.read(zone, name, rtype).await?;
-    let published = published(name, rtype, smallest_ttl(&read.records), &read.records)?;
-    evaluate(expect, published.as_ref())?;
-    if published.is_none() {
+    let seen = published_for_write(name, rtype, smallest_ttl(&read.records), &read.records)?;
+    evaluate_seen(expect, &seen)?;
+    if !seen.exists() {
         return Ok(DeleteOutcome::NotPresent);
     }
     let steps: Vec<Step<'_, B::Handle>> = read
@@ -3369,22 +3447,232 @@ mod tests {
         assert_eq!(e.kind(), ErrorKind::Protocol);
     }
 
-    /// A read the model cannot hold fails the operation instead of writing over it.
+    /// A read the model cannot hold is reported as such by `get_rrset` in every shape. A whole
+    /// set write fails instead of writing over it; a per-record write repairs it (see
+    /// `per_record_surplus_singletons_are_repaired`).
     #[tokio::test]
     async fn a_set_the_model_cannot_hold_is_protocol() {
         for shape in Shape::all() {
+            let label = shape.label();
             shape.insert(RecordType::CNAME, "a.example.net.", true, 600);
             shape.insert(RecordType::CNAME, "b.example.net.", true, 600);
             assert_eq!(
                 kind(shape.get(RecordType::CNAME).await),
-                ErrorKind::Protocol
+                ErrorKind::Protocol,
+                "{label}"
             );
+            if matches!(shape, Shape::Records(_)) {
+                continue;
+            }
             let wanted = set(RecordType::CNAME, None, &["c.example.net."]);
             assert_eq!(
                 kind(shape.set(&wanted, Expect::Any).await),
-                ErrorKind::Protocol
+                ErrorKind::Protocol,
+                "{label}"
             );
-            assert!(shape.writes().is_empty());
+            assert!(shape.writes().is_empty(), "{label}");
         }
+        // A record that is not valid data for the type stays a read the client cannot
+        // interpret, also for a per-record write.
+        let bad = Stored {
+            data: RecordData::parse(RecordType::A, "192.0.2.1").unwrap(),
+            enabled: true,
+            ttl: None,
+            handle: (),
+        };
+        let good = Stored {
+            data: data(RecordType::CNAME, "a.example.net."),
+            enabled: true,
+            ttl: None,
+            handle: (),
+        };
+        assert_eq!(
+            super::published_for_write(&name(), RecordType::CNAME, None, &[good, bad])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Protocol
+        );
+    }
+
+    /// Two published records of a singleton type at a per-record provider: `set_rrset` and
+    /// `delete_rrset` repair the name, deleting the surplus first, so that the number of
+    /// published records only goes down and never reaches zero unless the caller deletes.
+    #[tokio::test]
+    async fn per_record_surplus_singletons_are_repaired() {
+        let cname = |target: &str| set(RecordType::CNAME, None, &[target]);
+        let rec = |text: &str| (text.to_owned(), true, 600);
+        let two = |in_place: bool| {
+            let fake = per_record(in_place);
+            store(&fake.0).insert(RecordType::CNAME, "a.example.net.", true, 600);
+            store(&fake.0).insert(RecordType::CNAME, "b.example.net.", true, 600);
+            fake
+        };
+        async fn set_cname(fake: &RecordFake, target: &str) -> Result<SetOutcome, Error> {
+            let wanted = set(RecordType::CNAME, None, &[target]);
+            super::set_per_record(fake, &zone(), &wanted, Expect::Any).await
+        }
+
+        // A new value, in place: the first record goes, the last is changed.
+        let fake = two(true);
+        assert_eq!(
+            set_cname(&fake, "c.example.net.").await.unwrap(),
+            SetOutcome::Replaced
+        );
+        assert_eq!(
+            store(&fake.0).writes_logged(),
+            ["delete a.example.net.", "update b.example.net."]
+        );
+        assert_eq!(
+            store(&fake.0).texts(RecordType::CNAME),
+            [rec("c.example.net.")]
+        );
+
+        // A new value without in-place updates: deletes, then the create.
+        let fake = two(false);
+        assert_eq!(
+            set_cname(&fake, "c.example.net.").await.unwrap(),
+            SetOutcome::Replaced
+        );
+        assert_eq!(
+            store(&fake.0).writes_logged(),
+            [
+                "delete a.example.net.",
+                "delete b.example.net.",
+                "create c.example.net."
+            ]
+        );
+        assert_eq!(
+            store(&fake.0).texts(RecordType::CNAME),
+            [rec("c.example.net.")]
+        );
+
+        // The requested value is one of them: only the other is deleted, the name never empty.
+        for in_place in [true, false] {
+            let fake = two(in_place);
+            assert_eq!(
+                set_cname(&fake, "b.example.net.").await.unwrap(),
+                SetOutcome::Replaced
+            );
+            assert_eq!(store(&fake.0).writes_logged(), ["delete a.example.net."]);
+            assert_eq!(
+                store(&fake.0).texts(RecordType::CNAME),
+                [rec("b.example.net.")]
+            );
+            // Repaired: the next call has nothing to do.
+            assert_eq!(
+                set_cname(&fake, "b.example.net.").await.unwrap(),
+                SetOutcome::Unchanged
+            );
+        }
+
+        // Two records with the same value are surplus too, never `Unchanged`.
+        let fake = per_record(true);
+        store(&fake.0).insert(RecordType::CNAME, "a.example.net.", true, 600);
+        store(&fake.0).insert(RecordType::CNAME, "a.example.net.", true, 600);
+        assert_eq!(
+            set_cname(&fake, "a.example.net.").await.unwrap(),
+            SetOutcome::Replaced
+        );
+        assert_eq!(store(&fake.0).writes_logged(), ["delete a.example.net."]);
+        assert_eq!(
+            store(&fake.0).texts(RecordType::CNAME),
+            [rec("a.example.net.")]
+        );
+
+        // A failure after the first delete leaves one record; the repeat converges.
+        let fake = two(true);
+        store(&fake.0).fail_write = Some(2);
+        assert_eq!(
+            kind(set_cname(&fake, "c.example.net.").await),
+            ErrorKind::Transient
+        );
+        assert_eq!(
+            store(&fake.0).texts(RecordType::CNAME),
+            [rec("b.example.net.")]
+        );
+        store(&fake.0).log.clear();
+        assert_eq!(
+            set_cname(&fake, "c.example.net.").await.unwrap(),
+            SetOutcome::Replaced
+        );
+        assert_eq!(store(&fake.0).writes_logged(), ["update b.example.net."]);
+        assert_eq!(
+            store(&fake.0).texts(RecordType::CNAME),
+            [rec("c.example.net.")]
+        );
+
+        // Expectations: the rrset exists and matches no expected set; nothing is written.
+        let fake = two(true);
+        let wanted = cname("c.example.net.");
+        let expected = cname("a.example.net.");
+        for expect in [Expect::Absent, Expect::Matches(&expected)] {
+            assert_eq!(
+                kind(super::set_per_record(&fake, &zone(), &wanted, expect).await),
+                ErrorKind::PreconditionFailed
+            );
+        }
+        assert_eq!(
+            kind(
+                super::delete_per_record(
+                    &fake,
+                    &zone(),
+                    &name(),
+                    RecordType::CNAME,
+                    Expect::Matches(&expected)
+                )
+                .await
+            ),
+            ErrorKind::PreconditionFailed
+        );
+        assert!(store(&fake.0).writes_logged().is_empty());
+        // `get_rrset` keeps reporting the state honestly.
+        assert_eq!(
+            kind(super::get_per_record(&fake, &zone(), &name(), RecordType::CNAME).await),
+            ErrorKind::Protocol
+        );
+
+        // `delete_rrset` deletes every published record; a disabled one stays.
+        store(&fake.0).insert(RecordType::CNAME, "d.example.net.", false, 600);
+        assert_eq!(
+            super::delete_per_record(&fake, &zone(), &name(), RecordType::CNAME, Expect::Any)
+                .await
+                .unwrap(),
+            DeleteOutcome::Deleted
+        );
+        assert_eq!(
+            store(&fake.0).writes_logged(),
+            ["delete a.example.net.", "delete b.example.net."]
+        );
+        assert_eq!(
+            store(&fake.0).texts(RecordType::CNAME),
+            [("d.example.net.".to_owned(), false, 600)]
+        );
+    }
+
+    /// SOA is refused for writes by the layer itself, also where a provider's capabilities would
+    /// let it through.
+    #[tokio::test]
+    async fn soa_is_never_writable_whatever_the_capabilities_say() {
+        let mut caps = caps(Preconditions::ReadThenWrite, false);
+        caps.read_only_types = &[];
+        let fake = RecordFake(base(caps), true);
+        assert!(fake.capabilities().can_write(RecordType::SOA));
+        let soa = set(
+            RecordType::SOA,
+            None,
+            &["ns1.example.org. admin.example.org. 1 7200 3600 1209600 300"],
+        );
+        assert_eq!(
+            kind(super::set_per_record(&fake, &zone(), &soa, Expect::Any).await),
+            ErrorKind::UnsupportedRecordType
+        );
+        assert_eq!(
+            kind(
+                super::delete_per_record(&fake, &zone(), &name(), RecordType::SOA, Expect::Any)
+                    .await
+            ),
+            ErrorKind::UnsupportedRecordType
+        );
+        assert_eq!(store(&fake.0).log.len(), 0);
     }
 }

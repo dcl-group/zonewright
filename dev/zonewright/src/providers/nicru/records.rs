@@ -32,17 +32,20 @@
 //! name stay serialized.
 //!
 //! The API has no edit call, so a TTL change of a record that stays is staged as a new record
-//! with the same value and the new TTL followed by the deletion of the old one, and a CNAME or
-//! DNAME is replaced by a deletion and a creation (`updates_in_place` false); both are published
-//! by the one commit.
+//! with the same value and the new TTL followed by the deletion of the old one (for a CNAME or
+//! DNAME the deletion first, so that two records of the type are never staged at once), and a
+//! CNAME or DNAME is replaced by a deletion and a creation (`updates_in_place` false); both are
+//! published by the one commit.
 //!
 //! # Reads
 //!
 //! `get_rrset` and `list_rrsets` take the zone lock too, so they never see this process's edits
-//! between staging and commit. The documentation says neither that the record listing shows the
-//! published records nor that it shows the staged ones ("resource records which are already
-//! created in the zone file", Docs 4.5.2). A zone with staged changes, by `GET /zones` or by the
-//! `has-changes` attribute of the record listing itself, is therefore not read: `Error::Rejected`.
+//! between staging and commit, and they first settle staged changes this process left behind
+//! (commit or rollback, as their mark says), as a write does. The documentation says neither
+//! that the record listing shows the published records nor that it shows the staged ones
+//! ("resource records which are already created in the zone file", Docs 4.5.2). A zone with
+//! other staged changes, by `GET /zones` or by the `has-changes` attribute of the record listing
+//! itself, is therefore not read: `Error::Rejected`.
 //! The same check makes a write refuse a zone in which a foreign edit was staged between its zone
 //! lookup and its record listing.
 //!
@@ -99,14 +102,14 @@ use crate::locks::{NameGuard, NameLocks};
 use crate::meta::Capabilities;
 use crate::name::{DomainName, TargetName};
 use crate::provider::{SkipReason, ZoneListing};
-use crate::record::{Mx, RecordData, RecordType, Srv, Ttl, Txt, TxtDialect};
+use crate::record::{Mx, RecordData, RecordType, Srv, Ttl, Txt, TxtDialect, singleton};
 use crate::redact::Detail;
 use crate::rrsets::{
     self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
 };
 
 use super::Pending;
-use super::api::{Content, EditError, Rr, Shape, TXT, shape};
+use super::api::{Content, EditError, Rr, Shape, TXT, Zone, shape};
 use super::client::{Nicru, rejected};
 use super::txt::FOREIGN_CHANGES;
 
@@ -539,8 +542,8 @@ impl PerRecord for RecordOp<'_> {
         let target = self.client.resolve_zone(zone).await?;
         if self.writing {
             self.client.settle_leftovers(zone, &target).await?;
-        } else if target.has_changes {
-            return Err(rejected(STAGED_READ));
+        } else {
+            self.client.settle_before_read(zone, &target).await?;
         }
         *self.service.lock().unwrap_or_else(PoisonError::into_inner) = Some(target.service.clone());
         let listing = self.client.api.records(&target.service, zone).await?;
@@ -628,8 +631,11 @@ impl PerRecord for RecordOp<'_> {
         let Some(ttl) = update.ttl else {
             return Ok(());
         };
-        // No edit call: the same value with the new TTL, then the deletion of the old record.
-        // Both are staged and published by the operation's one commit.
+        // No edit call: the same value with the new TTL, and the deletion of the old record.
+        // Both are staged and published by the operation's one commit. For a singleton type
+        // (CNAME, DNAME) the deletion is staged first, so that the zone never holds two staged
+        // records of the type at the name (design section 3.4); for other types the new record
+        // goes first, as the record layer orders a replacement.
         if encode(rtype, &record.data).is_none() {
             return Err(Error::InvalidInput {
                 detail: Detail::constant(
@@ -637,15 +643,15 @@ impl PerRecord for RecordOp<'_> {
                 ),
             });
         }
-        self.create(
-            zone,
-            name,
-            rtype,
-            context,
-            &record.data,
-            SetTtl::Requested(ttl),
-        )
-        .await?;
+        let renewed = SetTtl::Requested(ttl);
+        if singleton(rtype) {
+            self.delete(zone, name, rtype, context, record).await?;
+            return self
+                .create(zone, name, rtype, context, &record.data, renewed)
+                .await;
+        }
+        self.create(zone, name, rtype, context, &record.data, renewed)
+            .await?;
         self.delete(zone, name, rtype, context, record).await
     }
 
@@ -698,15 +704,24 @@ fn shown(rtype: RecordType) -> bool {
 }
 
 impl Nicru {
+    /// Before a read of `zone`, under the zone lock: staged changes of this process left by an
+    /// earlier operation are committed or rolled back first, as their mark says, as a write
+    /// does; other staged changes are `Error::Rejected` (module documentation, "Reads"). A
+    /// zone without staged changes has its mark cleared.
+    async fn settle_before_read(&self, zone: &DomainName, target: &Zone) -> Result<(), Error> {
+        if target.has_changes && !self.is_marked(zone) {
+            return Err(rejected(STAGED_READ));
+        }
+        self.settle_leftovers(zone, target).await
+    }
+
     /// `list_rrsets`: every record of the zone, grouped by owner name and type, under the zone
     /// lock and only while the zone has no staged changes (module documentation).
     pub(super) async fn list_zone(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
         rrsets::check_list(&RecordOp::reading(self), zone)?;
         let _zone_guard = self.state().zone_locks.lock(zone).await;
         let target = self.resolve_zone(zone).await?;
-        if target.has_changes {
-            return Err(rejected(STAGED_READ));
-        }
+        self.settle_before_read(zone, &target).await?;
         let listing = self.api.records(&target.service, zone).await?;
         if listing.has_changes == Some(true) {
             return Err(rejected(STAGED_READ));

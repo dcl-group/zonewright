@@ -6,7 +6,10 @@
 //!
 //! - read: `GET …/dns`, every page (the listing has no filter), an exact name and type match
 //!   on the client's side, under no cached identifier: the domain's name is the key in every
-//!   path;
+//!   path. The form of the stated names is decided once per listing (`api::NameForm`): a TXT
+//!   record whose dotless name reads as this name in one form and as another in the other, in
+//!   a listing that does not decide the form, makes the operation fail with `Error::Protocol`
+//!   before any write;
 //! - create: `POST …/dns`, sent once, with the name relative to the zone, the value and the
 //!   TTL the value layer chose (the rrset's as read when the name has TXT records, else the
 //!   caller's or the configured one; the API requires a TTL, so the configured one stands in
@@ -40,7 +43,7 @@ use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
 use serde_json::Value;
 
-use super::api::{Fields, NewRecord, TXT, Written, names_match};
+use super::api::{Fields, NameForm, NewRecord, TXT, Written, is_owner};
 use super::client::Yandex360;
 
 /// How TXT data is read.
@@ -72,20 +75,20 @@ impl PerRecord for Yandex360 {
         zone: &DomainName,
         name: &DomainName,
     ) -> Result<PerRecordRead<u64>, Error> {
-        let records = self
-            .api
-            .records(zone)
-            .await?
-            .into_iter()
-            .filter(|record| {
-                record.rtype.eq_ignore_ascii_case(TXT) && names_match(&record.name, zone, name)
-            })
-            .map(|record| TxtRecord {
-                value: record.text().and_then(|text| READ.read(text)),
-                ttl: record.ttl.and_then(|secs| Ttl::from_secs(secs).ok()),
-                handle: record.record_id,
-            })
-            .collect();
+        let all = self.api.records(zone).await?;
+        // The name form is decided once for the whole listing (see `api::NameForm`); a TXT
+        // record whose name may or may not be this one is an error, never a guess.
+        let form = NameForm::of(&all, zone);
+        let mut records = Vec::new();
+        for record in all {
+            if record.rtype.eq_ignore_ascii_case(TXT) && is_owner(&record.name, zone, form, name)? {
+                records.push(TxtRecord {
+                    value: record.text().and_then(|text| READ.read(text)),
+                    ttl: record.ttl.and_then(|secs| Ttl::from_secs(secs).ok()),
+                    handle: record.record_id,
+                });
+            }
+        }
         Ok(PerRecordRead::Records(records))
     }
 

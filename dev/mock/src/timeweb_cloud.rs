@@ -46,12 +46,20 @@
 //!   subdomains included; the listing of a subdomain holds the records at that name and at every
 //!   name below it; a listing of a name that is neither a domain of the account nor a subdomain
 //!   of one is `404`;
+//! - [`Control::remove_subdomain`] removes a subdomain and leaves its records, so that they are
+//!   listed by the domain's listing only (a state the documentation rules out, for tests of a
+//!   client that must not guess);
 //! - a create at a name that is not yet a subdomain creates the subdomain (lego creates records
 //!   at challenge names without creating a subdomain first), unless
 //!   [`Control::set_require_subdomain`] makes it `404`, as the documentation's "created
 //!   beforehand" could mean; a subdomain stays when its last record is deleted;
-//! - a delete names the record at the name it is at: another name, even of the same domain, is
-//!   `404`;
+//! - how a delete or an update addressed through the path of another name of the same domain is
+//!   answered: the documentation describes `fqdn` as the name of the domain or subdomain the
+//!   record is at and says nothing about other names. By default the record is found by its
+//!   identifier within the domain whatever subdomain the path names, so a client that addresses
+//!   the wrong name deletes or changes the record anyway (the destructive reading,
+//!   [`Addressing::RecordId`]); [`Control::set_addressing`] switches to `404` for a record that
+//!   is not at the name of the path ([`Addressing::OwnName`]);
 //! - a body key that the type's documented object does not have is refused with `400`;
 //! - `limit` above 100 or below 1, an `offset` below 0, and a `limit` or `offset` that is not an
 //!   integer are refused with `400`; `meta.total` counts all the records of the listing;
@@ -155,6 +163,15 @@ pub enum ListingScope {
     OwnName,
 }
 
+/// How a delete or an update finds the record its path names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Addressing {
+    /// By identifier within the domain, whatever subdomain the path names (the default).
+    RecordId,
+    /// By identifier at the name the path names; a record at another name is `404`.
+    OwnName,
+}
+
 /// One record as the mock holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
@@ -191,9 +208,17 @@ struct Inner {
     /// A create at a name that is not a subdomain yet is `404`.
     require_subdomain: bool,
     scope: ListingScope,
+    addressing: Addressing,
 }
 
 impl Inner {
+    /// Whether the record `r` is the one the path of `domain` and `rel` (relative to it) names.
+    fn addressed(&self, r: &Record, domain: &str, rel: &str, id: u64) -> bool {
+        r.id == id
+            && r.domain == domain
+            && (self.addressing == Addressing::RecordId || r.subdomain == rel)
+    }
+
     /// The domain of the account that `fqdn` is, or is below, and the name relative to it
     /// (empty for the domain itself). The longest matching domain wins.
     fn locate(&self, fqdn: &str) -> Option<(String, String)> {
@@ -258,6 +283,7 @@ impl TimewebCloudMock {
             null_ids: HashSet::new(),
             require_subdomain: false,
             scope: ListingScope::Everything,
+            addressing: Addressing::RecordId,
         }));
         let router = Router::new()
             .route("/api/v1/domains", get(domains_list))
@@ -388,6 +414,19 @@ impl Control {
         lock(&self.state)
             .subdomains
             .insert((domain.to_owned(), subdomain));
+    }
+
+    /// Removes the subdomain `name` of `domain` (absolute or relative) and leaves its records.
+    pub fn remove_subdomain(&self, domain: &str, name: &str) {
+        let subdomain = relative(name, domain);
+        lock(&self.state)
+            .subdomains
+            .remove(&(domain.to_owned(), subdomain));
+    }
+
+    /// How a delete or an update finds the record its path names.
+    pub fn set_addressing(&self, addressing: Addressing) {
+        lock(&self.state).addressing = addressing;
     }
 
     /// Which records the listing of a domain holds.
@@ -806,9 +845,13 @@ async fn record_delete(
         return bad_request("record_id must be an integer");
     };
     let before = inner.records.len();
-    inner
+    let doomed: Vec<u64> = inner
         .records
-        .retain(|r| !(r.domain == domain && r.subdomain == rel && r.id == id));
+        .iter()
+        .filter(|r| inner.addressed(r, &domain, &rel, id))
+        .map(|r| r.id)
+        .collect();
+    inner.records.retain(|r| !doomed.contains(&r.id));
     if inner.records.len() == before {
         return not_found("DNS record not found");
     }
@@ -835,11 +878,14 @@ async fn record_update(
         Ok(fields) => fields,
         Err(response) => return response,
     };
-    let Some(record) = inner
+    let Some(index) = inner
         .records
-        .iter_mut()
-        .find(|r| r.domain == domain && r.subdomain == rel && r.id == id)
+        .iter()
+        .position(|r| inner.addressed(r, &domain, &rel, id))
     else {
+        return not_found("DNS record not found");
+    };
+    let Some(record) = inner.records.get_mut(index) else {
         return not_found("DNS record not found");
     };
     if record.rtype != fields.rtype {

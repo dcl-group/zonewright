@@ -9,8 +9,8 @@
 //! does it (`hcloud zone set-records`, `internal/cmd/zone/rrset/set_records.go`): read the
 //! rrset; when there is none, create it with `POST /zones/{id}/rrsets` (records and TTL in one
 //! request); otherwise send `set_records`, which "overwrites the resource records (RRs) of an
-//! existing RRSet" in one request. The records of a set are therefore replaced by one request
-//! (`atomic_rrset_write`), never by a delete followed by a create. The API checks no condition
+//! existing RRSet" in one request. The records of a set are therefore replaced by one request,
+//! never by a delete followed by a create. The API checks no condition
 //! on the rrset as the client read it, hence `Preconditions::ReadThenWrite`: a change another
 //! process makes between the read and the write is overwritten.
 //!
@@ -20,7 +20,8 @@
 //! first and `change_ttl` second, each sent once and each waited for; a write that changes only
 //! one of them sends only that one. If the second fails, the records are already replaced and
 //! the TTL is not; the error is returned, and the caller's repeat reads that state and sends
-//! only `change_ttl`.
+//! only `change_ttl`. Since such a replacement is two requests, `atomic_rrset_write` is false:
+//! it holds for the records alone and for a new rrset, not for every replacement.
 //!
 //! # What the model does not carry
 //!

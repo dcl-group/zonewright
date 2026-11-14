@@ -26,10 +26,13 @@
 //! | list zones    | `GET /`                          | 200, array of zones     |
 //! | list records  | `GET /{zone}/{type}/`            | 200, array of records   |
 //! | create record | `POST /{zone}/{type}/`           | 201, the new record     |
+//! | update CNAME  | `PUT /{zone}/cname/{record}`     | 200, the changed record |
 //! | delete record | `DELETE /{zone}/{type}/{record}` | 204                     |
 //!
-//! The OpenAPI also documents `PUT /{zone}/{type}/{record}`. It is not used: its documented
-//! bodies carry no TTL, and those of A, AAAA and SRV carry only the name (see `records.rs`).
+//! The OpenAPI documents `PUT /{zone}/{type}/{record}` for every type. Only the CNAME one is
+//! used, to change a CNAME's target in place (its body `CnameRecord_Update` is `content` alone);
+//! the documented bodies carry no TTL, and those of A, AAAA and SRV carry only the name (see
+//! `records.rs`).
 //!
 //! The listings return everything in one answer (no paging is documented), so they are
 //! bounded by the transport's 4 MiB body limit alone; a larger answer fails, it is never
@@ -427,6 +430,36 @@ impl Api {
         Ok(self.written(&response))
     }
 
+    /// Changes the target of the CNAME record `record_id` to `content` (without its trailing
+    /// dot). Sent once: a write other than the delete of one record is never repeated (design
+    /// section 5.3).
+    // Source: the OpenAPI, `PUT /v2/dns/{DnsUuid}/cname/{CnameRecordUuid}` ("Изменить
+    // CNAME-запись"): the body `CnameRecord_Update` has the single property `content`
+    // (`content-cname`); 200 with `CnameRecord_Update_Response` (`uuid`, `name`, `dns`,
+    // `content`, `ttl`); 400, 401, 404 ("record not found"), 409.
+    pub(super) async fn update_cname(
+        &self,
+        zone_id: &str,
+        record_id: &str,
+        content: &str,
+    ) -> Result<Written, Error> {
+        #[derive(Serialize)]
+        struct CnameUpdate<'a> {
+            content: &'a str,
+        }
+        let url = self
+            .base
+            .url()
+            .id(zone_id)
+            .path(Kind::Cname.member())
+            .id(record_id)
+            .build()?;
+        let response = self
+            .send(&Request::new(Method::PUT, url).json(&CnameUpdate { content })?)
+            .await?;
+        Ok(self.written(&response))
+    }
+
     /// Deletes one TXT record by its identifier. Repeating it is safe, so the transport may.
     // Source: the OpenAPI, `DELETE /v2/dns/{DnsUuid}/txt/{TxtRecordUuid}`: 204; 401, 404
     // ("record not found"). lego internal/client.go:86-90.
@@ -472,8 +505,8 @@ impl Api {
     /// An answer the client does not expect. 401, 403, 429, 3xx and 5xx were mapped by the
     /// transport already. The documented refusals are `Rejected`; anything else is an answer
     /// the client cannot interpret.
-    // Source: the OpenAPI: 400 ("validation error of the request parameters") on the listings
-    // and the creates, 409 on the creates. No error body is documented, so the message is taken
+    // Source: the OpenAPI: 400 ("validation error of the request parameters") on the listings,
+    // the creates and the updates, 409 on the creates and the updates. No error body is documented, so the message is taken
     // by the transport's default extractor.
     fn refusal(&self, response: &Response) -> Error {
         match response.status() {

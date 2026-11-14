@@ -54,6 +54,10 @@
 //!   on this proves nothing about the provider;
 //! - `name` is not required for MX (its schema does not list it) and defaults to `@`;
 //! - `data` is stored and answered exactly as sent (host names keep or lack their trailing dot);
+//!   with [`Control::set_apex_target_as_at`], the `data` of a CNAME, MX, NS or SRV record that
+//!   names the domain itself (with or without a trailing dot) is answered as `@`, the form
+//!   DigitalOcean's Terraform provider expects (`digitalocean/domain/resource_record.go`, the
+//!   read, at commit `5c5eea1`); the reference shows no example of it;
 //! - [`Control::insert_zone_defaults`] seeds an SOA record whose `data` is `1800` and three NS
 //!   records at the apex; the SOA's `data` form is not documented;
 //! - a `per_page` outside 1 to 200 or a `page` below 1 is refused with `422`;
@@ -166,6 +170,7 @@ struct Inner {
     page_cap: Option<usize>,
     name_form: NameForm,
     loose_filter: bool,
+    apex_target_as_at: bool,
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -209,6 +214,7 @@ impl DigitalOceanMock {
             page_cap: None,
             name_form: NameForm::Relative,
             loose_filter: false,
+            apex_target_as_at: false,
         }));
         let router = Router::new()
             .route("/v2/account", get(account))
@@ -358,6 +364,11 @@ impl Control {
     /// The form in which answers state a record's name.
     pub fn set_name_form(&self, form: NameForm) {
         lock(&self.state).name_form = form;
+    }
+
+    /// Answers a CNAME, MX, NS or SRV `data` that names the domain itself as `@`.
+    pub fn set_apex_target_as_at(&self, at: bool) {
+        lock(&self.state).apex_target_as_at = at;
     }
 
     /// Makes the `name` filter of the record listing match by substring.
@@ -533,14 +544,21 @@ async fn domain_get(
     axum::Json(json!({"domain": domain_json(&domain)})).into_response()
 }
 
-fn record_json(record: &Record, form: NameForm) -> Value {
-    let name = match form {
+fn record_json(record: &Record, inner: &Inner) -> Value {
+    let name = match inner.name_form {
         NameForm::Relative => record.name.clone(),
         NameForm::Absolute => absolute(&record.name, &record.domain),
     };
+    let host = matches!(record.rtype.as_str(), "CNAME" | "MX" | "NS" | "SRV");
+    let apex = record.data.strip_suffix('.').unwrap_or(&record.data);
+    let data = if inner.apex_target_as_at && host && apex.eq_ignore_ascii_case(&record.domain) {
+        "@".to_owned()
+    } else {
+        record.data.clone()
+    };
     let f = &record.fields;
     json!({
-        "id": record.id, "type": record.rtype, "name": name, "data": record.data,
+        "id": record.id, "type": record.rtype, "name": name, "data": data,
         "priority": f.priority, "port": f.port, "ttl": record.ttl, "weight": f.weight,
         "flags": f.flags, "tag": f.tag
     })
@@ -668,7 +686,7 @@ async fn records_list(
                     }
                 })
             })
-            .map(|r| record_json(r, inner.name_form))
+            .map(|r| record_json(r, &inner))
             .collect();
         (items, format!("/v2/domains/{domain}/records"))
     };
@@ -737,7 +755,7 @@ async fn record_create(
         return response;
     }
     inner.next_id += 1;
-    let created = record_json(&record, inner.name_form);
+    let created = record_json(&record, &inner);
     inner.records.push(record);
     (
         StatusCode::CREATED,
@@ -810,7 +828,7 @@ async fn record_update(
     if let Err(response) = validate(&updated) {
         return response;
     }
-    let answer = record_json(&updated, inner.name_form);
+    let answer = record_json(&updated, &inner);
     if let Some(slot) = inner.records.get_mut(index) {
         *slot = updated;
     }

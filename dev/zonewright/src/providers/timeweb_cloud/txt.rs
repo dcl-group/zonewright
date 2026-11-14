@@ -5,12 +5,12 @@
 //! layer takes the per-name lock, reads and decides; this file maps its calls onto the API. All
 //! three calls are addressed to the owner name itself (the zone, or the full name below it):
 //!
-//! - read: `GET /v1/domains/{name}/dns-records`, every page, then the records of type TXT at
-//!   exactly the requested name, selected on the client's side. The listing of a subdomain
-//!   holds all its records, so every record at the name is seen and no identifier needs to be
-//!   remembered between operations. A listing of a name below the zone that states a record
-//!   without a name is refused (`Error::Protocol`), since such a record could be at the name or
-//!   at the zone itself;
+//! - read: the listings of the zone and of every subdomain the domain's answer states, every
+//!   page, each record placed at its owner name as the record-level read and the zone listing
+//!   place it (`names.rs`), then the records of type TXT at exactly the requested name. Every
+//!   record at the name is seen and no identifier needs to be remembered between operations. A
+//!   TXT record whose stated name may be the requested name or another one is refused
+//!   (`Error::Protocol`): a value is never taken for ours, nor deleted, on a guess;
 //! - create: `POST /v2/domains/{name}/dns-records`, sent once, with the value and the TTL the
 //!   value layer chose (the rrset's as read when the name has TXT records, else the caller's,
 //!   else the configured one, else none, so that the provider decides). No subdomain is created
@@ -35,8 +35,10 @@ use crate::record::{Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
-use super::api::{Created, Deleted, NewRecord, Record, TXT, check_named, stated_names};
+use super::api::{Created, Deleted, NewRecord, TXT};
 use super::client::TimewebCloud;
+use super::names::{self, Owner};
+use super::records::ambiguous;
 
 /// How TXT data is read.
 const READ: TxtDialect = TxtDialect::Auto;
@@ -68,17 +70,24 @@ impl PerRecord for TimewebCloud {
         zone: &DomainName,
         name: &DomainName,
     ) -> Result<PerRecordRead<Option<u64>>, Error> {
-        let listed = self.api.records(zone, name).await?;
-        check_named(&listed, name == zone)?;
-        let records = listed
-            .into_iter()
-            .filter(|record| is_txt_at(record, zone, name))
-            .map(|record| TxtRecord {
-                value: record.value().and_then(|text| READ.read(text)),
-                ttl: record.ttl().and_then(|secs| Ttl::from_secs(secs).ok()),
-                handle: record.id(),
-            })
-            .collect();
+        let listings = self.api.zone_listings(zone).await?;
+        let mut records = Vec::new();
+        for placed in names::place(zone, &listings)? {
+            if placed.record.rtype != TXT {
+                continue;
+            }
+            if placed.owner.may_be(name) {
+                return Err(ambiguous());
+            }
+            if placed.owner == Owner::At(name.clone()) {
+                let record = placed.record;
+                records.push(TxtRecord {
+                    value: record.value().and_then(|text| READ.read(text)),
+                    ttl: record.ttl().and_then(|secs| Ttl::from_secs(secs).ok()),
+                    handle: record.id(),
+                });
+            }
+        }
         Ok(PerRecordRead::Records(records))
     }
 
@@ -147,9 +156,4 @@ impl PerRecord for TimewebCloud {
         }
         Ok(())
     }
-}
-
-/// Whether a listed record is a TXT record at exactly `name`.
-fn is_txt_at(record: &Record, zone: &DomainName, name: &DomainName) -> bool {
-    record.rtype == TXT && stated_names(record.subdomain(), zone).contains(name)
 }

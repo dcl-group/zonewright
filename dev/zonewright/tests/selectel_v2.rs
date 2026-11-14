@@ -2120,7 +2120,8 @@ async fn selectel_v2_record_round_trips() {
 
 /// Values the API returns in another valid spelling read as canonical data and compare equal
 /// to the canonical form; writing the same set back is `Unchanged` and leaves the provider's
-/// text alone.
+/// text alone. (A name without the trailing dot and unquoted TXT text are outside the documented
+/// form, not other spellings: `selectel_v2_values_outside_the_documented_form_are_non_canonical`.)
 #[tokio::test]
 async fn selectel_v2_reads_provider_spellings() {
     let (mock, client) = setup().await;
@@ -2128,7 +2129,7 @@ async fn selectel_v2_reads_provider_spellings() {
     for (rtype, provider, canonical) in [
         ("AAAA", "2001:0DB8:0000::0001", "2001:db8::1"),
         ("MX", "10 MAIL.Example.org.", "10 mail.example.org."),
-        ("CNAME", "target.example.net", "target.example.net."),
+        ("CNAME", "Target.Example.net.", "target.example.net."),
         ("TXT", "\"a\" \"b\"", "\"ab\""),
         (
             "CAA",
@@ -2168,22 +2169,104 @@ async fn selectel_v2_reads_provider_spellings() {
             [(provider.to_owned(), false)]
         );
     }
-    // An unquoted TXT value is the value itself (the `Auto` rule).
-    control.insert_rrset(
-        "example.org",
-        "raw.example.org",
-        "TXT",
-        600,
-        &["plain words"],
-    );
-    let read = client
-        .get_rrset(&zone(), &dn("raw.example.org"), RecordType::TXT)
+}
+
+/// The documented content has names "with a dot at the end" and TXT "wrapped in `\"`"; what
+/// other text means is not documented. A name without the dot (relative or absolute?) and
+/// unquoted TXT (one string or several?) are read as non-canonical data: never equal to the
+/// absolute name or the quoted value, so a `set_rrset` of those replaces them (one write)
+/// instead of answering `Unchanged`; get and list read alike.
+#[tokio::test]
+async fn selectel_v2_values_outside_the_documented_form_are_non_canonical() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    for (rtype, provider, wanted) in [
+        ("CNAME", "mail.example.org", "mail.example.org."),
+        ("MX", "10 mx.example.net", "10 mx.example.net."),
+        ("SRV", "0 5 443 host", "0 5 443 host."),
+        ("NS", "@", "example.org."),
+        ("TXT", "plain words", "\"plain words\""),
+        ("TXT", "token", "\"token\""),
+    ] {
+        let name = format!("m{}.example.org", rtype.to_lowercase());
+        control.insert_rrset("example.org", &name, rtype, 600, &[provider]);
+        let rtype: RecordType = rtype.parse().unwrap();
+        let read = client
+            .get_rrset(&zone(), &dn(&name), rtype)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!read.records()[0].is_canonical(), "{rtype} {provider}");
+        assert_eq!(read.records()[0].as_str(), provider);
+        let listing = client.list_rrsets(&zone()).await.unwrap();
+        assert!(listing.rrsets.contains(&read), "{rtype} {provider}");
+        let before = writes(&mock);
+        assert_eq!(
+            client
+                .set_rrset(&zone(), &rrset(&name, rtype, None, &[wanted]), Expect::Any)
+                .await
+                .unwrap(),
+            SetOutcome::Replaced,
+            "{rtype} {provider}"
+        );
+        assert_eq!(writes(&mock), before + 1, "{rtype} {provider}");
+        assert_eq!(
+            control.contents(&name, &rtype.to_string()),
+            [(wanted.to_owned(), false)]
+        );
+        control.delete_rrset(&name, &rtype.to_string());
+    }
+}
+
+/// An rrset a web resource manages (`managed_by`) is never deleted: the delete would drop the
+/// association that an update preserves. `delete_rrset` and the removal of the last TXT value
+/// are `InvalidInput` with nothing written; an update still works and keeps it.
+#[tokio::test]
+async fn selectel_v2_managed_rrset_is_not_deleted() {
+    const RESOURCE: &str = "00000000-0000-4000-8000-0000000000aa";
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_rrset("example.org", REC, "A", 600, &["192.0.2.1"]);
+    control.set_managed_by(REC, "A", Some(RESOURCE));
+    let e = client
+        .delete_rrset(&zone(), &dn(REC), RecordType::A, Expect::Any)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    control.insert_rrset("example.org", NAME, "TXT", 600, &["\"ours\""]);
+    control.set_managed_by(NAME, "TXT", Some(RESOURCE));
+    let e = remove(&client, "ours").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    assert_eq!(writes(&mock), 0);
     assert_eq!(
-        read.records(),
-        [Txt::new("plain words").unwrap().to_data().unwrap()]
+        control.contents(REC, "A"),
+        [("192.0.2.1".to_owned(), false)]
+    );
+    assert_eq!(control.txt_values(NAME), ["ours"]);
+    // A replacement is an update, which keeps the managing resource.
+    assert_eq!(
+        client
+            .set_rrset(
+                &zone(),
+                &rrset(REC, RecordType::A, None, &["192.0.2.2"]),
+                Expect::Any
+            )
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(
+        control.rrset(REC, "A").unwrap().managed_by.as_deref(),
+        Some(RESOURCE)
+    );
+    // Without a managing resource the delete goes through.
+    control.set_managed_by(REC, "A", None);
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(REC), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
     );
 }
 
@@ -2921,9 +3004,9 @@ fn random_u64() -> u64 {
     hasher.finish()
 }
 
-/// Adds and removes two values under a generated label in the zone the maintainer names, then
-/// runs a record-level round trip (A and TXT rrsets) on another generated name, and removes
-/// exactly what it added afterwards, also when the body failed.
+/// Adds and removes two values under a generated label in the zone the maintainer names, and
+/// removes exactly what it added afterwards, also when the body failed. The record-level round
+/// trip is `live_selectel_v2_record_round_trip`.
 #[tokio::test]
 #[ignore = "live API: run only by the maintainer"]
 async fn live_selectel_v2_add_and_remove() {
@@ -3036,7 +3119,62 @@ async fn live_selectel_v2_add_and_remove() {
         outcome = probe_body.await;
     }
 
-    // Record level: a round trip of A and TXT rrsets on a fresh name of the test's own. The
+    // Cleanup: exactly the values this test added, with the value operations.
+    let mut cleanup = Vec::new();
+    for value in &values {
+        if let Err(e) = client.remove_txt_value(&zone, &name, value).await {
+            cleanup.push(format!("{e}"));
+        }
+    }
+    for value in &probe_values {
+        if let Err(e) = client.remove_txt_value(&zone, &probe, value).await {
+            cleanup.push(format!("{e}"));
+        }
+    }
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+    assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
+}
+
+/// A record-level round trip on names the test generates (`_zw-live-<random>-rr` and `-cn`
+/// below the zone the maintainer names): A with a TTL, TXT with spaces and more than 255
+/// characters, and a CNAME whose target lies in the zone, written absolute with the trailing dot
+/// (the read-back shows how the API spells names inside values). Created with `Expect::Absent`,
+/// read back, `Unchanged` when written again, listed, replaced under `Expect::Matches`; the
+/// rrsets are deleted afterwards, also when the body failed, and only while they hold nothing
+/// but what the test wrote.
+#[tokio::test]
+#[ignore = "live API: run only by the maintainer"]
+async fn live_selectel_v2_record_round_trip() {
+    let settings = live_env("ZONEWRIGHT_LIVE_SELECTEL_V2_SETTINGS");
+    let credentials = live_env("ZONEWRIGHT_LIVE_SELECTEL_V2_CREDENTIALS");
+    let zone = dn(&live_env("ZONEWRIGHT_LIVE_SELECTEL_V2_ZONE"));
+    let ctx = Context::new(zonewright::ContextOptions::default()).unwrap();
+    let client = Arc::new(
+        AnyProvider::from_json(
+            ProviderId::SelectelV2,
+            &settings,
+            &SecretString::from(credentials),
+            &ctx,
+        )
+        .unwrap(),
+    );
+    let tag = random_u64();
+    let outcome: Result<(), tokio::task::JoinError>;
+    let cname_name = zone.prepend(&format!("_zw-live-{tag:016x}-cn")).unwrap();
+    let cname_set = RrSet::new(
+        cname_name.clone(),
+        RecordType::CNAME,
+        None,
+        [RecordData::parse(
+            RecordType::CNAME,
+            &format!("_zw-live-{tag:016x}-rr.{}", zone.without_dot()),
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    // A round trip of A, TXT and CNAME rrsets on fresh names of the test's own. The
     // cleanup deletes exactly these rrsets, under an expectation that they hold only what the
     // test wrote, so nothing written by anyone else is removed.
     let records = zone.prepend(&format!("_zw-live-{tag:016x}-rr")).unwrap();
@@ -3063,7 +3201,7 @@ async fn live_selectel_v2_add_and_remove() {
         ],
     )
     .unwrap();
-    if outcome.is_ok() {
+    {
         let record_body = tokio::spawn({
             let (client, zone, records, a_set, txt_set) = (
                 client.clone(),
@@ -3072,6 +3210,7 @@ async fn live_selectel_v2_add_and_remove() {
                 a_set.clone(),
                 txt_set.clone(),
             );
+            let (cname_name, cname_set) = (cname_name.clone(), cname_set.clone());
             async move {
                 assert_eq!(
                     client
@@ -3125,23 +3264,35 @@ async fn live_selectel_v2_add_and_remove() {
                     .await
                     .unwrap_err();
                 assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{e:?}");
+                // A name inside a value, written absolute with the dot: read back canonical
+                // (a spelling without the dot would read as non-canonical data and fail here).
+                assert_eq!(
+                    client
+                        .set_rrset(&zone, &cname_set, Expect::Absent)
+                        .await
+                        .unwrap(),
+                    SetOutcome::Created
+                );
+                let read = client
+                    .get_rrset(&zone, &cname_name, RecordType::CNAME)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                eprintln!("record-level probe: CNAME read back as {read:?}");
+                assert!(read.same_records(&cname_set), "{read:?}");
+                assert_eq!(
+                    client
+                        .set_rrset(&zone, &cname_set, Expect::Any)
+                        .await
+                        .unwrap(),
+                    SetOutcome::Unchanged
+                );
             }
         });
         outcome = record_body.await;
     }
 
-    // Cleanup: exactly the values this test added, with the value operations.
     let mut cleanup = Vec::new();
-    for value in &values {
-        if let Err(e) = client.remove_txt_value(&zone, &name, value).await {
-            cleanup.push(format!("{e}"));
-        }
-    }
-    for value in &probe_values {
-        if let Err(e) = client.remove_txt_value(&zone, &probe, value).await {
-            cleanup.push(format!("{e}"));
-        }
-    }
     // The record-level rrsets: deleted only while they hold nothing but what the test wrote.
     for rtype in [RecordType::A, RecordType::TXT] {
         match client.get_rrset(&zone, &records, rtype).await {
@@ -3169,6 +3320,27 @@ async fn live_selectel_v2_add_and_remove() {
             Ok(None) => {}
             Err(e) => cleanup.push(format!("{e}")),
         }
+    }
+    match client
+        .get_rrset(&zone, &cname_name, RecordType::CNAME)
+        .await
+    {
+        Ok(Some(current)) if current.same_records(&cname_set) => {
+            if let Err(e) = client
+                .delete_rrset(
+                    &zone,
+                    &cname_name,
+                    RecordType::CNAME,
+                    Expect::Matches(&current),
+                )
+                .await
+            {
+                cleanup.push(format!("{e}"));
+            }
+        }
+        Ok(Some(_)) => cleanup.push("the CNAME at the test's name holds foreign data".into()),
+        Ok(None) => {}
+        Err(e) => cleanup.push(format!("{e}")),
     }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());

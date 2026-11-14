@@ -49,9 +49,10 @@ enum Lookup {
 /// The record-level operations cover A, AAAA, CNAME, MX, NS, SRV and TXT. Replacing an rrset is
 /// several requests (creates, then deletes) and not atomic (`atomic_rrset_write` is false), and a
 /// writer outside this process that changes the rrset between the read and the writes is not
-/// detected (`Preconditions::ReadThenWrite`). The API cannot change the TTL of an existing
-/// record: a requested TTL that differs from that of a record which stays is
-/// `Error::InvalidInput`, and nothing is written.
+/// detected (`Preconditions::ReadThenWrite`). A CNAME is replaced by one in-place update of its
+/// target, so a refused change leaves the old record. The API cannot change the TTL of an
+/// existing record: a requested TTL that differs from that of a record which stays (a CNAME
+/// changed in place included) is `Error::InvalidInput`, and nothing is written.
 ///
 /// The API returns the zone listing and the records of one type in one answer each, without
 /// paging, so a listing is bounded by the transport's 4 MiB body limit; a larger one fails.

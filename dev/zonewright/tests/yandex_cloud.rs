@@ -2028,7 +2028,8 @@ async fn yandex_cloud_record_round_trips() {
 
 /// Values the API returns in another valid spelling read as canonical data and compare equal
 /// to the canonical form; writing the same set back is `Unchanged` and leaves the provider's
-/// text alone.
+/// text alone. (A name without the trailing dot is relative to the zone, not another spelling of
+/// an absolute name: `yandex_cloud_reads_values_in_master_file_format`.)
 #[tokio::test]
 async fn yandex_cloud_reads_provider_spellings() {
     let (mock, client) = setup().await;
@@ -2036,12 +2037,9 @@ async fn yandex_cloud_reads_provider_spellings() {
     for (rtype, provider, canonical) in [
         ("AAAA", "2001:0DB8:0000::0001", "2001:db8::1"),
         ("MX", "10 MAIL.Example.org.", "10 mail.example.org."),
-        ("CNAME", "target.example.net", "target.example.net."),
-        (
-            "ANAME",
-            "example.com.website.yandexcloud.net",
-            "example.com.website.yandexcloud.net.",
-        ),
+        ("CNAME", "target.example.net.", "target.example.net."),
+        ("ANAME", "www", "www.example.org."),
+        ("NS", "@", "example.org."),
         ("TXT", "\"a\" \"b\"", "\"ab\""),
         (
             "CAA",
@@ -2091,6 +2089,104 @@ async fn yandex_cloud_reads_provider_spellings() {
         .unwrap()
         .unwrap();
     assert_eq!(read.records(), [txt("plain-value").to_data().unwrap()]);
+}
+
+/// The service "uses MASTER FILES format": a name without the trailing dot inside a value is
+/// relative to the zone, and unquoted text with spaces is several strings. Such a value never
+/// equals the absolute name or the single string of the same characters, so a `set_rrset` of
+/// those replaces it instead of answering `Unchanged`; get and list read alike.
+#[tokio::test]
+async fn yandex_cloud_reads_values_in_master_file_format() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    for (rtype, provider, read_as, wanted) in [
+        (
+            "CNAME",
+            "mail.example.org",
+            "mail.example.org.example.org.",
+            "mail.example.org.",
+        ),
+        (
+            "MX",
+            "10 mx.example.net",
+            "10 mx.example.net.example.org.",
+            "10 mx.example.net.",
+        ),
+        (
+            "SRV",
+            "0 5 443 host",
+            "0 5 443 host.example.org.",
+            "0 5 443 host.",
+        ),
+        ("TXT", "v=spf1 -all", "\"v=spf1-all\"", "\"v=spf1 -all\""),
+    ] {
+        let name = format!("m{}.example.org", rtype.to_lowercase());
+        control.insert_rrset(ZONE, &name, rtype, "600", &[provider]);
+        let rtype: RecordType = rtype.parse().unwrap();
+        let expected = rrset(&name, rtype, Some(600), &[read_as]);
+        let read = client.get_rrset(&zone(), &dn(&name), rtype).await.unwrap();
+        assert_eq!(read.as_ref(), Some(&expected), "{rtype}");
+        let listing = client.list_rrsets(&zone()).await.unwrap();
+        assert!(listing.rrsets.contains(&expected), "{rtype}");
+        let before = writes(&mock);
+        assert_eq!(
+            client
+                .set_rrset(&zone(), &rrset(&name, rtype, None, &[wanted]), Expect::Any)
+                .await
+                .unwrap(),
+            SetOutcome::Replaced,
+            "{rtype}"
+        );
+        assert_eq!(writes(&mock), before + 1, "{rtype}");
+        assert_eq!(
+            stored(&mock, &name, &rtype.to_string()),
+            [wanted],
+            "{rtype}"
+        );
+    }
+}
+
+/// The answer to `getRecordSet` must be the record set asked for: another name or type is
+/// `Protocol`, and nothing is written over it.
+#[tokio::test]
+async fn yandex_cloud_record_set_answer_of_another_name_or_type_is_protocol() {
+    for body in [
+        r#"{"name":"other.example.org.","type":"A","ttl":"600","data":["192.0.2.1"]}"#,
+        r#"{"name":"rec.example.org.","type":"AAAA","ttl":"600","data":["2001:db8::1"]}"#,
+        r#"{"name":"other","type":"A","ttl":"600","data":["192.0.2.1"]}"#,
+        r#"{"type":"A","ttl":"600","data":["192.0.2.1"]}"#,
+    ] {
+        let (mock, client) = setup().await;
+        mock.control()
+            .insert_rrset(ZONE, REC, "A", "600", &["192.0.2.1"]);
+        mock.faults()
+            .push(Fault::on("GET", GET_SET).respond(200, body));
+        let e = client
+            .set_rrset(
+                &zone(),
+                &rrset(REC, RecordType::A, None, &["192.0.2.9"]),
+                Expect::Any,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{body}");
+        assert_eq!(writes(&mock), 0, "{body}");
+    }
+    // The same set spelled relative to the zone is the one asked for.
+    let (mock, client) = setup().await;
+    mock.control()
+        .insert_rrset(ZONE, REC, "A", "600", &["192.0.2.1"]);
+    mock.faults().push(Fault::on("GET", GET_SET).respond(
+        200,
+        r#"{"name":"rec","type":"A","ttl":"600","data":["192.0.2.1"]}"#,
+    ));
+    assert_eq!(
+        client
+            .get_rrset(&zone(), &dn(REC), RecordType::A)
+            .await
+            .unwrap(),
+        Some(rrset(REC, RecordType::A, Some(600), &["192.0.2.1"]))
+    );
 }
 
 #[tokio::test]
@@ -2994,9 +3090,8 @@ fn random_u64() -> u64 {
 /// Adds and removes two values under a generated label in the zone the maintainer names, and
 /// removes exactly the values it added afterwards, also when the body failed. A second client
 /// on its own context then races the first on a fresh name, so that the strict call's refusal
-/// of a stale write is observed. Then a record-level round trip (A, TXT with spaces, a `;` and
-/// more than 255 characters, HTTPS with an unquoted `alpn`) on another generated name, whose
-/// sets are deleted afterwards only while they hold what the test wrote.
+/// of a stale write is observed. The record-level round trip is
+/// `live_yandex_cloud_record_round_trip`.
 #[tokio::test]
 #[ignore = "live API: run only by the maintainer"]
 async fn live_yandex_cloud_add_and_remove() {
@@ -3104,9 +3199,65 @@ async fn live_yandex_cloud_add_and_remove() {
         outcome = probe_body.await;
     }
 
-    // Record level: a round trip of A, TXT and HTTPS record sets on a fresh name of the test's
-    // own. The cleanup deletes exactly these sets, under an expectation that they hold only
-    // what the test wrote, so nothing written by anyone else is removed.
+    // Cleanup: exactly the values this test added, with the value operations.
+    let mut cleanup = Vec::new();
+    for value in &values {
+        if let Err(e) = client.remove_txt_value(&zone, &name, value).await {
+            cleanup.push(format!("{e}"));
+        }
+    }
+    for value in &probe_values {
+        if let Err(e) = client.remove_txt_value(&zone, &probe, value).await {
+            cleanup.push(format!("{e}"));
+        }
+    }
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+    assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
+}
+
+/// A record-level round trip on names the test generates (`_zw-live-<random>-rr` and
+/// `-cn` below the zone the maintainer names): A with a TTL, TXT with spaces, a `;` and more
+/// than 255 characters, HTTPS with an unquoted `alpn`, and a CNAME whose target lies in the zone
+/// (written absolute with the trailing dot; the read-back shows how the API spells it, the open
+/// question of reading names inside values relative to the zone). Created with `Expect::Absent`,
+/// read back, `Unchanged` when written again, listed, replaced under `Expect::Matches`; the
+/// sets are deleted afterwards, also when the body failed, and only while they hold nothing but
+/// what the test wrote.
+#[tokio::test]
+#[ignore = "live API: run only by the maintainer"]
+async fn live_yandex_cloud_record_round_trip() {
+    let settings = live_env("ZONEWRIGHT_LIVE_YANDEX_CLOUD_SETTINGS");
+    let credentials = live_env("ZONEWRIGHT_LIVE_YANDEX_CLOUD_CREDENTIALS");
+    let zone = dn(&live_env("ZONEWRIGHT_LIVE_YANDEX_CLOUD_ZONE"));
+    let ctx = Context::new(zonewright::ContextOptions::default()).unwrap();
+    let client = Arc::new(
+        AnyProvider::from_json(
+            ProviderId::YandexCloud,
+            &settings,
+            &SecretString::from(credentials),
+            &ctx,
+        )
+        .unwrap(),
+    );
+    let tag = random_u64();
+    let outcome: Result<(), tokio::task::JoinError>;
+    let cname_name = zone.prepend(&format!("_zw-live-{tag:016x}-cn")).unwrap();
+    let cname_set = RrSet::new(
+        cname_name.clone(),
+        RecordType::CNAME,
+        None,
+        [RecordData::parse(
+            RecordType::CNAME,
+            &format!("_zw-live-{tag:016x}-rr.{}", zone.without_dot()),
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    // A round trip of A, TXT, HTTPS and CNAME record sets on fresh names of the test's own. The
+    // cleanup deletes exactly these sets, under an expectation that they hold only what the test
+    // wrote, so nothing written by anyone else is removed.
     let records = zone.prepend(&format!("_zw-live-{tag:016x}-rr")).unwrap();
     let a_set = RrSet::new(
         records.clone(),
@@ -3145,9 +3296,10 @@ async fn live_yandex_cloud_add_and_remove() {
         [rd(RecordType::HTTPS, "1 . alpn=h3,h2 port=8443")],
     )
     .unwrap();
-    if outcome.is_ok() {
+    {
         let record_body = tokio::spawn({
             let (client, zone, records) = (client.clone(), zone.clone(), records.clone());
+            let (cname_name, cname_set) = (cname_name.clone(), cname_set.clone());
             let (a_set, a_next, txt_set, https_set) = (
                 a_set.clone(),
                 a_next.clone(),
@@ -3194,23 +3346,33 @@ async fn live_yandex_cloud_add_and_remove() {
                     .await
                     .unwrap_err();
                 assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{e:?}");
+                assert_eq!(
+                    client
+                        .set_rrset(&zone, &cname_set, Expect::Absent)
+                        .await
+                        .unwrap(),
+                    SetOutcome::Created
+                );
+                let read = client
+                    .get_rrset(&zone, &cname_name, RecordType::CNAME)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                eprintln!("record-level probe: CNAME read back as {read:?}");
+                assert!(read.same_records(&cname_set), "{read:?}");
+                assert_eq!(
+                    client
+                        .set_rrset(&zone, &cname_set, Expect::Any)
+                        .await
+                        .unwrap(),
+                    SetOutcome::Unchanged
+                );
             }
         });
         outcome = record_body.await;
     }
 
-    // Cleanup: exactly the values this test added, with the value operations.
     let mut cleanup = Vec::new();
-    for value in &values {
-        if let Err(e) = client.remove_txt_value(&zone, &name, value).await {
-            cleanup.push(format!("{e}"));
-        }
-    }
-    for value in &probe_values {
-        if let Err(e) = client.remove_txt_value(&zone, &probe, value).await {
-            cleanup.push(format!("{e}"));
-        }
-    }
     // The record-level sets: deleted only while they hold nothing but what the test wrote.
     for (rtype, ours) in [
         (RecordType::A, [a_set.records(), a_next.records()].concat()),
@@ -3233,6 +3395,27 @@ async fn live_yandex_cloud_add_and_remove() {
             Ok(None) => {}
             Err(e) => cleanup.push(format!("{e}")),
         }
+    }
+    match client
+        .get_rrset(&zone, &cname_name, RecordType::CNAME)
+        .await
+    {
+        Ok(Some(current)) if current.same_records(&cname_set) => {
+            if let Err(e) = client
+                .delete_rrset(
+                    &zone,
+                    &cname_name,
+                    RecordType::CNAME,
+                    Expect::Matches(&current),
+                )
+                .await
+            {
+                cleanup.push(format!("{e}"));
+            }
+        }
+        Ok(Some(_)) => cleanup.push("the CNAME at the test's name holds foreign data".into()),
+        Ok(None) => {}
+        Err(e) => cleanup.push(format!("{e}")),
     }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());

@@ -79,9 +79,12 @@
 //! one (design section 3.6, `TtlSupport::PerRecord`). "All proxied records have a TTL of Auto
 //! ... This value cannot be edited"
 //! (<https://developers.cloudflare.com/dns/manage-dns-records/reference/ttl/>): a requested TTL
-//! for a proxied record is `Error::InvalidInput`. The read puts proxied records first, so that
-//! the layer, which changes TTLs in the order of the read and before any create, meets that
-//! refusal before it has written anything.
+//! for a proxied record is `Error::InvalidInput`.
+//!
+//! Both refusals (a requested TTL for a proxied record, a create into an rrset whose records
+//! disagree) are made in `PerRecord::check_plan`, over every request of the plan before the
+//! first is sent, so a refused operation writes nothing: no TTL change of another record of the
+//! set goes out ahead of the refused create. `create` and `update` repeat the checks.
 
 use std::collections::BTreeMap;
 
@@ -97,7 +100,7 @@ use crate::provider::ZoneListing;
 use crate::record::{Caa, RecordData, RecordType, Tlsa, Ttl, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
-    self, Listing, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
+    self, Listing, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Step, Stored,
 };
 
 use super::api::{NewRecord, Record, RecordPatch, Written};
@@ -449,20 +452,10 @@ impl PerRecord for Cloudflare {
         data: &RecordData,
         ttl: SetTtl,
     ) -> Result<(), Error> {
-        let Some(inherit) = &context.inherit else {
-            return Err(Error::InvalidInput {
-                detail: Detail::constant(
-                    "the records of the rrset differ in their proxy status, private routing or \
-                     settings, so a new record cannot take them over",
-                ),
-            });
-        };
+        let inherit = inherited(context, ttl)?;
         let encoded = encode(rtype, data).ok_or_else(not_sendable)?;
         let ttl = if inherit.proxied {
-            match ttl {
-                SetTtl::Requested(_) => return Err(proxied_ttl()),
-                _ => TTL_AUTOMATIC,
-            }
+            TTL_AUTOMATIC
         } else {
             match ttl {
                 SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => ttl.as_secs(),
@@ -532,9 +525,7 @@ impl PerRecord for Cloudflare {
     ) -> Result<(), Error> {
         // Every record is enabled (the API has no disabled records), so `update.enable` is
         // never asked for and there is nothing to send for it.
-        if update.ttl.is_some() && record.handle.attributes.proxied {
-            return Err(proxied_ttl());
-        }
+        check_update(record, update)?;
         let encoded = match update.data {
             Some(data) => Some(encode(rtype, data).ok_or_else(not_sendable)?),
             None => None,
@@ -567,6 +558,23 @@ impl PerRecord for Cloudflare {
             }
             Written::Refused(e) => Err(e),
         }
+    }
+
+    /// The refusals of the module documentation ("TTL", "Attributes the model does not
+    /// carry"), for every request of the plan before the first is sent.
+    fn check_plan(
+        &self,
+        _zone: &DomainName,
+        _name: &DomainName,
+        _rtype: RecordType,
+        context: &ReadContext,
+        steps: &[Step<'_, Handle>],
+    ) -> Result<(), Error> {
+        steps.iter().try_for_each(|step| match step {
+            Step::Create { ttl, .. } => inherited(context, *ttl).map(|_| ()),
+            Step::Update { record, update } => check_update(record, update),
+            Step::Delete(_) => Ok(()),
+        })
     }
 
     async fn delete(
@@ -602,6 +610,31 @@ impl PerRecord for Cloudflare {
             Written::Refused(e) => Err(e),
         }
     }
+}
+
+/// The attributes a new record with `ttl` takes over, or the refusal: the records read disagree,
+/// or they are proxied and a TTL is requested.
+fn inherited(context: &ReadContext, ttl: SetTtl) -> Result<&Attributes, Error> {
+    let Some(inherit) = &context.inherit else {
+        return Err(Error::InvalidInput {
+            detail: Detail::constant(
+                "the records of the rrset differ in their proxy status, private routing or \
+                 settings, so a new record cannot take them over",
+            ),
+        });
+    };
+    if inherit.proxied && matches!(ttl, SetTtl::Requested(_)) {
+        return Err(proxied_ttl());
+    }
+    Ok(inherit)
+}
+
+/// A change of one record: a TTL cannot be set on a proxied record.
+fn check_update(record: &Stored<Handle>, update: &RecordUpdate<'_>) -> Result<(), Error> {
+    if update.ttl.is_some() && record.handle.attributes.proxied {
+        return Err(proxied_ttl());
+    }
+    Ok(())
 }
 
 /// A requested TTL for a proxied record.

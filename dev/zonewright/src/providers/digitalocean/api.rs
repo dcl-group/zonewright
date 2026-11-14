@@ -407,8 +407,9 @@ impl Api {
     /// Complete or an error. Pages are fetched by number, never by the `links.pages.next` URL
     /// (a URL from an answer is not requested, design section 5.1); the presence of that link
     /// says whether another page follows. The listing is complete when no link follows and the
-    /// items received reach `meta.total`; fewer, an absent `meta.total`, an absent list field,
-    /// or an empty page with a next link is `Error::Protocol`.
+    /// items received reach `meta.total`; fewer, an absent `meta.total`, a `meta.total` that
+    /// changes between pages (items moved while the pages were read, so one may have been passed
+    /// over), an absent list field, or an empty page with a next link is `Error::Protocol`.
     // Source: Domains and Domain Records, list answers: `links` optional with `pages.next`
     // among the forward links, `meta` required with `total`. Assumption (not documented): that
     // `meta.total` counts the items under the request's filters and that `pages.next` is absent
@@ -424,9 +425,12 @@ impl Api {
         U: Fn(u32) -> Result<Url, Error>,
     {
         let received = AtomicU64::new(0);
+        // The `meta.total` of the first page; `u64::MAX` until it is read.
+        let first_total = AtomicU64::new(u64::MAX);
         pager::collect(1u32, |page| {
             let url = url(page);
             let received = &received;
+            let first_total = &first_total;
             async move {
                 let response = self.http.send(&Request::get(url?)).await?;
                 if response.status() == 404
@@ -448,6 +452,17 @@ impl Api {
                     .and_then(|meta| meta.get("total"))
                     .and_then(Value::as_u64)
                     .ok_or_else(|| protocol("the provider's listing states no total"))?;
+                if let Err(first) = first_total.compare_exchange(
+                    u64::MAX,
+                    total,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) && first != total
+                {
+                    return Err(protocol(
+                        "the provider's listing changed its number of items between pages",
+                    ));
+                }
                 let has_next = body
                     .get("links")
                     .and_then(|links| links.get("pages"))

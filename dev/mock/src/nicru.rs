@@ -505,6 +505,26 @@ impl Control {
         self.staged(name, "TXT").iter().map(Record::value).collect()
     }
 
+    /// Publishes every staged change of zone `zone`, as a commit request would; for a fault hook
+    /// that applies a commit whose answer is then lost.
+    pub fn commit(&self, zone: &str) {
+        let mut inner = lock(&self.state);
+        let Some(id) = inner.zone_by_name(zone).map(|z| z.id) else {
+            return;
+        };
+        let staged: Vec<Record> = inner
+            .staged
+            .iter()
+            .filter(|r| r.zone_id == id)
+            .cloned()
+            .collect();
+        inner.published.retain(|r| r.zone_id != id);
+        inner.published.extend(staged);
+        for z in inner.zones.iter_mut().filter(|z| z.id == id) {
+            z.has_changes = false;
+        }
+    }
+
     /// Invalidates every issued token, as an expiry would.
     pub fn expire_tokens(&self) {
         lock(&self.state).tokens.clear();

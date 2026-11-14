@@ -39,7 +39,12 @@
 //!   it, and `@` as the apex (the help page above, which describes the console, not the API); an
 //!   empty name and a name with a trailing dot are refused with `400`; a record at the apex is
 //!   stated as `@` ([`NameForm::Relative`]) or as the domain's full name ([`NameForm::Full`]),
-//!   and the full form is the one the listing page's field description names;
+//!   and the full form is the one the listing page's field description names; the full name
+//!   with a trailing dot ([`NameForm::Absolute`]) is a third form no source shows, kept so that
+//!   the absolute reading can be tested apart from the ambiguous dotless one;
+//! - a name stored relative may repeat the domain (`www.example.org` inside `example.org`, the
+//!   owner `www.example.org.example.org`): a create stores its name as sent, and
+//!   [`Control::insert_relative`] stores one directly;
 //! - a `ttl` that is not a positive integer is refused with `400`; no range is enforced, as
 //!   none is documented;
 //! - the fields a create or an edit requires per type, and their checks, all refused with `400`:
@@ -123,6 +128,8 @@ pub enum NameForm {
     Relative,
     /// The full name, without a trailing dot.
     Full,
+    /// The full name, with a trailing dot.
+    Absolute,
 }
 
 /// One record as the mock holds it.
@@ -341,6 +348,33 @@ impl Control {
         self.insert(domain, name, rtype, text, fields, ttl)
     }
 
+    /// Adds a record with the given fields at `name` taken as relative to `domain` exactly as
+    /// given (`@` for the apex), as another writer would, without any check: a name that repeats
+    /// the domain stays below it. Returns the record's identifier.
+    pub fn insert_relative(
+        &self,
+        domain: &str,
+        name: &str,
+        rtype: &str,
+        fields: Value,
+        ttl: u32,
+    ) -> u64 {
+        let mut fields = match fields {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        let text = match fields.remove("text") {
+            Some(Value::String(text)) => text,
+            _ => String::new(),
+        };
+        let id = self.insert(domain, "@", rtype, text, fields, ttl);
+        let mut inner = lock(&self.state);
+        if let Some(record) = inner.records.iter_mut().find(|r| r.id == id) {
+            record.name = name.to_lowercase();
+        }
+        id
+    }
+
     fn insert(
         &self,
         domain: &str,
@@ -532,6 +566,8 @@ fn record_json(record: &Record, form: NameForm) -> Value {
         (NameForm::Relative, name) => name.to_owned(),
         (NameForm::Full, "@") => record.domain.clone(),
         (NameForm::Full, name) => format!("{name}.{}", record.domain),
+        (NameForm::Absolute, "@") => format!("{}.", record.domain),
+        (NameForm::Absolute, name) => format!("{name}.{}.", record.domain),
     };
     let mut body = json!({
         "recordId": record.id, "type": record.rtype, "name": name, "ttl": record.ttl
