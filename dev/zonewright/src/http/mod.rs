@@ -4,8 +4,9 @@
 //! retries, rate-limit handling, the size cap, redaction and logging live here.
 //!
 //! - [`Transport`] is the `reqwest` client of a [`Context`]: own `rustls` configuration with the
-//!   `aws-lc-rs` provider passed explicitly, HTTP/1.1 only, no redirects, no proxy, no cookies,
-//!   no decompression, connect and whole-request timeouts.
+//!   `aws-lc-rs` provider passed explicitly, HTTP/1.1 only, no redirects, no proxy from the
+//!   environment (only the explicit `ContextOptions::proxy`, see [`proxy`]), no cookies, no
+//!   decompression, connect and whole-request timeouts.
 //! - [`Http`] is one provider client's handle on it: the provider ID for `tracing`, the client's
 //!   [`Scrubber`], its static credential header, its request pacing and its error-message
 //!   extractor. [`Http::send`] and [`Http::send_with_token`] run the retry rules of section 5.3
@@ -39,6 +40,7 @@ pub(crate) mod gate;
 pub(crate) mod keystone;
 pub(crate) mod pager;
 pub(crate) mod poll;
+pub(crate) mod proxy;
 pub(crate) mod request;
 mod retry;
 pub(crate) mod tls;
@@ -46,6 +48,8 @@ pub(crate) mod token;
 pub(crate) mod url;
 pub(crate) mod zone_cache;
 
+#[cfg(test)]
+mod proxy_tests;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
@@ -150,6 +154,7 @@ use crate::error::Error;
 use crate::id::ProviderId;
 use crate::redact::{Detail, Scrubber, SecretSlot};
 
+use proxy::ProxySetting;
 use request::MessageFn;
 
 /// A client's classifier of further rate-limit answers ([`HttpBuilder::rate_limit`]).
@@ -174,12 +179,15 @@ struct Shared {
     connect_timeout: Duration,
     request_timeout: Duration,
     loopback_only: bool,
+    /// The explicit proxy of the context, if any.
+    proxy: Option<ProxySetting>,
 }
 
 impl fmt::Debug for Transport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Transport")
             .field("loopback_only", &self.shared.loopback_only)
+            .field("proxied", &self.shared.proxy.is_some())
             .field(
                 "no_ca_certificates",
                 &self.shared.trust.no_ca_certificates(),
@@ -190,7 +198,7 @@ impl fmt::Debug for Transport {
 
 impl Transport {
     /// Builds the HTTP client of a context from its options (design section 5.1). An invalid
-    /// extra root certificate is `Error::Config`.
+    /// extra root certificate or proxy setting is `Error::Config`.
     pub(crate) fn new(options: &ContextOptions) -> Result<Transport, Error> {
         let provider = tls::crypto_provider();
         let extra = tls::extra_roots(&options.extra_root_certificates)?;
@@ -214,6 +222,11 @@ impl Transport {
                 "user_agent_suffix must be 1 to 128 printable ASCII characters",
             ),
         })?;
+        let proxy = options
+            .proxy
+            .as_ref()
+            .map(|proxy| ProxySetting::parse(proxy, options.loopback_only))
+            .transpose()?;
         let shared = Arc::new(Shared {
             provider,
             trust,
@@ -221,6 +234,7 @@ impl Transport {
             connect_timeout: options.connect_timeout,
             request_timeout: options.request_timeout,
             loopback_only: options.loopback_only,
+            proxy,
         });
         let client = build_client(&shared, None)?;
         Ok(Transport { client, shared })
@@ -243,7 +257,7 @@ fn build_client(
     identity: Option<ClientIdentity>,
 ) -> Result<reqwest::Client, Error> {
     let tls = tls::client_config(&shared.provider, &shared.trust, identity)?;
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         // The preconfigured path: `reqwest` uses this configuration as it is and does not look
         // for a process-wide crypto provider.
         .tls_backend_preconfigured(tls)
@@ -257,13 +271,19 @@ fn build_client(
         // credentials through a proxy.
         .no_proxy()
         .referer(false)
+        // Covers the whole connector: the TCP connection (to the proxy, if any), the `CONNECT`
+        // exchange and the TLS handshake with the provider.
         .connect_timeout(shared.connect_timeout)
         .timeout(shared.request_timeout)
-        .user_agent(shared.user_agent.clone())
-        .build()
-        .map_err(|_| Error::Config {
-            detail: Detail::constant("the HTTP client could not be built"),
-        })
+        .user_agent(shared.user_agent.clone());
+    // After `no_proxy`, which clears the list: the explicit proxy is the only one, and adding it
+    // keeps the environment unread (`auto_sys_proxy = false` in `ClientBuilder::proxy`).
+    if let Some(proxy) = &shared.proxy {
+        builder = builder.proxy(proxy.reqwest()?);
+    }
+    builder.build().map_err(|_| Error::Config {
+        detail: Detail::constant("the HTTP client could not be built"),
+    })
 }
 
 /// One provider client's handle on the transport.
@@ -363,7 +383,8 @@ pub(crate) struct HttpBuilder {
 
 impl HttpBuilder {
     fn new(transport: Transport, provider: ProviderId) -> HttpBuilder {
-        HttpBuilder {
+        let shared = transport.shared.clone();
+        let builder = HttpBuilder {
             transport,
             provider,
             secrets: Vec::new(),
@@ -374,7 +395,11 @@ impl HttpBuilder {
             rate_limit: None,
             origins: Vec::new(),
             error: None,
-        }
+        };
+        // The context's proxy credentials are secrets of every client: a forwarding proxy's
+        // error answer can echo them, and that answer goes through the client's scrubber.
+        let proxy_secrets = shared.proxy.iter().flat_map(ProxySetting::secrets);
+        proxy_secrets.fold(builder, HttpBuilder::secret)
     }
 
     /// Registers a secret with the client's scrubber: every field of the credentials, whether

@@ -4,6 +4,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use secrecy::SecretString;
+
 use crate::error::Error;
 use crate::locks::NameLocks;
 use crate::redact::Detail;
@@ -136,7 +138,23 @@ pub struct ContextOptions {
     /// DER-encoded certificates trusted in addition to the platform's roots.
     pub extra_root_certificates: Vec<Vec<u8>>,
     /// Refuse to connect to anything but loopback addresses. For tests. Default false.
+    ///
+    /// With a [`proxy`](ContextOptions::proxy), the proxy must be a loopback IP literal as well;
+    /// the policy for request URLs is unchanged.
     pub loopback_only: bool,
+    /// The HTTP proxy every HTTP provider request of the context goes through. Default `None`:
+    /// requests go directly to the provider.
+    ///
+    /// Only this setting configures a proxy. The environment (`HTTP_PROXY`, `HTTPS_PROXY`,
+    /// `ALL_PROXY`, `NO_PROXY` and their lowercase forms) and the system proxy configuration are
+    /// ignored, with and without it. See [`HttpProxy`] for what is supported and what the proxy
+    /// can see.
+    ///
+    /// The RFC 2136 client (DNS over TCP) and the inspector (DNS over UDP and TCP) do not use it;
+    /// they connect to their name servers directly.
+    ///
+    /// Checked by [`Context::new`] in builds with an HTTP provider, the only ones that use it.
+    pub proxy: Option<HttpProxy>,
 }
 
 impl Default for ContextOptions {
@@ -147,7 +165,83 @@ impl Default for ContextOptions {
             request_timeout: Duration::from_secs(30),
             extra_root_certificates: Vec::new(),
             loopback_only: false,
+            proxy: None,
         }
+    }
+}
+
+/// An HTTP proxy for the provider requests of a [`Context`] ([`ContextOptions::proxy`]).
+///
+/// Supported: a proxy reached over `http://` or `https://`. A request to an `https://` provider
+/// endpoint goes through a `CONNECT` tunnel (RFC 9110 section 9.3.6): the proxy sees the host and
+/// port of the endpoint and nothing else; the TLS session with the provider runs inside the
+/// tunnel, and the provider's certificate is verified exactly as without a proxy. A request to a
+/// plain-HTTP loopback endpoint (tests) is forwarded in absolute form; it is refused when the
+/// proxy is not itself on a loopback IP literal, so that plain HTTP never leaves the host. Every
+/// HTTP request of the context goes through the proxy; there is no exclusion list.
+///
+/// With `https://`, the connection to the proxy is verified with the context's trust anchors
+/// (the platform's and [`ContextOptions::extra_root_certificates`]). With `http://`, the proxy
+/// credentials travel to the proxy unencrypted; the provider traffic is still protected by TLS.
+///
+/// Refused with [`Error::Config`] by [`Context::new`]: a URL with user info (the credentials go in
+/// [`username`](HttpProxy::username) and [`password`](HttpProxy::password)), a scheme other than
+/// `http` and `https` (SOCKS is not supported), a path, query or fragment, and, with
+/// [`ContextOptions::loopback_only`], a host that is not a loopback IP literal. No error text
+/// repeats the URL or a credential.
+///
+/// Credentials are sent as `Proxy-Authorization: Basic` (RFC 7617) when
+/// [`username`](HttpProxy::username) is set. A proxy that refuses them (`407`) makes the request
+/// fail with [`Error::Config`], which is not retryable: the credentials belong to the
+/// configuration of the context, not to the provider, so the error is never
+/// [`Error::Auth`](crate::Error::Auth). A proxy that refuses to open a tunnel, or cannot be
+/// reached, gives [`Error::Transient`](crate::Error::Transient). The password is removed from
+/// every error text like a provider credential, and `Debug` shows neither credential.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct HttpProxy {
+    /// `http://host:port` or `https://host:port`; without a port, 80 or 443.
+    pub url: String,
+    /// User name for Basic proxy authentication: not empty, without `:` and control characters.
+    pub username: Option<String>,
+    /// Password for Basic proxy authentication, without control characters. Requires
+    /// [`username`](HttpProxy::username).
+    pub password: Option<SecretString>,
+}
+
+impl HttpProxy {
+    /// A proxy without credentials.
+    pub fn new(url: String) -> HttpProxy {
+        HttpProxy {
+            url,
+            username: None,
+            password: None,
+        }
+    }
+
+    /// The same proxy with Basic credentials.
+    #[must_use]
+    pub fn with_credentials(mut self, username: String, password: SecretString) -> HttpProxy {
+        self.username = Some(username);
+        self.password = Some(password);
+        self
+    }
+}
+
+impl fmt::Debug for HttpProxy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A URL with user info is refused by `Context::new`, but `Debug` may run before that:
+        // a URL that could carry user info is not shown.
+        let url = if self.url.contains('@') {
+            "[withheld: the URL contains user info]"
+        } else {
+            self.url.as_str()
+        };
+        f.debug_struct("HttpProxy")
+            .field("url", &url)
+            .field("username", &self.username.as_ref().map(|_| "[set]"))
+            .field("password", &self.password.as_ref().map(|_| "[set]"))
+            .finish()
     }
 }
 

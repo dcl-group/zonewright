@@ -13,6 +13,8 @@
 //!   request: answer with a status, `429` with `Retry-After`, a redirect, an oversized body, a
 //!   delay, a dropped connection, a truncated body, slow headers, or a hook that changes the
 //!   mock's state between two requests.
+//! - [`proxy::ProxyServer`]: a forward proxy (`CONNECT` tunnels and plain forwarding) with optional
+//!   Basic proxy authentication, for the tests of the transport's proxy setting.
 //!
 //! # Writing a provider mock
 //!
@@ -87,6 +89,7 @@ mod fault;
 mod log;
 
 pub mod dns;
+pub mod proxy;
 
 pub mod acme_dns;
 pub mod beget;

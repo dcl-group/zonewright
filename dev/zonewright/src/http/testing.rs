@@ -95,12 +95,14 @@ pub(crate) fn client_cert() -> (
 
 /// A minimal HTTPS server on `127.0.0.1` built from `rustls` alone, on its own threads: it
 /// completes the handshake, reads one request head, answers `200` with a small JSON body and
-/// closes. It offers ALPN `h2` and `http/1.1` and records what was negotiated.
+/// closes. It offers ALPN `h2` and `http/1.1` and records what was negotiated and every request
+/// head it read.
 pub(crate) struct TlsServer {
     pub(crate) addr: SocketAddr,
     pub(crate) connections: Arc<AtomicUsize>,
     pub(crate) answered: Arc<AtomicUsize>,
     pub(crate) alpn: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub(crate) heads: Arc<Mutex<Vec<String>>>,
 }
 
 impl TlsServer {
@@ -130,18 +132,25 @@ impl TlsServer {
             connections: Arc::default(),
             answered: Arc::default(),
             alpn: Arc::default(),
+            heads: Arc::default(),
         };
-        let (connections, answered, alpn) = (
+        let (connections, answered, alpn, heads) = (
             server.connections.clone(),
             server.answered.clone(),
             server.alpn.clone(),
+            server.heads.clone(),
         );
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 connections.fetch_add(1, Ordering::SeqCst);
-                let (config, answered, alpn) = (config.clone(), answered.clone(), alpn.clone());
-                std::thread::spawn(move || serve_tls(stream, config, &answered, &alpn));
+                let (config, answered, alpn, heads) = (
+                    config.clone(),
+                    answered.clone(),
+                    alpn.clone(),
+                    heads.clone(),
+                );
+                std::thread::spawn(move || serve_tls(stream, config, &answered, &alpn, &heads));
             }
         });
         server
@@ -160,6 +169,7 @@ fn serve_tls(
     config: Arc<ServerConfig>,
     answered: &AtomicUsize,
     alpn: &Mutex<Vec<Vec<u8>>>,
+    heads: &Mutex<Vec<String>>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let Ok(conn) = ServerConnection::new(config) else {
@@ -174,6 +184,10 @@ fn serve_tls(
             Ok(n) => head.extend_from_slice(&buf[..n]),
         }
     }
+    heads
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(&head).into_owned());
     if let Some(protocol) = tls.conn.alpn_protocol() {
         alpn.lock().unwrap().push(protocol.to_vec());
     }
@@ -187,6 +201,160 @@ fn serve_tls(
     }
     tls.conn.send_close_notify();
     let _ = tls.flush();
+}
+
+/// A TLS terminator on `127.0.0.1` in front of a plain TCP service (`backend`), on its own
+/// threads: it completes the handshake with its certificate and relays the plaintext both ways.
+/// Put in front of a `zonewright_mock::proxy::ProxyServer`, it is an `https://` proxy. Counts
+/// connections and completed handshakes.
+pub(crate) struct TlsFront {
+    pub(crate) addr: SocketAddr,
+    pub(crate) connections: Arc<AtomicUsize>,
+    pub(crate) handshakes: Arc<AtomicUsize>,
+}
+
+impl TlsFront {
+    pub(crate) fn start(
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        backend: SocketAddr,
+    ) -> Self {
+        let config = ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+        let config = Arc::new(config);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let front = TlsFront {
+            addr: listener.local_addr().unwrap(),
+            connections: Arc::default(),
+            handshakes: Arc::default(),
+        };
+        let (connections, handshakes) = (front.connections.clone(), front.handshakes.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                connections.fetch_add(1, Ordering::SeqCst);
+                let (config, handshakes) = (config.clone(), handshakes.clone());
+                std::thread::spawn(move || relay_tls(stream, config, backend, &handshakes));
+            }
+        });
+        front
+    }
+
+    /// `https://127.0.0.1:<port>`, the proxy URL.
+    pub(crate) fn url(&self) -> String {
+        format!("https://{}", self.addr)
+    }
+}
+
+/// Relays between the TLS session on `stream` and a plain connection to `backend`. One thread
+/// moves client bytes (handshake and data) into the session and plaintext to the backend; the
+/// other moves backend bytes into the session. The session is shared under a lock; socket reads
+/// happen outside it.
+fn relay_tls(
+    stream: TcpStream,
+    config: Arc<ServerConfig>,
+    backend: SocketAddr,
+    handshakes: &AtomicUsize,
+) {
+    let Ok(conn) = ServerConnection::new(config) else {
+        return;
+    };
+    let session = Arc::new(Mutex::new(conn));
+    let socket = Arc::new(stream);
+    let mut upstream: Option<TcpStream> = None;
+    let mut counted = false;
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = match (&*socket).read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let mut plain = Vec::new();
+        {
+            let mut tls = session.lock().unwrap();
+            let mut input = &buf[..n];
+            while !input.is_empty() {
+                if tls.read_tls(&mut input).is_err() {
+                    return;
+                }
+                if tls.process_new_packets().is_err() {
+                    let _ = tls.write_tls(&mut &*socket);
+                    return;
+                }
+            }
+            let mut chunk = [0u8; 16 * 1024];
+            loop {
+                match tls.reader().read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(k) => plain.extend_from_slice(&chunk[..k]),
+                    Err(_) => break,
+                }
+            }
+            while tls.wants_write() {
+                if tls.write_tls(&mut &*socket).is_err() {
+                    return;
+                }
+            }
+            if !counted && !tls.is_handshaking() {
+                counted = true;
+                handshakes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        if plain.is_empty() {
+            continue;
+        }
+        if upstream.is_none() {
+            let Ok(connected) = TcpStream::connect(backend) else {
+                return;
+            };
+            let Ok(reader) = connected.try_clone() else {
+                return;
+            };
+            let (session, socket) = (session.clone(), socket.clone());
+            std::thread::spawn(move || {
+                let mut reader = reader;
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    let n = match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let mut tls = session.lock().unwrap();
+                    if tls.writer().write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    while tls.wants_write() {
+                        if tls.write_tls(&mut &*socket).is_err() {
+                            return;
+                        }
+                    }
+                }
+                let mut tls = session.lock().unwrap();
+                tls.send_close_notify();
+                while tls.wants_write() {
+                    if tls.write_tls(&mut &*socket).is_err() {
+                        break;
+                    }
+                }
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            });
+            upstream = Some(connected);
+        }
+        if let Some(up) = upstream.as_mut()
+            && up.write_all(&plain).is_err()
+        {
+            return;
+        }
+    }
+    if let Some(up) = upstream {
+        let _ = up.shutdown(std::net::Shutdown::Write);
+    }
 }
 
 /// A TCP listener on `127.0.0.1` that accepts connections and never says anything, so a TLS

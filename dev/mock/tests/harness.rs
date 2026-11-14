@@ -1,5 +1,5 @@
-//! Self-tests of the shared harness: server lifecycle, request log, fault injection and the echo
-//! server. Requests are written by hand over a raw `TcpStream`, so the crate needs no HTTP client.
+//! Self-tests of the shared harness: server lifecycle, request log, fault injection, the echo
+//! server and the forward proxy. Requests are written by hand over a raw `TcpStream`, so the crate needs no HTTP client.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +13,7 @@ use axum::routing::{get, post};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use zonewright_mock::echo::{self, Echo, EchoServer, Spelling};
+use zonewright_mock::proxy::{Behavior, ProxyServer};
 use zonewright_mock::{Fault, MockServer};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -798,4 +799,174 @@ async fn echo_has_fault_injection() {
     echo.faults().push(Fault::any().status(502));
     assert_eq!(send(echo.addr(), "GET", "/").await.status, Some(502));
     assert_eq!(send(echo.addr(), "GET", "/").await.status, Some(400));
+}
+
+// --- the forward proxy ---
+
+/// Reads from `stream` until the end of an answer head.
+async fn read_head(stream: &mut TcpStream) -> Answer {
+    tokio::time::timeout(TIMEOUT, async {
+        let mut raw = Vec::new();
+        let mut byte = [0u8; 1];
+        while !raw.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            raw.push(byte[0]);
+        }
+        Answer::parse(raw)
+    })
+    .await
+    .expect("a head within the timeout")
+}
+
+#[tokio::test]
+async fn proxy_tunnels_connect_to_loopback_and_records_the_bytes() {
+    let server = MockServer::start(hello_router()).await;
+    let proxy = ProxyServer::start().await;
+    assert_eq!(proxy.url(), format!("http://{}", proxy.addr()));
+    let mut stream = TcpStream::connect(proxy.addr()).await.unwrap();
+    let authority = server.addr().to_string();
+    stream
+        .write_all(format!("CONNECT {authority} HTTP/1.1\r\nhost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let established = read_head(&mut stream).await;
+    assert_eq!(established.status, Some(200));
+    stream
+        .write_all(&request("GET", "/hello", &[], ""))
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut raw))
+        .await
+        .unwrap()
+        .unwrap();
+    let answer = Answer::parse(raw);
+    assert_eq!(answer.status, Some(200));
+    assert_eq!(answer.body_str(), "hi");
+    let log = proxy.log();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].method, "CONNECT");
+    assert_eq!(log[0].target, authority);
+    assert_eq!(log[0].header("host"), Some(authority.as_str()));
+    let tunneled = String::from_utf8_lossy(&proxy.tunneled()).into_owned();
+    assert!(
+        tunneled.starts_with("GET /hello HTTP/1.1\r\n"),
+        "{tunneled}"
+    );
+    assert_eq!(server.log().len(), 1);
+    assert_eq!(proxy.connections(), 1);
+}
+
+#[tokio::test]
+async fn proxy_forwards_absolute_form_without_the_proxy_headers() {
+    let server = MockServer::start(hello_router()).await;
+    let proxy = ProxyServer::start().await;
+    let body = "{\"a\":1}";
+    let target = server.url("/zones/z1/records");
+    let answer = send_raw(
+        proxy.addr(),
+        &request(
+            "POST",
+            &target,
+            &[
+                ("proxy-authorization", "Basic cDpx"),
+                ("proxy-connection", "keep-alive"),
+                ("authorization", "Bearer t"),
+            ],
+            body,
+        ),
+    )
+    .await;
+    assert_eq!(answer.status, Some(200));
+    assert_eq!(answer.body_str(), body);
+    let log = proxy.log();
+    assert_eq!(log[0].method, "POST");
+    assert_eq!(log[0].target, target);
+    assert_eq!(log[0].header("proxy-authorization"), Some("Basic cDpx"));
+    let logged = server.log().last().unwrap();
+    assert_eq!(logged.path, "/zones/z1/records");
+    assert_eq!(logged.body_str(), body);
+    assert_eq!(logged.header("authorization"), Some("Bearer t"));
+    assert!(logged.header("proxy-authorization").is_none());
+    assert!(logged.header("proxy-connection").is_none());
+    assert!(proxy.tunneled().is_empty());
+}
+
+#[tokio::test]
+async fn proxy_demands_basic_credentials_and_echoes_what_it_got() {
+    let server = MockServer::start(hello_router()).await;
+    let proxy = ProxyServer::start().await;
+    proxy.require_basic("u", "p w");
+    // "u:p w" and "u:wrong" in base64.
+    let (right, wrong) = ("Basic dTpwIHc=", "Basic dTp3cm9uZw==");
+    let target = server.url("/hello");
+    let missing = send(proxy.addr(), "GET", &target).await;
+    assert_eq!(missing.status, Some(407));
+    assert_eq!(
+        missing.header("proxy-authenticate"),
+        Some("Basic realm=\"mock\"")
+    );
+    let refused = send_raw(
+        proxy.addr(),
+        &request("GET", &target, &[("proxy-authorization", wrong)], ""),
+    )
+    .await;
+    assert_eq!(refused.status, Some(407));
+    assert!(refused.body_str().contains(wrong), "{}", refused.body_str());
+    assert!(
+        refused.body_str().contains("u:wrong"),
+        "{}",
+        refused.body_str()
+    );
+    assert!(server.log().is_empty());
+    let passed = send_raw(
+        proxy.addr(),
+        &request("GET", &target, &[("proxy-authorization", right)], ""),
+    )
+    .await;
+    assert_eq!(passed.status, Some(200));
+    // A refusal echoes the credentials too, decoded.
+    proxy.set_behavior(Behavior::Refuse(502));
+    let refused = send_raw(
+        proxy.addr(),
+        &request("GET", &target, &[("proxy-authorization", right)], ""),
+    )
+    .await;
+    assert_eq!(refused.status, Some(502));
+    assert!(
+        refused.body_str().contains("u:p w"),
+        "{}",
+        refused.body_str()
+    );
+    assert_eq!(server.log().len(), 1);
+    assert_eq!(proxy.log().len(), 4);
+}
+
+#[tokio::test]
+async fn proxy_stalls_closes_and_connects_to_loopback_only() {
+    let proxy = ProxyServer::start().await;
+    // Anything but a loopback literal is refused without a connection attempt.
+    for target in ["192.0.2.1:443", "example.invalid:443", "localhost:443"] {
+        let a = send(proxy.addr(), "CONNECT", target).await;
+        assert_eq!(a.status, Some(403), "{target}");
+    }
+    let a = send(proxy.addr(), "GET", "http://192.0.2.1/x").await;
+    assert_eq!(a.status, Some(403));
+    let a = send(proxy.addr(), "GET", "/origin-form").await;
+    assert_eq!(a.status, Some(400));
+    proxy.set_behavior(Behavior::Close);
+    let a = send(proxy.addr(), "CONNECT", "127.0.0.1:9").await;
+    assert!(a.status.is_none() && a.raw.is_empty());
+    proxy.set_behavior(Behavior::Stall);
+    let mut stream = TcpStream::connect(proxy.addr()).await.unwrap();
+    stream
+        .write_all(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    let mut byte = [0u8; 1];
+    let stalled = tokio::time::timeout(Duration::from_millis(300), stream.read(&mut byte)).await;
+    assert!(stalled.is_err(), "the proxy answered: {stalled:?}");
+    assert_eq!(proxy.log().len(), 7);
 }

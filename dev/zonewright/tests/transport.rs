@@ -5,10 +5,12 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
-//! Tests of the HTTP transport through the public API: building a `Context`, its options, and
-//! source scans. The transport itself is private to the crate; its behavior against loopback
-//! servers (TLS, redirects, proxies, timeouts, the size cap, retries, rate limits, tokens,
-//! secrets in errors and logs) is tested by the unit tests in `src/http/tests.rs`.
+//! Tests of the HTTP transport through the public API: building a `Context`, its options (the
+//! proxy setting included, and a provider client that reaches its API through a proxy), and source
+//! scans. The transport itself is private to the crate; its behavior against loopback servers
+//! (TLS, redirects, proxies, timeouts, the size cap, retries, rate limits, tokens, secrets in
+//! errors and logs) is tested by the unit tests in `src/http/tests.rs` and
+//! `src/http/proxy_tests.rs`.
 
 mod common;
 
@@ -125,6 +127,104 @@ mod http {
         let mut options = ContextOptions::default();
         options.extra_root_certificates = vec![Vec::new()];
         assert_eq!(Context::new(options).unwrap_err().kind(), ErrorKind::Config);
+    }
+
+    /// The proxy setting through the public API: refusals without echo, and `Debug` without
+    /// credentials.
+    #[test]
+    fn a_proxy_setting_is_checked_and_printed_without_credentials() {
+        use secrecy::SecretString;
+        use zonewright::HttpProxy;
+
+        let with = |url: &str, loopback_only: bool| {
+            let mut options = ContextOptions::default();
+            options.loopback_only = loopback_only;
+            options.proxy = Some(HttpProxy::new(url.to_owned()).with_credentials(
+                "proxy-user".to_owned(),
+                SecretString::from("pr0xy-pa55-canary".to_owned()),
+            ));
+            options
+        };
+        for (url, loopback_only) in [
+            ("http://u:url-canary@127.0.0.1:3128", false),
+            ("socks5://127.0.0.1:1080", false),
+            ("http://127.0.0.1:3128/url-canary", false),
+            ("http://proxy.example.test:3128", true),
+        ] {
+            let e = Context::new(with(url, loopback_only)).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Config, "{url}");
+            let text = format!("{e} {e:?}");
+            assert!(text.contains("proxy.url"), "{text}");
+            assert!(
+                !text.contains("canary") && !text.contains("example"),
+                "{text}"
+            );
+        }
+        for url in ["http://127.0.0.1:3128", "https://[::1]:8443"] {
+            let options = with(url, true);
+            let ctx = Context::new(options.clone()).unwrap();
+            let text = format!("{options:?} {ctx:?}");
+            assert!(!text.contains("pr0xy-pa55-canary"), "{text}");
+            assert!(text.contains(url), "{text}");
+        }
+        // A URL with user info is not printed, even before `Context::new` refuses it.
+        let options = with("http://u:url-canary@127.0.0.1:3128", false);
+        assert!(!format!("{options:?}").contains("canary"));
+        // Without the setting the default is no proxy.
+        assert!(ContextOptions::default().proxy.is_none());
+    }
+
+    /// A provider client built through the public API reaches its API through the proxy: the
+    /// proxy gets the request with the proxy credentials, the API gets it with the provider
+    /// credential and without the proxy's.
+    #[cfg(feature = "cloudflare")]
+    #[tokio::test]
+    async fn a_provider_client_reaches_its_api_through_the_proxy() {
+        use secrecy::SecretString;
+        use zonewright::providers::cloudflare::{
+            Cloudflare, CloudflareConfig, CloudflareCredentials,
+        };
+        use zonewright::{HttpProxy, Provider};
+        use zonewright_mock::cloudflare::{CloudflareMock, Seed};
+        use zonewright_mock::proxy::ProxyServer;
+
+        let mock = CloudflareMock::start(Seed::standard()).await;
+        let proxy = ProxyServer::start().await;
+        proxy.require_basic("proxy-user", "proxy-password");
+        let mut options = ContextOptions::default();
+        options.loopback_only = true;
+        options.proxy = Some(HttpProxy::new(proxy.url()).with_credentials(
+            "proxy-user".to_owned(),
+            SecretString::from("proxy-password".to_owned()),
+        ));
+        let ctx = Context::new(options).unwrap();
+        let mut config = CloudflareConfig::default();
+        config.base_url = mock.base_url();
+        let credentials =
+            CloudflareCredentials::new(SecretString::from("cf-test-token".to_owned()));
+        let client = Cloudflare::new(config, credentials, &ctx).unwrap();
+        let zones = client.list_zones().await.unwrap();
+        let expected = zonewright::DomainName::parse("example.org").unwrap();
+        assert!(zones.iter().any(|z| z.name == expected), "{zones:?}");
+        let log = proxy.log();
+        assert!(!log.is_empty());
+        for entry in &log {
+            assert!(entry.target.starts_with(&mock.base_url()), "{entry:?}");
+            assert!(entry.header("proxy-authorization").is_some());
+        }
+        let api = mock.log().entries();
+        assert_eq!(api.len(), log.len());
+        for entry in &api {
+            assert_eq!(entry.header("authorization"), Some("Bearer cf-test-token"));
+            assert!(entry.header("proxy-authorization").is_none());
+        }
+
+        // Wrong proxy credentials: a configuration error, not the provider's `Auth`.
+        proxy.require_basic("proxy-user", "another-password");
+        let e = client.list_zones().await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Config, "{e:?}");
+        assert!(!e.is_retryable());
+        assert_eq!(mock.log().entries().len(), api.len());
     }
 
     #[test]
