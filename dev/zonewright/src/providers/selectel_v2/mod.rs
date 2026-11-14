@@ -1,8 +1,8 @@
 //! Selectel v2 (provider ID `selectel_v2`): the Selectel DNS v2 API, authenticated through the
 //! provider's Keystone identity service.
 //!
-//! The metadata is present in every build. The client, [`SelectelV2`], with its settings
-//! [`SelectelV2Config`] and credentials [`SelectelV2Credentials`], is compiled with the cargo
+//! The metadata is present in every build. The client, `SelectelV2`, with its settings
+//! `SelectelV2Config` and credentials `SelectelV2Credentials`, is compiled with the cargo
 //! feature `selectel_v2`.
 //!
 //! This version offers `check`, `list_zones` and the TXT value operations. The TXT value

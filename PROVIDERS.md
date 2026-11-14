@@ -26,6 +26,7 @@ None yet.
 | Provider    | ID            | Levels     | Notes                                                                                            |
 | ----------- | ------------- | ---------- | ------------------------------------------------------------------------------------------------ |
 | Selectel v2 | `selectel_v2` | TXT values | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
+| Cloudflare  | `cloudflare`  | TXT values |                                                                                                  |
 
 ## Planned
 
@@ -34,7 +35,6 @@ None yet.
 | acme-dns      | `acme_dns`      | TXT values only: the acme-dns API offers nothing else.                                           |
 | Beget         | `beget`         |                                                                                                  |
 | Cloud.ru      | `cloud_ru`      |                                                                                                  |
-| Cloudflare    | `cloudflare`    |                                                                                                  |
 | DigitalOcean  | `digitalocean`  |                                                                                                  |
 | Hetzner       | `hetzner`       |                                                                                                  |
 | nic.ru        | `nicru`         |                                                                                                  |

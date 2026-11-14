@@ -17,3 +17,4 @@ All notable changes to this crate are recorded in this file. The format follows
 - HTTP transport for provider clients on `rustls` with `aws-lc-rs`; the crate installs no
   process-wide crypto provider.
 - Selectel v2 client (`selectel_v2`): connection check, zone listing, TXT value operations.
+- Cloudflare client (`cloudflare`): connection check, zone listing, TXT value operations.

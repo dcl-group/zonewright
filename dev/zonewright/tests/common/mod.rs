@@ -33,10 +33,13 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
             r#"{"account_id":"123456","project_id":"project-a","username":"zw-test-user","base_url":"http://127.0.0.1:9/domains/v2","auth_url":"http://127.0.0.1:9/identity/v3"}"#,
             r#"{"password":"test-only-password"}"#,
         ),
+        ProviderId::Cloudflare => (
+            r#"{"base_url":"http://127.0.0.1:9/client/v4"}"#,
+            r#"{"api_token":"test-only-token"}"#,
+        ),
         ProviderId::AcmeDns
         | ProviderId::Beget
         | ProviderId::CloudRu
-        | ProviderId::Cloudflare
         | ProviderId::DigitalOcean
         | ProviderId::Hetzner
         | ProviderId::Nicru
