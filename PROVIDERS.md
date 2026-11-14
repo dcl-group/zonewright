@@ -23,7 +23,9 @@ None yet.
 
 ## Implemented, not yet verified
 
-None yet.
+| Provider    | ID            | Levels     | Notes                                                                                            |
+| ----------- | ------------- | ---------- | ------------------------------------------------------------------------------------------------ |
+| Selectel v2 | `selectel_v2` | TXT values | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
 
 ## Planned
 
@@ -39,7 +41,6 @@ None yet.
 | reg.ru        | `regru`         | An earlier version of this client was proven against the live API.                               |
 | RFC 2136      | `rfc2136`       | Dynamic update has no operation that lists the records of a zone.                                |
 | Route 53      | `route53`       |                                                                                                  |
-| Selectel v2   | `selectel_v2`   | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
 | Timeweb Cloud | `timeweb_cloud` |                                                                                                  |
 | VK Cloud      | `vk_cloud`      |                                                                                                  |
 | Yandex 360    | `yandex_360`    |                                                                                                  |

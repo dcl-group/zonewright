@@ -1,0 +1,485 @@
+//! The Selectel DNS v2 API as this client uses it: authentication, one function per endpoint,
+//! the wire types, paging and the classification of answers. Nothing here knows the value layer
+//! or the zone cache; `client.rs` and `txt.rs` build on these calls.
+//!
+//! Sources (hard rule 3):
+//!
+//! - [DNS v2]: <https://docs.selectel.ru/api/docs/cloud-services/dns_api/dns_api_actual/>.
+//! - [Authorization]: <https://docs.selectel.ru/api/authorization/>.
+//! - The provider's Go client `github.com/selectel/domains-go`, `pkg/v2` (`client.go`,
+//!   `model.go`, `error.go`, `rrsetManager.go`, `zoneManager.go`).
+//! - lego `providers/dns/selectelv2/selectelv2.go`.
+//!
+//! Endpoints used, all below the `base_url`:
+//!
+//! | Call            | Request                               | Success                  |
+//! | --------------- | ------------------------------------- | ------------------------ |
+//! | list zones      | `GET /zones?filter&limit&offset`      | 200, page                |
+//! | list rrsets     | `GET /zones/{zone}/rrset?name&rrset_types&limit&offset` | 200, page |
+//! | create rrset    | `POST /zones/{zone}/rrset`            | 200, the new rrset       |
+//! | update rrset    | `PATCH /zones/{zone}/rrset/{rrset}`   | 204                      |
+//! | delete rrset    | `DELETE /zones/{zone}/rrset/{rrset}`  | 204                      |
+//!
+//! [DNS v2]: https://docs.selectel.ru/api/docs/cloud-services/dns_api/dns_api_actual/
+//! [Authorization]: https://docs.selectel.ru/api/authorization/
+
+use std::fmt;
+use std::sync::{Mutex, PoisonError};
+
+use reqwest::{Method, Url};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::error::Error;
+use crate::http::keystone::X_AUTH_TOKEN;
+use crate::http::pager::{self, Page};
+use crate::http::{Endpoint, Http, Keystone, Request, Response, Token, TokenSource};
+use crate::name::DomainName;
+use crate::redact::Detail;
+
+/// Page size of every listing: the documented maximum and default of `limit`.
+// Source: DNS v2 documentation, query parameter `limit` (1 to 1000, default 1000).
+const PAGE_LIMIT: u64 = 1000;
+
+/// Record type names as the API spells them.
+pub(super) const TXT: &str = "TXT";
+
+/// One page of a listing.
+// Source: DNS v2 documentation and domains-go `List` (`count`, `next_offset`, `result`).
+#[derive(Deserialize)]
+struct Listing<T> {
+    /// Items under the filter, all pages together.
+    #[serde(default)]
+    count: Option<u64>,
+    /// Offset of the next page; `0` on the last one (not stated by the documentation; the
+    /// client also stops on an empty page and when `count` is reached).
+    #[serde(default)]
+    next_offset: Option<u64>,
+    /// The items. Required: a listing without it is not a complete read.
+    result: Vec<T>,
+}
+
+/// A zone as `GET /zones` returns it; other fields are ignored.
+// Source: DNS v2 documentation, zone object; domains-go `Zone`.
+#[derive(Debug, Deserialize)]
+pub(super) struct Zone {
+    /// The zone's identifier.
+    pub(super) id: String,
+    /// The zone name: absolute, with the trailing dot, in Unicode.
+    pub(super) name: String,
+    /// A disabled zone is not served.
+    #[serde(default)]
+    pub(super) disabled: Option<bool>,
+    /// The project that owns the zone. `GET /zones` may list zones of other projects, which the
+    /// token cannot change (`403`).
+    #[serde(default)]
+    pub(super) project_id: Option<String>,
+}
+
+/// An rrset as the API returns it; other fields are ignored.
+// Source: DNS v2 documentation, rrset object; `comment` and `managed_by` can be `null`
+// (observed in the log of lego issue #3208).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub(crate) struct Rrset {
+    /// The rrset's identifier.
+    pub(super) id: String,
+    /// The owner name: absolute, with the trailing dot, in Unicode.
+    pub(super) name: String,
+    /// The record type.
+    #[serde(rename = "type")]
+    pub(super) rtype: String,
+    /// TTL in seconds.
+    pub(super) ttl: u32,
+    /// Free text, kept on every update.
+    #[serde(default)]
+    pub(super) comment: Option<String>,
+    /// The records. Required: an rrset without it is not a complete read.
+    pub(super) records: Vec<Record>,
+}
+
+/// One record of an rrset. Written back exactly as read.
+// Source: DNS v2 documentation, `records[]`: `content` and `disabled`.
+// `pub(crate)`: it is the `Handle` of the client's `WholeSet` implementation, a crate-wide trait.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Record {
+    /// The value in the API's text form.
+    pub(super) content: String,
+    /// A disabled record is kept but not published.
+    #[serde(default)]
+    pub(super) disabled: bool,
+}
+
+/// The body of `POST /zones/{zone}/rrset`.
+// Source: DNS v2 documentation; domains-go `RRSetCreateForm`.
+#[derive(Serialize)]
+pub(super) struct NewRrset<'a> {
+    /// The owner name, absolute, in Unicode.
+    pub(super) name: &'a str,
+    /// The record type.
+    #[serde(rename = "type")]
+    pub(super) rtype: &'a str,
+    /// TTL in seconds.
+    pub(super) ttl: u32,
+    /// The records; 1 to 100.
+    pub(super) records: &'a [Record],
+}
+
+/// The body of `PATCH /zones/{zone}/rrset/{rrset}`: no `name` and no `type`.
+// Source: DNS v2 documentation; lego `rrsetUpdateForm` and domains-go `RRSetUpdateForm`
+// (`ttl`, `records`, `comment`, `managed_by`).
+#[derive(Serialize)]
+pub(super) struct RrsetUpdate<'a> {
+    /// TTL in seconds.
+    pub(super) ttl: u32,
+    /// The complete new list of records; 1 to 100.
+    pub(super) records: &'a [Record],
+    /// The rrset's comment, sent back so that it is kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) comment: Option<&'a str>,
+}
+
+/// The answer to a write that addresses a zone or rrset by identifier.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Written {
+    /// The provider accepted the write.
+    Done,
+    /// `404`: the zone or the rrset does not exist (any more).
+    NotFound,
+}
+
+/// The client's handle on the API: the transport, the endpoint and the token.
+pub(super) struct Api {
+    http: Http,
+    base: Endpoint,
+    keystone: Keystone,
+    tokens: TokenSource,
+    /// The project of the last token, as the identity service stated it.
+    project: Mutex<Option<String>>,
+}
+
+impl fmt::Debug for Api {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Api")
+            .field("base", &self.base)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Api {
+    /// The API at `base`, authenticated with tokens from `keystone`.
+    pub(super) fn new(http: Http, base: Endpoint, keystone: Keystone) -> Api {
+        Api {
+            http,
+            base,
+            keystone,
+            // Keystone tokens state their expiry (24 hours at Selectel, per the authorization
+            // documentation); no cap beyond it is needed.
+            tokens: TokenSource::new(None),
+            project: Mutex::new(None),
+        }
+    }
+
+    /// The ID of the project the last token is scoped to, if the identity service stated it.
+    /// Known once a token was obtained.
+    pub(super) fn token_project(&self) -> Option<String> {
+        self.project
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The token exchange: remembers the project the token is scoped to.
+    async fn fetch(&self) -> Result<Token, Error> {
+        let issued = self.keystone.fetch(&self.http).await?;
+        if let Some(id) = issued.project_id {
+            // Every state of the slot is valid; a panic elsewhere cannot corrupt it.
+            *self.project.lock().unwrap_or_else(PoisonError::into_inner) = Some(id);
+        }
+        Ok(issued.token)
+    }
+
+    /// Obtains a token unless a valid one is cached: proves that the credentials are accepted.
+    pub(super) async fn authenticate(&self) -> Result<(), Error> {
+        self.tokens.get(|| self.fetch()).await.map(drop)
+    }
+
+    /// Sends `request` with the project-scoped token in `X-Auth-Token`.
+    // Source: authorization documentation (the DNS API takes the token in `X-Auth-Token`).
+    async fn send(&self, request: &Request) -> Result<Response, Error> {
+        self.http
+            .send_with_token(request, &self.tokens, &X_AUTH_TOKEN, || self.fetch())
+            .await
+    }
+
+    /// Every zone whose name contains `filter` (all zones for `None`). The filter is a
+    /// substring search, so the caller compares names exactly.
+    // Source: DNS v2 documentation, `GET /zones` with `filter`; lego `getZone` compares
+    // `zone.Name` with the FQDN after filtering.
+    pub(super) async fn zones(&self, filter: Option<&str>) -> Result<Vec<Zone>, Error> {
+        let url = |offset: u64| {
+            let mut url = self.base.url().path("/zones");
+            if let Some(filter) = filter {
+                url = url.query("filter", filter);
+            }
+            page_query(url, offset).build()
+        };
+        self.list(url, None).await
+    }
+
+    /// Every rrset of type `rtype` in zone `zone_id` whose name contains `name` (the API's
+    /// filter is not exact; the caller compares). A `404` means the zone does not exist (a
+    /// stale identifier) and is `Error::ZoneNotFound` for `zone`.
+    // Source: DNS v2 documentation, `GET /zones/{zone_id}/rrset` with `name` and `rrset_types`;
+    // lego sends the name without the trailing dot and compares `rrset.Name` exactly.
+    pub(super) async fn rrsets(
+        &self,
+        zone: &DomainName,
+        zone_id: &str,
+        name: &str,
+        rtype: &'static str,
+    ) -> Result<Vec<Rrset>, Error> {
+        let url = |offset: u64| {
+            let url = self
+                .base
+                .url()
+                .path("/zones")
+                .id(zone_id)
+                .path("/rrset")
+                .query("name", name)
+                .query("rrset_types", rtype);
+            page_query(url, offset).build()
+        };
+        self.list(url, Some(zone)).await
+    }
+
+    /// Creates an rrset. Sent once: a create is not idempotent. `409` means an rrset of this
+    /// name and type appeared after the caller's read and is `Error::Conflict`.
+    // Source: DNS v2 documentation, `POST /zones/{zone_id}/rrset` (200 with the rrset; 409 on a
+    // conflict).
+    pub(super) async fn create_rrset(
+        &self,
+        zone_id: &str,
+        rrset: &NewRrset<'_>,
+    ) -> Result<Written, Error> {
+        let url = self
+            .base
+            .url()
+            .path("/zones")
+            .id(zone_id)
+            .path("/rrset")
+            .build()?;
+        let response = self
+            .send(&Request::new(Method::POST, url).json(rrset)?)
+            .await?;
+        match response.status() {
+            _ if response.is_success() => Ok(Written::Done),
+            404 => Ok(Written::NotFound),
+            409 => Err(Error::Conflict {
+                detail: Detail::constant(
+                    "an rrset of this name and type was created between the read and the write",
+                ),
+            }),
+            _ => Err(self.refusal(&response)),
+        }
+    }
+
+    /// Replaces the records, TTL and comment of an rrset. Sent once: the write carries no
+    /// condition, and a repeat would widen the window in which another writer's change is
+    /// overwritten (design section 5.3).
+    // Source: DNS v2 documentation, `PATCH /zones/{zone_id}/rrset/{rrset_id}` (204).
+    pub(super) async fn update_rrset(
+        &self,
+        zone_id: &str,
+        rrset_id: &str,
+        update: &RrsetUpdate<'_>,
+    ) -> Result<Written, Error> {
+        let url = self.rrset_url(zone_id, rrset_id)?;
+        let response = self
+            .send(&Request::new(Method::PATCH, url).json(update)?)
+            .await?;
+        self.written(&response)
+    }
+
+    /// Deletes an rrset. Idempotent: a delete by identifier.
+    // Source: DNS v2 documentation, `DELETE /zones/{zone_id}/rrset/{rrset_id}` (204).
+    pub(super) async fn delete_rrset(
+        &self,
+        zone_id: &str,
+        rrset_id: &str,
+    ) -> Result<Written, Error> {
+        let url = self.rrset_url(zone_id, rrset_id)?;
+        let response = self
+            .send(&Request::new(Method::DELETE, url).idempotent())
+            .await?;
+        self.written(&response)
+    }
+
+    fn rrset_url(&self, zone_id: &str, rrset_id: &str) -> Result<Url, Error> {
+        self.base
+            .url()
+            .path("/zones")
+            .id(zone_id)
+            .path("/rrset")
+            .id(rrset_id)
+            .build()
+    }
+
+    fn written(&self, response: &Response) -> Result<Written, Error> {
+        match response.status() {
+            _ if response.is_success() => Ok(Written::Done),
+            404 => Ok(Written::NotFound),
+            _ => Err(self.refusal(response)),
+        }
+    }
+
+    /// Reads every page of a listing. `url` builds the URL of the page at an offset. A `404`
+    /// is `Error::ZoneNotFound` for `zone` when one is given, else a refusal.
+    async fn list<T, U>(&self, url: U, zone: Option<&DomainName>) -> Result<Vec<T>, Error>
+    where
+        T: DeserializeOwned,
+        U: Fn(u64) -> Result<Url, Error>,
+    {
+        pager::collect(0, |offset| {
+            let url = url(offset);
+            async move { self.page(url?, offset, zone).await }
+        })
+        .await
+    }
+
+    async fn page<T: DeserializeOwned>(
+        &self,
+        url: Url,
+        offset: u64,
+        zone: Option<&DomainName>,
+    ) -> Result<Page<T, u64>, Error> {
+        let response = self.send(&Request::get(url)).await?;
+        if response.status() == 404
+            && let Some(zone) = zone
+        {
+            return Err(Error::zone_not_found(zone.clone()));
+        }
+        if !response.is_success() {
+            return Err(self.refusal(&response));
+        }
+        let listing: Listing<T> =
+            response.json("the provider's listing is not in the expected form")?;
+        let next = next_offset(offset, &listing);
+        Ok(Page {
+            items: listing.result,
+            next,
+        })
+    }
+
+    /// An answer the client does not expect. 401, 403, 429 and 5xx were mapped by the
+    /// transport already.
+    // Source: DNS v2 documentation, status codes 400 (bad request), 409 (conflict) and 422
+    // (validation error); the earlier implementation reported them as refusals and anything
+    // else as an unexpected answer.
+    fn refusal(&self, response: &Response) -> Error {
+        match response.status() {
+            400 | 409 | 422 => self.http.reject(response),
+            status => Error::Protocol {
+                detail: self.http.detail(&format!(
+                    "status {status}: {}",
+                    self.http.body_detail(response)
+                )),
+            },
+        }
+    }
+}
+
+/// Appends `limit` and `offset`.
+fn page_query(url: crate::http::url::UrlBuilder, offset: u64) -> crate::http::url::UrlBuilder {
+    url.query("limit", &PAGE_LIMIT.to_string())
+        .query("offset", &offset.to_string())
+}
+
+/// The offset of the page after the one at `offset`, or `None` on the last page. The
+/// documentation does not say how the last page is marked, so the listing ends at the first
+/// of: an empty page, `next_offset` absent or `0`, or `count` reached. A `next_offset` beyond
+/// the items received is followed.
+fn next_offset<T>(offset: u64, listing: &Listing<T>) -> Option<u64> {
+    let received = u64::try_from(listing.result.len()).unwrap_or(u64::MAX);
+    let after = offset.saturating_add(received);
+    let next = listing.next_offset.unwrap_or(0);
+    let last = received == 0 || next == 0 || listing.count.is_some_and(|count| after >= count);
+    (!last).then_some(after.max(next))
+}
+
+/// The provider's error message: `error` (a string, or an object with `message` as Keystone
+/// sends it) and `description`, joined by `: `.
+// Source: DNS v2 documentation and domains-go `BadResponseError` (`{"error", "description",
+// "location"}`); OpenStack Identity API v3 error body (`{"error": {"code", "message",
+// "title"}}`).
+pub(super) fn error_message(body: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        #[serde(default)]
+        error: Option<serde_json::Value>,
+        #[serde(default)]
+        description: Option<String>,
+    }
+    let body: ErrorBody = serde_json::from_str(body).ok()?;
+    let error = match body.error {
+        Some(serde_json::Value::String(text)) => Some(text),
+        Some(serde_json::Value::Object(object)) => object
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
+    .filter(|text| !text.is_empty());
+    let description = body.description.filter(|text| !text.is_empty());
+    match (error, description) {
+        (Some(error), Some(description)) => Some(format!("{error}: {description}")),
+        (Some(text), None) | (None, Some(text)) => Some(text),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Listing, error_message, next_offset};
+
+    #[test]
+    fn error_messages_join_error_and_description() {
+        for (body, expected) in [
+            (
+                r#"{"error":"Zone not found","description":"no such zone"}"#,
+                Some("Zone not found: no such zone"),
+            ),
+            (r#"{"error":"bad request"}"#, Some("bad request")),
+            (
+                r#"{"error":{"code":401,"message":"nope","title":"Unauthorized"}}"#,
+                Some("nope"),
+            ),
+            (r#"{"description":"only this"}"#, Some("only this")),
+            (r#"{"error":7}"#, None),
+            ("<html>oops</html>", None),
+        ] {
+            assert_eq!(error_message(body).as_deref(), expected, "{body}");
+        }
+    }
+
+    fn listing(count: Option<u64>, next: Option<u64>, items: usize) -> Listing<u8> {
+        Listing {
+            count,
+            next_offset: next,
+            result: vec![0; items],
+        }
+    }
+
+    #[test]
+    fn pages_end_on_any_last_page_marker() {
+        assert_eq!(
+            next_offset(0, &listing(Some(2500), Some(1000), 1000)),
+            Some(1000)
+        );
+        assert_eq!(next_offset(2000, &listing(Some(2500), Some(0), 500)), None);
+        assert_eq!(next_offset(0, &listing(Some(2500), None, 1000)), None);
+        assert_eq!(next_offset(1000, &listing(Some(2500), Some(2000), 0)), None);
+        assert_eq!(next_offset(0, &listing(Some(1000), Some(1000), 1000)), None);
+        // A next offset beyond the items received is followed.
+        assert_eq!(next_offset(0, &listing(None, Some(1500), 1000)), Some(1500));
+    }
+}

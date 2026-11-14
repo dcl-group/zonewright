@@ -5,8 +5,15 @@
 //! (<https://docs.openstack.org/api-ref/identity/v3/#password-authentication-with-scoped-authorization>):
 //! `POST /v3/auth/tokens` with the user's name, domain and password and a project scope; the
 //! token is returned in the `X-Subject-Token` header of a `201 Created` answer, its expiry in the
-//! body's `token.expires_at` (ISO 8601). The earlier implementations of both clients accepted
-//! `200` as well, and answered `400` with an authentication error; both are kept.
+//! body's `token.expires_at` (ISO 8601) and the project it is scoped to in `token.project.id`.
+//! The earlier implementations of both clients accepted `200` as well, and answered `400` with an
+//! authentication error; both are kept.
+//!
+//! The project is named by its ID, or by its name within a domain (a project name is unique only
+//! within its domain). Selectel documents both forms of the scope
+//! (<https://docs.selectel.ru/api/authorization/>: `"scope": {"project": {"name": ...,
+//! "domain": {"name": <account number>}}}`, or `{"project": {"id": ...}}`); the OpenStack
+//! reference above defines both.
 
 use bytes::Bytes;
 use reqwest::Method;
@@ -84,12 +91,47 @@ struct Named<'a> {
 
 #[derive(Serialize)]
 struct Scope<'a> {
-    project: ProjectId<'a>,
+    project: ProjectRef<'a>,
 }
 
+/// The `project` member of the scope: `{"id": ..}` or `{"name": .., "domain": {"name": ..}}`.
 #[derive(Serialize)]
-struct ProjectId<'a> {
-    id: &'a str,
+#[serde(untagged)]
+enum ProjectRef<'a> {
+    Id { id: &'a str },
+    Name { name: &'a str, domain: Named<'a> },
+}
+
+/// The project a token is scoped to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectScope<'a> {
+    /// The project with this ID.
+    Id(&'a str),
+    /// The project with this name in the Keystone domain `domain`.
+    Name {
+        /// The project's name.
+        name: &'a str,
+        /// The domain the project belongs to.
+        domain: &'a str,
+    },
+}
+
+/// What an exchange returns: the token, and the ID of the project it is scoped to when the
+/// answer states one (which a client scoped by project name needs to recognize its project).
+pub(crate) struct Issued {
+    /// The token and its lifetime.
+    pub(crate) token: Token,
+    /// `token.project.id` of the answer.
+    pub(crate) project_id: Option<String>,
+}
+
+impl std::fmt::Debug for Issued {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Issued")
+            .field("token", &self.token)
+            .field("project_id", &self.project_id)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -99,18 +141,27 @@ struct TokenAnswer {
 
 #[derive(Deserialize)]
 struct TokenBody {
+    #[serde(default)]
     expires_at: Option<String>,
+    #[serde(default)]
+    project: Option<ProjectBody>,
+}
+
+#[derive(Deserialize)]
+struct ProjectBody {
+    #[serde(default)]
+    id: Option<String>,
 }
 
 impl Keystone {
     /// An exchange against the identity endpoint `identity` (the URL that ends in `/v3`) for
-    /// user `user_name` in domain `user_domain`, scoped to project `project_id`. The password
-    /// must also be registered with the client's scrubber.
+    /// user `user_name` in domain `user_domain`, scoped to `project`. The password must also be
+    /// registered with the client's scrubber.
     pub(crate) fn new(
         identity: &Endpoint,
         user_name: &str,
         user_domain: &str,
-        project_id: &str,
+        project: ProjectScope<'_>,
         password: &SecretString,
     ) -> Result<Keystone, Error> {
         use secrecy::ExposeSecret as _;
@@ -128,11 +179,23 @@ impl Keystone {
                     },
                 },
                 scope: Scope {
-                    project: ProjectId { id: project_id },
+                    project: match project {
+                        ProjectScope::Id(id) => ProjectRef::Id { id },
+                        ProjectScope::Name { name, domain } => ProjectRef::Name {
+                            name,
+                            domain: Named { name: domain },
+                        },
+                    },
                 },
             },
         })?;
         Ok(Keystone { url, body })
+    }
+
+    /// Exchanges the password for a token, for a [`TokenSource`](super::TokenSource) fetch
+    /// closure: [`Keystone::fetch`] without the project ID.
+    pub(crate) async fn fetch_token(&self, http: &Http) -> Result<Token, Error> {
+        self.fetch(http).await.map(|issued| issued.token)
     }
 
     /// Exchanges the password for a token. The transport registers the token with `http`'s
@@ -140,9 +203,9 @@ impl Keystone {
     ///
     /// Answers: 200 or 201 with `X-Subject-Token` is the token, its lifetime from
     /// `token.expires_at` (none stated when absent or unreadable, which the token cache treats
-    /// as one hour); 400 and 401 are `Error::Auth`; 403, 429 and 5xx follow the shared mapping;
-    /// anything else is `Error::Rejected`.
-    pub(crate) async fn fetch(&self, http: &Http) -> Result<Token, Error> {
+    /// as one hour) and the project from `token.project.id`; 400 and 401 are `Error::Auth`;
+    /// 403, 429 and 5xx follow the shared mapping; anything else is `Error::Rejected`.
+    pub(crate) async fn fetch(&self, http: &Http) -> Result<Issued, Error> {
         let request = Request::new(Method::POST, self.url.clone())
             .idempotent()
             .anonymous()
@@ -166,11 +229,21 @@ impl Keystone {
                     "the identity service answered without an X-Subject-Token header",
                 ),
             })?;
-        let lifetime = response
+        let body = response
             .json::<TokenAnswer>("the identity service's token answer is not in the expected form")
             .ok()
-            .and_then(|answer| answer.token.expires_at)
-            .and_then(|at| lifetime_until(&at));
-        Ok(Token::new(SecretString::from(token), lifetime))
+            .map(|answer| answer.token);
+        let lifetime = body
+            .as_ref()
+            .and_then(|body| body.expires_at.as_deref())
+            .and_then(lifetime_until);
+        let project_id = body
+            .and_then(|body| body.project)
+            .and_then(|project| project.id)
+            .filter(|id| !id.is_empty());
+        Ok(Issued {
+            token: Token::new(SecretString::from(token), lifetime),
+            project_id,
+        })
     }
 }

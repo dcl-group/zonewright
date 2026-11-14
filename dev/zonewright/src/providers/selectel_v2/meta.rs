@@ -4,9 +4,9 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements. Until the client is ported,
-//! every operation flag is false, `record_types` is empty and `txt_values` is `NotOffered`; the
-//! provider's developer switches them on together with the client code that implements them.
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and
+//! the TXT value operations on plain values. The record-level operations are not written yet, so
+//! their flags are false and `record_types` is empty.
 
 use crate::id::ProviderId;
 use crate::meta::{
@@ -123,17 +123,20 @@ const FIELDS: &[ConfigField] = &[
 
 /// What this version of the crate implements for Selectel v2.
 const CAPABILITIES: Capabilities = Capabilities {
-    list_zones: false,
+    list_zones: true,
     list_rrsets: false,
     get_rrset: false,
     set_rrset: false,
     delete_rrset: false,
-    add_txt_value: false,
-    remove_txt_value: false,
+    add_txt_value: true,
+    remove_txt_value: true,
     record_types: TypeSet::Listed(&[]),
     read_only_types: &[],
+    // The encoding of values with spaces, quotes, backslashes or non-ASCII bytes is not
+    // established for this API (design section 4.4).
     txt_plain_only: true,
-    txt_values: ValueGuarantee::NotOffered,
+    // The rrset is replaced whole by PATCH, which carries no condition (design section 3.5).
+    txt_values: ValueGuarantee::ReadThenWrite,
     preconditions: Preconditions::ReadThenWrite,
     atomic_rrset_write: false,
     ttl: TtlSupport::PerRrset {

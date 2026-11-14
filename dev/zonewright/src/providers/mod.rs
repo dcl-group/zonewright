@@ -61,6 +61,9 @@ pub(crate) fn meta_of(id: ProviderId) -> &'static ProviderMeta {
 /// [`AnyProvider::from_json`] returns [`Error::NotCompiled`] for every ID.
 #[derive(Debug)]
 #[non_exhaustive]
+// A client is built once and lives as long as the application uses the account; boxing the larger
+// clients would add an indirection to every call to save bytes that are allocated once.
+#[allow(clippy::large_enum_variant)]
 pub enum AnyProvider {
     /// The acme-dns client (`acme_dns`).
     #[cfg(feature = "acme_dns")]
@@ -472,23 +475,8 @@ impl From<yandex_cloud::YandexCloud> for AnyProvider {
 // PLACEHOLDER: removed together with the last placeholder client.
 /// What a placeholder client checks of its configuration: that both texts are JSON objects. It
 /// keeps nothing of them, and its errors are fixed texts.
-#[cfg(any(
-    feature = "acme_dns",
-    feature = "beget",
-    feature = "cloud_ru",
-    feature = "cloudflare",
-    feature = "digitalocean",
-    feature = "hetzner",
-    feature = "nicru",
-    feature = "regru",
-    feature = "rfc2136",
-    feature = "route53",
-    feature = "selectel_v2",
-    feature = "timeweb_cloud",
-    feature = "vk_cloud",
-    feature = "yandex_360",
-    feature = "yandex_cloud"
-))]
+// Unused in a build whose providers are all ported.
+#[allow(dead_code)]
 fn placeholder_json(settings: &str, credentials: &SecretString) -> Result<(), Error> {
     use secrecy::ExposeSecret as _;
 
@@ -509,42 +497,12 @@ fn placeholder_json(settings: &str, credentials: &SecretString) -> Result<(), Er
 
 // PLACEHOLDER: removed together with the last placeholder client.
 /// A JSON object whose contents are skipped without being stored.
-#[cfg(any(
-    feature = "acme_dns",
-    feature = "beget",
-    feature = "cloud_ru",
-    feature = "cloudflare",
-    feature = "digitalocean",
-    feature = "hetzner",
-    feature = "nicru",
-    feature = "regru",
-    feature = "rfc2136",
-    feature = "route53",
-    feature = "selectel_v2",
-    feature = "timeweb_cloud",
-    feature = "vk_cloud",
-    feature = "yandex_360",
-    feature = "yandex_cloud"
-))]
+// Unused in a build whose providers are all ported.
+#[allow(dead_code)]
 struct AnyObject;
 
-#[cfg(any(
-    feature = "acme_dns",
-    feature = "beget",
-    feature = "cloud_ru",
-    feature = "cloudflare",
-    feature = "digitalocean",
-    feature = "hetzner",
-    feature = "nicru",
-    feature = "regru",
-    feature = "rfc2136",
-    feature = "route53",
-    feature = "selectel_v2",
-    feature = "timeweb_cloud",
-    feature = "vk_cloud",
-    feature = "yandex_360",
-    feature = "yandex_cloud"
-))]
+// Unused in a build whose providers are all ported.
+#[allow(dead_code)]
 impl<'de> serde::Deserialize<'de> for AnyObject {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<AnyObject, D::Error> {
         struct Visitor;

@@ -29,6 +29,10 @@ pub fn dn(s: &str) -> DomainName {
 /// loopback address.
 pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
     match id {
+        ProviderId::SelectelV2 => (
+            r#"{"account_id":"123456","project_id":"project-a","username":"zw-test-user","base_url":"http://127.0.0.1:9/domains/v2","auth_url":"http://127.0.0.1:9/identity/v3"}"#,
+            r#"{"password":"test-only-password"}"#,
+        ),
         ProviderId::AcmeDns
         | ProviderId::Beget
         | ProviderId::CloudRu
@@ -39,7 +43,6 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
         | ProviderId::Regru
         | ProviderId::Rfc2136
         | ProviderId::Route53
-        | ProviderId::SelectelV2
         | ProviderId::TimewebCloud
         | ProviderId::VkCloud
         | ProviderId::Yandex360

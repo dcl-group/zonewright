@@ -28,7 +28,7 @@ use zonewright_mock::{Fault, MockServer};
 use crate::context::ContextOptions;
 use crate::error::{Error, ErrorKind};
 
-use super::keystone::{Keystone, X_AUTH_TOKEN};
+use super::keystone::{Keystone, ProjectScope, X_AUTH_TOKEN};
 use super::request::{BODY_LIMIT, Request, TokenAuth};
 use super::testing::echo::{
     CANARIES, CANARY_KEY, CANARY_PASSWORD, CANARY_TOKEN, CANARY_USER, Dialect, LogCapture,
@@ -961,7 +961,7 @@ async fn keystone_exchanges_the_password_for_a_scoped_token() {
         &identity,
         "user-1",
         "123456",
-        "project-abc",
+        ProjectScope::Id("project-abc"),
         &SecretString::from(CANARY_PASSWORD),
     )
     .unwrap();
@@ -970,7 +970,9 @@ async fn keystone_exchanges_the_password_for_a_scoped_token() {
     for _ in 0..2 {
         let request = get(&server, "/dns/zones");
         let response = http
-            .send_with_token(&request, &tokens, &X_AUTH_TOKEN, || keystone.fetch(&http))
+            .send_with_token(&request, &tokens, &X_AUTH_TOKEN, || {
+                keystone.fetch_token(&http)
+            })
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -1000,6 +1002,76 @@ async fn keystone_exchanges_the_password_for_a_scoped_token() {
     }
 }
 
+/// The scope by project name carries the project's domain; the project ID the answer states is
+/// returned with the token, and is absent when the answer states none.
+#[tokio::test]
+async fn keystone_scopes_by_project_name_and_returns_the_project_id() {
+    let router = Router::new().route(
+        "/v3/auth/tokens",
+        routing::post(|body: zonewright_mock::axum::body::Bytes| async move {
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let project = &request["auth"]["scope"]["project"];
+            // Scoped by name: the answer states the project; by ID: it states none.
+            let answer = if project.get("name").is_some() {
+                serde_json::json!({ "token": { "project": { "id": "project-from-name" } } })
+            } else {
+                serde_json::json!({ "token": {} })
+            };
+            (
+                StatusCode::CREATED,
+                [("x-subject-token", "ks-token-2")],
+                zonewright_mock::axum::Json(answer),
+            )
+        }),
+    );
+    let server = MockServer::start(router).await;
+    let ctx = testing::context(testing::options());
+    let identity = Endpoint::parse("auth_url", &server.url("/v3"), &ctx).unwrap();
+    let http = testing::http(&ctx, |b| b.secret(CANARY_PASSWORD).endpoint(&identity));
+    let password = SecretString::from(CANARY_PASSWORD);
+
+    let by_name = Keystone::new(
+        &identity,
+        "user-1",
+        "user-domain",
+        ProjectScope::Name {
+            name: "dns-project",
+            domain: "123456",
+        },
+        &password,
+    )
+    .unwrap();
+    let issued = by_name.fetch(&http).await.unwrap();
+    assert_eq!(issued.project_id.as_deref(), Some("project-from-name"));
+    assert!(!format!("{issued:?}").contains("ks-token"));
+    let request = server.log().last().unwrap();
+    assert_eq!(
+        request.body_json().unwrap()["auth"]["scope"],
+        serde_json::json!({ "project": { "name": "dns-project", "domain": { "name": "123456" } } })
+    );
+    assert_eq!(
+        request.body_json().unwrap()["auth"]["identity"]["password"]["user"]["domain"],
+        serde_json::json!({ "name": "user-domain" })
+    );
+
+    let by_id = Keystone::new(
+        &identity,
+        "user-1",
+        "user-domain",
+        ProjectScope::Id("project-abc"),
+        &password,
+    )
+    .unwrap();
+    assert_eq!(by_id.fetch(&http).await.unwrap().project_id, None);
+    assert_eq!(
+        server.log().last().unwrap().body_json().unwrap()["auth"]["scope"],
+        serde_json::json!({ "project": { "id": "project-abc" } })
+    );
+    // `fetch_token` is the same exchange without the project.
+    by_id.fetch_token(&http).await.unwrap();
+    assert_eq!(server.log().len(), 3);
+}
+
 #[tokio::test]
 async fn keystone_failures() {
     let ctx = testing::context(testing::options());
@@ -1020,7 +1092,7 @@ async fn keystone_failures() {
             &identity,
             "u",
             "d",
-            "p",
+            ProjectScope::Id("p"),
             &SecretString::from(CANARY_PASSWORD),
         )
         .unwrap();
@@ -1388,7 +1460,7 @@ async fn keystone_password_and_token_never_reach_errors() {
                 &identity,
                 CANARY_USER,
                 "domain",
-                "project",
+                ProjectScope::Id("project"),
                 &SecretString::from(CANARY_PASSWORD),
             )
             .unwrap();

@@ -316,6 +316,21 @@ impl Error {
             detail: Detail::new(detail),
         }
     }
+
+    /// The `Config` error for a settings object that does not deserialize, for provider clients.
+    ///
+    /// The text is built from the position only. The deserializer's own message is not used: it
+    /// can quote the input.
+    // Called by provider clients only; unused in a build without one.
+    #[allow(dead_code)]
+    pub(crate) fn settings_syntax(line: usize, column: usize) -> Error {
+        Error::Config {
+            detail: Detail::new(&format!(
+                "the settings are not a valid settings object (line {line}, column {column}); \
+                 unknown keys are refused"
+            )),
+        }
+    }
 }
 
 /// The kind of an [`Error`], with a stable identifier for each.

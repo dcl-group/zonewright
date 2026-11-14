@@ -1,1 +1,946 @@
-//! Mock of the Selectel v2 API. Written with the `selectel_v2` client.
+//! Mock of the Selectel DNS v2 API and of the Keystone identity service in front of it.
+//!
+//! Shapes follow the provider's documentation, the same sources the client cites:
+//!
+//! - DNS v2: <https://docs.selectel.ru/api/docs/cloud-services/dns_api/dns_api_actual/> and the
+//!   provider's Go client `github.com/selectel/domains-go` (`pkg/v2`): zones and rrsets with
+//!   `{count, next_offset, result}` pages, `limit` (1 to 1000) and `offset`; `PATCH` and `DELETE`
+//!   answer `204`; create answers `200` with the new rrset; errors are
+//!   `{"error", "description"}`; `ttl` 60 to 604800; `records` 1 to 100.
+//! - Keystone: <https://docs.selectel.ru/api/authorization/> and the OpenStack Identity v3 API:
+//!   `POST /identity/v3/auth/tokens` answers `201` with the token in `X-Subject-Token` and
+//!   `token.expires_at` in the body; wrong credentials answer `401`.
+//!
+//! Choices of the mock where the documentation says nothing, each made so that a client cannot
+//! rely on the lenient reading: the `filter` of the zone listing and the `name` of the rrset
+//! listing match substrings, so a listing returns "noisy" neighbors the client must skip; a
+//! zone of another project is either hidden or listed and answered `403`
+//! ([`Seed::list_foreign_zones`]); a TXT record whose content is not quoted is refused with
+//! `422`. Error texts are invented.
+//!
+//! A test holds a [`SelectelV2Mock`]. It dereferences to the [`MockServer`], so the request log
+//! and the fault queue of the shared harness work as usual:
+//!
+//! ```text
+//! let mock = SelectelV2Mock::start(Seed::standard()).await;
+//! mock.faults().push(Fault::on("POST", "/domains/v2/zones/*/rrset").status(500));
+//! // ... drive the client against mock.base_url() and mock.auth_url() ...
+//! assert_eq!(mock.control().txt_values("_acme-challenge.example.org"), ["v1"]);
+//! ```
+
+// Handlers return finished HTTP answers as their error values and hand them straight to axum;
+// boxing them would only add noise.
+#![allow(clippy::result_large_err)]
+
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::MockServer;
+
+/// Path of the DNS API below the server's base URL.
+pub const API_PATH: &str = "/domains/v2";
+
+/// Path of the identity service below the server's base URL.
+pub const IDENTITY_PATH: &str = "/identity/v3";
+
+/// Record types the DNS API accepts (documentation, "Ограничения").
+const TYPES: [&str; 14] = [
+    "A", "AAAA", "ALIAS", "CAA", "CNAME", "DNAME", "HTTPS", "MX", "NS", "SOA", "SRV", "SVCB",
+    "SSHFP", "TXT",
+];
+
+/// Largest page and largest rrset the API accepts.
+const MAX_LIMIT: usize = 1000;
+const MAX_RECORDS: usize = 100;
+
+/// The state the mock starts from.
+#[derive(Clone, Debug)]
+pub struct Seed {
+    /// Service users that can obtain a token.
+    pub users: Vec<User>,
+    /// Zones, in listing order.
+    pub zones: Vec<SeedZone>,
+    /// List zones of other projects in `GET /zones` (requests into them answer `403`). The live
+    /// API's behavior is not established, so the client is tested against both.
+    pub list_foreign_zones: bool,
+    /// Lifetime of an issued token, as stated in `token.expires_at`.
+    pub token_ttl_s: u64,
+}
+
+/// A service user.
+#[derive(Clone, Debug)]
+pub struct User {
+    /// The account number, which is also the user's Keystone domain.
+    pub account_id: String,
+    /// The user's name.
+    pub username: String,
+    /// The user's password.
+    pub password: String,
+    /// The project a token is scoped to.
+    pub project_id: String,
+    /// The project's name, for scope by name.
+    pub project_name: String,
+}
+
+/// A zone of the seed.
+#[derive(Clone, Debug)]
+pub struct SeedZone {
+    /// The zone name, with or without the trailing dot.
+    pub name: String,
+    /// The project that owns it.
+    pub project_id: String,
+}
+
+impl Seed {
+    /// Account `123456`, user `zw-test-user` with password `test-only-password` in project
+    /// `project-a` (named `dns-project`), and the zone `example.org.` in that project. Tokens
+    /// state a lifetime of 24 hours, as the provider's do.
+    pub fn standard() -> Self {
+        Self {
+            users: vec![User {
+                account_id: "123456".into(),
+                username: "zw-test-user".into(),
+                password: "test-only-password".into(),
+                project_id: "project-a".into(),
+                project_name: "dns-project".into(),
+            }],
+            zones: vec![SeedZone {
+                name: "example.org.".into(),
+                project_id: "project-a".into(),
+            }],
+            list_foreign_zones: false,
+            token_ttl_s: 24 * 60 * 60,
+        }
+    }
+}
+
+/// One record of an rrset, as the API carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Record {
+    /// The record's value in the API's text form; TXT content is quoted.
+    pub content: String,
+    /// A disabled record is kept but not published.
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+/// An rrset as the API returns it.
+#[derive(Clone, Debug, Serialize)]
+pub struct Rrset {
+    /// The rrset's identifier.
+    pub id: String,
+    /// The zone's identifier.
+    pub zone_id: String,
+    /// The owner name, absolute, with the trailing dot.
+    pub name: String,
+    /// The record type.
+    #[serde(rename = "type")]
+    pub rtype: String,
+    /// TTL in seconds.
+    pub ttl: u32,
+    /// Free text; `null` when unset.
+    pub comment: Option<String>,
+    /// Free text; `null` when unset.
+    pub managed_by: Option<String>,
+    /// The records.
+    pub records: Vec<Record>,
+}
+
+/// A zone as the mock holds it.
+#[derive(Clone, Debug)]
+pub struct Zone {
+    /// The zone's identifier.
+    pub id: String,
+    /// The zone name, lowercase, with the trailing dot.
+    pub name: String,
+    /// The project that owns it.
+    pub project_id: String,
+    /// A disabled zone is listed with `"disabled": true`.
+    pub disabled: bool,
+}
+
+#[derive(Debug)]
+struct IssuedToken {
+    project_id: String,
+    revoked: bool,
+}
+
+#[derive(Debug)]
+struct Inner {
+    seed: Seed,
+    zones: Vec<Zone>,
+    rrsets: Vec<Rrset>,
+    tokens: HashMap<String, IssuedToken>,
+    issued: Vec<String>,
+    next_id: u64,
+}
+
+impl Inner {
+    /// A new identifier in the UUID form the provider uses.
+    fn new_id(&mut self) -> String {
+        self.next_id += 1;
+        format!("00000000-0000-4000-8000-{:012x}", self.next_id)
+    }
+
+    fn zone(&self, id: &str) -> Option<&Zone> {
+        self.zones.iter().find(|z| z.id == id)
+    }
+}
+
+type Shared = Arc<Mutex<Inner>>;
+
+fn lock(state: &Shared) -> MutexGuard<'_, Inner> {
+    // Every state of the mock is usable; a test that panicked elsewhere must not poison it.
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A running Selectel v2 mock. Dereferences to its [`MockServer`] for the request log and the
+/// fault queue; [`SelectelV2Mock::control`] reads and changes the state.
+#[derive(Debug)]
+pub struct SelectelV2Mock {
+    server: MockServer,
+    control: Control,
+}
+
+/// Reads and changes the state of a [`SelectelV2Mock`]. Cheap to clone, so that a fault hook
+/// ([`Fault::run`](crate::Fault::run)) can change the state between two requests of a client.
+#[derive(Clone, Debug)]
+pub struct Control {
+    state: Shared,
+}
+
+impl Deref for SelectelV2Mock {
+    type Target = MockServer;
+
+    fn deref(&self) -> &MockServer {
+        &self.server
+    }
+}
+
+impl SelectelV2Mock {
+    /// Starts the mock with `seed`.
+    pub async fn start(seed: Seed) -> Self {
+        let mut inner = Inner {
+            seed: seed.clone(),
+            zones: Vec::new(),
+            rrsets: Vec::new(),
+            tokens: HashMap::new(),
+            issued: Vec::new(),
+            next_id: 0,
+        };
+        for zone in &seed.zones {
+            let id = inner.new_id();
+            inner.zones.push(Zone {
+                id,
+                name: fqdn(&zone.name),
+                project_id: zone.project_id.clone(),
+                disabled: false,
+            });
+        }
+        let state = Arc::new(Mutex::new(inner));
+        let router = Router::new()
+            .route("/identity/v3/auth/tokens", post(keystone))
+            .route("/domains/v2/zones", get(zones_list))
+            .route("/domains/v2/zones/{zone}", get(zone_get))
+            .route(
+                "/domains/v2/zones/{zone}/rrset",
+                get(rrset_list).post(rrset_create),
+            )
+            .route(
+                "/domains/v2/zones/{zone}/rrset/{rrset}",
+                get(rrset_get).patch(rrset_update).delete(rrset_delete),
+            )
+            .with_state(state.clone());
+        Self {
+            server: MockServer::start(router).await,
+            control: Control { state },
+        }
+    }
+
+    /// The DNS API endpoint, for the client's `base_url`.
+    pub fn base_url(&self) -> String {
+        self.server.url(API_PATH)
+    }
+
+    /// The identity endpoint, for the client's `auth_url`.
+    pub fn auth_url(&self) -> String {
+        self.server.url(IDENTITY_PATH)
+    }
+
+    /// The state control.
+    pub fn control(&self) -> &Control {
+        &self.control
+    }
+}
+
+impl Control {
+    /// Every zone.
+    pub fn zones(&self) -> Vec<Zone> {
+        lock(&self.state).zones.clone()
+    }
+
+    /// The identifier of zone `name`.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such zone.
+    pub fn zone_id(&self, name: &str) -> String {
+        let name = fqdn(name);
+        lock(&self.state)
+            .zones
+            .iter()
+            .find(|z| z.name == name)
+            .map(|z| z.id.clone())
+            .unwrap_or_else(|| panic!("no zone {name}"))
+    }
+
+    /// Adds a zone of `project_id`.
+    pub fn insert_zone(&self, name: &str, project_id: &str) -> String {
+        let mut inner = lock(&self.state);
+        let id = inner.new_id();
+        inner.zones.push(Zone {
+            id: id.clone(),
+            name: fqdn(name),
+            project_id: project_id.to_owned(),
+            disabled: false,
+        });
+        id
+    }
+
+    /// Marks zone `name` disabled or enabled.
+    pub fn set_zone_disabled(&self, name: &str, disabled: bool) {
+        let name = fqdn(name);
+        for zone in lock(&self.state)
+            .zones
+            .iter_mut()
+            .filter(|z| z.name == name)
+        {
+            zone.disabled = disabled;
+        }
+    }
+
+    /// Deletes zone `name` and creates it again under a new identifier, with the same rrsets
+    /// (under new rrset identifiers). Returns the new zone identifier.
+    pub fn recreate_zone(&self, name: &str) -> String {
+        let name = fqdn(name);
+        let mut inner = lock(&self.state);
+        let new_id = inner.new_id();
+        let old_id = inner
+            .zones
+            .iter()
+            .find(|z| z.name == name)
+            .map(|z| z.id.clone())
+            .unwrap_or_else(|| panic!("no zone {name}"));
+        for zone in inner.zones.iter_mut().filter(|z| z.id == old_id) {
+            zone.id = new_id.clone();
+        }
+        let moved: Vec<usize> = (0..inner.rrsets.len())
+            .filter(|&i| inner.rrsets[i].zone_id == old_id)
+            .collect();
+        for i in moved {
+            let rrset_id = inner.new_id();
+            let rrset = &mut inner.rrsets[i];
+            rrset.zone_id = new_id.clone();
+            rrset.id = rrset_id;
+        }
+        new_id
+    }
+
+    /// Every rrset.
+    pub fn rrsets(&self) -> Vec<Rrset> {
+        lock(&self.state).rrsets.clone()
+    }
+
+    /// The rrset of `name` and `rtype`, if any.
+    pub fn rrset(&self, name: &str, rtype: &str) -> Option<Rrset> {
+        let name = fqdn(name);
+        lock(&self.state)
+            .rrsets
+            .iter()
+            .find(|r| r.name == name && r.rtype == rtype)
+            .cloned()
+    }
+
+    /// Creates an rrset in zone `zone` directly, as another writer would: `contents` are the
+    /// API's text, each record enabled. Returns the rrset's identifier.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such zone.
+    pub fn insert_rrset(
+        &self,
+        zone: &str,
+        name: &str,
+        rtype: &str,
+        ttl: u32,
+        contents: &[&str],
+    ) -> String {
+        let zone_id = self.zone_id(zone);
+        let mut inner = lock(&self.state);
+        let id = inner.new_id();
+        inner.rrsets.push(Rrset {
+            id: id.clone(),
+            zone_id,
+            name: fqdn(name),
+            rtype: rtype.to_owned(),
+            ttl,
+            comment: None,
+            managed_by: None,
+            records: contents
+                .iter()
+                .map(|content| Record {
+                    content: (*content).to_owned(),
+                    disabled: false,
+                })
+                .collect(),
+        });
+        id
+    }
+
+    /// Sets the comment of the rrset of `name` and `rtype`.
+    pub fn set_comment(&self, name: &str, rtype: &str, comment: Option<&str>) {
+        let name = fqdn(name);
+        for rrset in lock(&self.state)
+            .rrsets
+            .iter_mut()
+            .filter(|r| r.name == name && r.rtype == rtype)
+        {
+            rrset.comment = comment.map(str::to_owned);
+        }
+    }
+
+    /// Disables or enables the TXT records of `name` whose unquoted content is `value`.
+    pub fn set_txt_disabled(&self, name: &str, value: &str, disabled: bool) {
+        let name = fqdn(name);
+        for rrset in lock(&self.state)
+            .rrsets
+            .iter_mut()
+            .filter(|r| r.name == name && r.rtype == "TXT")
+        {
+            for record in rrset
+                .records
+                .iter_mut()
+                .filter(|r| unquoted(&r.content) == value)
+            {
+                record.disabled = disabled;
+            }
+        }
+    }
+
+    /// The TXT contents of `name` with the outer quotes removed, in rrset order, disabled
+    /// records included.
+    pub fn txt_values(&self, name: &str) -> Vec<String> {
+        self.txt_records(name)
+            .into_iter()
+            .map(|r| unquoted(&r.content).to_owned())
+            .collect()
+    }
+
+    /// The unquoted TXT contents of the disabled records of `name`.
+    pub fn txt_disabled(&self, name: &str) -> Vec<String> {
+        self.txt_records(name)
+            .into_iter()
+            .filter(|r| r.disabled)
+            .map(|r| unquoted(&r.content).to_owned())
+            .collect()
+    }
+
+    fn txt_records(&self, name: &str) -> Vec<Record> {
+        self.rrset(name, "TXT")
+            .map(|r| r.records)
+            .unwrap_or_default()
+    }
+
+    /// Revokes every token issued so far: requests with them answer `401`.
+    pub fn revoke_tokens(&self) {
+        for token in lock(&self.state).tokens.values_mut() {
+            token.revoked = true;
+        }
+    }
+
+    /// Lifetime stated for tokens issued from now on. The mock does not enforce it; revoke
+    /// tokens to make the API refuse them.
+    pub fn set_token_ttl(&self, seconds: u64) {
+        lock(&self.state).seed.token_ttl_s = seconds;
+    }
+
+    /// Every token issued so far, in order.
+    pub fn issued_tokens(&self) -> Vec<String> {
+        lock(&self.state).issued.clone()
+    }
+
+    /// Number of tokens issued so far.
+    pub fn tokens_issued(&self) -> usize {
+        lock(&self.state).issued.len()
+    }
+}
+
+/// `name` lowercase with exactly one trailing dot.
+fn fqdn(name: &str) -> String {
+    let name = name.trim().to_lowercase();
+    if name.ends_with('.') {
+        name
+    } else {
+        format!("{name}.")
+    }
+}
+
+/// The content without its outer quotes.
+fn unquoted(content: &str) -> &str {
+    content.trim_matches('"')
+}
+
+/// An error answer in the documented shape.
+fn error(status: StatusCode, error: &str, description: Option<&str>) -> Response {
+    let mut body = json!({ "error": error });
+    if let Some(description) = description {
+        body["description"] = json!(description);
+    }
+    (status, axum::Json(body)).into_response()
+}
+
+fn validation(description: &str) -> Response {
+    error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "validation error",
+        Some(description),
+    )
+}
+
+/// `seconds` since the Unix epoch as an RFC 3339 timestamp in UTC.
+fn rfc3339(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let rest = seconds % 86_400;
+    // Civil date from days since 1970-01-01 (H. Hinnant, "chrono-Compatible Low-Level Date
+    // Algorithms").
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000000Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
+async fn keystone(State(state): State<Shared>, body: Bytes) -> Response {
+    let unauthorized = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"error": {
+                "code": 401,
+                "message": "The request you have made requires authentication.",
+                "title": "Unauthorized"
+            }})),
+        )
+            .into_response()
+    };
+    let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "malformed request body", None);
+    };
+    let auth = &request["auth"];
+    let user = &auth["identity"]["password"]["user"];
+    let project = &auth["scope"]["project"];
+    let mut inner = lock(&state);
+    let found = inner
+        .seed
+        .users
+        .iter()
+        .find(|u| {
+            auth["identity"]["methods"] == json!(["password"])
+                && user["name"].as_str() == Some(u.username.as_str())
+                && user["domain"]["name"].as_str() == Some(u.account_id.as_str())
+                && user["password"].as_str() == Some(u.password.as_str())
+                && (project["id"].as_str() == Some(u.project_id.as_str())
+                    || (project["name"].as_str() == Some(u.project_name.as_str())
+                        && project["domain"]["name"].as_str() == Some(u.account_id.as_str())))
+        })
+        .cloned();
+    let Some(user) = found else {
+        return unauthorized();
+    };
+    let n = inner.issued.len() + 1;
+    let token = format!("gAAAA-mock-token-{n:04}-zz");
+    inner.tokens.insert(
+        token.clone(),
+        IssuedToken {
+            project_id: user.project_id.clone(),
+            revoked: false,
+        },
+    );
+    inner.issued.push(token.clone());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expires_at = rfc3339(now + inner.seed.token_ttl_s);
+    drop(inner);
+    let mut response = (
+        StatusCode::CREATED,
+        axum::Json(json!({"token": {
+            "expires_at": expires_at,
+            "methods": ["password"],
+            "project": {"id": user.project_id, "name": user.project_name}
+        }})),
+    )
+        .into_response();
+    if let Ok(value) = token.parse() {
+        response.headers_mut().insert("x-subject-token", value);
+    }
+    response
+}
+
+/// The project of the request's `X-Auth-Token`, or the `401` answer.
+fn authorize(state: &Shared, headers: &HeaderMap) -> Result<String, Response> {
+    let refused = || error(StatusCode::UNAUTHORIZED, "authorization required", None);
+    let token = headers
+        .get("x-auth-token")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(refused)?;
+    match lock(state).tokens.get(token) {
+        Some(t) if !t.revoked => Ok(t.project_id.clone()),
+        _ => Err(refused()),
+    }
+}
+
+/// The zone `zone_id` as `project` may use it: `404` when there is none, `403` when it belongs
+/// to another project.
+fn own_zone(state: &Shared, zone_id: &str, project: &str) -> Result<Zone, Response> {
+    match lock(state).zone(zone_id) {
+        None => Err(error(StatusCode::NOT_FOUND, "zone not found", None)),
+        Some(zone) if zone.project_id != project => Err(error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            Some("the zone belongs to another project"),
+        )),
+        Some(zone) => Ok(zone.clone()),
+    }
+}
+
+fn query<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+/// One page of `items` by `limit` and `offset`: `next_offset` is the offset of the next page,
+/// `0` on the last page.
+fn paginate<T: Serialize>(items: Vec<T>, pairs: &[(String, String)]) -> Response {
+    let limit = match query(pairs, "limit").map(str::parse::<usize>) {
+        None => MAX_LIMIT,
+        Some(Ok(limit)) if (1..=MAX_LIMIT).contains(&limit) => limit,
+        Some(_) => return validation("limit must be between 1 and 1000"),
+    };
+    let offset = match query(pairs, "offset").map(str::parse::<usize>) {
+        None => 0,
+        Some(Ok(offset)) => offset,
+        Some(Err(_)) => return validation("offset must be a non-negative integer"),
+    };
+    let count = items.len();
+    let page: Vec<T> = items.into_iter().skip(offset).take(limit).collect();
+    let next = if offset + limit < count {
+        offset + limit
+    } else {
+        0
+    };
+    axum::Json(json!({ "count": count, "next_offset": next, "result": page })).into_response()
+}
+
+fn zone_json(zone: &Zone) -> Value {
+    json!({
+        "id": zone.id,
+        "name": zone.name,
+        "project_id": zone.project_id,
+        "comment": null,
+        "disabled": zone.disabled,
+        "protected": false,
+        "created_at": "2026-01-10T12:00:00Z",
+        "updated_at": "2026-01-10T12:00:00Z",
+        "delegation_checked_at": "2026-11-09T08:00:00Z",
+        "last_delegated_at": "2026-01-11T00:00:00Z",
+        "last_check_status": true
+    })
+}
+
+async fn zones_list(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    let project = match authorize(&state, &headers) {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    let filter = query(&pairs, "filter").unwrap_or("").to_lowercase();
+    let inner = lock(&state);
+    let zones: Vec<Value> = inner
+        .zones
+        .iter()
+        .filter(|z| z.project_id == project || inner.seed.list_foreign_zones)
+        .filter(|z| z.name.contains(&filter))
+        .map(zone_json)
+        .collect();
+    drop(inner);
+    paginate(zones, &pairs)
+}
+
+async fn zone_get(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(zone_id): Path<String>,
+) -> Response {
+    let project = match authorize(&state, &headers) {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    match own_zone(&state, &zone_id, &project) {
+        Ok(zone) => axum::Json(zone_json(&zone)).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn rrset_list(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(zone_id): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    let project = match authorize(&state, &headers) {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    if let Err(response) = own_zone(&state, &zone_id, &project) {
+        return response;
+    }
+    let name = query(&pairs, "name").unwrap_or("").to_lowercase();
+    // `rrset_types` may repeat, and one value may list several types separated by commas.
+    let types: Vec<&str> = pairs
+        .iter()
+        .filter(|(k, _)| k == "rrset_types")
+        .flat_map(|(_, v)| v.split(','))
+        .collect();
+    let items: Vec<Rrset> = lock(&state)
+        .rrsets
+        .iter()
+        .filter(|r| r.zone_id == zone_id && r.name.contains(&name))
+        .filter(|r| types.is_empty() || types.contains(&r.rtype.as_str()))
+        .cloned()
+        .collect();
+    paginate(items, &pairs)
+}
+
+async fn rrset_get(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((zone_id, rrset_id)): Path<(String, String)>,
+) -> Response {
+    let project = match authorize(&state, &headers) {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    if let Err(response) = own_zone(&state, &zone_id, &project) {
+        return response;
+    }
+    let found = lock(&state)
+        .rrsets
+        .iter()
+        .find(|r| r.id == rrset_id && r.zone_id == zone_id)
+        .cloned();
+    match found {
+        Some(rrset) => axum::Json(rrset).into_response(),
+        None => error(StatusCode::NOT_FOUND, "rrset not found", None),
+    }
+}
+
+fn validate_ttl(ttl: Option<u64>) -> Result<u32, Response> {
+    match ttl {
+        Some(ttl) if (60..=604_800).contains(&ttl) => {
+            u32::try_from(ttl).map_err(|_| validation("ttl must be between 60 and 604800"))
+        }
+        _ => Err(validation("ttl must be between 60 and 604800")),
+    }
+}
+
+fn validate_records(rtype: &str, records: &Value) -> Result<Vec<Record>, Response> {
+    let records: Vec<Record> =
+        serde_json::from_value(records.clone()).map_err(|_| validation("records are invalid"))?;
+    if records.is_empty() || records.len() > MAX_RECORDS {
+        return Err(validation("records must hold 1 to 100 items"));
+    }
+    let quoted = |c: &str| c.len() >= 2 && c.starts_with('"') && c.ends_with('"');
+    if rtype == "TXT" && records.iter().any(|r| !quoted(&r.content)) {
+        return Err(validation("TXT content must be quoted"));
+    }
+    Ok(records)
+}
+
+async fn rrset_create(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(zone_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let project = match authorize(&state, &headers) {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    let zone = match own_zone(&state, &zone_id, &project) {
+        Ok(zone) => zone,
+        Err(response) => return response,
+    };
+    let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "malformed request body", None);
+    };
+    let Some(name) = request["name"].as_str() else {
+        return validation("name is required");
+    };
+    if !name.ends_with('.') {
+        return validation("name must be absolute");
+    }
+    let name = name.to_lowercase();
+    if name != zone.name && !name.ends_with(&format!(".{}", zone.name)) {
+        return validation("name is outside the zone");
+    }
+    let rtype = request["type"].as_str().unwrap_or("");
+    if !TYPES.contains(&rtype) {
+        return validation("unsupported type");
+    }
+    let ttl = match validate_ttl(request["ttl"].as_u64()) {
+        Ok(ttl) => ttl,
+        Err(response) => return response,
+    };
+    let records = match validate_records(rtype, &request["records"]) {
+        Ok(records) => records,
+        Err(response) => return response,
+    };
+    let mut inner = lock(&state);
+    if inner
+        .rrsets
+        .iter()
+        .any(|r| r.zone_id == zone_id && r.name == name && r.rtype == rtype)
+    {
+        return error(StatusCode::CONFLICT, "rrset already exists", None);
+    }
+    let rrset = Rrset {
+        id: inner.new_id(),
+        zone_id,
+        name,
+        rtype: rtype.to_owned(),
+        ttl,
+        comment: None,
+        managed_by: None,
+        records,
+    };
+    inner.rrsets.push(rrset.clone());
+    axum::Json(rrset).into_response()
+}
+
+async fn rrset_update(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((zone_id, rrset_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    let project = match authorize(&state, &headers) {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    if let Err(response) = own_zone(&state, &zone_id, &project) {
+        return response;
+    }
+    let Ok(Value::Object(request)) = serde_json::from_slice::<Value>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "malformed request body", None);
+    };
+    // The update form has no `name` and no `type` (domains-go `RRSetUpdateForm`).
+    if request
+        .keys()
+        .any(|k| !matches!(k.as_str(), "ttl" | "records" | "comment" | "managed_by"))
+    {
+        return validation("unexpected field");
+    }
+    let Some(rtype) = lock(&state)
+        .rrsets
+        .iter()
+        .find(|r| r.id == rrset_id && r.zone_id == zone_id)
+        .map(|r| r.rtype.clone())
+    else {
+        return error(StatusCode::NOT_FOUND, "rrset not found", None);
+    };
+    let ttl = match request.get("ttl").map(|t| validate_ttl(t.as_u64())) {
+        None => None,
+        Some(Ok(ttl)) => Some(ttl),
+        Some(Err(response)) => return response,
+    };
+    let records = match request.get("records").map(|r| validate_records(&rtype, r)) {
+        None => None,
+        Some(Ok(records)) => Some(records),
+        Some(Err(response)) => return response,
+    };
+    let mut inner = lock(&state);
+    if let Some(rrset) = inner.rrsets.iter_mut().find(|r| r.id == rrset_id) {
+        if let Some(ttl) = ttl {
+            rrset.ttl = ttl;
+        }
+        if let Some(records) = records {
+            rrset.records = records;
+        }
+        if let Some(comment) = request.get("comment") {
+            rrset.comment = comment.as_str().map(str::to_owned);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn rrset_delete(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((zone_id, rrset_id)): Path<(String, String)>,
+) -> Response {
+    let project = match authorize(&state, &headers) {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    if let Err(response) = own_zone(&state, &zone_id, &project) {
+        return response;
+    }
+    let mut inner = lock(&state);
+    let before = inner.rrsets.len();
+    inner
+        .rrsets
+        .retain(|r| !(r.id == rrset_id && r.zone_id == zone_id));
+    if inner.rrsets.len() == before {
+        return error(StatusCode::NOT_FOUND, "rrset not found", None);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rfc3339;
+
+    #[test]
+    fn timestamps_are_rfc3339() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000000Z");
+        assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00.000000Z");
+        assert_eq!(rfc3339(4_102_444_799), "2099-12-31T23:59:59.000000Z");
+    }
+}
