@@ -73,4 +73,4 @@ The first version, 0.1.0. Not tagged yet.
   provider. Secrets are held in `secrecy` wrappers and never appear in `Debug` output, error text or
   `tracing` events. The crate emits `tracing` events only, without request or response bodies or
   headers.
-- Minimum supported Rust version 1.88, edition 2024.
+- Minimum supported Rust version 1.99, edition 2024.

@@ -3286,17 +3286,13 @@ repository.
 
 ### 13.1 MSRV
 
-`rust-version = "1.88"`, one value for the whole crate.
+`rust-version = "1.99"`, one value for the whole crate. Decided by the maintainer on 2026-11-14.
 
-It is the highest `rust-version` any dependency declares, in every feature combination: the Unicode
-data crates under `idna` (always present) and `hickory-proto` (inspector) both declare 1.88; nothing
-declares more (section 9.4). The language itself needs less (edition 2024 is 1.85). Both known
-consumers build on a newer toolchain.
-
-This differs from the value first proposed for this design, 1.89. That value came from a cache crate
-underneath a DNS resolver library; section 8.1 does not use that library, so the reason is gone and
-the same rule, "the lowest value that is true for every feature", now gives 1.88. Raising it later
-is a one-line change and, before 1.0, a minor-version event.
+The dependency tree would allow less: the highest `rust-version` any dependency declares, in every
+feature combination, is 1.88 (the Unicode data crates under `idna`, and `hickory-proto` for the
+inspector; section 9.4). The crate declares 1.99 because that is the toolchain its known consumers
+build on and the oldest one the gates are run with; a lower value would be a promise nobody checks.
+Raising it later is a one-line change and, before 1.0, a minor-version event.
 
 ### 13.2 SemVer notes
 
@@ -3341,7 +3337,7 @@ Foundations:
 
 1. **Async runtime: tokio.** The HTTP client requires it and both known consumers run on it. A
    runtime-agnostic design would need its own timers, locks and sockets for no present user.
-2. **MSRV 1.88.** Section 13.1.
+2. **MSRV 1.99.** Section 13.1.
 3. **TLS: the crate builds its own `rustls::ClientConfig` with an explicit `aws-lc-rs` provider and
    hands it to the HTTP client.** With the `rustls-no-provider` feature the ordinary path panics if
    the application installed no process-wide provider, and library code must not panic; installing
@@ -3478,8 +3474,16 @@ Added after review:
 
 ### 13.4 Open points for the maintainer
 
-1. **MSRV 1.88 or 1.89.** The design uses 1.88 (section 13.1). If the inspector should use a
-   resolver library after all, it is 1.89.
+The maintainer reviewed these points on 2026-11-14. Decided then: the MSRV is 1.99 (item 1); Timeweb
+Cloud writes through the v2 calls only, and reading through the listing calls that are not
+deprecated is accepted (item 12); the reading of hard rule 2 for providers without a conditional
+write is accepted (item 14); an explicit proxy setting is added (item 15). Accepted as they stand:
+the retry rule for non-idempotent requests (item 2), the inspector's default resolvers (item 4) and
+its refusal of private addresses by default (item 16), strict settings keys, and the provider's own
+published client code as a source of API facts next to its documentation. The remaining items stay
+open until a live check or a concrete need settles them.
+
+1. **MSRV: decided by the maintainer on 2026-11-14 — 1.99** (section 13.1).
 2. **Rate-limit answers to non-idempotent requests.** The earlier TXT-only implementation retried
    any request after a 429, on the grounds that a rate-limited request was not executed. `AGENTS.md`
    says only idempotent requests are retried automatically, and this design follows it: such a

@@ -157,7 +157,7 @@ logged.
 
 ## MSRV and versioning
 
-The minimum supported Rust version is 1.88, edition 2024. The crate follows
+The minimum supported Rust version is 1.99, edition 2024. The crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) as Cargo applies it: before 1.0 an
 incompatible change to the public API raises the second number. The public API uses only `std::time`
 for time, and its public enums and structs that will grow (provider IDs, error kinds, capabilities,
