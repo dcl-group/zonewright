@@ -2,7 +2,8 @@
 //!
 //! The keys are those of the earlier TXT-only implementation, minus its propagation timeout (an
 //! application setting now). They are a compatibility surface: applications persist them. The
-//! optional keys accept `null` as "the default", as the earlier implementation did.
+//! optional keys accept `null` as "the default", as the earlier implementation did; the default
+//! is declared on the field (design section 2.8), so a deserialized config holds it.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -47,12 +48,37 @@ pub struct Rfc2136Config {
     pub server: String,
     /// The name of the TSIG key, as configured on the server.
     pub key_name: String,
-    /// `hmac-sha256` (the default when `None`) or `hmac-sha512`.
-    #[serde(default)]
-    pub algorithm: Option<String>,
-    /// TTL of new records, in seconds: 1 to 86400; 60 when `None`.
-    #[serde(default)]
-    pub ttl: Option<u32>,
+    /// `hmac-sha256` (the default) or `hmac-sha512`. An absent key, `null` and an empty text
+    /// mean the default.
+    #[serde(
+        default = "default_algorithm",
+        deserialize_with = "algorithm_or_default"
+    )]
+    pub algorithm: String,
+    /// TTL of new records, in seconds: 1 to 86400; default 60. An absent key and `null` mean
+    /// the default.
+    #[serde(default = "default_ttl", deserialize_with = "ttl_or_default")]
+    pub ttl: u32,
+}
+
+/// The default of `algorithm`.
+fn default_algorithm() -> String {
+    Algorithm::HmacSha256.as_str().to_owned()
+}
+
+/// The default of `ttl`.
+fn default_ttl() -> u32 {
+    DEFAULT_TTL
+}
+
+/// `algorithm`, with `null` read as the default.
+fn algorithm_or_default<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_else(default_algorithm))
+}
+
+/// `ttl`, with `null` read as the default.
+fn ttl_or_default<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    Ok(Option::<u32>::deserialize(d)?.unwrap_or(DEFAULT_TTL))
 }
 
 impl Rfc2136Config {
@@ -62,8 +88,8 @@ impl Rfc2136Config {
         Rfc2136Config {
             server,
             key_name,
-            algorithm: None,
-            ttl: None,
+            algorithm: default_algorithm(),
+            ttl: DEFAULT_TTL,
         }
     }
 
@@ -88,12 +114,12 @@ impl Rfc2136Config {
             .ok()
             .filter(|name| !name.is_root())
             .ok_or_else(|| config("key_name must be a domain-style key name"))?;
-        let algorithm = match self.algorithm.as_deref().map(str::trim) {
-            None | Some("") => Algorithm::HmacSha256,
-            Some(text) => Algorithm::parse(text)
+        let algorithm = match self.algorithm.trim() {
+            "" => Algorithm::HmacSha256,
+            text => Algorithm::parse(text)
                 .ok_or_else(|| config("algorithm must be hmac-sha256 or hmac-sha512"))?,
         };
-        let ttl = self.ttl.unwrap_or(DEFAULT_TTL);
+        let ttl = self.ttl;
         if !(TTL_MIN..=TTL_MAX).contains(&ttl) {
             return Err(config("ttl must be between 1 and 86400"));
         }

@@ -113,7 +113,9 @@ pub struct Capabilities {
     /// How a write's precondition is checked.
     pub preconditions: Preconditions,
     /// Replacing an rrset is one request at the provider. False where the API works with
-    /// individual records and a replacement is several requests.
+    /// individual records (or individual values) and a replacement is several requests, and
+    /// where the API cannot replace a set at all. For a provider without record-level operations
+    /// in this crate, the flag says what a set replacement is at the provider's API.
     pub atomic_rrset_write: bool,
     /// How TTLs can be set.
     pub ttl: TtlSupport,

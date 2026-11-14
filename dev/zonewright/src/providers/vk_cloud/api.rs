@@ -31,7 +31,8 @@
 //! returned in part. The OpenAPI documents `404` ("records not found") for both listings next
 //! to `200`; it does not say whether an empty listing is `200 []` or `404`, and for the TXT
 //! listing a `404` can also mean that the zone does not exist. [`Api::txt_records`] therefore
-//! reports a `404` as such and leaves its meaning to the caller.
+//! reports a `404` as such and leaves its meaning to the caller; [`Api::zones`] treats it as
+//! an error, since it cannot be told apart from a wrong `dns_url`.
 
 use std::fmt;
 
@@ -41,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Error;
 use crate::http::keystone::X_AUTH_TOKEN;
 use crate::http::{Endpoint, Http, Keystone, Request, Response, TokenSource};
+use crate::redact::Detail;
 
 /// A zone as `GET /` returns it; other fields are ignored.
 // Source: the OpenAPI, `Dns_Filter` (`zone`, `tenant`, `status` and the identifier, named
@@ -162,7 +164,10 @@ impl Api {
             .await
     }
 
-    /// Every zone of the project. A `404` is an empty listing.
+    /// Every zone of the project. A `404` is `Error::Protocol`, not an empty listing: it is
+    /// also what a `dns_url` with a wrong path gets, and reading it as "no zones" would turn a
+    /// misconfiguration into `ZoneNotFound` for every zone. A project without zones whose
+    /// listing answers `404` therefore fails the same way.
     // Source: the OpenAPI, `GET /v2/dns/`: 200 with an array of `Dns_Filter`, 404 "records not
     // found"; lego internal/client.go:45-58 (`ListZones`, `JoinPath("/")`, so the path ends in
     // a slash).
@@ -170,7 +175,12 @@ impl Api {
         let url = self.base.url().path("/").build()?;
         let response = self.send(&Request::get(url)).await?;
         if response.status() == 404 {
-            return Ok(Vec::new());
+            return Err(Error::Protocol {
+                detail: Detail::constant(
+                    "the zone listing answered 404: either dns_url does not point at the DNS \
+                     API, or the project has no zones; the answer does not tell which",
+                ),
+            });
         }
         if !response.is_success() {
             return Err(self.refusal(&response));

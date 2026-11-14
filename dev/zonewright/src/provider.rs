@@ -191,9 +191,11 @@ pub enum RemoveOutcome {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct CheckReport {
-    /// The credentials were exercised against the provider and accepted. False only when the
-    /// provider offers no request that tests credentials without naming a zone and `zones` was
-    /// empty.
+    /// The credentials were exercised against the provider and accepted. False when no request
+    /// tested them: the provider offers no request that tests credentials without naming a zone
+    /// and `zones` was empty, or the provider offers no request that tests credentials without
+    /// writing (acme-dns, whose only authenticated request stores a value, so its `check` sends
+    /// nothing and always reports false).
     pub credentials_verified: bool,
     /// One entry per requested zone, in the order given.
     pub zones: Vec<ZoneCheck>,

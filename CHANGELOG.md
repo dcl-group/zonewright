@@ -44,3 +44,9 @@ All notable changes to this crate are recorded in this file. The format follows
 - Record-level operations (`list_rrsets`, `get_rrset`, `set_rrset`, `delete_rrset` with
   preconditions) for Selectel v2: A, AAAA, ALIAS, CAA, CNAME, MX, NS, SRV, SSHFP and TXT; SOA is
   read only.
+
+### Changed
+
+- `Rfc2136Config`: `algorithm` is a `String` and `ttl` a `u32` with the documented defaults; `null`
+  is still read as the default.
+- `Yandex360Config` no longer implements `Default`: `org_id` is required.

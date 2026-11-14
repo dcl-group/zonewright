@@ -26,6 +26,7 @@
 //!   "records not found" next to `200`); [`Seed::empty_is_404`] picks one, `404` by default;
 //! - a TXT listing or a create in a zone that does not exist answers `404` (documented for the
 //!   listing as "records not found" only, not documented for the create);
+//!   [`Seed::unknown_zone_lists_empty`] makes the listing answer `200 []` instead;
 //! - a create of a name and content that exists is the "duplication" of the documented `409`;
 //! - zones of another project are not listed, and requests into them answer `404`;
 //! - a record name ending in a dot is refused with `400` (names are relative to the zone);
@@ -88,6 +89,9 @@ pub struct Seed {
     pub zones: Vec<SeedZone>,
     /// Answer an empty listing with `404` instead of `200 []`.
     pub empty_is_404: bool,
+    /// Answer a TXT listing under a zone identifier that does not exist with `200 []` instead
+    /// of `404`.
+    pub unknown_zone_lists_empty: bool,
     /// The key of the zone identifier in the zone listing: `uuid` (lego) or `DnsUuid` (the
     /// OpenAPI).
     pub zone_id_key: &'static str,
@@ -134,6 +138,7 @@ impl Seed {
                 project_id: PROJECT.into(),
             }],
             empty_is_404: true,
+            unknown_zone_lists_empty: false,
             zone_id_key: "uuid",
             token_ttl_s: 24 * 60 * 60,
         }
@@ -591,6 +596,9 @@ async fn txt_list(
         Err(response) => return response,
     };
     if let Err(response) = own_zone(&state, &zone_id, &project) {
+        if lock(&state).seed.unknown_zone_lists_empty {
+            return axum::Json(Value::Array(Vec::new())).into_response();
+        }
         return response;
     }
     let records: Vec<Value> = lock(&state)

@@ -131,10 +131,14 @@ const CAPABILITIES: Capabilities = Capabilities {
     // Every write carries the old set in the strict call's deletions (design section 3.5).
     txt_values: ValueGuarantee::Conditional,
     preconditions: Preconditions::Atomic,
-    atomic_rrset_write: false,
+    // One `updateRecordSets` call replaces the record set (design section 11.1).
+    atomic_rrset_write: true,
+    // What the API accepts for a TTL a caller requests: 0 to 2147483647
+    // (https://yandex.cloud/en/docs/dns/api-ref/DnsZone/updateRecordSets, `ttl`). The narrower
+    // range of the `ttl` setting (config.rs) concerns the configured default only.
     ttl: TtlSupport::PerRrset {
-        min: 60,
-        max: 604_800,
+        min: 0,
+        max: 2_147_483_647,
     },
     provider_default_ttl: false,
     asynchronous: true,

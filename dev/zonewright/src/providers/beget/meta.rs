@@ -95,7 +95,8 @@ const CAPABILITIES: Capabilities = Capabilities {
     txt_plain_only: true,
     txt_values: ValueGuarantee::ReadThenWrite,
     preconditions: Preconditions::ReadThenWrite,
-    atomic_rrset_write: false,
+    // One `dns/changeRecords` request replaces the TXT set of the name (design section 11.1).
+    atomic_rrset_write: true,
     // The API keeps a TTL per record: lego providers/dns/beget/internal/types.go:94 (`ttl` of
     // each written record) and fixtures/getData-real.json (an observed answer, `ttl` on each).
     ttl: TtlSupport::PerRecord {

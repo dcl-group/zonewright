@@ -69,6 +69,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     txt_values: ValueGuarantee::Rotating,
     // No meaning: there is no read and no record-level write (design section 11.1).
     preconditions: Preconditions::ReadThenWrite,
+    // No rrset can be replaced: the API only adds a value to a rotating pair.
     atomic_rrset_write: false,
     // The server serves every value with a TTL of its own choosing.
     ttl: TtlSupport::NotSettable,

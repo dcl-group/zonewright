@@ -121,7 +121,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     // section 3.5).
     txt_values: ValueGuarantee::Conditional,
     preconditions: Preconditions::Atomic,
-    atomic_rrset_write: false,
+    atomic_rrset_write: true,
     ttl: TtlSupport::PerRrset {
         min: 1,
         max: 86_400,

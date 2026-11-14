@@ -123,9 +123,13 @@ fn acceptable(value: &Txt) -> Option<&str> {
 
 /// True when the error says the request did not change anything at the server: the transport
 /// knows it never reached the server (refused before it was sent, or no connection could be
-/// established), or the server answered with a refusal. Anything else (a timeout, a connection
-/// lost after it was established, a 5xx, an answer that cannot be read) leaves the outcome
-/// unknown.
+/// established: `SendError::certainly_unsent`), or the server answered with a refusal (a 4xx
+/// status, mapped to `Auth`, `Forbidden`, `RateLimited` or `Rejected`). Anything else leaves the
+/// outcome unknown: a timeout, a connection lost after it was established, a 5xx, an answer that
+/// cannot be read, and an error the transport raises itself without being certain that nothing
+/// was sent, such as a refused certificate (`Config`; in TLS 1.3 the server can refuse the client
+/// certificate after the client has started to send). The error kind alone never decides that a
+/// request was not sent.
 ///
 /// A failed connection must count as a refusal: as an unknown outcome it would stay in the memory
 /// as an unconfirmed send, and next to a live neighbor every repeat within the memory's lifetime
@@ -134,12 +138,7 @@ fn refused(error: &SendError) -> bool {
     error.certainly_unsent()
         || matches!(
             error.error().kind(),
-            ErrorKind::Auth
-                | ErrorKind::Forbidden
-                | ErrorKind::RateLimited
-                | ErrorKind::Rejected
-                | ErrorKind::Config
-                | ErrorKind::InvalidInput
+            ErrorKind::Auth | ErrorKind::Forbidden | ErrorKind::RateLimited | ErrorKind::Rejected
         )
 }
 
@@ -324,5 +323,24 @@ mod tests {
             detail: Detail::constant("not sent"),
         });
         assert!(refused(&local));
+    }
+
+    /// An error the transport raises itself is a refusal only when the transport is certain that
+    /// nothing was sent: a refused certificate (`Config`, not certainly unsent) leaves the
+    /// outcome unknown, the same kind refused before any connection is a refusal.
+    #[test]
+    fn transport_errors_count_only_when_certainly_unsent() {
+        let certificate = || Error::Config {
+            detail: Detail::constant(
+                "the provider's TLS certificate, or the client certificate, was not accepted",
+            ),
+        };
+        assert!(!refused(&SendError::answered(certificate())));
+        assert!(refused(&SendError::before_send(certificate())));
+        let build = || Error::InvalidInput {
+            detail: Detail::constant("the HTTP request could not be built"),
+        };
+        assert!(!refused(&SendError::answered(build())));
+        assert!(refused(&SendError::before_send(build())));
     }
 }

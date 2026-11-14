@@ -438,6 +438,111 @@ mod tests {
         assert_eq!(check(&unsigned, &request_mac, now), Verdict::Unsigned);
     }
 
+    /// The shape of a signed answer for [`answer_shaped`].
+    struct Shape {
+        /// Records placed in the additional section before the TSIG record; the MAC covers them.
+        extra: Vec<u8>,
+        extra_count: u16,
+        class: u16,
+        ttl: u32,
+        /// Octets appended to the TSIG RDATA after the other data, counted in RDLENGTH.
+        trailing: Vec<u8>,
+    }
+
+    impl Default for Shape {
+        fn default() -> Shape {
+            Shape {
+                extra: Vec::new(),
+                extra_count: 0,
+                class: CLASS_ANY,
+                ttl: 0,
+                trailing: Vec::new(),
+            }
+        }
+    }
+
+    /// Like [`answer`], with a correct MAC over whatever `shape` changes.
+    fn answer_shaped(k: &Key, request_mac: &[u8], time: u64, shape: &Shape) -> Vec<u8> {
+        let zone = DomainName::parse("example.org").unwrap();
+        let mut m = Builder::update(&zone).finish().unwrap().with_id(5);
+        m[2] |= 0x80;
+        m.extend_from_slice(&shape.extra);
+        m[10..12].copy_from_slice(&shape.extra_count.to_be_bytes());
+        let mut data = (request_mac.len() as u16).to_be_bytes().to_vec();
+        data.extend_from_slice(request_mac);
+        data.extend_from_slice(&m);
+        data.extend_from_slice(&variables(k, time, FUDGE, 0, &[]).unwrap());
+        let mac = k.algorithm.mac(SECRET, &data);
+        let mut rd = k.algorithm.wire_name().to_vec();
+        rd.extend_from_slice(&time.to_be_bytes()[2..]);
+        rd.extend_from_slice(&FUDGE.to_be_bytes());
+        rd.extend_from_slice(&(mac.len() as u16).to_be_bytes());
+        rd.extend_from_slice(&mac);
+        rd.extend_from_slice(&[0, 5, 0, 0, 0, 0]);
+        rd.extend_from_slice(&shape.trailing);
+        m.extend_from_slice(b"\x06zw-key\x00\x00\xfa");
+        m.extend_from_slice(&shape.class.to_be_bytes());
+        m.extend_from_slice(&shape.ttl.to_be_bytes());
+        m.extend_from_slice(&(rd.len() as u16).to_be_bytes());
+        m.extend_from_slice(&rd);
+        m[10..12].copy_from_slice(&(shape.extra_count + 1).to_be_bytes());
+        m
+    }
+
+    /// RFC 8945 section 5.1: the TSIG record "MUST be the only TSIG RR in the message"; section
+    /// 4.2: its CLASS "MUST be ANY" and its TTL "MUST be 0"; its RDATA is exactly the fields of
+    /// section 4.2. An answer that breaks one of these is refused even though its MAC, which
+    /// covers none of them, verifies.
+    #[test]
+    fn verify_refuses_a_misshapen_tsig_record() {
+        let k = key(Algorithm::HmacSha256, SECRET);
+        let request_mac = [9u8; 32];
+        let now = 1_700_000_000;
+        let check = |shape: Shape| {
+            let buf = answer_shaped(&k, &request_mac, now, &shape);
+            verify(&buf, &parse(&buf).unwrap(), &request_mac, &k, now)
+        };
+        // The helper itself produces an answer that verifies.
+        assert_eq!(check(Shape::default()), Verdict::Ok);
+        // A second TSIG record before the last one.
+        let mut extra = b"\x06zw-key\x00\x00\xfa\x00\xff\0\0\0\0".to_vec();
+        let mut rd = Algorithm::HmacSha256.wire_name().to_vec();
+        rd.extend_from_slice(&[
+            0, 0, 0x65, 0x53, 0xf1, 0x00, 0x01, 0x2c, 0, 0, 0, 5, 0, 0, 0, 0,
+        ]);
+        extra.extend_from_slice(&(rd.len() as u16).to_be_bytes());
+        extra.extend_from_slice(&rd);
+        assert!(matches!(
+            check(Shape {
+                extra,
+                extra_count: 1,
+                ..Shape::default()
+            }),
+            Verdict::Invalid(_)
+        ));
+        assert!(matches!(
+            check(Shape {
+                class: 1,
+                ..Shape::default()
+            }),
+            Verdict::Invalid(_)
+        ));
+        assert!(matches!(
+            check(Shape {
+                ttl: 60,
+                ..Shape::default()
+            }),
+            Verdict::Invalid(_)
+        ));
+        assert!(matches!(
+            check(Shape {
+                trailing: vec![0],
+                ..Shape::default()
+            }),
+            Verdict::Invalid(_)
+        ));
+    }
+
     #[test]
     fn algorithms_parse() {
         assert_eq!(

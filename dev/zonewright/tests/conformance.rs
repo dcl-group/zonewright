@@ -307,21 +307,67 @@ fn capabilities_are_consistent() {
     }
 }
 
+/// `Capabilities::atomic_rrset_write` per provider: whether replacing an rrset is one request at
+/// the provider (design sections 2.5 and 11.1). For a provider without record-level operations
+/// the flag says what a set replacement is at its API. Written out, with the reason, so that a
+/// change is deliberate.
+const ATOMIC_RRSET_WRITE: &[(ProviderId, bool)] = &[
+    // No rrset can be replaced: the API only adds a value to a rotating pair.
+    (ProviderId::AcmeDns, false),
+    // `dns/changeRecords` replaces the TXT set of a name in one request.
+    (ProviderId::Beget, true),
+    // One record per name and type holds the list of values; one request replaces it.
+    (ProviderId::CloudRu, true),
+    // Individual records: a replacement is several requests.
+    (ProviderId::Cloudflare, false),
+    (ProviderId::DigitalOcean, false),
+    // Value-level add and remove actions; a whole-set call is not established (design 11.2).
+    (ProviderId::Hetzner, false),
+    // Individual records, staged and committed: several requests.
+    (ProviderId::Nicru, false),
+    (ProviderId::Regru, false),
+    // One UPDATE deletes the RRset and adds the new RRs as one transaction (RFC 2136).
+    (ProviderId::Rfc2136, true),
+    // One change batch, applied atomically.
+    (ProviderId::Route53, true),
+    // An rrset with an ID, created or replaced in one request.
+    (ProviderId::SelectelV2, true),
+    (ProviderId::TimewebCloud, false),
+    (ProviderId::VkCloud, false),
+    (ProviderId::Yandex360, false),
+    // One `updateRecordSets` call.
+    (ProviderId::YandexCloud, true),
+];
+
+#[test]
+fn atomic_rrset_write_follows_the_native_unit() {
+    assert_eq!(ATOMIC_RRSET_WRITE.len(), ProviderId::ALL.len());
+    for &(id, atomic) in ATOMIC_RRSET_WRITE {
+        assert_eq!(
+            id.meta().capabilities.atomic_rrset_write,
+            atomic,
+            "{id}: atomic_rrset_write"
+        );
+    }
+}
+
 // ---- Metadata fields and configuration types ---------------------------------------------------
 
-/// The keys of the provider's `…Config` type: `settings` deserialized into it and serialized
-/// again. Every field of the type is serialized (none is skipped), so these are all its keys.
-/// `None` when the provider is not compiled in.
-fn config_type_keys(
+/// The provider's `…Config` type with `settings` deserialized into it and serialized again, as
+/// a JSON object. Every field of the type is serialized (none is skipped), so its keys are all
+/// the type's keys. `None` when the provider is not compiled in.
+fn config_type_object(
     id: ProviderId,
     #[allow(unused_variables)] // Reason: unused in a build without providers.
     settings: &str,
-) -> Option<BTreeSet<String>> {
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     #[allow(dead_code)] // Reason: unused in a build without providers.
-    fn keys<T: serde::de::DeserializeOwned + serde::Serialize>(settings: &str) -> BTreeSet<String> {
+    fn keys<T: serde::de::DeserializeOwned + serde::Serialize>(
+        settings: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
         let config: T = serde_json::from_str(settings).unwrap();
         match serde_json::to_value(&config).unwrap() {
-            serde_json::Value::Object(map) => map.keys().cloned().collect(),
+            serde_json::Value::Object(map) => map,
             other => panic!("the settings type serializes to {other}"),
         }
     }
@@ -442,7 +488,11 @@ fn metadata_fields_equal_the_configuration_types() {
             .filter(|f| f.secret)
             .map(|f| f.key.to_owned())
             .collect();
-        let config_keys = config_type_keys(id, settings).unwrap();
+        let config_keys: BTreeSet<String> = config_type_object(id, settings)
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
         if config_keys != settings_fields {
             misses.push(format!(
                 "{id}: settings fields {settings_fields:?} differ from the config type's keys {config_keys:?}"
@@ -510,6 +560,112 @@ fn metadata_fields_equal_the_configuration_types() {
         }
     }
     assert!(misses.is_empty(), "{}", misses.join("\n"));
+}
+
+/// The defaults the metadata states are the defaults of the `…Config` type: a settings object
+/// with only the required keys, deserialized into the type and serialized again, holds the
+/// metadata's default at every key that has one (as text, an integer compared by its decimal
+/// form). A field the type leaves unset (`null`) while the metadata states a default is a miss,
+/// as is a required key that the type fills in on its own. All misses are reported together.
+#[test]
+fn metadata_defaults_equal_the_configuration_types() {
+    let mut misses: Vec<String> = Vec::new();
+    for &id in ProviderId::ALL.iter().filter(|id| id.available()) {
+        let meta = id.meta();
+        let (settings, _) = common::sample_config(id);
+        let sample: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(settings).unwrap();
+        let required: serde_json::Map<String, serde_json::Value> = sample
+            .into_iter()
+            .filter(|(key, _)| meta.field(key).is_some_and(|f| f.required && !f.secret))
+            .collect();
+        let required_text = serde_json::Value::Object(required.clone()).to_string();
+        let object = config_type_object(id, &required_text).unwrap();
+        for field in meta.fields.iter().filter(|f| !f.secret) {
+            let key = field.key;
+            let value = object.get(key).unwrap_or(&serde_json::Value::Null);
+            match field.default {
+                Some(default) => {
+                    let text = match value {
+                        serde_json::Value::String(text) => Some(text.clone()),
+                        serde_json::Value::Number(number) => Some(number.to_string()),
+                        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+                        _ => None,
+                    };
+                    if text.as_deref() != Some(default) {
+                        misses.push(format!(
+                            "{id}.{key}: the metadata's default is {default:?}, the config type's is {value}"
+                        ));
+                    }
+                }
+                None if field.required && !required.contains_key(key) => {
+                    misses.push(format!(
+                        "{id}.{key}: required, but missing from the sample configuration"
+                    ));
+                }
+                None => {}
+            }
+        }
+        // A required key has no default in the type: without it, the settings do not
+        // deserialize.
+        for field in meta.fields.iter().filter(|f| f.required && !f.secret) {
+            let without = edit_object(&required_text, field.key, None);
+            if config_deserializes(id, &without) {
+                misses.push(format!(
+                    "{id}.{}: required, but the config type deserializes without it",
+                    field.key
+                ));
+            }
+        }
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n"));
+}
+
+/// Whether `settings` deserializes into the provider's `…Config` type (no validation).
+fn config_deserializes(
+    id: ProviderId,
+    #[allow(unused_variables)] // Reason: unused in a build without providers.
+    settings: &str,
+) -> bool {
+    #[allow(dead_code)] // Reason: unused in a build without providers.
+    fn parses<T: serde::de::DeserializeOwned>(settings: &str) -> bool {
+        serde_json::from_str::<T>(settings).is_ok()
+    }
+    #[allow(unused_imports)] // Reason: unused in a build without providers.
+    use zonewright::providers::*;
+    match id {
+        #[cfg(feature = "acme_dns")]
+        ProviderId::AcmeDns => parses::<acme_dns::AcmeDnsConfig>(settings),
+        #[cfg(feature = "beget")]
+        ProviderId::Beget => parses::<beget::BegetConfig>(settings),
+        #[cfg(feature = "cloud_ru")]
+        ProviderId::CloudRu => parses::<cloud_ru::CloudRuConfig>(settings),
+        #[cfg(feature = "cloudflare")]
+        ProviderId::Cloudflare => parses::<cloudflare::CloudflareConfig>(settings),
+        #[cfg(feature = "digitalocean")]
+        ProviderId::DigitalOcean => parses::<digitalocean::DigitalOceanConfig>(settings),
+        #[cfg(feature = "hetzner")]
+        ProviderId::Hetzner => parses::<hetzner::HetznerConfig>(settings),
+        #[cfg(feature = "nicru")]
+        ProviderId::Nicru => parses::<nicru::NicruConfig>(settings),
+        #[cfg(feature = "regru")]
+        ProviderId::Regru => parses::<regru::RegruConfig>(settings),
+        #[cfg(feature = "rfc2136")]
+        ProviderId::Rfc2136 => parses::<rfc2136::Rfc2136Config>(settings),
+        #[cfg(feature = "route53")]
+        ProviderId::Route53 => parses::<route53::Route53Config>(settings),
+        #[cfg(feature = "selectel_v2")]
+        ProviderId::SelectelV2 => parses::<selectel_v2::SelectelV2Config>(settings),
+        #[cfg(feature = "timeweb_cloud")]
+        ProviderId::TimewebCloud => parses::<timeweb_cloud::TimewebCloudConfig>(settings),
+        #[cfg(feature = "vk_cloud")]
+        ProviderId::VkCloud => parses::<vk_cloud::VkCloudConfig>(settings),
+        #[cfg(feature = "yandex_360")]
+        ProviderId::Yandex360 => parses::<yandex_360::Yandex360Config>(settings),
+        #[cfg(feature = "yandex_cloud")]
+        ProviderId::YandexCloud => parses::<yandex_cloud::YandexCloudConfig>(settings),
+        _ => false,
+    }
 }
 
 // ---- Behavior agrees with capabilities ---------------------------------------------------------

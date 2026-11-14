@@ -900,9 +900,9 @@ async fn vk_cloud_duplicate_create_is_conflict() {
     assert_eq!(values(&mock), ["AAA"]);
 }
 
-/// Whether an empty listing is `404` or `200 []` is not documented. Both work; a `404` under a
-/// cached zone identifier costs one zone lookup (it might be a stale identifier), under a fresh
-/// one it is an empty listing.
+/// Whether an empty listing is `404` or `200 []` is not documented. Both work; either one under
+/// a cached zone identifier costs one zone lookup (it might be a stale identifier), under a
+/// fresh one it is an empty listing.
 #[tokio::test]
 async fn vk_cloud_empty_listing_either_way() {
     for empty_is_404 in [true, false] {
@@ -916,26 +916,106 @@ async fn vk_cloud_empty_listing_either_way() {
         );
         assert_eq!(lookups(), 1);
         assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
-        // Cached identifier, empty zone: a 404 leads to one more lookup.
-        assert_eq!(lookups(), 1 + usize::from(empty_is_404));
+        // Cached identifier, empty zone: one more lookup.
+        assert_eq!(lookups(), 2, "empty_is_404 = {empty_is_404}");
+        // Cached identifier, a record in the zone: no lookup.
         assert_eq!(
             remove(&client, "AAA").await.unwrap(),
             RemoveOutcome::RrsetDeleted
         );
+        assert_eq!(lookups(), 2, "empty_is_404 = {empty_is_404}");
         assert_eq!(
             remove(&client, "AAA").await.unwrap(),
             RemoveOutcome::NotPresent
         );
-        assert_eq!(lookups(), 1 + 2 * usize::from(empty_is_404));
-        // A project without zones: an empty list either way.
+        assert_eq!(lookups(), 3, "empty_is_404 = {empty_is_404}");
+        // A project without zones: `200 []` is an empty list; a `404` cannot be told apart
+        // from a wrong `dns_url` and is an error.
         let mut seed = Seed::standard();
         seed.empty_is_404 = empty_is_404;
         seed.zones.clear();
         let (_mock, empty) = setup_with(seed).await;
-        assert!(empty.list_zones().await.unwrap().is_empty());
-        let e = add(&empty, "AAA").await.unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::ZoneNotFound, "{e:?}");
+        if empty_is_404 {
+            let e = empty.list_zones().await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+            let e = add(&empty, "AAA").await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+        } else {
+            assert!(empty.list_zones().await.unwrap().is_empty());
+            let e = add(&empty, "AAA").await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::ZoneNotFound, "{e:?}");
+        }
     }
+}
+
+/// A `dns_url` whose path is wrong gets `404` for the zone listing. That is an error in every
+/// operation, never "no zones": `check` does not report the zone as missing, `list_zones` does
+/// not return an empty list, and nothing is written.
+#[tokio::test]
+async fn vk_cloud_zone_listing_404_is_an_error() {
+    let (mock, client) = setup().await;
+    for _ in 0..3 {
+        mock.faults().push(Fault::on("GET", ZONES).status(404));
+    }
+    let e = client.check(&[zone()]).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    let e = client.list_zones().await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    assert_eq!(writes(&mock), 0);
+}
+
+/// The zone is recreated under a new identifier while the client has the old one cached, and
+/// the provider answers the old identifier's TXT listing with `200 []` (what it does is not
+/// documented). The empty listing is confirmed by a fresh lookup: the value in the recreated
+/// zone is found and removed, never reported `NotPresent`.
+#[tokio::test]
+async fn vk_cloud_empty_listing_under_cached_id_is_confirmed() {
+    let mut seed = Seed::standard();
+    seed.unknown_zone_lists_empty = true;
+    let (mock, client) = setup_with(seed).await;
+    let control = mock.control();
+    assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
+    control.recreate_zone(ZONE);
+    assert_eq!(values(&mock), ["AAA"], "the record moved with the zone");
+    let lookups = mock.log().count(Some("GET"), ZONES);
+    assert_eq!(
+        remove(&client, "AAA").await.unwrap(),
+        RemoveOutcome::RrsetDeleted
+    );
+    assert_eq!(mock.log().count(Some("GET"), ZONES), lookups + 1);
+    assert!(values(&mock).is_empty());
+}
+
+/// Two zones of the same name in the project, with different identifiers: the client does not
+/// pick one. Operations are `Config` with nothing written, `check` reports the zone as not
+/// usable with a reason, and `list_zones` lists the name once without caching an identifier.
+#[tokio::test]
+async fn vk_cloud_ambiguous_zone_name_is_refused() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    // An identifier cached before the second zone appears is dropped by `list_zones`.
+    assert_eq!(add(&client, "BBB").await.unwrap(), AddOutcome::Created);
+    let before = writes(&mock);
+    control.insert_zone(ZONE, PROJECT);
+    assert_eq!(client.list_zones().await.unwrap().len(), 1);
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Config, "{e:?}");
+    let e = remove(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Config, "{e:?}");
+    let report = client.check(&[zone()]).await.unwrap();
+    assert!(!report.zones[0].found);
+    assert!(report.zones[0].detail.is_some());
+    let zones = client.list_zones().await.unwrap();
+    assert_eq!(zones.len(), 1);
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(
+        e.kind(),
+        ErrorKind::Config,
+        "not cached by list_zones: {e:?}"
+    );
+    assert_eq!(writes(&mock), before);
 }
 
 /// A listing that is not complete or not in the documented form is an error, never a shorter

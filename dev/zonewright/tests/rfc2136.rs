@@ -21,9 +21,9 @@ use zonewright::{
     Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, Ttl, Txt,
 };
 use zonewright_mock::rfc2136::{
-    BADKEY, BADSIG, BADTIME, Call, FORMERR, Fault, KEY_NAME_512, MockKey, MockRecord, NOTAUTH,
-    NXDOMAIN, Op, REFUSED, Rfc2136Mock, SERVFAIL, STANDARD_SECRET, STANDARD_SECRET_512, Seed,
-    TYPE_A, TYPE_TXT, txt_rdata,
+    BADKEY, BADSIG, BADTIME, Call, FORMERR, Fault, KEY_NAME_512, MockKey, MockRecord, NOERROR,
+    NOTAUTH, NXDOMAIN, Op, REFUSED, Rfc2136Mock, SERVFAIL, STANDARD_SECRET, STANDARD_SECRET_512,
+    Seed, TYPE_A, TYPE_CNAME, TYPE_TXT, txt_rdata,
 };
 
 use common::echo::{LogCapture, assert_clean};
@@ -153,6 +153,28 @@ fn ttls(mock: &Rfc2136Mock) -> Vec<(String, u32)> {
 }
 
 // ---- Secrets (design section 12.2) -------------------------------------------------------------
+
+/// Neither client type nor credentials type can be printed with `Display` or serialized.
+/// Checked at compile time: the call is ambiguous if the trait is implemented.
+macro_rules! assert_not_impl {
+    ($ty:ty: $($tr:path),+ $(,)?) => {
+        $(
+            const _: () = {
+                trait AmbiguousIfImpl<A> {
+                    fn some_item() {}
+                }
+                impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+                #[allow(dead_code)] // Reason: a marker type that is never built.
+                struct Invalid;
+                impl<T: ?Sized + $tr> AmbiguousIfImpl<Invalid> for T {}
+                let _ = <$ty as AmbiguousIfImpl<_>>::some_item;
+            };
+        )+
+    };
+}
+
+assert_not_impl!(Rfc2136: std::fmt::Display, serde::Serialize);
+assert_not_impl!(Rfc2136Credentials: std::fmt::Display, serde::Serialize);
 
 /// A synthetic TSIG secret, distinctive in base64 and in hex.
 const CANARY_SECRET: &[u8; 32] = b"cAnary-TSIG-secret/+=@ \"'&<>\\~*!";
@@ -859,7 +881,7 @@ async fn rfc2136_ttl_policy() {
     assert!(mock.control().calls().is_empty());
     // The configured TTL.
     let mut config = settings(&mock, KEY);
-    config.ttl = Some(300);
+    config.ttl = 300;
     let custom = Rfc2136::new(config, credentials(STANDARD_SECRET), &context()).unwrap();
     custom
         .add_txt_value(&zone(), &dn("x.example.org"), &txt("v5"), None)
@@ -872,11 +894,72 @@ async fn rfc2136_ttl_policy() {
 async fn rfc2136_hmac_sha512_key() {
     let mock = Rfc2136Mock::start(Seed::standard()).await;
     let mut config = settings(&mock, KEY_NAME_512.trim_end_matches('.'));
-    config.algorithm = Some("hmac-sha512".to_owned());
+    config.algorithm = "hmac-sha512".to_owned();
     let client = Rfc2136::new(config, credentials(STANDARD_SECRET_512), &context()).unwrap();
     assert_eq!(add(&client, "v1").await.unwrap(), AddOutcome::Created);
     assert_eq!(mock.control().txt(NAME_DOT), ["v1"]);
     assert_eq!(mock.control().calls()[0].request_mac.len(), 64);
+}
+
+/// A server ignores the add of a TXT record at a name that holds a CNAME and still answers
+/// NOERROR (RFC 2136 section 3.4.2.2). The add carries the prerequisite "no CNAME RRset"
+/// (section 2.4.3), so it is `Rejected` instead of a `Created` for nothing; with read access, on
+/// the blind path, and when the CNAME appears between the read and the write. A removal finds no
+/// TXT value and writes nothing.
+#[tokio::test]
+async fn rfc2136_add_next_to_a_cname_is_rejected() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let cname = MockRecord {
+        name: NAME_DOT.to_owned(),
+        rtype: TYPE_CNAME,
+        ttl: 300,
+        rdata: b"\x06target\x07example\x03org\x00".to_vec(),
+    };
+    control.add_record(cname.clone());
+    let err = add(&client, "v1").await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Rejected, "{err:?}");
+    assert!(err.to_string().contains("CNAME"), "{err}");
+    assert_eq!((queries(&mock), updates(&mock)), (1, 1));
+    let calls = control.calls();
+    let update = calls.iter().find(|c| c.op == Op::Update).unwrap();
+    assert_eq!(update.prereqs.len(), 1);
+    let prereq = &update.prereqs[0];
+    assert_eq!(
+        (prereq.name.as_str(), prereq.rtype, prereq.class, prereq.ttl),
+        (NAME_DOT, TYPE_CNAME, 254, 0)
+    );
+    assert!(prereq.rdata.is_empty());
+    assert_eq!(control.records(NAME_DOT), std::slice::from_ref(&cname));
+
+    // Removal: no TXT value at the name, nothing written.
+    control.clear_calls();
+    assert_eq!(
+        remove(&client, "v1").await.unwrap(),
+        RemoveOutcome::NotPresent
+    );
+    assert_eq!(updates(&mock), 0);
+
+    // The blind path.
+    control.refuse_queries(true);
+    assert_eq!(
+        add(&client, "v1").await.unwrap_err().kind(),
+        ErrorKind::Rejected
+    );
+    assert_eq!(control.records(NAME_DOT), std::slice::from_ref(&cname));
+    control.refuse_queries(false);
+
+    // A CNAME created by another writer between the read and the write: the server evaluates
+    // the prerequisite with the update.
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.push(Fault::on(Op::Update).foreign_record(cname.clone()));
+    assert_eq!(
+        add(&client, "v0").await.unwrap_err().kind(),
+        ErrorKind::Rejected
+    );
+    assert_eq!((queries(&mock), updates(&mock)), (1, 1));
+    assert_eq!(control.records(NAME_DOT), [cname]);
 }
 
 // ---- Blind writes (design section 3.5) ---------------------------------------------------------
@@ -1019,7 +1102,7 @@ async fn rfc2136_tsig_errors_are_auth_errors() {
     );
     // The key's algorithm differs from the server's: BADKEY as well.
     let mut config = settings(&mock, KEY);
-    config.algorithm = Some("hmac-sha512".to_owned());
+    config.algorithm = "hmac-sha512".to_owned();
     let other_alg = Rfc2136::new(config, credentials(STANDARD_SECRET), &ctx).unwrap();
     assert_eq!(
         remove(&other_alg, "AAA").await.unwrap_err().kind(),
@@ -1187,6 +1270,38 @@ async fn rfc2136_check_reports_zones() {
             .all(|c| c.prereqs.len() == 1 && c.prereqs[0].class == 255)
     );
     assert!(mock.control().records("example.org.").is_empty());
+}
+
+/// SERVFAIL to the query of `check(&[])` is repeated and then `Transient`, never a report.
+#[tokio::test]
+async fn rfc2136_check_without_zones_servfail_is_transient() {
+    let (mock, client) = setup().await;
+    mock.control()
+        .push(Fault::on(Op::Query).rcode(SERVFAIL).times(3));
+    let err = tokio::time::timeout(SLOW, client.check(&[]))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Transient, "{err:?}");
+    assert_eq!(queries(&mock), 3);
+}
+
+/// A signed answer that reports a TSIG error under an RCODE other than NOTAUTH contradicts RFC
+/// 8945 sections 5.2.1 to 5.2.3, where every TSIG error a server reports carries RCODE 9
+/// (NOTAUTH): it is `Protocol`, neither a success nor an `Auth` error, and it is not repeated.
+#[tokio::test]
+async fn rfc2136_tsig_error_without_notauth_is_protocol() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.push(Fault::on(Op::Update).rcode(NOERROR).tsig_error(BADSIG));
+    let err = add(&client, "v1").await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Protocol, "{err:?}");
+    assert_eq!(updates(&mock), 1);
+    control.push(Fault::on(Op::Query).rcode(NOERROR).tsig_error(BADTIME));
+    assert_eq!(
+        client.check(&[]).await.unwrap_err().kind(),
+        ErrorKind::Protocol
+    );
 }
 
 /// Without zones, `check` still exercises the key: a signed query whose answer is verified.

@@ -118,6 +118,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     // One record per value, created and deleted by identifier (design section 3.5).
     txt_values: ValueGuarantee::PerValue,
     preconditions: Preconditions::ReadThenWrite,
+    // Individual records with IDs: a replacement is several requests.
     atomic_rrset_write: false,
     ttl: TtlSupport::PerRecord {
         min: 60,

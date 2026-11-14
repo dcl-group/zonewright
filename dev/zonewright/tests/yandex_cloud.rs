@@ -27,7 +27,7 @@ use zonewright_mock::Fault;
 use zonewright_mock::axum;
 use zonewright_mock::axum::http::{Method, StatusCode};
 use zonewright_mock::axum::response::IntoResponse as _;
-use zonewright_mock::echo::{DEFAULT_ISSUED_TOKEN, EchoServer, Echoed, Render};
+use zonewright_mock::echo::{DEFAULT_ISSUED_TOKEN, Echo, EchoServer, Echoed, Render};
 use zonewright_mock::yandex_cloud::{
     Seed, SeedZone, StrictFailure, YandexCloudMock, ec_private_key_pem, other_test_key, test_key,
 };
@@ -247,6 +247,72 @@ async fn yandex_cloud_secret_echo() {
             }
         }
     }
+
+    // The key ID and the service account ID travel only inside the signed JWT (the `kid` of its
+    // header, the `iss` of its claims), base64url-encoded. An IAM service that quotes the
+    // decoded JWT back in its error message puts them in plain text: they are redacted too.
+    for status in [400, 401] {
+        let label = format!("{status} iam decoded jwt");
+        let echo = Echo::new(status)
+            .token_path("/no-token-endpoint")
+            .render_under(TOKENS, decoded_jwt(status))
+            .start()
+            .await;
+        let client = echo_client(&echo, &echo.url(TOKENS));
+        let mut texts = Vec::new();
+        match client.check(&[zone()]).await {
+            Ok(report) => panic!("{label}: check passed without a token: {report:?}"),
+            Err(e) => texts.push(format!("{e} | {e:?}")),
+        }
+        match client
+            .add_txt_value(&zone(), &name(), &txt("v1"), None)
+            .await
+        {
+            Ok(outcome) => panic!("{label}: the echo accepted a write: {outcome:?}"),
+            Err(e) => texts.push(format!("{e} | {e:?}")),
+        }
+        assert!(
+            echo.log().count(Some("POST"), TOKENS) >= 2,
+            "{label}: the IAM service was not reached"
+        );
+        for text in &texts {
+            assert!(
+                text.contains(REDACTED),
+                "{label}: the decoded JWT did not reach the error: {text}"
+            );
+            assert_clean(&label, text, &secrets);
+        }
+    }
+}
+
+/// A renderer for the IAM token path that decodes the JWT of the request and answers `status`
+/// with its header and claims, in plain text, as the error message.
+fn decoded_jwt(status: u16) -> Render {
+    Arc::new(move |e: &Echoed| {
+        let body: Value = serde_json::from_str(&e.body).unwrap();
+        let jwt = body["jwt"].as_str().unwrap();
+        let parts: Vec<Value> = jwt
+            .split('.')
+            .take(2)
+            .map(|part| {
+                let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(part)
+                    .unwrap();
+                serde_json::from_slice(&raw).unwrap()
+            })
+            .collect();
+        let kid = parts[0]["kid"].as_str().unwrap();
+        let iss = parts[1]["iss"].as_str().unwrap();
+        assert_eq!((kid, iss), (CANARY_KEY, CANARY_USER));
+        (
+            StatusCode::from_u16(status).unwrap(),
+            axum::Json(json!({
+                "code": 3,
+                "message": format!("cannot accept the JWT of key {kid} for account {iss}"),
+            })),
+        )
+            .into_response()
+    })
 }
 
 /// A renderer that answers the reads like the API (one public zone; no record set, or a TXT set
@@ -809,19 +875,8 @@ async fn yandex_cloud_add_creates_rrset() {
         .unwrap();
     assert_eq!(set.ttl, "300");
 
-    // A TTL outside the provider's range is refused before any request.
-    let requests = mock.log().len();
-    let e = client
-        .add_txt_value(
-            &zone(),
-            &name(),
-            &txt("DDD"),
-            Some(Ttl::from_secs(30).unwrap()),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
     // A value that is not plain is refused before any request.
+    let requests = mock.log().len();
     let e = add(&client, "two words").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
     assert_eq!(mock.log().len(), requests);
@@ -905,6 +960,78 @@ async fn yandex_cloud_txt_dialect() {
     assert_eq!(data(&mock), [undecodable]);
     assert_eq!(add(&client, "plain").await.unwrap(), AddOutcome::Appended);
     assert_eq!(data(&mock), [undecodable, "plain"]);
+}
+
+/// The TTL a caller requests may be anything the API accepts, 0 to 2147483647, not only the
+/// range of the `ttl` setting.
+#[tokio::test]
+async fn yandex_cloud_caller_ttl_covers_the_api_range() {
+    let (mock, client) = setup().await;
+    for (i, secs) in [0u32, 30, 604_801, 2_147_483_647].into_iter().enumerate() {
+        let name = dn(&format!("_acme-challenge.t{i}.example.org"));
+        let outcome = client
+            .add_txt_value(
+                &zone(),
+                &name,
+                &txt("AAA"),
+                Some(Ttl::from_secs(secs).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, AddOutcome::Created, "{secs}");
+        let set = mock
+            .control()
+            .rrset(ZONE, &format!("_acme-challenge.t{i}.example.org"), "TXT")
+            .unwrap();
+        assert_eq!(set.ttl, secs.to_string());
+    }
+    let caps = &ProviderId::YandexCloud.meta().capabilities;
+    assert!(caps.ttl.accepts(0) && caps.ttl.accepts(2_147_483_647));
+}
+
+/// A foreign value that the client can decode but stores in another form (two quoted
+/// character-strings) is written back exactly as read, never re-encoded, when a value is added
+/// next to it or removed from beside it.
+#[tokio::test]
+async fn yandex_cloud_kept_values_are_written_as_read() {
+    let (mock, client) = setup().await;
+    let foreign = "\"for\" \"eign\"";
+    mock.control()
+        .insert_rrset(ZONE, NAME, "TXT", "60", &[foreign]);
+    assert_eq!(add(&client, "ours").await.unwrap(), AddOutcome::Appended);
+    assert_eq!(data(&mock), [foreign, "ours"]);
+    assert_eq!(
+        last_update(&mock)["additions"][0]["data"],
+        json!([foreign, "ours"])
+    );
+    assert_eq!(
+        remove(&client, "ours").await.unwrap(),
+        RemoveOutcome::Removed
+    );
+    assert_eq!(data(&mock), [foreign]);
+    assert_eq!(last_update(&mock)["additions"][0]["data"], json!([foreign]));
+}
+
+/// After `updateRecordSets` was accepted (200), an answer whose operation cannot be read leaves
+/// the outcome unknown: `Transient`, not `Protocol` (design section 3.7), and not repeated.
+#[tokio::test]
+async fn yandex_cloud_unreadable_operation_after_accepted_write_is_transient() {
+    let (mock, client) = setup().await;
+    for (label, body) in [
+        ("not json", "not json".to_owned()),
+        ("no operation", r#"{"unexpected":true}"#.to_owned()),
+        (
+            "unsafe id",
+            json!({"id": "../op", "done": false}).to_string(),
+        ),
+    ] {
+        let before = writes(&mock);
+        mock.faults()
+            .push(Fault::on("POST", UPDATE).respond(200, body));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Transient, "{label}: {e:?}");
+        assert_eq!(writes(&mock), before + 1, "{label}: sent once");
+    }
 }
 
 /// A record set holds at most 100 values: the 101st is refused before the write.

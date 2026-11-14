@@ -77,6 +77,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     // Every value is a record of its own; requests name only our records (design section 3.5).
     txt_values: ValueGuarantee::PerValue,
     preconditions: Preconditions::ReadThenWrite,
+    // Individual records with IDs: a replacement is several requests.
     atomic_rrset_write: false,
     ttl: TtlSupport::PerRecord {
         min: 60,

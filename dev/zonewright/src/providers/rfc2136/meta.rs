@@ -93,7 +93,9 @@ const CAPABILITIES: Capabilities = Capabilities {
     txt_plain_only: false,
     txt_values: ValueGuarantee::PerValue,
     preconditions: Preconditions::Atomic,
-    atomic_rrset_write: false,
+    // One UPDATE can delete the RRset and add its new RRs, applied as one transaction (RFC 2136
+    // sections 2.5.2, 3.3.2 and 3.4.2.1; design section 11.1).
+    atomic_rrset_write: true,
     ttl: TtlSupport::PerRrset {
         min: 1,
         max: 86_400,

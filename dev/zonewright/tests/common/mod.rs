@@ -24,9 +24,9 @@ pub fn dn(s: &str) -> DomainName {
 /// Settings and credentials JSON with which `AnyProvider::from_json` builds a client of `id`
 /// without any request. Synthetic values only.
 ///
-/// A placeholder client accepts any two JSON objects. When a client is ported, its developer
-/// asks the lead to replace its entry with the smallest valid configuration, pointed at a
-/// loopback address.
+/// Each entry is the smallest valid configuration of the provider's client, with every endpoint
+/// pointed at port 9 of the IPv4 loopback address, so that a request sent by mistake never
+/// reaches a provider.
 pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
     match id {
         ProviderId::SelectelV2 => (

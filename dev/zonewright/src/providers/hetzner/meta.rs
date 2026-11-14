@@ -94,6 +94,8 @@ const CAPABILITIES: Capabilities = Capabilities {
     // The API adds and removes values of an rrset by value (design section 3.5).
     txt_values: ValueGuarantee::PerValue,
     preconditions: Preconditions::ReadThenWrite,
+    // Values are added and removed by value actions, so a replacement is several requests; a
+    // whole-set call is not established for this client (design section 11.2).
     atomic_rrset_write: false,
     // Source: the reference, Zone RRSets, `ttl`: 60 to 2147483647 seconds, one per rrset.
     ttl: TtlSupport::PerRrset {

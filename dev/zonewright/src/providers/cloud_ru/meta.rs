@@ -122,7 +122,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     // immediately before the write (design section 3.5).
     txt_values: ValueGuarantee::ReadThenWrite,
     preconditions: Preconditions::ReadThenWrite,
-    atomic_rrset_write: false,
+    atomic_rrset_write: true,
     ttl: TtlSupport::PerRrset {
         min: 60,
         max: 86_400,

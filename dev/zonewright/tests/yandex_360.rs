@@ -121,6 +121,8 @@ macro_rules! assert_not_impl {
 
 assert_not_impl!(Yandex360: std::fmt::Display, serde::Serialize);
 assert_not_impl!(Yandex360Credentials: std::fmt::Display, serde::Serialize);
+// A config with a required key has no `Default` (design section 2.8).
+assert_not_impl!(Yandex360Config: Default);
 
 /// What the echo's record listings answer: no record, a record with a foreign value, or a
 /// record with the value `v1`.
@@ -1297,14 +1299,23 @@ fn yandex_360_minimal_configuration_builds() {
     )
     .unwrap();
     assert_eq!(client.id(), ProviderId::Yandex360);
-    // The organization is required.
-    AnyProvider::from_json(
-        ProviderId::Yandex360,
-        "{}",
-        &SecretString::from(r#"{"oauth_token":"test-only-token"}"#.to_owned()),
-        &context(),
-    )
-    .unwrap_err();
+    // The organization is required: a settings object without it is refused by name, not
+    // read as an empty organization ID (design section 2.8).
+    for settings in ["{}", r#"{"base_url":"http://127.0.0.1:9","ttl":300}"#] {
+        let e = AnyProvider::from_json(
+            ProviderId::Yandex360,
+            settings,
+            &SecretString::from(r#"{"oauth_token":"test-only-token"}"#.to_owned()),
+            &context(),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Config);
+        assert_eq!(
+            e.to_string(),
+            "invalid provider configuration: the settings lack the required key org_id",
+            "{settings}"
+        );
+    }
 }
 
 /// A token pasted with surrounding whitespace is sent without it.
@@ -1417,7 +1428,7 @@ fn yandex_360_config_errors_name_no_value() {
 #[test]
 fn yandex_360_config_keys_match_metadata() {
     let meta = ProviderId::Yandex360.meta();
-    let settings = serde_json::to_value(Yandex360Config::default()).unwrap();
+    let settings = serde_json::to_value(Yandex360Config::new(ORG_ID)).unwrap();
     let mut settings_keys: Vec<&str> = settings
         .as_object()
         .unwrap()

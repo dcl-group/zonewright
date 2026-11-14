@@ -13,6 +13,8 @@ use crate::error::Error;
 use crate::name::{DomainName, TargetName};
 use crate::redact::Detail;
 
+/// Type code of CNAME (RFC 1035 section 3.2.2).
+pub(super) const TYPE_CNAME: u16 = 5;
 /// Type code of SOA (RFC 1035 section 3.2.2).
 pub(super) const TYPE_SOA: u16 = 6;
 /// Type code of TXT (RFC 1035 section 3.2.2).
@@ -179,6 +181,16 @@ impl Builder {
     /// RDATA.
     pub(super) fn prereq_name_in_use(&mut self, name: &DomainName) -> Result<(), Error> {
         self.rr(0, name, TYPE_ANY, CLASS_ANY, 0, &[])
+    }
+
+    /// Prerequisite "RRset does not exist" (RFC 2136 section 2.4.3): class NONE, the type, TTL
+    /// 0, no RDATA. A server answers YXRRSET when the RRset exists (section 3.2.5).
+    pub(super) fn prereq_rrset_absent(
+        &mut self,
+        name: &DomainName,
+        rtype: u16,
+    ) -> Result<(), Error> {
+        self.rr(0, name, rtype, CLASS_NONE, 0, &[])
     }
 
     /// "Add to an RRset" (RFC 2136 section 2.5.1): the zone's class, the RR's TTL and RDATA. A

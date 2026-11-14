@@ -1,7 +1,7 @@
 //! The VK Cloud client: construction, `Debug`, zone resolution and the [`Provider`]
 //! implementation. The layout of a provider module is described in the Selectel v2 client.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use secrecy::{ExposeSecret as _, SecretString};
@@ -18,8 +18,22 @@ use crate::record::{Ttl, Txt};
 use crate::redact::Detail;
 use crate::values;
 
-use super::api::Api;
+use super::api::{Api, Zone};
 use super::config::{self, VkCloudConfig, VkCloudCredentials};
+
+/// Why a zone is not usable when the project lists more than one zone of its name.
+const AMBIGUOUS: &str = "the project lists more than one zone of this name, with different \
+                         identifiers; the client cannot tell which one to change";
+
+/// The result of looking a zone up by name.
+enum Lookup {
+    /// Exactly one identifier.
+    Found(String),
+    /// No zone of the name.
+    Missing,
+    /// Several zones of the name with different identifiers.
+    Ambiguous,
+}
 
 /// The VK Cloud public DNS client.
 ///
@@ -92,11 +106,16 @@ impl VkCloud {
         })
     }
 
-    /// The zone's identifier, looked up afresh. A missing zone is `Error::ZoneNotFound`.
+    /// The zone's identifier, looked up afresh. A missing zone is `Error::ZoneNotFound`; a name
+    /// that several zones of the project carry is `Error::Config`.
     pub(super) async fn resolve_zone(&self, zone: &DomainName) -> Result<String, Error> {
-        self.find_zone(zone)
-            .await?
-            .ok_or_else(|| Error::zone_not_found(zone.clone()))
+        match self.find_zone(zone).await? {
+            Lookup::Found(id) => Ok(id),
+            Lookup::Missing => Err(Error::zone_not_found(zone.clone())),
+            Lookup::Ambiguous => Err(Error::Config {
+                detail: Detail::constant(AMBIGUOUS),
+            }),
+        }
     }
 
     /// The identifier a write goes to: the cached one (the read of the same operation has just
@@ -120,34 +139,39 @@ impl VkCloud {
     }
 
     /// Looks the zone up by name in the project's listing and compares the names exactly.
+    /// Every zone of the name counts: two with different identifiers are ambiguous, never "the
+    /// first one".
     // Source: the OpenAPI has no zone-by-name path; lego vkcloud.go:132-143 lists the zones
-    // and compares `zone.Zone` with the zone name without the trailing dot.
-    async fn find_zone(&self, zone: &DomainName) -> Result<Option<String>, Error> {
-        let found = self
-            .api
-            .zones()
-            .await?
-            .into_iter()
-            .find(|z| DomainName::parse(&z.zone).is_ok_and(|name| &name == zone));
-        match found {
-            None => Ok(None),
-            Some(z) => {
-                let id = z.id().ok_or(Error::Protocol {
-                    detail: Detail::constant("the provider listed the zone without an identifier"),
-                })?;
-                Ok(Some(path_id(id)?.to_owned()))
+    // and compares `zone.Zone` with the zone name without the trailing dot (lego takes the
+    // first match; this client refuses to guess between several).
+    async fn find_zone(&self, zone: &DomainName) -> Result<Lookup, Error> {
+        let listed = self.api.zones().await?;
+        let mut found: Option<String> = None;
+        for z in listed.iter().filter(|z| is_zone(z, zone)) {
+            let id = z.id().ok_or(Error::Protocol {
+                detail: Detail::constant("the provider listed the zone without an identifier"),
+            })?;
+            let id = path_id(id)?;
+            match &found {
+                None => found = Some(id.to_owned()),
+                Some(first) if first == id => {}
+                Some(_) => return Ok(Lookup::Ambiguous),
             }
         }
+        Ok(found.map_or(Lookup::Missing, Lookup::Found))
     }
 
     async fn check_zone(&self, zone: &DomainName) -> Result<ZoneCheck, Error> {
         self.forget_zone(zone);
         Ok(match self.find_zone(zone).await? {
-            Some(id) => {
+            Lookup::Found(id) => {
                 self.zones.insert(zone, &id);
                 ZoneCheck::new(zone.clone(), true, None)
             }
-            None => ZoneCheck::new(zone.clone(), false, None),
+            Lookup::Missing => ZoneCheck::new(zone.clone(), false, None),
+            Lookup::Ambiguous => {
+                ZoneCheck::new(zone.clone(), false, Some(Detail::constant(AMBIGUOUS)))
+            }
         })
     }
 }
@@ -167,18 +191,31 @@ impl Provider for VkCloud {
         Ok(CheckReport::new(true, checks))
     }
 
-    /// Every zone of the project, in one answer. The identifiers are cached.
+    /// Every zone of the project, in one answer. The identifiers are cached, except for a name
+    /// that several zones carry with different identifiers: it is listed, and an operation on
+    /// it is `Error::Config`.
     async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
-        let mut names = BTreeSet::new();
+        let mut ids: BTreeMap<DomainName, Option<String>> = BTreeMap::new();
         for zone in self.api.zones().await? {
             let (Ok(name), Some(Ok(id))) = (DomainName::parse(&zone.zone), zone.id().map(path_id))
             else {
                 continue;
             };
-            self.zones.insert(&name, id);
-            names.insert(name);
+            ids.entry(name)
+                .and_modify(|seen| {
+                    if seen.as_deref() != Some(id) {
+                        *seen = None;
+                    }
+                })
+                .or_insert_with(|| Some(id.to_owned()));
         }
-        Ok(names.into_iter().map(ZoneInfo::new).collect())
+        for (name, id) in &ids {
+            match id {
+                Some(id) => self.zones.insert(name, id),
+                None => self.forget_zone(name),
+            }
+        }
+        Ok(ids.into_keys().map(ZoneInfo::new).collect())
     }
 
     async fn add_txt_value(
@@ -199,6 +236,11 @@ impl Provider for VkCloud {
     ) -> Result<RemoveOutcome, Error> {
         values::remove_per_record(self, zone, name, value).await
     }
+}
+
+/// Whether the listed zone `listed` is `zone`.
+fn is_zone(listed: &Zone, zone: &DomainName) -> bool {
+    DomainName::parse(&listed.zone).is_ok_and(|name| &name == zone)
 }
 
 /// Builds the client from stored configuration: deserializes both objects and calls

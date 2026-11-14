@@ -38,9 +38,10 @@ pub(super) const DEFAULT_OPERATION_URL: &str = "https://operation.api.cloud.yand
 pub(super) const DEFAULT_TTL: u32 = 60;
 
 /// TTL range of the `ttl` setting, in seconds. The API accepts 0 to 2147483647
-/// (https://yandex.cloud/en/docs/dns/api-ref/DnsZone/updateRecordSets, `ttl`); the setting keeps
-/// a narrower range, which the metadata states: a TTL below one minute or above a week is not
-/// useful for the records this client writes.
+/// (https://yandex.cloud/en/docs/dns/api-ref/DnsZone/updateRecordSets, `ttl`), and so does the
+/// TTL a caller passes to an operation (the capabilities say so); the setting keeps a narrower
+/// range, which the metadata states: a configured default below one minute or above a week is
+/// not useful for the records this client writes.
 pub(super) const TTL_MIN: u32 = 60;
 pub(super) const TTL_MAX: u32 = 604_800;
 

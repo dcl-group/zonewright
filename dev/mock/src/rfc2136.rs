@@ -63,6 +63,8 @@ use tokio::net::{TcpListener, TcpStream};
 pub const TYPE_TXT: u16 = 16;
 /// Type code of A (RFC 1035 section 3.2.2).
 pub const TYPE_A: u16 = 1;
+/// Type code of CNAME (RFC 1035 section 3.2.2).
+pub const TYPE_CNAME: u16 = 5;
 const TYPE_SOA: u16 = 6;
 const TYPE_TSIG: u16 = 250;
 const TYPE_ANY: u16 = 255;
@@ -236,7 +238,7 @@ pub struct Fault {
     op: Option<Op>,
     times: usize,
     delay: Duration,
-    foreign: Option<(String, Vec<u8>)>,
+    foreign: Option<MockRecord>,
     close: bool,
     rcode: Option<u8>,
     unsigned: bool,
@@ -253,6 +255,7 @@ pub struct Fault {
     short_length: bool,
     drop_reply: bool,
     extra_answer: Option<(String, u16, u16, Vec<u8>)>,
+    tsig_error: u16,
 }
 
 impl Fault {
@@ -288,7 +291,18 @@ impl Fault {
     /// Adds a TXT record with `value` (one character-string) at `name` before the request is
     /// processed: a change by another writer.
     pub fn foreign_txt(mut self, name: &str, value: &str) -> Fault {
-        self.foreign = Some((name.to_owned(), txt_rdata(value.as_bytes())));
+        self.foreign = Some(MockRecord {
+            name: name.to_ascii_lowercase(),
+            rtype: TYPE_TXT,
+            ttl: 600,
+            rdata: txt_rdata(value.as_bytes()),
+        });
+        self
+    }
+
+    /// Adds `record` before the request is processed: a change by another writer, of any type.
+    pub fn foreign_record(mut self, record: MockRecord) -> Fault {
+        self.foreign = Some(record);
         self
     }
 
@@ -386,6 +400,14 @@ impl Fault {
     /// Processes the request, then closes the connection without answering.
     pub fn drop_reply(mut self) -> Fault {
         self.drop_reply = true;
+        self
+    }
+
+    /// Puts this TSIG error code into the answer's TSIG record, with a valid MAC over it,
+    /// whatever the RCODE. Combined with [`Fault::rcode`], it produces an answer that reports a
+    /// TSIG error under an RCODE other than NOTAUTH, which RFC 8945 section 5.2 does not allow.
+    pub fn tsig_error(mut self, error: u16) -> Fault {
+        self.tsig_error = error;
         self
     }
 
@@ -864,13 +886,8 @@ async fn handle(b: &[u8], control: &Control) -> Reply {
     if !fault.delay.is_zero() {
         tokio::time::sleep(fault.delay).await;
     }
-    if let Some((name, rdata)) = &fault.foreign {
-        control.add_record(MockRecord {
-            name: name.to_ascii_lowercase(),
-            rtype: TYPE_TXT,
-            ttl: 600,
-            rdata: rdata.clone(),
-        });
+    if let Some(record) = &fault.foreign {
+        control.add_record(record.clone());
     }
     let (skew, refuse_queries) = {
         let state = lock(&control.state);
@@ -980,7 +997,7 @@ async fn handle(b: &[u8], control: &Control) -> Reply {
         secret: Some(&key.secret),
         request_mac: &tsig.mac,
         time: now(skew + fault.time_offset),
-        error: 0,
+        error: fault.tsig_error,
         other: Vec::new(),
     });
     let reply = answer(&req, rcode, &answers, signing, &fault);
@@ -1019,10 +1036,15 @@ fn process(req: &Request, control: &Control, refuse_queries: bool) -> (u8, Answe
             if refuse_queries || !zones.iter().any(|z| in_zone(&req.qname, z)) {
                 return (REFUSED, Vec::new());
             }
+            // A CNAME at the name answers a query of any type (RFC 1034 section 4.3.2, step
+            // 3a). The mock does not follow the chain to the target.
             let answers: Answers = state
                 .records
                 .iter()
-                .filter(|r| r.name == req.qname && (req.qtype == r.rtype || req.qtype == TYPE_ANY))
+                .filter(|r| {
+                    r.name == req.qname
+                        && (req.qtype == r.rtype || req.qtype == TYPE_ANY || r.rtype == TYPE_CNAME)
+                })
                 .map(|r| (r.rtype, r.ttl, r.rdata.clone()))
                 .collect();
             let exists =
@@ -1071,6 +1093,22 @@ fn update(req: &Request, zones: &[String], records: &mut Vec<MockRecord>) -> u8 
     }
     for u in &req.updates {
         match u.class {
+            // RFC 2136 section 3.4.2.2: "In the case of a CNAME Update RR and a non-CNAME Zone
+            // RRset or vice versa, ignore the CNAME Update RR, otherwise replace the CNAME Zone
+            // RR with the CNAME Update RR." The add is ignored silently: NOERROR all the same.
+            CLASS_IN
+                if records.iter().any(|r| {
+                    r.name == u.name && ((r.rtype == TYPE_CNAME) != (u.rtype == TYPE_CNAME))
+                }) => {}
+            CLASS_IN if u.rtype == TYPE_CNAME => {
+                records.retain(|r| !(r.name == u.name && r.rtype == TYPE_CNAME));
+                records.push(MockRecord {
+                    name: u.name.clone(),
+                    rtype: u.rtype,
+                    ttl: u.ttl,
+                    rdata: u.rdata.clone(),
+                });
+            }
             CLASS_IN => {
                 for r in records
                     .iter_mut()

@@ -11,7 +11,14 @@
 //!   that lets the key update but not query, design section 11.3) is
 //!   [`PerRecordRead::Unavailable`], and the layer takes the blind path of design section 3.5.
 //! - create: an UPDATE with one "add to an RRset" record (RFC 2136 section 2.5.1). It names only
-//!   our RR; the server adds it to the RRset and leaves the others alone.
+//!   our RR; the server adds it to the RRset and leaves the others alone. It carries the
+//!   prerequisite "no CNAME RRset at the name" (section 2.4.3): a server silently ignores the
+//!   add of a non-CNAME record at a name that holds a CNAME (section 3.4.2.2) and still answers
+//!   NOERROR, so without the prerequisite the add would report success for a value that was
+//!   never stored. A failed prerequisite (YXRRSET, section 3.2.5) is `Error::Rejected`. The
+//!   prerequisite is evaluated with the update, so it holds on the blind path too and against a
+//!   CNAME created between the read and the write; it changes nothing that could hold a foreign
+//!   value.
 //! - delete: an UPDATE with one "delete an RR from an RRset" record (RFC 2136 section 2.5.4)
 //!   carrying the RDATA exactly as the server returned it, so a value stored with other
 //!   character-string boundaries is matched too (the server compares RDATA, section 3.4.2.4).
@@ -19,8 +26,8 @@
 //! - delete without a read: the same, with the value's canonical encoding (255-octet
 //!   character-strings).
 //!
-//! No message carries a prerequisite: a single-RR change cannot lose a foreign value, hence
-//! `ValueGuarantee::PerValue`.
+//! No message carries a prerequisite about TXT records: a single-RR change cannot lose a foreign
+//! value, hence `ValueGuarantee::PerValue`. The only prerequisite is the CNAME guard of create.
 //!
 //! TXT values travel as wire-format RDATA (RFC 1035 section 3.3.14), so every value the record
 //! model holds can be written, not only plain ones; the only bound is the size of the message.
@@ -41,13 +48,14 @@ use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
 use super::client::Rfc2136;
-use super::wire::{self, Builder, CLASS_IN, TYPE_TXT, rcode};
+use super::wire::{self, Builder, CLASS_IN, TYPE_CNAME, TYPE_TXT, rcode};
 
 /// Room for everything of an UPDATE except the TXT RDATA: header (12), zone section (at most
-/// 255 + 4), the update record's owner and fixed fields (at most 255 + 10) and the TSIG record
-/// (at most 255 + 10 for owner and fixed fields, 13 for the algorithm name, 16 for the fixed
-/// RDATA fields, 64 for the MAC): 894 octets, rounded up.
-const MESSAGE_OVERHEAD: usize = 1024;
+/// 255 + 4), the CNAME prerequisite (at most 255 + 10), the update record's owner and fixed
+/// fields (at most 255 + 10) and the TSIG record (at most 255 + 10 for owner and fixed fields,
+/// 13 for the algorithm name, 16 for the fixed RDATA fields, 64 for the MAC): 1159 octets,
+/// rounded up.
+const MESSAGE_OVERHEAD: usize = 1280;
 
 impl TxtBase for Rfc2136 {
     fn provider(&self) -> ProviderId {
@@ -137,6 +145,7 @@ impl PerRecord for Rfc2136 {
             WriteTtl::New(None) | WriteTtl::Existing(None) => self.ttl,
         };
         let mut update = Builder::update(zone);
+        update.prereq_rrset_absent(name, TYPE_CNAME)?;
         update.add(name, TYPE_TXT, ttl, &encode(value)?)?;
         self.update(zone, name, update, "update").await
     }
@@ -184,6 +193,13 @@ impl Rfc2136 {
             }),
             rcode::NOTAUTH => Err(Error::zone_not_found(zone.clone())),
             rcode::NOTZONE => Err(Error::name_outside_zone(name.clone(), zone.clone())),
+            // Only the CNAME guard of create is a prerequisite that can fail this way.
+            rcode::YXRRSET => Err(Error::Rejected {
+                status: None,
+                detail: Detail::constant(
+                    "the name holds a CNAME (YXRRSET): a server ignores a TXT record added next                      to a CNAME (RFC 2136 section 3.4.2.2)",
+                ),
+            }),
             other => Err(rcode_error(other)),
         }
     }

@@ -106,6 +106,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     // section 3.5).
     txt_values: ValueGuarantee::PerValue,
     preconditions: Preconditions::ReadThenWrite,
+    // Individual records without IDs: a replacement is several requests.
     atomic_rrset_write: false,
     // `zone/add_txt` has no TTL parameter (documentation 9.9).
     ttl: TtlSupport::NotSettable,

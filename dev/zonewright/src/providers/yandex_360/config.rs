@@ -36,26 +36,29 @@ pub(super) const TTL_MAX: u32 = 86_400;
 const ORG_ID_MAX_DIGITS: usize = 19;
 
 /// Settings of the Yandex 360 client: the non-secret part of its configuration.
+///
+/// `org_id` is required, so the type has no `Default` and no container-level serde default: a
+/// settings object without `org_id` is an error naming the key (design section 2.8).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Yandex360Config {
     /// API endpoint; default `https://api360.yandex.net`.
+    #[serde(default = "default_base_url")]
     pub base_url: String,
     /// The numeric ID of the Yandex 360 organization. Required.
     pub org_id: String,
     /// TTL of a new record, in seconds: 60 to 86400, default 300.
+    #[serde(default = "default_ttl")]
     pub ttl: u32,
 }
 
-impl Default for Yandex360Config {
-    fn default() -> Yandex360Config {
-        Yandex360Config {
-            base_url: DEFAULT_BASE_URL.to_owned(),
-            org_id: String::new(),
-            ttl: DEFAULT_TTL,
-        }
-    }
+fn default_base_url() -> String {
+    DEFAULT_BASE_URL.to_owned()
+}
+
+fn default_ttl() -> u32 {
+    DEFAULT_TTL
 }
 
 impl Yandex360Config {
@@ -63,8 +66,9 @@ impl Yandex360Config {
     #[must_use]
     pub fn new(org_id: impl Into<String>) -> Yandex360Config {
         Yandex360Config {
+            base_url: default_base_url(),
             org_id: org_id.into(),
-            ..Yandex360Config::default()
+            ttl: default_ttl(),
         }
     }
 
@@ -119,10 +123,20 @@ impl Yandex360Credentials {
     }
 }
 
+/// The text of the error for a settings object without `org_id`.
+const MISSING_ORG_ID: &str = "the settings lack the required key org_id";
+
 /// Parses the settings object. The deserializer's message can quote the input, so the error
-/// text is built from the position of the problem only.
+/// text is fixed apart from the position of the problem and, for the missing required key, its
+/// name.
 pub(super) fn parse_settings(text: &str) -> Result<Yandex360Config, Error> {
-    serde_json::from_str(text).map_err(|e| Error::settings_syntax(e.line(), e.column()))
+    serde_json::from_str(text).map_err(|e| {
+        if e.to_string().starts_with("missing field `org_id`") {
+            config(MISSING_ORG_ID)
+        } else {
+            Error::settings_syntax(e.line(), e.column())
+        }
+    })
 }
 
 /// Parses the credentials object. Any failure is one fixed text naming the expected key.

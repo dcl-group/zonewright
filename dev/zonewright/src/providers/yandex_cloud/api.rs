@@ -412,9 +412,18 @@ impl Api {
     }
 
     /// The record set `name` of type `rtype` in zone `zone_id`. `name` is relative to the zone.
-    // Source: DnsZone.getRecordSet (`name`, `type`); Errors (`NOT_FOUND` is 404, for the zone and
-    // for the record set alike); lego yandexcloud.go:211-222 sends the name relative to the zone
-    // and reads "RecordSet not found" as an absent record set.
+    // Source: DnsZone.getRecordSet (`name`, `type`); Errors (the gRPC code `NOT_FOUND` maps to
+    // 404); lego yandexcloud.go:211-222 sends the name relative to the zone and reads an error
+    // whose text is "RecordSet not found" as an absent record set.
+    // Assumption (not documented): a missing record set is answered 404. The getRecordSet page
+    // lists no error, the error mapping gives the status of `NOT_FOUND` but not which calls use
+    // it, and lego matches the error text, not a status. If a missing set gets another status,
+    // the read fails with that refusal instead of reporting "no set": an add then fails rather
+    // than creates, and a removal fails rather than reports `NotPresent`; nothing is written. If
+    // a 404 can also mean something else, a cached zone ID is confirmed with `DnsZone.get` first
+    // (txt.rs), and a write after a wrong "no set" carries no deletion and is refused by the
+    // strict call when a set exists ("Attempted to add record with existing name and type"), so
+    // no foreign value is overwritten.
     pub(super) async fn record_set(
         &self,
         zone_id: &str,
@@ -479,8 +488,11 @@ impl Api {
                 not_found: response.status() == 404,
             });
         }
-        let operation: Operation =
-            response.json("the provider's operation is not in the expected form")?;
+        // Accepted: from here on an answer that cannot be read leaves the outcome unknown, and
+        // the write may have happened (design section 3.7).
+        let operation: Operation = response
+            .json("the provider's operation is not in the expected form")
+            .map_err(|_| accepted_unreadable())?;
         self.finish(operation).await
     }
 
@@ -490,7 +502,9 @@ impl Api {
         if operation.done {
             return Ok(self.outcome(operation));
         }
-        let id = path_id(&operation.id)?.to_owned();
+        let id = path_id(&operation.id)
+            .map_err(|_| accepted_unreadable())?
+            .to_owned();
         self.poller
             .run(|| {
                 let id = id.clone();
@@ -551,6 +565,17 @@ impl Api {
                 )),
             },
         }
+    }
+}
+
+/// A write the provider accepted whose operation cannot be read: its outcome is unknown, so the
+/// error is `Transient`, never `Protocol` (design section 3.7).
+fn accepted_unreadable() -> Error {
+    Error::Transient {
+        detail: Detail::constant(
+            "the provider accepted the change, but its operation could not be read; the change \
+             may have been applied",
+        ),
     }
 }
 

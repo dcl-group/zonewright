@@ -10,7 +10,8 @@
 //!   under the zone-ID cache. A `404` is "records not found" in the documentation, and also what
 //!   a zone that does not exist gets: under a freshly looked-up identifier it is an empty
 //!   listing, under a cached one it may be a stale identifier, so the zone is looked up again
-//!   and the read repeated once (design section 3.8);
+//!   and the read repeated once (design section 3.8). An empty `200` listing under a cached
+//!   identifier is treated the same way, since what a stale identifier gets is not documented;
 //! - create: `POST …/{zone}/txt/`, sent once; a refusal is followed by a new read, and our
 //!   value found there is `Error::Conflict` (created by another writer meanwhile);
 //! - delete: `DELETE …/{zone}/txt/{record}`, by the identifier just read. A `404` is success
@@ -172,7 +173,8 @@ impl PerRecord for VkCloud {
 
 impl VkCloud {
     /// The read phase under the zone cache: the TXT records of `name` in the zone `id`. A `404`
-    /// is an empty listing under a freshly looked-up identifier and `Stale` under a cached one.
+    /// or an empty listing is an empty listing under a freshly looked-up identifier and `Stale`
+    /// under a cached one.
     async fn read_txt(
         &self,
         zone: &DomainName,
@@ -180,6 +182,11 @@ impl VkCloud {
         id: ZoneId,
     ) -> Result<Attempt<Vec<TxtRecord<String>>>, Error> {
         match self.api.txt_records(&id.id).await? {
+            // An empty listing under a cached identifier is confirmed by a fresh lookup: what
+            // an identifier that no longer exists gets is not documented, and a `200 []` for it
+            // would otherwise turn a removal into "not present" while the value is published
+            // in the recreated zone. A zone with any TXT record proves its identifier.
+            Some(records) if records.is_empty() && !id.fresh => Ok(Attempt::Stale),
             Some(records) => Ok(Attempt::Done(
                 records
                     .into_iter()

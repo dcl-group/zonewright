@@ -721,9 +721,9 @@ pub enum RemoveOutcome {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct CheckReport {
-    /// The credentials were exercised against the provider and accepted. False only when the
-    /// provider offers no request that tests credentials without naming a zone and `zones` was
-    /// empty.
+    /// The credentials were exercised against the provider and accepted. False when the provider
+    /// offers no request that tests credentials without changing anything (acme-dns), or none
+    /// that does so without naming a zone and `zones` was empty.
     pub credentials_verified: bool,
     /// One entry per requested zone, in the order given.
     pub zones: Vec<ZoneCheck>,
@@ -2701,7 +2701,7 @@ this table is a guess about such an API.
 | `route53`       | yes; plain values      | TXT only until established (alias and routing-policy sets need a decision first)         | —                                                                    | 60                    | 120 s                       | Auto / Presentation                                     | Amazon Route 53 API reference, lego                                                                |
 | `selectel_v2`   | yes; plain values      | list, get, set, delete                                                                   | A, AAAA, ALIAS, CAA, CNAME, MX, NS, SOA (read only), SRV, SSHFP, TXT | 60                    | —                           | Auto / Presentation                                     | Selectel DNS API v2 and authorization documentation. Earlier TXT-level version proven live         |
 | `timeweb_cloud` | yes; plain values      | TXT only until established (the v1 endpoints in use are marked deprecated)               | —                                                                    | provider default      | —                           | Auto / Raw                                              | a client generated from the public OpenAPI description, lego                                       |
-| `vk_cloud`      | yes; plain values      | TXT only until established (only TXT endpoints are known)                                | —                                                                    | 60                    | —                           | Auto / Raw                                              | lego only; the provider's documentation was not readable                                           |
+| `vk_cloud`      | yes; plain values      | TXT only until implemented (the API description documents other types)                   | —                                                                    | 60                    | —                           | Auto / Raw                                              | the provider's published API description, lego                                                     |
 | `yandex_360`    | yes; plain values      | TXT only until established                                                               | —                                                                    | 300                   | —                           | Auto / Raw                                              | Yandex 360 API documentation, lego                                                                 |
 | `yandex_cloud`  | yes; plain values      | list, get, set, delete                                                                   | A, AAAA, ANAME, CAA, CNAME, HTTPS, MX, NS, PTR, SOA, SRV, SVCB, TXT  | 60                    | —                           | Auto / Raw for TXT values, Presentation at record level | Yandex Cloud DNS, IAM and Operation API documentation, lego. Earlier TXT-level version proven live |
 
@@ -2807,8 +2807,11 @@ Behavior that the design fixes because the generic sections cannot:
     the client's own read, as "RRset exists (value dependent)"; a failed prerequisite (`YXRRSET`,
     `NXRRSET`) is handled as section 3.4 describes for a refused conditional write. A prerequisite
     cannot express a TTL, so a TTL in `Matches` is compared by the client after its read.
-  - The TXT value operations send single-RR changes and need no prerequisite (`PerValue`). Deleting
-    a whole rrset is never sent by them.
+  - The TXT value operations send single-RR changes (`PerValue`); deleting a whole rrset is never
+    sent by them. An add carries one prerequisite, "no CNAME at the name" (RFC 2136 section 2.4.3):
+    without it a server silently ignores a TXT add at a name that owns a CNAME (section 3.4.2.2),
+    and the client would report a value as created that was not. The server's `YXRRSET` answer is
+    `Error::Rejected`.
   - TTL: with read access an add carries the TTL of the existing rrset. Without it the exception of
     section 3.6 applies: the add carries the client's `ttl`, and the server may apply it to the
     whole rrset.
