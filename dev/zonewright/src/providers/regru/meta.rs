@@ -4,9 +4,9 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements. Until the client is ported,
-//! every operation flag is false, `record_types` is empty and `txt_values` is `NotOffered`; the
-//! provider's developer switches them on together with the client code that implements them.
+//! Capabilities describe what this version of the crate implements: `check` and the TXT value
+//! operations on plain values. The API has no zone listing, and the record-level operations are
+//! not written yet, so their flags are false and `record_types` is empty.
 
 use crate::id::ProviderId;
 use crate::meta::{
@@ -63,7 +63,7 @@ const FIELDS: &[ConfigField] = &[
         kind: FieldKind::Multiline,
         default: None,
         label: "Client certificate key (PEM)",
-        help: "The PKCS#8 private key of the client certificate; given together with the certificate.",
+        help: "The private key of the client certificate (PEM: PKCS#8, PKCS#1 or SEC1); given together with the certificate.",
         advanced: true,
     },
     ConfigField {
@@ -95,14 +95,19 @@ const CAPABILITIES: Capabilities = Capabilities {
     get_rrset: false,
     set_rrset: false,
     delete_rrset: false,
-    add_txt_value: false,
-    remove_txt_value: false,
+    add_txt_value: true,
+    remove_txt_value: true,
     record_types: TypeSet::Listed(&[]),
     read_only_types: &[],
+    // The documentation allows only alphanumeric ASCII characters in the text of a TXT record
+    // (9.9); the encoding of anything else is not established (design section 4.4).
     txt_plain_only: true,
-    txt_values: ValueGuarantee::NotOffered,
+    // Every value is a record of its own, identified by its content and removed by it (design
+    // section 3.5).
+    txt_values: ValueGuarantee::PerValue,
     preconditions: Preconditions::ReadThenWrite,
     atomic_rrset_write: false,
+    // `zone/add_txt` has no TTL parameter (documentation 9.9).
     ttl: TtlSupport::NotSettable,
     provider_default_ttl: true,
     asynchronous: false,

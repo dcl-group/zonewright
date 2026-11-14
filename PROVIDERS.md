@@ -37,14 +37,14 @@ None yet.
 | Cloud.ru      | `cloud_ru`      | TXT values |                                                                                                  |
 | Hetzner       | `hetzner`       | TXT values |                                                                                                  |
 | nic.ru        | `nicru`         | TXT values |                                                                                                  |
+| reg.ru        | `regru`         | TXT values | An earlier version of this client was proven against the live API.                               |
 
 ## Planned
 
-| Provider | ID         | Notes                                                              |
-| -------- | ---------- | ------------------------------------------------------------------ |
-| acme-dns | `acme_dns` | TXT values only: the acme-dns API offers nothing else.             |
-| Beget    | `beget`    |                                                                    |
-| reg.ru   | `regru`    | An earlier version of this client was proven against the live API. |
+| Provider | ID         | Notes                                                  |
+| -------- | ---------- | ------------------------------------------------------ |
+| acme-dns | `acme_dns` | TXT values only: the acme-dns API offers nothing else. |
+| Beget    | `beget`    |                                                        |
 
 "An earlier version was proven" does not make the client verified here: it is verified again once it
 is implemented in this crate.

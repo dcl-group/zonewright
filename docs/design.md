@@ -2726,7 +2726,9 @@ Behavior that the design fixes because the generic sections cannot:
   being mistaken for a foreign edit; (d) tries the commit up to three times and returns
   `Error::Transient` if all fail. The mark is process memory; after a restart a zone left with
   staged changes needs a commit by hand.
-- `regru`, `beget`. With an empty zone list `check` has no request that tests the credentials;
+- `regru`. `check` calls the API's no-operation request, which the documentation describes as
+  requiring valid credentials, on every call; `credentials_verified` is always true.
+- `beget`. With an empty zone list `check` has no request that tests the credentials;
   `credentials_verified` is false.
 - `rfc2136`. DNS over TCP to the configured `server` (an IP literal or a host name, with an optional
   port, default 53).
