@@ -21,6 +21,8 @@ pub use caa::Caa;
 pub use data::RecordData;
 pub use mx::Mx;
 pub use rrset::RrSet;
+#[cfg(feature = "selectel_v2")]
+pub(crate) use rrset::singleton;
 pub use rtype::RecordType;
 pub use srv::Srv;
 pub use svcb::{SvcParam, Svcb};

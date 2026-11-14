@@ -80,6 +80,32 @@ impl RecordData {
         }
     }
 
+    /// Reads a value as a provider returned it (design section 4.9): the strict parser first,
+    /// with `origin` for providers that spell names relative to the zone (`None`: names are
+    /// absolute) and the client's reading rule for TXT; if that fails, the provider's text kept
+    /// as non-canonical data, trimmed of surrounding whitespace. Never fails and never "fixes up"
+    /// text the parser refuses.
+    // Used by the clients with record-level operations (`crate::rrsets`).
+    #[cfg(feature = "selectel_v2")]
+    pub(crate) fn from_provider(
+        rtype: RecordType,
+        text: &str,
+        origin: Option<&DomainName>,
+        txt: super::txt::TxtDialect,
+    ) -> RecordData {
+        let parsed = if rtype == RecordType::TXT {
+            txt.read(text)
+                .ok_or(RecordError::NotCanonical)
+                .and_then(|value| value.to_data())
+        } else {
+            match origin {
+                Some(origin) => RecordData::parse_relative(rtype, text, origin),
+                None => RecordData::parse(rtype, text),
+            }
+        };
+        parsed.unwrap_or_else(|_| RecordData::non_canonical(text))
+    }
+
     /// Parses this value's text as `rtype` for a typed view; `NotCanonical` for raw text.
     pub(crate) fn rdata(&self, rtype: RecordType) -> Result<Rdata, RecordError> {
         if !self.canonical {
@@ -478,4 +504,59 @@ fn parse_generic(tokens: &[Token<'_>]) -> Result<Vec<u8>, RecordError> {
         ));
     }
     Ok(data)
+}
+
+#[cfg(test)]
+#[cfg(feature = "selectel_v2")]
+mod tests {
+    use super::RecordData;
+    use crate::name::DomainName;
+    use crate::record::{RecordType, TxtDialect};
+
+    #[test]
+    fn provider_text_falls_back_to_non_canonical() {
+        let zone = DomainName::parse("example.org").unwrap();
+        let a = RecordData::from_provider(RecordType::A, " 192.0.2.1 ", None, TxtDialect::Auto);
+        assert!(a.is_canonical());
+        assert_eq!(a.as_str(), "192.0.2.1");
+        let cname =
+            RecordData::from_provider(RecordType::CNAME, "www", Some(&zone), TxtDialect::Auto);
+        assert_eq!(cname.as_str(), "www.example.org.");
+        let odd =
+            RecordData::from_provider(RecordType::A, " not an address ", None, TxtDialect::Auto);
+        assert!(!odd.is_canonical());
+        assert_eq!(odd.as_str(), "not an address");
+        let raw = RecordData::from_provider(RecordType::TXT, "a b", None, TxtDialect::Raw);
+        assert_eq!(raw.as_str(), "\"a b\"");
+        let bad = RecordData::from_provider(RecordType::TXT, "a b", None, TxtDialect::Presentation);
+        assert!(!bad.is_canonical());
+        assert_eq!(bad.as_str(), "a b");
+    }
+
+    /// Text the parser refuses is kept as it was, never repaired: an MX without its preference
+    /// is not given one, a CAA with an unknown flag spelling is not reinterpreted.
+    #[test]
+    fn provider_text_is_never_fixed_up() {
+        for (rtype, text) in [
+            (RecordType::MX, "mail.example.org."),
+            (RecordType::CAA, "x issue \"ca.example.net\""),
+            (RecordType::SRV, "0 0 0"),
+            (RecordType::AAAA, "2001:db8::zz"),
+            (RecordType::TXT, "\"open"),
+        ] {
+            let data = RecordData::from_provider(rtype, text, None, TxtDialect::Auto);
+            assert!(!data.is_canonical(), "{rtype} {text}");
+            assert_eq!(data.as_str(), text, "{rtype}");
+            assert!(data.to_wire(rtype).is_err());
+        }
+        // A spelling the parser accepts is normalized, not kept.
+        let mx = RecordData::from_provider(
+            RecordType::MX,
+            "010  MAIL.Example.org",
+            None,
+            TxtDialect::Auto,
+        );
+        assert!(mx.is_canonical());
+        assert_eq!(mx.as_str(), "10 mail.example.org.");
+    }
 }

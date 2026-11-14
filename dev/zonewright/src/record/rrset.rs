@@ -50,15 +50,7 @@ impl RrSet {
         }
         records.sort();
         records.dedup();
-        let singleton = matches!(
-            rtype,
-            RecordType::CNAME
-                | RecordType::SOA
-                | RecordType::DNAME
-                | RecordType::ALIAS
-                | RecordType::ANAME
-        );
-        if singleton && records.len() > 1 {
+        if singleton(rtype) && records.len() > 1 {
             return Err(RecordError::NotSingleton);
         }
         Ok(RrSet {
@@ -105,6 +97,18 @@ impl RrSet {
     pub fn with_ttl(self, ttl: Option<Ttl>) -> RrSet {
         RrSet { ttl, ..self }
     }
+}
+
+/// The types whose rrset holds exactly one record: CNAME, SOA, DNAME, ALIAS and ANAME.
+pub(crate) fn singleton(rtype: RecordType) -> bool {
+    matches!(
+        rtype,
+        RecordType::CNAME
+            | RecordType::SOA
+            | RecordType::DNAME
+            | RecordType::ALIAS
+            | RecordType::ANAME
+    )
 }
 
 /// Serialized shape of an rrset.

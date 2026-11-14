@@ -62,6 +62,11 @@ mod redact;
 ))]
 mod values;
 
+// The record-level layer is the shared implementation of the clients' record-level operations;
+// compiled with the providers whose clients implement them.
+#[cfg(feature = "selectel_v2")]
+mod rrsets;
+
 #[cfg(feature = "__http")]
 mod http;
 

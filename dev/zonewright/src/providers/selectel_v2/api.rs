@@ -18,6 +18,7 @@
 //! | --------------- | ------------------------------------- | ------------------------ |
 //! | list zones      | `GET /zones?filter&limit&offset`      | 200, page                |
 //! | list rrsets     | `GET /zones/{zone}/rrset?name&rrset_types&limit&offset` | 200, page |
+//! | list all rrsets | `GET /zones/{zone}/rrset?limit&offset`  | 200, page                |
 //! | create rrset    | `POST /zones/{zone}/rrset`            | 200, the new rrset       |
 //! | update rrset    | `PATCH /zones/{zone}/rrset/{rrset}`   | 204                      |
 //! | delete rrset    | `DELETE /zones/{zone}/rrset/{rrset}`  | 204                      |
@@ -52,7 +53,8 @@ const PAGE_LIMIT: u64 = 1000;
 // /zones/{zone_id}/rrset/{rrset_id}`.
 const X_MANAGED_BY: HeaderName = HeaderName::from_static("x-managed-by");
 
-/// Record type names as the API spells them.
+/// The API's spelling of the TXT type.
+// Source: the OpenAPI, `AllowedRecordTypes`.
 pub(super) const TXT: &str = "TXT";
 
 /// One page of a listing.
@@ -247,9 +249,9 @@ impl Api {
         self.list(url, None).await
     }
 
-    /// Every rrset of type `rtype` in zone `zone_id` whose name contains `name` (the API's
-    /// filter is not exact; the caller compares). A `404` means the zone does not exist (a
-    /// stale identifier) and is `Error::ZoneNotFound` for `zone`.
+    /// Every rrset of type `rtype` (the API's spelling) in zone `zone_id` whose name contains
+    /// `name` (the API's filter is not exact; the caller compares). A `404` means the zone does
+    /// not exist (a stale identifier) and is `Error::ZoneNotFound` for `zone`.
     // Source: the OpenAPI, `GET /zones/{zone_id}/rrset` with `name` and `rrset_types` (an
     // array); 404 when the zone is not found;
     // lego sends the name without the trailing dot and compares `rrset.Name` exactly.
@@ -258,7 +260,7 @@ impl Api {
         zone: &DomainName,
         zone_id: &str,
         name: &str,
-        rtype: &'static str,
+        rtype: &str,
     ) -> Result<Vec<Rrset>, Error> {
         let url = |offset: u64| {
             let url = self
@@ -269,6 +271,22 @@ impl Api {
                 .path("/rrset")
                 .query("name", name)
                 .query("rrset_types", rtype);
+            page_query(url, offset).build()
+        };
+        self.list(url, Some(zone)).await
+    }
+
+    /// Every rrset of zone `zone_id`, of every type, all pages. A `404` is
+    /// `Error::ZoneNotFound` for `zone`, as for [`Api::rrsets`].
+    // Source: the OpenAPI, `GET /zones/{zone_id}/rrset`: every filter (`name`, `rrset_types`,
+    // `search`, `managed_by`) is optional; `limit` and `offset` page through the result.
+    pub(super) async fn all_rrsets(
+        &self,
+        zone: &DomainName,
+        zone_id: &str,
+    ) -> Result<Vec<Rrset>, Error> {
+        let url = |offset: u64| {
+            let url = self.base.url().path("/zones").id(zone_id).path("/rrset");
             page_query(url, offset).build()
         };
         self.list(url, Some(zone)).await

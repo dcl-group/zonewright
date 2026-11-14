@@ -25,10 +25,27 @@
 //! - a zone of another project is either hidden from `GET /zones` or listed
 //!   ([`Seed::list_foreign_zones`]); requests into it answer `403` on every path (documented
 //!   for `PATCH` and `DELETE` only);
-//! - a TXT record whose content is not quoted is refused with `422`;
+//! - a TXT record whose content is not quoted is refused with `422`; content that does not have
+//!   the form of its type (below) is refused with `422` as well (the documented validation
+//!   status; the per-type check itself is the mock's reading of the sources);
+//! - the content of DNAME, HTTPS and SVCB records is not checked beyond being non-empty: no source
+//!   gives its form;
+//! - a create of an SOA rrset, and an update or delete of the SOA rrset or of the NS rrset at the
+//!   apex, is refused with `422` (the documentation says these "cannot be edited or deleted",
+//!   not with which status);
 //! - an update replaces the comment with the one it carries (none when absent) and the
 //!   managing resource with its `X-Managed-By` header (none when absent);
 //! - the next offset of the last page is `0`.
+//!
+//! Content per type, as the provider's Terraform documentation for `selectel_domains_rrset_v2`
+//! describes it (`docs/resources/domains_rrset_v2.md` in
+//! `github.com/selectel/terraform-provider-selectel`): A an IPv4 address; AAAA an IPv6 address;
+//! TXT text wrapped in quotes; CNAME, ALIAS and NS a name "with a dot at the end"; MX
+//! `<priority> <host>`; SRV `<priority> <weight> <port> <target>`; SSHFP
+//! `<algorithm> <fingerprint_type> <fingerprint>` with algorithm 1 to 4, type 1 or 2 and a hex
+//! fingerprint; CAA `<flag> <tag> <value>` with flag 0 to 128, tag one of `issue`, `issuewild`,
+//! `iodef`, `auth`, `path`, `policy`, and the value wrapped in quotes. The mock accepts nothing
+//! looser; a name's labels are checked only for being non-empty.
 //!
 //! Error texts are invented.
 //!
@@ -475,6 +492,33 @@ impl Control {
         }
     }
 
+    /// Disables or enables the records of `name` and `rtype` whose content is `content`.
+    pub fn set_disabled(&self, name: &str, rtype: &str, content: &str, disabled: bool) {
+        let name = fqdn(name);
+        for rrset in lock(&self.state)
+            .rrsets
+            .iter_mut()
+            .filter(|r| r.name == name && r.rtype == rtype)
+        {
+            for record in rrset.records.iter_mut().filter(|r| r.content == content) {
+                record.disabled = disabled;
+            }
+        }
+    }
+
+    /// The contents of the records of `name` and `rtype`, in rrset order, each with its
+    /// `disabled` flag; empty when there is no such rrset.
+    pub fn contents(&self, name: &str, rtype: &str) -> Vec<(String, bool)> {
+        self.rrset(name, rtype)
+            .map(|r| {
+                r.records
+                    .into_iter()
+                    .map(|record| (record.content, record.disabled))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The TXT contents of `name` with the outer quotes removed, in rrset order, disabled
     /// records included.
     pub fn txt_values(&self, name: &str) -> Vec<String> {
@@ -827,7 +871,62 @@ fn validate_records(rtype: &str, records: &Value) -> Result<Vec<Record>, Respons
     if rtype == "TXT" && records.iter().any(|r| !quoted(&r.content)) {
         return Err(validation("TXT content must be quoted"));
     }
+    if records.iter().any(|r| !content_valid(rtype, &r.content)) {
+        return Err(validation("content does not match the record type"));
+    }
     Ok(records)
+}
+
+/// The content has the form the provider's documentation gives for `rtype` (module
+/// documentation).
+fn content_valid(rtype: &str, content: &str) -> bool {
+    let fields: Vec<&str> = content.split(' ').collect();
+    let number = |text: &str, max: u32| text.parse::<u32>().is_ok_and(|n| n <= max);
+    let absolute = |text: &str| {
+        text == "."
+            || (text.len() > 1
+                && text.ends_with('.')
+                && text
+                    .trim_end_matches('.')
+                    .split('.')
+                    .all(|label| !label.is_empty()))
+    };
+    let quoted = |text: &str| text.len() >= 2 && text.starts_with('"') && text.ends_with('"');
+    match (rtype, fields.as_slice()) {
+        ("A", [address]) => address.parse::<std::net::Ipv4Addr>().is_ok(),
+        ("AAAA", [address]) => address.parse::<std::net::Ipv6Addr>().is_ok(),
+        ("TXT", _) => quoted(content),
+        ("CNAME" | "ALIAS" | "NS", [target]) => absolute(target),
+        ("MX", [priority, host]) => number(priority, 65_535) && absolute(host),
+        ("SRV", [priority, weight, port, target]) => {
+            number(priority, 65_535)
+                && number(weight, 65_535)
+                && number(port, 65_535)
+                && absolute(target)
+        }
+        ("SSHFP", [algorithm, fp_type, fingerprint]) => {
+            matches!(*algorithm, "1" | "2" | "3" | "4")
+                && matches!(*fp_type, "1" | "2")
+                && !fingerprint.is_empty()
+                && fingerprint.len() % 2 == 0
+                && fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        ("CAA", [flag, tag, value @ ..]) => {
+            number(flag, 128)
+                && matches!(
+                    *tag,
+                    "issue" | "issuewild" | "iodef" | "auth" | "path" | "policy"
+                )
+                && quoted(&value.join(" "))
+        }
+        ("DNAME" | "HTTPS" | "SVCB" | "SOA", _) => !content.trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// The rrset is one the documentation says cannot be edited or deleted: SOA, and NS at the apex.
+fn protected(zone: &Zone, name: &str, rtype: &str) -> bool {
+    rtype == "SOA" || (rtype == "NS" && name == zone.name)
 }
 
 fn validate_comment(comment: Option<&Value>) -> Result<Option<String>, Response> {
@@ -870,6 +969,9 @@ async fn rrset_create(
     let rtype = request["type"].as_str().unwrap_or("");
     if !TYPES.contains(&rtype) {
         return validation("unsupported type");
+    }
+    if protected(&zone, &name, rtype) {
+        return validation("this record set cannot be created");
     }
     let ttl = match validate_ttl(request["ttl"].as_u64()) {
         Ok(ttl) => ttl,
@@ -915,9 +1017,10 @@ async fn rrset_update(
         Ok(project) => project,
         Err(response) => return response,
     };
-    if let Err(response) = own_zone(&state, &zone_id, &project) {
-        return response;
-    }
+    let zone = match own_zone(&state, &zone_id, &project) {
+        Ok(zone) => zone,
+        Err(response) => return response,
+    };
     let Ok(Value::Object(request)) = serde_json::from_slice::<Value>(&body) else {
         return error(StatusCode::BAD_REQUEST, "malformed request body", None);
     };
@@ -932,14 +1035,17 @@ async fn rrset_update(
         .get("x-managed-by")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let Some(rtype) = lock(&state)
+    let Some((name, rtype)) = lock(&state)
         .rrsets
         .iter()
         .find(|r| r.id == rrset_id && r.zone_id == zone_id)
-        .map(|r| r.rtype.clone())
+        .map(|r| (r.name.clone(), r.rtype.clone()))
     else {
         return error(StatusCode::NOT_FOUND, "rrset not found", None);
     };
+    if protected(&zone, &name, &rtype) {
+        return validation("this record set cannot be edited");
+    }
     let ttl = match validate_ttl(request.get("ttl").and_then(Value::as_u64)) {
         Ok(ttl) => ttl,
         Err(response) => return response,
@@ -974,10 +1080,18 @@ async fn rrset_delete(
         Ok(project) => project,
         Err(response) => return response,
     };
-    if let Err(response) = own_zone(&state, &zone_id, &project) {
-        return response;
-    }
+    let zone = match own_zone(&state, &zone_id, &project) {
+        Ok(zone) => zone,
+        Err(response) => return response,
+    };
     let mut inner = lock(&state);
+    if inner
+        .rrsets
+        .iter()
+        .any(|r| r.id == rrset_id && r.zone_id == zone_id && protected(&zone, &r.name, &r.rtype))
+    {
+        return validation("this record set cannot be deleted");
+    }
     let before = inner.rrsets.len();
     inner
         .rrsets
@@ -990,7 +1104,47 @@ async fn rrset_delete(
 
 #[cfg(test)]
 mod tests {
-    use super::rfc3339;
+    use super::{content_valid, rfc3339};
+
+    #[test]
+    fn content_is_checked_per_type() {
+        for (rtype, content) in [
+            ("A", "192.0.2.1"),
+            ("AAAA", "2001:db8::1"),
+            ("TXT", "\"hello, world!\""),
+            ("CNAME", "origin.example."),
+            ("ALIAS", "origin.example."),
+            ("NS", "a.ns.example."),
+            ("MX", "10 mail.example.org."),
+            ("SRV", "10 20 30 example.org."),
+            ("SRV", "0 0 0 ."),
+            ("SSHFP", "1 1 7491973e5f8b39d5327cd4e08bc81b05f7710b49"),
+            ("CAA", "128 issue \"ca.example.net\""),
+            ("CAA", "0 iodef \"mailto:a b@example.org\""),
+        ] {
+            assert!(content_valid(rtype, content), "{rtype} {content}");
+        }
+        for (rtype, content) in [
+            ("A", "192.0.2"),
+            ("A", "192.0.2.1 "),
+            ("AAAA", "192.0.2.1"),
+            ("TXT", "unquoted"),
+            ("CNAME", "origin.example"),
+            ("MX", "mail.example.org."),
+            ("MX", "70000 mail.example.org."),
+            ("SRV", "10 20 example.org."),
+            ("SSHFP", "5 1 abcd"),
+            ("SSHFP", "1 3 abcd"),
+            ("SSHFP", "1 1 abc"),
+            ("CAA", "129 issue \"ca\""),
+            ("CAA", "0 other \"ca\""),
+            ("CAA", "0 issue ca"),
+            ("TLSA", "3 1 1 abcd"),
+            ("DNAME", ""),
+        ] {
+            assert!(!content_valid(rtype, content), "{rtype} {content}");
+        }
+    }
 
     #[test]
     fn timestamps_are_rfc3339() {

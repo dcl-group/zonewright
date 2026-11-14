@@ -15,11 +15,16 @@
 //! - `api.rs`: the provider's HTTP API and nothing else: endpoint constants, wire types, one
 //!   function per endpoint, paging, the error-message extractor and the mapping of statuses the
 //!   transport leaves to the client. Every fact carries its source.
+//! - `rrset.rs`: the provider's native unit as both layers use it (read one by name and type,
+//!   create, update, delete), with the rules for each answer, on top of `api.rs`.
+//! - `records.rs`: the record-level operations: the mapping between the API's content text and
+//!   `RecordData`, the implementation of one shape of the record layer (`crate::rrsets`), and the
+//!   zone listing.
 //! - `txt.rs`: the TXT value operations: the provider's TXT dialect and the implementation of
-//!   one shape of the value layer (`crate::values`) on top of `api.rs`.
+//!   one shape of the value layer (`crate::values`).
 //! - `client.rs` (this file): the client type, its constructor and `from_json`, `Debug`,
-//!   zone resolution with the zone-ID cache, and `impl Provider`, whose TXT methods call the
-//!   value layer.
+//!   zone resolution with the zone-ID cache, and `impl Provider`, whose record-level methods call
+//!   the record layer and whose TXT methods call the value layer.
 //!
 //! Tests live in `tests/<id>.rs` against the stateful mock in `dev/mock/src/<id>.rs`.
 
@@ -35,10 +40,13 @@ use crate::http::{Http, Keystone, ZoneCache, path_id};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
-use crate::values;
+use crate::{rrsets, values};
 
 use super::api::{self, Api, Zone};
 use super::config::{self, Project, SelectelV2Config, SelectelV2Credentials};
@@ -49,10 +57,11 @@ const ZONE_DISABLED: &str = "the zone is disabled at the provider";
 /// The Selectel DNS v2 client.
 ///
 /// Authenticates with the OpenStack Keystone password exchange, scoped to one project, and
-/// sends the token in `X-Auth-Token`. The native unit is the rrset, replaced whole: TXT value
-/// operations read the rrset and write it back with the value added or removed, under the
-/// per-name lock of the [`Context`]. A writer outside this process that changes the same rrset
-/// between that read and that write can lose its change (`ValueGuarantee::ReadThenWrite`).
+/// sends the token in `X-Auth-Token`. The native unit is the rrset, replaced whole: record-level
+/// writes and TXT value operations read the rrset and write it back, under the per-name lock of
+/// the [`Context`]. A writer outside this process that changes the same rrset between that read
+/// and that write can lose its change (`Preconditions::ReadThenWrite`,
+/// `ValueGuarantee::ReadThenWrite`).
 ///
 /// Zone identifiers are cached for the life of the client; a stale one is detected and
 /// resolved again.
@@ -247,6 +256,40 @@ impl Provider for SelectelV2 {
             names.insert(name);
         }
         Ok(names.into_iter().map(ZoneInfo::new).collect())
+    }
+
+    /// Every rrset of the zone, all pages. Rrsets of types outside the record-level type list
+    /// (DNAME, HTTPS, SVCB) are listed too; what the model cannot hold is in `skipped`.
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_whole_set(self, zone, name, rtype).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        rrsets::set_whole_set(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_whole_set(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(
