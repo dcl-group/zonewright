@@ -40,7 +40,7 @@ use crate::record::{Ttl, Txt};
 use crate::redact::Detail;
 use crate::values;
 
-use super::api::{self, Api};
+use super::api::{self, Api, Zone};
 use super::config::{self, Project, SelectelV2Config, SelectelV2Credentials};
 
 /// Why a zone that exists cannot be used.
@@ -136,15 +136,18 @@ impl SelectelV2 {
         }
     }
 
-    /// The zone's identifier for a write: the cached one, which the operation's read has just
-    /// used, or one looked up afresh.
-    pub(super) async fn zone_id(&self, zone: &DomainName) -> Result<String, Error> {
-        if let Some(id) = self.zones.get(zone) {
-            return Ok(id);
+    /// The project the token is scoped to: the configured ID, or for a project given by name
+    /// the ID the identity service stated for the token. Known once a token was obtained.
+    fn own_project(&self) -> Result<String, Error> {
+        match &self.config.project_id {
+            Some(id) => Ok(id.clone()),
+            None => self.api.token_project().ok_or(Error::Protocol {
+                detail: Detail::constant(
+                    "the identity service did not state the project of the token, so the \
+                     zones of the configured project cannot be told from others",
+                ),
+            }),
         }
-        let id = self.resolve_zone(zone).await?;
-        self.zones.insert(zone, &id);
-        Ok(id)
     }
 
     /// Drops the cached identifier of `zone`.
@@ -156,19 +159,25 @@ impl SelectelV2 {
 
     /// Looks the zone up by name. There is no endpoint for one zone by name: the listing is
     /// filtered by the name in Unicode and compared exactly, since the filter matches
-    /// substrings.
-    // Source: research of the DNS v2 documentation; lego `getZone`
+    /// substrings. Of several zones with the name, one of the token's project is preferred:
+    /// zones of other projects cannot be changed with this token.
+    // Source: the OpenAPI has no zone-by-name path (`GET /zones/{zone_id}` only); lego `getZone`
     // (providers/dns/selectelv2/selectelv2.go) converts with `idna.ToUnicode` and compares
     // `zone.Name` with the FQDN.
     async fn find_zone(&self, zone: &DomainName) -> Result<Lookup, Error> {
         let unicode = zone.to_unicode();
         let filter = unicode.strip_suffix('.').unwrap_or(&unicode);
-        let found = self
+        let named: Vec<Zone> = self
             .api
             .zones(Some(filter))
             .await?
             .into_iter()
-            .find(|z| DomainName::parse(&z.name).is_ok_and(|name| &name == zone));
+            .filter(|z| DomainName::parse(&z.name).is_ok_and(|name| &name == zone))
+            .collect();
+        // The listing obtained a token, so the project is normally known now.
+        let project = self.own_project().ok();
+        let own = |z: &&Zone| project.is_some() && z.project_id == project;
+        let found = named.iter().find(own).or_else(|| named.first());
         match found {
             None => Ok(Lookup::Missing),
             Some(z) if z.disabled == Some(true) => Ok(Lookup::Disabled),
@@ -220,15 +229,7 @@ impl Provider for SelectelV2 {
     /// service states for the token. The identifiers are cached.
     async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
         let zones = self.api.zones(None).await?;
-        let project = match &self.config.project_id {
-            Some(id) => id.clone(),
-            None => self.api.token_project().ok_or(Error::Protocol {
-                detail: Detail::constant(
-                    "the identity service did not state the project of the token, so the \
-                     zones of the configured project cannot be told from others",
-                ),
-            })?,
-        };
+        let project = self.own_project()?;
         let project = Some(project.as_str());
         let mut names = BTreeSet::new();
         for zone in zones {

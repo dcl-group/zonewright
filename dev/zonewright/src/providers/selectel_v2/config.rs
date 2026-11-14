@@ -32,7 +32,7 @@ pub(super) const DEFAULT_TTL: u32 = 60;
 pub(super) const TTL_MIN: u32 = 60;
 pub(super) const TTL_MAX: u32 = 604_800;
 
-/// Longest user name the client accepts (the earlier implementation's limit).
+/// Longest user name the client accepts: a bound of the client's own, not of the API.
 const USERNAME_MAX: usize = 255;
 
 /// Settings of the Selectel v2 client: the non-secret part of its configuration.
@@ -130,7 +130,7 @@ impl SelectelV2Config {
                 return Err(config("one of project_id and project_name is required"));
             }
         };
-        if self.username.is_empty() || self.username.len() > USERNAME_MAX {
+        if self.username.is_empty() || self.username.chars().count() > USERNAME_MAX {
             return Err(config("username must be 1 to 255 characters long"));
         }
         let user_domain = match &self.user_domain_name {

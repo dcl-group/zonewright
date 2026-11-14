@@ -20,7 +20,10 @@ use zonewright::{
     RecordType, RemoveOutcome, RrSet, Txt,
 };
 use zonewright_mock::Fault;
-use zonewright_mock::echo::{DEFAULT_ISSUED_TOKEN, EchoServer};
+use zonewright_mock::axum;
+use zonewright_mock::axum::http::{Method, StatusCode};
+use zonewright_mock::axum::response::IntoResponse as _;
+use zonewright_mock::echo::{DEFAULT_ISSUED_TOKEN, EchoServer, Echoed, Render};
 use zonewright_mock::selectel_v2::{Seed, SeedZone, SelectelV2Mock};
 
 use common::echo::{CANARY_KEY, CANARY_PASSWORD, LogCapture, REDACTED, assert_clean, dialects};
@@ -165,7 +168,68 @@ async fn selectel_v2_secret_echo() {
                 "{label}: the identity service was not reached"
             );
         }
+        // The listings answer normally, so the write itself reaches the echo: a create (no
+        // rrset) and an update (an rrset with a foreign value).
+        for status in [400, 403, 422, 500] {
+            for existing in [false, true] {
+                let label = format!(
+                    "{} {:?} {status} write existing={existing}",
+                    dialect.name, dialect.spelling
+                );
+                let echo = dialect
+                    .echo(status)
+                    .render_under(
+                        "/domains/v2/zones",
+                        listings_then(dialect.render.clone(), existing),
+                    )
+                    .start()
+                    .await;
+                let client = echo_client(&echo, &echo.token_url());
+                echo_round(&label, &client, &secrets).await;
+                let (method, path) = if existing {
+                    ("PATCH", RRSET)
+                } else {
+                    ("POST", RRSETS)
+                };
+                assert_eq!(
+                    echo.log().count(Some(method), path),
+                    1,
+                    "{label}: the write did not reach the echo"
+                );
+            }
+        }
     }
+}
+
+/// A renderer that answers the zone and rrset listings like the API (one zone; no rrset, or a
+/// TXT rrset with a foreign value) and every other request with `errors`.
+fn listings_then(errors: Render, existing: bool) -> Render {
+    Arc::new(move |e: &Echoed| {
+        if e.method != Method::GET {
+            return errors(e);
+        }
+        let result = if e.path.ends_with("/zones") {
+            serde_json::json!([{
+                "id": "00000000-0000-4000-8000-000000000001",
+                "name": "example.org.",
+                "project_id": "project-a"
+            }])
+        } else if existing {
+            serde_json::json!([{
+                "id": "00000000-0000-4000-8000-000000000002",
+                "zone_id": "00000000-0000-4000-8000-000000000001",
+                "name": "_acme-challenge.example.org.",
+                "type": "TXT",
+                "ttl": 60,
+                "records": [{"content": "\"foreign\"", "disabled": false}]
+            }])
+        } else {
+            serde_json::json!([])
+        };
+        let count = result.as_array().map_or(0, Vec::len);
+        let body = serde_json::json!({"count": count, "next_offset": 0, "result": result});
+        (StatusCode::OK, axum::Json(body)).into_response()
+    })
 }
 
 fn echo_client(echo: &EchoServer, auth_url: &str) -> SelectelV2 {
@@ -330,6 +394,7 @@ async fn selectel_v2_never_removes_foreign_value() {
     );
     control.set_txt_disabled(NAME, "foreign-disabled", true);
     control.set_comment(NAME, "TXT", Some("set by hand"));
+    control.set_managed_by(NAME, "TXT", Some("00000000-0000-4000-8000-0000000000aa"));
     let original = control.rrset(NAME, "TXT").unwrap();
 
     let ours = txt("ours");
@@ -352,6 +417,16 @@ async fn selectel_v2_never_removes_foreign_value() {
     assert_eq!(during.ttl, 600);
     assert_eq!(during.comment.as_deref(), Some("set by hand"));
     assert_eq!(
+        during.managed_by.as_deref(),
+        Some("00000000-0000-4000-8000-0000000000aa")
+    );
+    let patch = mock.log().matching(Some("PATCH"), RRSET).pop().unwrap();
+    assert_eq!(patch.body_json().unwrap()["comment"], "set by hand");
+    assert_eq!(
+        patch.header("x-managed-by"),
+        Some("00000000-0000-4000-8000-0000000000aa")
+    );
+    assert_eq!(
         control.txt_values(NAME),
         ["foreign", "foreign-disabled", "ours"]
     );
@@ -366,6 +441,7 @@ async fn selectel_v2_never_removes_foreign_value() {
     assert_eq!(after.records, original.records);
     assert_eq!(after.ttl, original.ttl);
     assert_eq!(after.comment, original.comment);
+    assert_eq!(after.managed_by, original.managed_by);
 
     // A single foreign value: nothing is deleted.
     let other = "_acme-challenge.www.example.org";
@@ -546,8 +622,9 @@ async fn selectel_v2_unsupported_operations_send_nothing() {
     assert!(mock.log().is_empty());
 }
 
-/// Retry behavior: a create and an update are sent once whatever happens (a 5xx is the
-/// operation's error, and the repeat starts with a read); a delete by identifier is retried.
+/// Retry behavior: a create, an update and a delete of the rrset are each sent once whatever
+/// happens (a 5xx is the operation's error, and the repeat starts with a read). A repeated
+/// delete could remove a value another writer added after the read.
 #[tokio::test]
 async fn selectel_v2_writes_are_sent_once() {
     let (mock, client) = setup().await;
@@ -576,15 +653,99 @@ async fn selectel_v2_writes_are_sent_once() {
     assert_eq!(mock.log().count(Some("PATCH"), RRSET), 1);
     assert_eq!(mock.control().txt_values(NAME), ["AAA"]);
 
-    mock.faults().push(Fault::on("DELETE", RRSET).status(502));
+    // The delete is answered 502 and not applied; meanwhile another writer adds a value. A
+    // repeat of the delete would remove it.
+    let hook = mock.control().clone();
+    mock.faults().push(
+        Fault::on("DELETE", RRSET)
+            .run(move || {
+                let mut records = hook.txt_values(NAME);
+                records.push("foreign".into());
+                let quoted: Vec<String> = records.iter().map(|v| format!("\"{v}\"")).collect();
+                let quoted: Vec<&str> = quoted.iter().map(String::as_str).collect();
+                hook.delete_rrset(NAME, "TXT");
+                hook.insert_rrset("example.org", NAME, "TXT", 60, &quoted);
+            })
+            .status(502),
+    );
+    let e = client
+        .remove_txt_value(&zone(), &name(), &txt("AAA"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(mock.log().count(Some("DELETE"), RRSET), 1);
+    assert_eq!(mock.control().txt_values(NAME), ["AAA", "foreign"]);
+    // The repeat reads the new state and removes only our value.
     assert_eq!(
         client
             .remove_txt_value(&zone(), &name(), &txt("AAA"))
             .await
             .unwrap(),
+        RemoveOutcome::Removed
+    );
+    assert_eq!(mock.control().txt_values(NAME), ["foreign"]);
+
+    // A rejected token on a write is not repeated with a new one: the operation fails and its
+    // repeat obtains the new token.
+    mock.faults().push(Fault::on("PATCH", RRSET).status(401));
+    let e = client
+        .add_txt_value(&zone(), &name(), &txt("CCC"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    mock.faults().push(Fault::on("POST", RRSETS).status(401));
+    let other = dn("_acme-challenge.www.example.org");
+    let e = client
+        .add_txt_value(&zone(), &other, &txt("CCC"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    // A rate limit on a write is reported, not waited out and repeated.
+    mock.faults()
+        .push(Fault::on("PATCH", RRSET).rate_limited("1"));
+    let e = client
+        .add_txt_value(&zone(), &name(), &txt("CCC"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::RateLimited, "{e:?}");
+    assert_eq!(mock.log().count(Some("PATCH"), RRSET), 4);
+    assert_eq!(mock.log().count(Some("POST"), RRSETS), 3);
+    assert_eq!(mock.control().txt_values(NAME), ["foreign"]);
+    assert_eq!(add(&client, "CCC").await.unwrap(), AddOutcome::Appended);
+}
+
+/// A delete answered 404 is a success only when a new read finds no rrset: removed meanwhile
+/// by someone else, the rrset is gone; with the zone recreated (and the rrset in it) the value
+/// is still published, and the answer is a retryable `Conflict`.
+#[tokio::test]
+async fn selectel_v2_delete_not_found_reads_again() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    add(&client, "AAA").await.unwrap();
+    let hook = control.clone();
+    mock.faults().push(Fault::on("DELETE", RRSET).run(move || {
+        hook.delete_rrset(NAME, "TXT");
+    }));
+    assert_eq!(
+        remove(&client, "AAA").await.unwrap(),
         RemoveOutcome::RrsetDeleted
     );
-    assert_eq!(mock.log().count(Some("DELETE"), RRSET), 2);
+    assert!(control.rrsets().is_empty());
+
+    add(&client, "AAA").await.unwrap();
+    let hook = control.clone();
+    mock.faults().push(Fault::on("DELETE", RRSET).run(move || {
+        hook.recreate_zone("example.org");
+    }));
+    let e = remove(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+    assert!(e.is_retryable());
+    assert_eq!(control.txt_values(NAME), ["AAA"]);
+    assert_eq!(
+        remove(&client, "AAA").await.unwrap(),
+        RemoveOutcome::RrsetDeleted
+    );
+    assert!(control.rrsets().is_empty());
 }
 
 // ---- TXT records and rrsets --------------------------------------------------------------------
@@ -790,14 +951,42 @@ async fn selectel_v2_txt_dialect() {
 }
 
 /// An rrset created by someone else between the read and the create is a retryable `Conflict`;
-/// nothing is overwritten, and the repeat appends.
+/// nothing is overwritten, and the repeat appends. What the API answers to such a create is not
+/// documented (the mock's 409 is invented): whatever the refusal, the client reads again and
+/// decides by what it finds. A refusal with no rrset there is the refusal.
 #[tokio::test]
 async fn selectel_v2_create_conflict_is_conflict() {
+    for status in [None, Some(422), Some(400)] {
+        create_conflict(status).await;
+    }
+    let (mock, client) = setup().await;
+    mock.faults()
+        .push(Fault::on("POST", RRSETS).respond(422, r#"{"error":"validation error"}"#));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::Rejected {
+                status: Some(422),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(mock.control().rrsets().is_empty());
+}
+
+/// A foreign create races ours; the mock answers with its own 409 (`None`) or with `status`.
+async fn create_conflict(status: Option<u16>) {
     let (mock, client) = setup().await;
     let hook = mock.control().clone();
-    mock.faults().push(Fault::on("POST", RRSETS).run(move || {
+    let fault = Fault::on("POST", RRSETS).run(move || {
         hook.insert_rrset("example.org", NAME, "TXT", 60, &["\"foreign\""]);
-    }));
+    });
+    mock.faults().push(match status {
+        None => fault,
+        Some(status) => fault.respond(status, r#"{"error":"refused"}"#),
+    });
     let e = client
         .add_txt_value(&zone(), &name(), &txt("AAA"), None)
         .await
@@ -959,6 +1148,15 @@ async fn selectel_v2_check_reports_zones() {
     assert!(report.credentials_verified);
     assert!(report.zones.is_empty());
     assert_eq!(mock2.control().tokens_issued(), 1);
+    // A cached token proves nothing about the credentials now: every `check` exchanges them.
+    client2.check(&[]).await.unwrap();
+    assert_eq!(mock2.control().tokens_issued(), 2);
+    add(&client2, "AAA").await.unwrap();
+    assert_eq!(
+        mock2.control().tokens_issued(),
+        2,
+        "the new token is cached"
+    );
     // `check` looks zones up afresh every time.
     client.check(&[zone()]).await.unwrap();
     assert_eq!(mock.log().count(Some("GET"), ZONES), 3);
@@ -1002,6 +1200,103 @@ async fn selectel_v2_list_zones_own_project_all_pages() {
         2,
         "the zone was cached"
     );
+}
+
+/// Names are sent in Unicode form (design section 11.3): the zone filter and the name of a new
+/// rrset. The mock stores Unicode names, so an ASCII-compatible spelling would not be found.
+#[tokio::test]
+async fn selectel_v2_internationalized_names_are_sent_in_unicode() {
+    let mut seed = Seed::standard();
+    seed.zones = vec![SeedZone {
+        name: "пример.рф.".into(),
+        project_id: "project-a".into(),
+    }];
+    let (mock, client) = setup_with(seed).await;
+    let zone = dn("пример.рф");
+    let name = dn("_acme-challenge.пример.рф");
+    assert!(zone.as_str().starts_with("xn--"));
+    assert_eq!(
+        client
+            .add_txt_value(&zone, &name, &txt("AAA"), None)
+            .await
+            .unwrap(),
+        AddOutcome::Created
+    );
+    assert_eq!(
+        mock.control().rrsets()[0].name,
+        "_acme-challenge.пример.рф."
+    );
+    assert_eq!(
+        client
+            .remove_txt_value(&zone, &name, &txt("AAA"))
+            .await
+            .unwrap(),
+        RemoveOutcome::RrsetDeleted
+    );
+    assert!(client.check(&[zone]).await.unwrap().zones[0].found);
+}
+
+/// Records of another type at the same name are never touched.
+#[tokio::test]
+async fn selectel_v2_other_types_at_the_name_are_untouched() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_rrset("example.org", NAME, "A", 300, &["192.0.2.1"]);
+    let before = control.rrset(NAME, "A").unwrap();
+    assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
+    assert_eq!(add(&client, "BBB").await.unwrap(), AddOutcome::Appended);
+    assert_eq!(
+        remove(&client, "AAA").await.unwrap(),
+        RemoveOutcome::Removed
+    );
+    assert_eq!(
+        remove(&client, "BBB").await.unwrap(),
+        RemoveOutcome::RrsetDeleted
+    );
+    let after = control.rrset(NAME, "A").unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.records, before.records);
+    assert_eq!(after.ttl, before.ttl);
+    assert!(control.rrset(NAME, "TXT").is_none());
+}
+
+/// A listing that stops short of the number of items it states is an error, never a shorter
+/// result.
+#[tokio::test]
+async fn selectel_v2_truncated_listing_is_protocol() {
+    let (mock, client) = setup().await;
+    mock.faults().push(Fault::on("GET", ZONES).respond(
+        200,
+        r#"{"count":3,"next_offset":0,"result":[{"id":"00000000-0000-4000-8000-000000000001","name":"example.org.","project_id":"project-a"}]}"#,
+    ));
+    let e = client.list_zones().await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+}
+
+/// Of two zones with the same name, the one of the token's project is used.
+#[tokio::test]
+async fn selectel_v2_zone_of_the_own_project_is_preferred() {
+    let mut seed = Seed::standard();
+    seed.zones = vec![
+        SeedZone {
+            name: "example.org.".into(),
+            project_id: "project-b".into(),
+        },
+        SeedZone {
+            name: "example.org.".into(),
+            project_id: "project-a".into(),
+        },
+    ];
+    seed.list_foreign_zones = true;
+    let (mock, client) = setup_with(seed).await;
+    assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
+    let own = mock
+        .control()
+        .zones()
+        .into_iter()
+        .find(|z| z.project_id == "project-a")
+        .unwrap();
+    assert_eq!(mock.control().rrsets()[0].zone_id, own.id);
 }
 
 // ---- Authentication ----------------------------------------------------------------------------
@@ -1130,7 +1425,10 @@ async fn selectel_v2_token_is_renewed_before_expiry() {
         .add_txt_value(&zone(), &name(), &txt("A2"), None)
         .await
         .unwrap();
-    assert!(mock.control().tokens_issued() >= 2);
+    // Every API request needed a new token, and none more were issued.
+    let api_requests = mock.log().count(None, "/domains/**");
+    assert!(api_requests >= 4);
+    assert_eq!(mock.control().tokens_issued(), api_requests);
 }
 
 /// Concurrent operations of one client share one token request.
@@ -1538,12 +1836,71 @@ async fn live_selectel_v2_add_and_remove() {
             );
         })
     };
-    let outcome = body.await;
+    let mut outcome = body.await;
+
+    // Probe: what the API answers to a create of an rrset that exists. Two clients on separate
+    // contexts (so the name lock does not serialize them) add to a fresh name at once; both
+    // read "no rrset", and the second create meets the first one's rrset. The client must
+    // never report both as created with a value lost, and a refusal must be `Conflict`.
+    let probe = zone.prepend(&format!("_zw-live-{tag:016x}-probe")).unwrap();
+    let probe_values = [
+        txt(&format!("zw-live-{tag:016x}-p")),
+        txt(&format!("zw-live-{tag:016x}-q")),
+    ];
+    if outcome.is_ok() {
+        let other_ctx = Context::new(zonewright::ContextOptions::default()).unwrap();
+        let settings = live_env("ZONEWRIGHT_LIVE_SELECTEL_V2_SETTINGS");
+        let credentials = live_env("ZONEWRIGHT_LIVE_SELECTEL_V2_CREDENTIALS");
+        let second = AnyProvider::from_json(
+            ProviderId::SelectelV2,
+            &settings,
+            &SecretString::from(credentials),
+            &other_ctx,
+        )
+        .unwrap();
+        let (a, b) = tokio::join!(
+            client.add_txt_value(&zone, &probe, &probe_values[0], None),
+            second.add_txt_value(&zone, &probe, &probe_values[1], None),
+        );
+        eprintln!("duplicate-create probe: {a:?} / {b:?}");
+        let probe_body = tokio::spawn({
+            let (client, zone, probe, probe_values) = (
+                client.clone(),
+                zone.clone(),
+                probe.clone(),
+                probe_values.clone(),
+            );
+            async move {
+                assert!(
+                    !(matches!(a, Ok(AddOutcome::Created)) && matches!(b, Ok(AddOutcome::Created))),
+                    "both creates reported success: the API accepted a duplicate create"
+                );
+                for result in [&a, &b] {
+                    if let Err(e) = result {
+                        assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+                    }
+                }
+                // Repeating the refused add converges; both values end up published.
+                for value in &probe_values {
+                    client
+                        .add_txt_value(&zone, &probe, value, None)
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        outcome = probe_body.await;
+    }
 
     // Cleanup: exactly the values this test added, with the value operations.
     let mut cleanup = Vec::new();
     for value in &values {
         if let Err(e) = client.remove_txt_value(&zone, &name, value).await {
+            cleanup.push(format!("{e}"));
+        }
+    }
+    for value in &probe_values {
+        if let Err(e) = client.remove_txt_value(&zone, &probe, value).await {
             cleanup.push(format!("{e}"));
         }
     }

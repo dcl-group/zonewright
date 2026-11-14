@@ -116,7 +116,7 @@ const FIELDS: &[ConfigField] = &[
         kind: FieldKind::Url,
         default: Some("https://cloud.api.selcloud.ru/identity/v3"),
         label: "Keystone URL",
-        help: "Endpoint of the provider's API; change it only to point the client at a test server.",
+        help: "Endpoint of the provider's identity service; change it only to point the client at a test server.",
         advanced: true,
     },
 ];

@@ -1278,7 +1278,15 @@ Rules common to all of them:
   opaque text, is never equal to the value being added or removed, and is written back unchanged. It
   does not make the operation fail.
 - A delete by identifier that is answered "not found" counts as done, on the first attempt and on a
-  repeated one: the record is gone, by an earlier attempt of this operation or by someone else.
+  repeated one: the record is gone, by an earlier attempt of this operation or by someone else. This
+  holds for one record of a per-record API. The delete of a whole rrset (the last value of a
+  whole-set provider) is sent once, and its "not found" is a success only when a new read finds no
+  rrset: the answer can also mean that the zone identifier went stale while the rrset, and with it
+  the value, is still published; then the result is `Error::Conflict`.
+- A create of a whole rrset whose refusal the provider does not document for an existing rrset is
+  followed by a new read: an rrset found there now was created by another writer after the
+  operation's read, nothing of it was overwritten, and the result is `Error::Conflict`; otherwise
+  the refusal is the error.
 - Each row of the table corresponds to a value of `Capabilities::txt_values`: `PerValue` for the
   first two rows and for RFC 2136, `Conditional` for Route 53 and Yandex Cloud, `ReadThenWrite` for
   Selectel v2, Beget and Cloud.ru, `Rotating` for acme-dns. At the three `ReadThenWrite` providers
@@ -1653,12 +1661,13 @@ numbers and tokens only; a URL returned by the provider is never requested.
 ### 5.3 Retries
 
 Each request is marked idempotent or not by the client code. A request is idempotent when executing
-it twice leaves the same state as executing it once: reads, deletes by identifier, token requests,
-and whole-set replacements that carry a condition the provider checks. Creating a record and
-appending a value are not. An unconditional whole-set replacement is idempotent in the strict sense
-but is marked "send once" all the same: every automatic repeat would lengthen the time between the
-operation's read and its last write, and with it the window in which another writer's change is
-overwritten (section 3.4).
+it twice leaves the same state as executing it once: reads, deletes of one record by identifier at a
+per-record API, token requests, and whole-set replacements that carry a condition the provider
+checks. Creating a record and appending a value are not. An unconditional whole-set replacement is
+idempotent in the strict sense but is marked "send once" all the same: every automatic repeat would
+lengthen the time between the operation's read and its last write, and with it the window in which
+another writer's change is overwritten (section 3.4). The same holds for an unconditional delete of
+a whole rrset, which can hold values another writer added after the read: it is sent once.
 
 - At most 3 attempts per request, counting the first.
 - An idempotent request is retried after a connection or timeout error and after a 5xx answer.
@@ -1686,7 +1695,8 @@ overwritten (section 3.4).
   rejected"); the caller's repeat of the operation starts with a read, which obtains the new token.
   The token is discarded also when the 401 answer is over the size limit. Tokens are renewed well
   before they expire, so this path is for revoked tokens, not for normal expiry.
-- A delete by identifier that is repeated and answered "not found" is a success (section 3.5).
+- A delete of one record by identifier that is repeated and answered "not found" is a success
+  (section 3.5).
 
 ### 5.4 Responses
 
@@ -2748,7 +2758,15 @@ Behavior that the design fixes because the generic sections cannot:
   are constants. A signature rejected for clock skew is `Error::Auth` with that hint.
 - `selectel_v2`. Names are sent in Unicode form. Records with the `disabled` flag follow section
   3.4. An rrset holds at most 100 records; a larger request is `InvalidInput`. An rrset is addressed
-  by reading it by name and type on every operation, not by a remembered ID.
+  by reading it by name and type on every operation, not by a remembered ID. The answer to a create
+  of an existing rrset is not documented, so a refused create is followed by a read (section 3.5);
+  the delete of the rrset is sent once. An update sends back the comment and, in the documented
+  `X-Managed-By` header, the managing resource as read, since whether an update without them clears
+  them is not established. A listing ends when the items received reach its stated `count`; one that
+  stops short of it is `Error::Protocol`. A project given by name is scoped within the account's
+  Keystone domain, and the project ID the identity service states for the token tells the project's
+  zones from others; of several zones with the requested name, the one of that project is used.
+  `check` exchanges the credentials for a new token even when one is cached.
 - `timeweb_cloud`. A record this process created is remembered by ID so it can be removed even if
   the listing does not show it. The memory is in `Context`, holds at most 1024 records, and drops an
   entry when the record is removed or 24 hours after it was created.
@@ -2837,6 +2855,9 @@ For every client, in its own test file, where the operation exists:
 - `<id>_stale_zone_id`: after the mock recreates the zone under a new identifier, the next operation
   succeeds or fails cleanly and the one after it succeeds; a removal never reports `NotPresent` for
   a value that is there.
+- `<id>_writes_are_sent_once`, for every client that writes: with a `502`, a `429` and a `401`
+  injected on each write request, the request log holds exactly one such request per operation.
+- `<id>_unsupported_operations_send_nothing`, for every client with an unsupported operation.
 
 `tests/conformance.rs` holds the checks that span providers: `parse(as_str(id)) == id` for all IDs,
 serde round trip, the literal table of section 2.4, the comparison with `PROVIDERS.md`, every

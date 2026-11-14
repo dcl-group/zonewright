@@ -3,20 +3,34 @@
 //! Shapes follow the provider's documentation, the same sources the client cites:
 //!
 //! - DNS v2: <https://docs.selectel.ru/api/docs/cloud-services/dns_api/dns_api_actual/> and the
-//!   provider's Go client `github.com/selectel/domains-go` (`pkg/v2`): zones and rrsets with
-//!   `{count, next_offset, result}` pages, `limit` (1 to 1000) and `offset`; `PATCH` and `DELETE`
-//!   answer `204`; create answers `200` with the new rrset; errors are
-//!   `{"error", "description"}`; `ttl` 60 to 604800; `records` 1 to 100.
-//! - Keystone: <https://docs.selectel.ru/api/authorization/> and the OpenStack Identity v3 API:
-//!   `POST /identity/v3/auth/tokens` answers `201` with the token in `X-Subject-Token` and
-//!   `token.expires_at` in the body; wrong credentials answer `401`.
+//!   OpenAPI document behind it, <https://docs.selectel.ru/api/dns-actual.json>: zones and
+//!   rrsets in `{count, next_offset, result}` pages with `limit` (minimum 1, default 1000) and
+//!   `offset`; create answers `200` with the new rrset; `PATCH` (`ttl` and `records` required,
+//!   `comment` at most 255 characters, `X-Managed-By` header) and `DELETE` answer `204`; a
+//!   missing zone or rrset is `404`; validation errors are `422`; error bodies are
+//!   `{"error", "description"}`; `ttl` 60 to 604800; `records` 1 to 100; the types of
+//!   `AllowedRecordTypes`.
+//! - Keystone: <https://docs.selectel.ru/en/api/authorization/> and the OpenStack Identity v3
+//!   API: `POST /identity/v3/auth/tokens` answers `201` with the token in `X-Subject-Token`
+//!   and `token.expires_at` and `token.project` in the body; wrong credentials answer `401`.
 //!
-//! Choices of the mock where the documentation says nothing, each made so that a client cannot
-//! rely on the lenient reading: the `filter` of the zone listing and the `name` of the rrset
-//! listing match substrings, so a listing returns "noisy" neighbors the client must skip; a
-//! zone of another project is either hidden or listed and answered `403`
-//! ([`Seed::list_foreign_zones`]); a TXT record whose content is not quoted is refused with
-//! `422`. Error texts are invented.
+//! Answers this mock invents because the documentation is silent, each chosen so that a client
+//! cannot rely on a lenient reading. A test that depends on one of them proves only how the
+//! client handles that answer, not that the provider gives it:
+//!
+//! - a create of a name and type that exists answers `409` (the documented codes of the create
+//!   are 200, 400, 401, 404, 422, 500; `409` is documented for zone calls only);
+//! - the zone `filter` and the rrset `name` filter match substrings, so a listing returns
+//!   "noisy" neighbors the client must skip;
+//! - a zone of another project is either hidden from `GET /zones` or listed
+//!   ([`Seed::list_foreign_zones`]); requests into it answer `403` on every path (documented
+//!   for `PATCH` and `DELETE` only);
+//! - a TXT record whose content is not quoted is refused with `422`;
+//! - an update replaces the comment with the one it carries (none when absent) and the
+//!   managing resource with its `X-Managed-By` header (none when absent);
+//! - the next offset of the last page is `0`.
+//!
+//! Error texts are invented.
 //!
 //! A test holds a [`SelectelV2Mock`]. It dereferences to the [`MockServer`], so the request log
 //! and the fault queue of the shared harness work as usual:
@@ -54,15 +68,18 @@ pub const API_PATH: &str = "/domains/v2";
 /// Path of the identity service below the server's base URL.
 pub const IDENTITY_PATH: &str = "/identity/v3";
 
-/// Record types the DNS API accepts (documentation, "Ограничения").
+/// Record types the DNS API accepts (the OpenAPI, `AllowedRecordTypes`).
 const TYPES: [&str; 14] = [
     "A", "AAAA", "ALIAS", "CAA", "CNAME", "DNAME", "HTTPS", "MX", "NS", "SOA", "SRV", "SVCB",
     "SSHFP", "TXT",
 ];
 
-/// Largest page and largest rrset the API accepts.
-const MAX_LIMIT: usize = 1000;
+/// Default page size and largest rrset the API accepts.
+const DEFAULT_LIMIT: usize = 1000;
 const MAX_RECORDS: usize = 100;
+
+/// Longest comment of an rrset.
+const MAX_COMMENT: usize = 255;
 
 /// The state the mock starts from.
 #[derive(Clone, Debug)]
@@ -420,6 +437,26 @@ impl Control {
         }
     }
 
+    /// Sets the managing resource of the rrset of `name` and `rtype`.
+    pub fn set_managed_by(&self, name: &str, rtype: &str, managed_by: Option<&str>) {
+        let name = fqdn(name);
+        for rrset in lock(&self.state)
+            .rrsets
+            .iter_mut()
+            .filter(|r| r.name == name && r.rtype == rtype)
+        {
+            rrset.managed_by = managed_by.map(str::to_owned);
+        }
+    }
+
+    /// Deletes the rrset of `name` and `rtype` directly, as another writer would.
+    pub fn delete_rrset(&self, name: &str, rtype: &str) {
+        let name = fqdn(name);
+        lock(&self.state)
+            .rrsets
+            .retain(|r| !(r.name == name && r.rtype == rtype));
+    }
+
     /// Disables or enables the TXT records of `name` whose unquoted content is `value`.
     pub fn set_txt_disabled(&self, name: &str, value: &str, disabled: bool) {
         let name = fqdn(name);
@@ -646,9 +683,9 @@ fn query<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
 /// `0` on the last page.
 fn paginate<T: Serialize>(items: Vec<T>, pairs: &[(String, String)]) -> Response {
     let limit = match query(pairs, "limit").map(str::parse::<usize>) {
-        None => MAX_LIMIT,
-        Some(Ok(limit)) if (1..=MAX_LIMIT).contains(&limit) => limit,
-        Some(_) => return validation("limit must be between 1 and 1000"),
+        None => DEFAULT_LIMIT,
+        Some(Ok(limit)) if limit >= 1 => limit,
+        Some(_) => return validation("limit must be at least 1"),
     };
     let offset = match query(pairs, "offset").map(str::parse::<usize>) {
         None => 0,
@@ -657,7 +694,7 @@ fn paginate<T: Serialize>(items: Vec<T>, pairs: &[(String, String)]) -> Response
     };
     let count = items.len();
     let page: Vec<T> = items.into_iter().skip(offset).take(limit).collect();
-    let next = if offset + limit < count {
+    let next = if offset.saturating_add(limit) < count {
         offset + limit
     } else {
         0
@@ -793,6 +830,16 @@ fn validate_records(rtype: &str, records: &Value) -> Result<Vec<Record>, Respons
     Ok(records)
 }
 
+fn validate_comment(comment: Option<&Value>) -> Result<Option<String>, Response> {
+    match comment {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.chars().count() <= MAX_COMMENT => Ok(Some(text.clone())),
+        Some(_) => Err(validation(
+            "comment must be a string of at most 255 characters",
+        )),
+    }
+}
+
 async fn rrset_create(
     State(state): State<Shared>,
     headers: HeaderMap,
@@ -832,6 +879,10 @@ async fn rrset_create(
         Ok(records) => records,
         Err(response) => return response,
     };
+    let comment = match validate_comment(request.get("comment")) {
+        Ok(comment) => comment,
+        Err(response) => return response,
+    };
     let mut inner = lock(&state);
     if inner
         .rrsets
@@ -846,7 +897,7 @@ async fn rrset_create(
         name,
         rtype: rtype.to_owned(),
         ttl,
-        comment: None,
+        comment,
         managed_by: None,
         records,
     };
@@ -870,13 +921,17 @@ async fn rrset_update(
     let Ok(Value::Object(request)) = serde_json::from_slice::<Value>(&body) else {
         return error(StatusCode::BAD_REQUEST, "malformed request body", None);
     };
-    // The update form has no `name` and no `type` (domains-go `RRSetUpdateForm`).
+    // The update form has `ttl`, `records` and `comment` only (`RRSetUpdateForm`).
     if request
         .keys()
-        .any(|k| !matches!(k.as_str(), "ttl" | "records" | "comment" | "managed_by"))
+        .any(|k| !matches!(k.as_str(), "ttl" | "records" | "comment"))
     {
         return validation("unexpected field");
     }
+    let managed_by = headers
+        .get("x-managed-by")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let Some(rtype) = lock(&state)
         .rrsets
         .iter()
@@ -885,27 +940,27 @@ async fn rrset_update(
     else {
         return error(StatusCode::NOT_FOUND, "rrset not found", None);
     };
-    let ttl = match request.get("ttl").map(|t| validate_ttl(t.as_u64())) {
-        None => None,
-        Some(Ok(ttl)) => Some(ttl),
-        Some(Err(response)) => return response,
+    let ttl = match validate_ttl(request.get("ttl").and_then(Value::as_u64)) {
+        Ok(ttl) => ttl,
+        Err(response) => return response,
     };
-    let records = match request.get("records").map(|r| validate_records(&rtype, r)) {
-        None => None,
-        Some(Ok(records)) => Some(records),
-        Some(Err(response)) => return response,
+    let Some(records) = request.get("records") else {
+        return validation("records are required");
+    };
+    let records = match validate_records(&rtype, records) {
+        Ok(records) => records,
+        Err(response) => return response,
+    };
+    let comment = match validate_comment(request.get("comment")) {
+        Ok(comment) => comment,
+        Err(response) => return response,
     };
     let mut inner = lock(&state);
     if let Some(rrset) = inner.rrsets.iter_mut().find(|r| r.id == rrset_id) {
-        if let Some(ttl) = ttl {
-            rrset.ttl = ttl;
-        }
-        if let Some(records) = records {
-            rrset.records = records;
-        }
-        if let Some(comment) = request.get("comment") {
-            rrset.comment = comment.as_str().map(str::to_owned);
-        }
+        rrset.ttl = ttl;
+        rrset.records = records;
+        rrset.comment = comment;
+        rrset.managed_by = managed_by;
     }
     StatusCode::NO_CONTENT.into_response()
 }

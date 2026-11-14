@@ -595,6 +595,18 @@ fn provider_sources_use_no_text_constructors() {
     }
 }
 
+/// True when a file of the provider's module under `src/providers/<id>/` contains `needle`.
+fn provider_sources_contain(id: ProviderId, needle: &str) -> bool {
+    let mut files = Vec::new();
+    rust_files(
+        &manifest_dir().join("src/providers").join(id.as_str()),
+        &mut files,
+    );
+    files
+        .iter()
+        .any(|path| std::fs::read_to_string(path).unwrap().contains(needle))
+}
+
 /// Every provider whose client is ported defines the tests that sections 12.2 and 12.3 require
 /// in its own test file. Placeholders are skipped; the scan applies as soon as one is replaced.
 #[test]
@@ -609,8 +621,21 @@ fn provider_test_files_define_the_required_tests() {
         if id != ProviderId::Rfc2136 {
             required.push("secret_echo");
         }
-        if caps.add_txt_value || caps.remove_txt_value || caps.set_rrset || caps.delete_rrset {
-            required.push("name_outside_zone_sends_nothing");
+        let writes =
+            caps.add_txt_value || caps.remove_txt_value || caps.set_rrset || caps.delete_rrset;
+        if writes {
+            // Design 12.3: name checks before any request, and the retry rule of section 5.3
+            // (a write that is not idempotent is sent once).
+            required.extend(["name_outside_zone_sends_nothing", "writes_are_sent_once"]);
+        }
+        // Design 2.5: an unsupported operation is `Unsupported` before any request.
+        if OPERATIONS.iter().any(|&op| !caps.supports(op)) {
+            required.push("unsupported_operations_send_nothing");
+        }
+        // Design 3.8 and 12.3: a client that caches zone identifiers tests a stale one. Whether
+        // it caches them is read from its sources: the shared cache is `ZoneCache`.
+        if provider_sources_contain(id, "ZoneCache") {
+            required.push("stale_zone_id");
         }
         if caps.add_txt_value {
             required.extend(["add_is_idempotent", "concurrent_adds_are_serialized"]);

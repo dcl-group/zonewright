@@ -29,11 +29,13 @@
 //! let zones: ZoneList = response.json("the zone listing is not in the expected form")?;
 //! ```
 
-// TEMPORARY (core phase): no client uses the transport yet.
-#![allow(dead_code)]
-// TEMPORARY (core phase): the re-exports have no user until the clients land; `dead_code` does
-// not cover unused imports.
-#![allow(unused_imports)]
+// Design section 9.2: not every provider uses every shared helper, so builds without
+// `all-providers` allow unused code here; the build with all providers does not, so that a
+// helper no provider uses is found.
+#![cfg_attr(not(feature = "all-providers"), allow(dead_code, unused_imports))]
+// TEMPORARY (porting phase): fourteen clients are still placeholders and leave helpers unused
+// even with all providers. Removed when the last placeholder client is replaced.
+#![cfg_attr(feature = "all-providers", allow(dead_code, unused_imports))]
 
 pub(crate) mod encode;
 pub(crate) mod gate;

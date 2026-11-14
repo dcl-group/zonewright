@@ -83,8 +83,18 @@ pub(crate) struct TxtSet<H, S> {
     pub(crate) snapshot: S,
 }
 
-/// The answer of a [`WholeSet`] read: the set, or `None` when there is no TXT rrset at the name.
-pub(crate) type SetRead<H, S> = Result<Option<TxtSet<H, S>>, Error>;
+/// What a [`WholeSet`] read found.
+#[derive(Clone, Debug)]
+pub(crate) struct SetState<H, S, C> {
+    /// What the read learned that the write needs whatever it found, such as the zone
+    /// identifier it used. A create has nothing else to go by.
+    pub(crate) context: C,
+    /// The set, or `None` when there is no TXT rrset at the name.
+    pub(crate) set: Option<TxtSet<H, S>>,
+}
+
+/// The answer of a [`WholeSet`] read.
+pub(crate) type SetRead<H, S, C> = Result<SetState<H, S, C>, Error>;
 
 /// One member of a whole set to be written.
 #[derive(Debug)]
@@ -201,20 +211,23 @@ pub(crate) trait WholeSet: TxtBase {
     type Handle: Send + Sync;
     /// The old set as read.
     type Snapshot: PartialEq + Send + Sync;
+    /// What the read hands to the write and the delete in every case ([`SetState::context`]).
+    type Context: Send + Sync;
 
-    /// The TXT rrset at `name`, or `None`.
+    /// The TXT rrset at `name`, or `None`, with the read's context.
     fn read(
         &self,
         zone: &DomainName,
         name: &DomainName,
-    ) -> impl Future<Output = SetRead<Self::Handle, Self::Snapshot>> + Send;
+    ) -> impl Future<Output = SetRead<Self::Handle, Self::Snapshot, Self::Context>> + Send;
 
-    /// Writes the rrset with exactly `members`. `prior` is the set as read (`None`: it did not
-    /// exist); a conditional client makes the write depend on it.
+    /// Writes the rrset with exactly `members`. `context` is the read's; `prior` is the set as
+    /// read (`None`: it did not exist); a conditional client makes the write depend on it.
     fn write(
         &self,
         zone: &DomainName,
         name: &DomainName,
+        context: &Self::Context,
         prior: Option<&Self::Snapshot>,
         members: &[Member<'_, Self::Handle>],
         ttl: WriteTtl,
@@ -225,6 +238,7 @@ pub(crate) trait WholeSet: TxtBase {
         &self,
         zone: &DomainName,
         name: &DomainName,
+        context: &Self::Context,
         prior: &Self::Snapshot,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
@@ -473,7 +487,7 @@ async fn reread_unchanged<B: WholeSet>(
     if !backend.reread_before_write() {
         return Ok(());
     }
-    let again = non_empty(backend.read(zone, name).await?)?;
+    let again = non_empty(backend.read(zone, name).await?.set)?;
     if again.as_ref().map(|set| &set.snapshot) == prior {
         Ok(())
     } else {
@@ -488,12 +502,14 @@ async fn add_whole_set_once<B: WholeSet>(
     value: &Txt,
     ttl: Option<Ttl>,
 ) -> Result<AddOutcome, Error> {
-    match non_empty(backend.read(zone, name).await?)? {
+    let state = backend.read(zone, name).await?;
+    let context = &state.context;
+    match non_empty(state.set)? {
         None => {
             reread_unchanged(backend, zone, name, None).await?;
             let members = [Member::Added(value)];
             backend
-                .write(zone, name, None, &members, WriteTtl::New(ttl))
+                .write(zone, name, context, None, &members, WriteTtl::New(ttl))
                 .await?;
             Ok(AddOutcome::Created)
         }
@@ -512,6 +528,7 @@ async fn add_whole_set_once<B: WholeSet>(
                 .write(
                     zone,
                     name,
+                    context,
                     Some(&set.snapshot),
                     &members,
                     WriteTtl::Existing(set.ttl),
@@ -528,7 +545,9 @@ async fn remove_whole_set_once<B: WholeSet>(
     name: &DomainName,
     value: &Txt,
 ) -> Result<RemoveOutcome, Error> {
-    let Some(set) = non_empty(backend.read(zone, name).await?)? else {
+    let state = backend.read(zone, name).await?;
+    let context = &state.context;
+    let Some(set) = non_empty(state.set)? else {
         return Ok(RemoveOutcome::NotPresent);
     };
     if !set.records.iter().any(|record| holds(record, value)) {
@@ -542,13 +561,14 @@ async fn remove_whole_set_once<B: WholeSet>(
         .collect();
     reread_unchanged(backend, zone, name, Some(&set.snapshot)).await?;
     if rest.is_empty() {
-        backend.delete(zone, name, &set.snapshot).await?;
+        backend.delete(zone, name, context, &set.snapshot).await?;
         Ok(RemoveOutcome::RrsetDeleted)
     } else {
         backend
             .write(
                 zone,
                 name,
+                context,
                 Some(&set.snapshot),
                 &rest,
                 WriteTtl::Existing(set.ttl),
@@ -567,8 +587,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Member, PerRecord, PerRecordRead, SetRead, TxtBase, TxtRecord, TxtSet, ValueCalls,
-        WholeSet, WriteTtl,
+        Member, PerRecord, PerRecordRead, SetRead, SetState, TxtBase, TxtRecord, TxtSet,
+        ValueCalls, WholeSet, WriteTtl,
     };
     use crate::error::{Error, ErrorKind};
     use crate::id::ProviderId;
@@ -866,23 +886,23 @@ mod tests {
     impl WholeSet for WholeFake {
         type Handle = Rec;
         type Snapshot = Vec<Rec>;
+        type Context = ();
 
-        async fn read(&self, _zone: &DomainName, name: &DomainName) -> SetRead<Rec, Vec<Rec>> {
+        async fn read(&self, _zone: &DomainName, name: &DomainName) -> SetRead<Rec, Vec<Rec>, ()> {
             let recs = self.0.store.lock().unwrap().read(name);
-            let Some(first) = recs.first() else {
-                return Ok(None);
-            };
-            Ok(Some(TxtSet {
+            let set = recs.first().map(|first| TxtSet {
                 records: recs.iter().map(|r| txt_record(r, r.clone())).collect(),
                 ttl: Some(Ttl::from_secs(first.ttl).unwrap()),
                 snapshot: recs.clone(),
-            }))
+            });
+            Ok(SetState { context: (), set })
         }
 
         async fn write(
             &self,
             _zone: &DomainName,
             name: &DomainName,
+            _context: &(),
             prior: Option<&Vec<Rec>>,
             members: &[Member<'_, Rec>],
             ttl: WriteTtl,
@@ -918,6 +938,7 @@ mod tests {
             &self,
             _zone: &DomainName,
             name: &DomainName,
+            _context: &(),
             prior: &Vec<Rec>,
         ) -> Result<(), Error> {
             delay(&self.0.store).await;
@@ -1631,17 +1652,22 @@ mod tests {
         impl WholeSet for EmptySet {
             type Handle = ();
             type Snapshot = ();
-            async fn read(&self, _zone: &DomainName, _name: &DomainName) -> SetRead<(), ()> {
-                Ok(Some(TxtSet {
-                    records: Vec::new(),
-                    ttl: None,
-                    snapshot: (),
-                }))
+            type Context = ();
+            async fn read(&self, _zone: &DomainName, _name: &DomainName) -> SetRead<(), (), ()> {
+                Ok(SetState {
+                    context: (),
+                    set: Some(TxtSet {
+                        records: Vec::new(),
+                        ttl: None,
+                        snapshot: (),
+                    }),
+                })
             }
             async fn write(
                 &self,
                 _zone: &DomainName,
                 _name: &DomainName,
+                _context: &(),
                 _prior: Option<&()>,
                 _members: &[Member<'_, ()>],
                 _ttl: WriteTtl,
@@ -1652,6 +1678,7 @@ mod tests {
                 &self,
                 _zone: &DomainName,
                 _name: &DomainName,
+                _context: &(),
                 _prior: &(),
             ) -> Result<(), Error> {
                 panic!("deleted after an unexpected read");

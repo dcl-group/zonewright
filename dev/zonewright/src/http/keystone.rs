@@ -6,14 +6,15 @@
 //! `POST /v3/auth/tokens` with the user's name, domain and password and a project scope; the
 //! token is returned in the `X-Subject-Token` header of a `201 Created` answer, its expiry in the
 //! body's `token.expires_at` (ISO 8601) and the project it is scoped to in `token.project.id`.
-//! The earlier implementations of both clients accepted `200` as well, and answered `400` with an
-//! authentication error; both are kept.
+//! Assumptions (not documented): a `200` answer is accepted like `201`, and a `400` answer to the
+//! exchange is reported as an authentication error. Neither can cause a write.
 //!
 //! The project is named by its ID, or by its name within a domain (a project name is unique only
-//! within its domain). Selectel documents both forms of the scope
-//! (<https://docs.selectel.ru/api/authorization/>: `"scope": {"project": {"name": ...,
-//! "domain": {"name": <account number>}}}`, or `{"project": {"id": ...}}`); the OpenStack
-//! reference above defines both.
+//! within its domain); the OpenStack reference above defines both forms of the scope. Selectel's
+//! documentation (<https://docs.selectel.ru/en/api/authorization/>) shows the scope by name,
+//! `"scope": {"project": {"name": ..., "domain": {"name": <account number>}}}`; the scope by ID
+//! is the one lego's Selectel and VK Cloud providers send through gophercloud
+//! (`Scope.ProjectID`).
 
 use bytes::Bytes;
 use reqwest::Method;
