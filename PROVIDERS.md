@@ -29,6 +29,7 @@ None yet.
 | Cloudflare   | `cloudflare`   | TXT values |                                                                                                  |
 | Yandex Cloud | `yandex_cloud` | TXT values | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
 | Route 53     | `route53`      | TXT values |                                                                                                  |
+| DigitalOcean | `digitalocean` | TXT values |                                                                                                  |
 
 ## Planned
 
@@ -37,7 +38,6 @@ None yet.
 | acme-dns      | `acme_dns`      | TXT values only: the acme-dns API offers nothing else.             |
 | Beget         | `beget`         |                                                                    |
 | Cloud.ru      | `cloud_ru`      |                                                                    |
-| DigitalOcean  | `digitalocean`  |                                                                    |
 | Hetzner       | `hetzner`       |                                                                    |
 | nic.ru        | `nicru`         |                                                                    |
 | reg.ru        | `regru`         | An earlier version of this client was proven against the live API. |

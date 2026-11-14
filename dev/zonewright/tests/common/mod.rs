@@ -56,10 +56,13 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
             r#"{"access_key_id":"AKIAZWTEST0000000001","base_url":"http://127.0.0.1:9"}"#,
             r#"{"secret_access_key":"test-only-secret"}"#,
         ),
+        ProviderId::DigitalOcean => (
+            r#"{"base_url":"http://127.0.0.1:9/v2"}"#,
+            r#"{"api_token":"test-only-token"}"#,
+        ),
         ProviderId::AcmeDns
         | ProviderId::Beget
         | ProviderId::CloudRu
-        | ProviderId::DigitalOcean
         | ProviderId::Hetzner
         | ProviderId::Nicru
         | ProviderId::Regru
