@@ -32,10 +32,7 @@
 // Design section 9.2: not every provider uses every shared helper, so builds without
 // `all-providers` allow unused code here; the build with all providers does not, so that a
 // helper no provider uses is found.
-#![cfg_attr(not(feature = "all-providers"), allow(dead_code, unused_imports))]
-// TEMPORARY (porting phase): fourteen clients are still placeholders and leave helpers unused
-// even with all providers. Removed when the last placeholder client is replaced.
-#![cfg_attr(feature = "all-providers", allow(dead_code, unused_imports))]
+#![cfg_attr(not(feature = "all-providers"), allow(dead_code))]
 
 pub(crate) mod encode;
 pub(crate) mod gate;
@@ -54,13 +51,91 @@ pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
 
+// Each re-export is compiled with the clients that import it, so that a build with only some
+// providers has no unused import (the items themselves are covered by the `dead_code` allowance
+// above).
 pub(crate) use gate::RateGate;
+#[cfg(any(feature = "selectel_v2", feature = "vk_cloud"))]
 pub(crate) use keystone::Keystone;
-pub(crate) use poll::{PollStep, Poller, poll_interval};
-pub(crate) use request::{Request, Response, TokenAuth};
-pub(crate) use token::{Token, TokenSource, lifetime_until};
-pub(crate) use url::{Endpoint, Origin, path_id};
-pub(crate) use zone_cache::{Attempt, ZoneCache, ZoneId};
+#[cfg(any(feature = "cloud_ru", feature = "hetzner", feature = "yandex_cloud"))]
+pub(crate) use poll::poll_interval;
+#[cfg(any(
+    feature = "cloud_ru",
+    feature = "hetzner",
+    feature = "route53",
+    feature = "yandex_cloud"
+))]
+pub(crate) use poll::{PollStep, Poller};
+#[cfg(any(
+    feature = "acme_dns",
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
+pub(crate) use request::Request;
+pub(crate) use request::Response;
+#[cfg(any(feature = "cloud_ru", feature = "nicru", feature = "yandex_cloud"))]
+pub(crate) use request::TokenAuth;
+#[cfg(feature = "route53")]
+pub(crate) use request::{Finish, Outgoing};
+#[cfg(feature = "acme_dns")]
+pub(crate) use retry::SendError;
+#[cfg(any(
+    feature = "cloud_ru",
+    feature = "nicru",
+    feature = "selectel_v2",
+    feature = "yandex_cloud"
+))]
+pub(crate) use token::Token;
+#[cfg(any(
+    feature = "cloud_ru",
+    feature = "nicru",
+    feature = "selectel_v2",
+    feature = "vk_cloud",
+    feature = "yandex_cloud"
+))]
+pub(crate) use token::TokenSource;
+#[cfg(feature = "yandex_cloud")]
+pub(crate) use token::lifetime_until;
+#[cfg(any(
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "vk_cloud",
+    feature = "yandex_cloud"
+))]
+pub(crate) use url::path_id;
+pub(crate) use url::{Endpoint, Origin};
+#[cfg(any(
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "hetzner",
+    feature = "selectel_v2",
+    feature = "vk_cloud",
+    feature = "yandex_cloud"
+))]
+pub(crate) use zone_cache::ZoneId;
+#[cfg(any(
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "hetzner",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "vk_cloud",
+    feature = "yandex_cloud"
+))]
+pub(crate) use zone_cache::{Attempt, ZoneCache};
 
 use std::fmt;
 use std::sync::Arc;
@@ -76,6 +151,9 @@ use crate::id::ProviderId;
 use crate::redact::{Detail, Scrubber, SecretSlot};
 
 use request::MessageFn;
+
+/// A client's classifier of further rate-limit answers ([`HttpBuilder::rate_limit`]).
+pub(crate) type RateLimitFn = fn(&Response) -> bool;
 use tls::{ClientIdentity, Trust};
 
 /// The user agent without the application's suffix.
@@ -157,11 +235,6 @@ impl Transport {
             shared: self.shared.clone(),
         })
     }
-
-    /// True when the context refuses everything but loopback addresses.
-    pub(crate) fn loopback_only(&self) -> bool {
-        self.shared.loopback_only
-    }
 }
 
 /// One `reqwest` client with the options of section 5.1.
@@ -203,6 +276,8 @@ pub(crate) struct Http {
     auth: Option<(HeaderName, HeaderValue)>,
     gate: Option<RateGate>,
     message: MessageFn,
+    /// Marks further answers as rate-limit answers, treated like a 429.
+    rate_limit: Option<RateLimitFn>,
     /// The origins of the client's endpoints: the only hosts its requests may go to.
     origins: Vec<Origin>,
     /// True when the transport presents a client certificate.
@@ -222,11 +297,6 @@ impl Http {
     /// A builder for the handle of a client of `provider` on `ctx`'s transport.
     pub(crate) fn builder(ctx: &Context, provider: ProviderId) -> HttpBuilder {
         HttpBuilder::new(ctx.http().clone(), provider)
-    }
-
-    /// The provider this handle belongs to.
-    pub(crate) fn provider(&self) -> ProviderId {
-        self.provider
     }
 
     /// The client's scrubber.
@@ -286,6 +356,7 @@ pub(crate) struct HttpBuilder {
     gate: Option<Duration>,
     identity: Option<ClientIdentity>,
     message: MessageFn,
+    rate_limit: Option<RateLimitFn>,
     origins: Vec<Origin>,
     error: Option<Error>,
 }
@@ -300,6 +371,7 @@ impl HttpBuilder {
             gate: None,
             identity: None,
             message: request::default_message,
+            rate_limit: None,
             origins: Vec::new(),
             error: None,
         }
@@ -346,20 +418,6 @@ impl HttpBuilder {
         self.secret(secret)
     }
 
-    /// Sends `Authorization: Basic base64(user:password)` with every request and registers the
-    /// password and the encoded value. The user is registered too: credentials objects carry it
-    /// as a secret field.
-    pub(crate) fn basic(mut self, user: &str, password: &str) -> HttpBuilder {
-        let encoded = request::basic_credentials(user, password);
-        match request::sensitive_value("Basic ", encoded.as_bytes()) {
-            Some(value) => self.auth = Some((AUTHORIZATION, value)),
-            None => self.fail(Error::Config {
-                detail: Detail::constant("the basic credentials cannot be sent in an HTTP header"),
-            }),
-        }
-        self.secret(user).secret(password).secret(&encoded)
-    }
-
     /// Declares an endpoint of the client: the API, the identity or token service. Requests
     /// may go only to the origins (scheme, host, port) of declared endpoints; a request to any
     /// other origin is refused before it is sent, so that no credential reaches a host the
@@ -401,6 +459,15 @@ impl HttpBuilder {
         self
     }
 
+    /// Declares further rate-limit answers: an answer for which `classify` is true is treated
+    /// exactly like a 429 (design section 5.3), for a provider that signals a refused request
+    /// rate with another status. It sees every answer that is not kept with
+    /// [`Request::keep_status`].
+    pub(crate) fn rate_limit(mut self, classify: RateLimitFn) -> HttpBuilder {
+        self.rate_limit = Some(classify);
+        self
+    }
+
     /// The handle, or the first problem met while building it.
     pub(crate) fn build(self) -> Result<Http, Error> {
         if let Some(e) = self.error {
@@ -425,6 +492,7 @@ impl HttpBuilder {
             auth: self.auth,
             gate: self.gate.map(RateGate::new),
             message: self.message,
+            rate_limit: self.rate_limit,
             origins: self.origins,
             identity,
         })

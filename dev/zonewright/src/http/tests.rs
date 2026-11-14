@@ -584,7 +584,6 @@ async fn idempotent_requests_retry_5xx_with_backoff() {
     let response = default_http().send(&get(&server, "/x")).await.unwrap();
     let elapsed = started.elapsed();
     assert_eq!(response.status(), 200);
-    assert_eq!(response.attempt(), 3);
     assert_eq!(server.log().len(), 3);
     // 500 ms and 1000 ms, each plus up to 25 %.
     assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
@@ -1280,6 +1279,330 @@ async fn a_rejected_token_with_an_oversized_answer_is_not_kept() {
     );
 }
 
+// --- unsent requests, rate-limit classifier, finisher, rejected tokens ---
+
+/// A loopback port nothing listens on.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+#[tokio::test]
+async fn a_refused_connection_is_certainly_unsent() {
+    let http = default_http();
+    let port = closed_port();
+    let target = url(&format!("http://127.0.0.1:{port}/x"));
+    let e = http
+        .try_send(&Request::new(Method::POST, target.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(e.error().kind(), ErrorKind::Transient, "{e:?}");
+    assert!(e.certainly_unsent(), "{e:?}");
+    // Every attempt of an idempotent request failed to connect.
+    let e = http.try_send(&Request::get(target)).await.unwrap_err();
+    assert!(e.certainly_unsent(), "{e:?}");
+}
+
+#[tokio::test]
+async fn a_connect_timeout_is_certainly_unsent() {
+    let silent = SilentServer::start();
+    let ctx = testing::context(ContextOptions {
+        connect_timeout: Duration::from_millis(300),
+        request_timeout: Duration::from_secs(30),
+        ..testing::options()
+    });
+    let http = testing::http(&ctx, |b| b);
+    // The TCP connection is accepted; the TLS handshake never completes.
+    let request = Request::new(Method::POST, url(&format!("https://{}/x", silent.addr)));
+    let e = http.try_send(&request).await.unwrap_err();
+    assert_eq!(e.error().kind(), ErrorKind::Transient, "{e:?}");
+    assert!(e.certainly_unsent(), "{e:?}");
+}
+
+#[tokio::test]
+async fn refusals_before_any_connection_are_certainly_unsent() {
+    let http = default_http();
+    for raw in ["https://example.org/x", "ftp://127.0.0.1/x"] {
+        let e = http
+            .try_send(&Request::new(Method::POST, url(raw)))
+            .await
+            .unwrap_err();
+        assert_eq!(e.error().kind(), ErrorKind::Config, "{raw}");
+        assert!(e.certainly_unsent(), "{raw}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_that_may_have_reached_the_server_is_never_unsent() {
+    let http = default_http();
+    for fault in [
+        Fault::any().always().drop_connection(),
+        Fault::any().always().status(500),
+        Fault::any().always().status(429),
+        Fault::any().always().status(401),
+        Fault::any()
+            .always()
+            .truncated_body(200, 100, "{\"partial\":"),
+    ] {
+        let server = ok_server().await;
+        server.faults().push(fault);
+        let e = http.try_send(&post(&server, "/x")).await.unwrap_err();
+        assert!(!e.certainly_unsent(), "{e:?}");
+        assert_eq!(server.log().len(), 1);
+    }
+    // A request timeout after the request was written.
+    let server = ok_server().await;
+    server
+        .faults()
+        .push(Fault::any().always().delay(Duration::from_secs(10)));
+    let e = short_timeout_http()
+        .try_send(&post(&server, "/slow"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.error().kind(), ErrorKind::Transient, "{e:?}");
+    assert!(!e.certainly_unsent(), "{e:?}");
+    // An idempotent request whose first attempt reached the server stays "maybe sent" even if
+    // a later attempt could not connect.
+    let server = ok_server().await;
+    server
+        .faults()
+        .push(Fault::any().always().drop_connection());
+    let e = http.try_send(&get(&server, "/x")).await.unwrap_err();
+    assert!(!e.certainly_unsent(), "{e:?}");
+    // `send` returns the same error.
+    let server = ok_server().await;
+    server.faults().push(Fault::any().status(500));
+    assert_eq!(
+        kind(http.send(&post(&server, "/x")).await),
+        ErrorKind::Transient
+    );
+}
+
+/// Route 53's shape: HTTP 400 with a throttling code.
+fn throttled(response: &super::Response) -> bool {
+    response.status() == 400 && response.text().contains("Throttling")
+}
+
+#[tokio::test]
+async fn a_classified_answer_is_treated_like_a_429() {
+    // An idempotent request is retried with back-off and then succeeds.
+    let server = ok_server().await;
+    let http = http_on(&server, |b| b.rate_limit(throttled));
+    server
+        .faults()
+        .push(Fault::any().respond(400, "<Code>Throttling</Code>"));
+    let started = Instant::now();
+    let response = http.send(&get(&server, "/x")).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(server.log().len(), 2);
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    // Throttled on every attempt: `RateLimited` after the bound.
+    let server = ok_server().await;
+    let http = http_on(&server, |b| b.rate_limit(throttled));
+    server.faults().push(
+        Fault::any()
+            .always()
+            .respond(400, "<Code>Throttling</Code>"),
+    );
+    let e = http.send(&get(&server, "/x")).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::RateLimited, "{e:?}");
+    assert_eq!(server.log().len(), 3);
+    // A request that is not idempotent is sent once.
+    let server = ok_server().await;
+    let http = http_on(&server, |b| b.rate_limit(throttled));
+    server.faults().push(
+        Fault::any()
+            .always()
+            .respond(400, "<Code>Throttling</Code>"),
+    );
+    let e = http.send(&post(&server, "/x")).await.unwrap_err();
+    assert!(
+        matches!(e, Error::RateLimited { retry_after: None }),
+        "{e:?}"
+    );
+    assert_eq!(server.log().len(), 1);
+    // A `Retry-After` on the classified answer is honored like on a 429.
+    let server = ok_server().await;
+    let http = http_on(&server, |b| b.rate_limit(throttled));
+    server.faults().push(
+        Fault::any()
+            .always()
+            .respond(400, "<Code>Throttling</Code>")
+            .header("retry-after", "120"),
+    );
+    let e = http.send(&get(&server, "/x")).await.unwrap_err();
+    assert_eq!(e.retry_after(), Some(Duration::from_secs(120)));
+    assert_eq!(server.log().len(), 1);
+    // Other answers, kept statuses and clients without a classifier are unaffected.
+    let server = ok_server().await;
+    let http = http_on(&server, |b| b.rate_limit(throttled));
+    server
+        .faults()
+        .push(Fault::any().respond(400, "<Code>Other</Code>"));
+    assert_eq!(http.send(&get(&server, "/x")).await.unwrap().status(), 400);
+    server
+        .faults()
+        .push(Fault::any().respond(400, "<Code>Throttling</Code>"));
+    let kept = get(&server, "/x").keep_status(400);
+    assert_eq!(http.send(&kept).await.unwrap().status(), 400);
+    server
+        .faults()
+        .push(Fault::any().respond(400, "<Code>Throttling</Code>"));
+    assert_eq!(
+        default_http()
+            .send(&get(&server, "/x"))
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(server.log().len(), 3);
+}
+
+/// A finisher that stamps each attempt with its number, a secret header and what it saw.
+struct Stamp {
+    calls: AtomicUsize,
+    seen: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
+    fail: bool,
+}
+
+impl Stamp {
+    fn new(fail: bool) -> Arc<Stamp> {
+        Arc::new(Stamp {
+            calls: AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail,
+        })
+    }
+}
+
+impl super::request::Finish for Stamp {
+    fn finish(
+        &self,
+        attempt: &super::request::Outgoing<'_>,
+    ) -> Result<Vec<(HeaderName, reqwest::header::HeaderValue)>, Error> {
+        if self.fail {
+            return Err(Error::InvalidInput {
+                detail: crate::redact::Detail::constant("the request could not be signed"),
+            });
+        }
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        self.seen.lock().unwrap().push((
+            attempt.method.to_string(),
+            attempt.url.to_string(),
+            attempt.body.to_vec(),
+        ));
+        let secret = super::request::sensitive_value("Sig ", format!("s-{n}").as_bytes()).unwrap();
+        Ok(vec![
+            (
+                HeaderName::from_static("x-attempt"),
+                reqwest::header::HeaderValue::from_str(&n.to_string()).unwrap(),
+            ),
+            (reqwest::header::AUTHORIZATION, secret),
+            // Replaces the header the client set.
+            (
+                HeaderName::from_static("x-fixed"),
+                reqwest::header::HeaderValue::from_static("finished"),
+            ),
+        ])
+    }
+}
+
+#[tokio::test]
+async fn a_finisher_completes_every_attempt_from_what_it_sends() {
+    let server = ok_server().await;
+    let http = http_on(&server, |b| b);
+    server.faults().push(Fault::any().times(2).status(503));
+    let stamp = Stamp::new(false);
+    let target = url(&server.url("/x?b=2&a=1"));
+    let request = Request::new(Method::PUT, target.clone())
+        .idempotent()
+        .header(
+            HeaderName::from_static("x-fixed"),
+            reqwest::header::HeaderValue::from_static("client"),
+        )
+        .body(encode::JSON, Bytes::from_static(b"{\"v\":1}"))
+        .finish_with(stamp.clone());
+    assert!(format!("{request:?}").contains("finished: true"));
+    let response = http.send(&request).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(stamp.calls.load(Ordering::SeqCst), 3);
+    for (method, seen_url, body) in stamp.seen.lock().unwrap().iter() {
+        assert_eq!(method, "PUT");
+        assert_eq!(seen_url, target.as_str());
+        assert_eq!(body.as_slice(), b"{\"v\":1}");
+    }
+    let log = server.log().matching(None, "/x");
+    assert_eq!(log.len(), 3);
+    for (i, logged) in log.iter().enumerate() {
+        let n = (i + 1).to_string();
+        assert_eq!(logged.header("x-attempt"), Some(n.as_str()));
+        assert_eq!(
+            logged.header("authorization"),
+            Some(format!("Sig s-{n}").as_str())
+        );
+        assert_eq!(logged.header("x-fixed"), Some("finished"));
+    }
+}
+
+#[tokio::test]
+async fn a_failed_finisher_sends_nothing() {
+    let server = ok_server().await;
+    let http = http_on(&server, |b| b);
+    let request = get(&server, "/x").finish_with(Stamp::new(true));
+    let e = http.try_send(&request).await.unwrap_err();
+    assert_eq!(e.error().kind(), ErrorKind::InvalidInput, "{e:?}");
+    assert!(e.certainly_unsent());
+    assert!(server.log().is_empty());
+    assert_eq!(server.connections(), 0);
+}
+
+#[tokio::test]
+async fn a_token_rejected_in_an_answer_is_discarded_exactly() {
+    let (server, issued) = token_server().await;
+    let http = http_on(&server, |b| b);
+    let tokens = TokenSource::new(None);
+    let token_url = server.url("/token");
+    let fetch = || fetch_token(&http, &token_url);
+    let first = token_call(&http, &tokens, &server, get(&server, "/api"))
+        .await
+        .unwrap();
+    assert_eq!(first.token_generation, Some(1));
+    // Another call renews the token meanwhile: the late rejection of the first one keeps it.
+    tokens.renew(fetch).await.unwrap();
+    assert_eq!(issued.load(Ordering::SeqCst), 2);
+    tokens.discard_rejected(&first).await;
+    let second = token_call(&http, &tokens, &server, get(&server, "/api"))
+        .await
+        .unwrap();
+    assert_eq!(second.token_generation, Some(2));
+    assert_eq!(issued.load(Ordering::SeqCst), 2);
+    // The rejection of the current token discards it: the next call fetches a new one.
+    tokens.discard_rejected(&second).await;
+    let third = token_call(&http, &tokens, &server, get(&server, "/api"))
+        .await
+        .unwrap();
+    assert_eq!(third.token_generation, Some(3));
+    assert_eq!(issued.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        api_requests(&server)
+            .last()
+            .unwrap()
+            .header("authorization"),
+        Some("Bearer tok-3")
+    );
+    // An answer to a request without a token names none and discards nothing.
+    let plain = http.send(&get(&server, "/api")).await.unwrap();
+    assert_eq!(plain.token_generation, None);
+    tokens.discard_rejected(&plain).await;
+    token_call(&http, &tokens, &server, get(&server, "/api"))
+        .await
+        .unwrap();
+    assert_eq!(issued.load(Ordering::SeqCst), 3);
+}
+
 // --- secrets ---
 
 /// One position in which a client sends a credential.
@@ -1287,16 +1610,14 @@ async fn a_rejected_token_with_an_oversized_answer_is_not_kept() {
 enum Position {
     Bearer,
     Header,
-    Basic,
     Form,
     Json,
     Query,
 }
 
-const POSITIONS: [Position; 6] = [
+const POSITIONS: [Position; 5] = [
     Position::Bearer,
     Position::Header,
-    Position::Basic,
     Position::Form,
     Position::Json,
     Position::Query,
@@ -1320,7 +1641,6 @@ fn canary_http(ctx: &crate::context::Context, server: &MockServer, position: Pos
                 "",
                 CANARY_KEY,
             ),
-            Position::Basic => b.basic(CANARY_USER, CANARY_PASSWORD),
             Position::Form | Position::Json | Position::Query => b,
         }
     })
@@ -1342,7 +1662,7 @@ fn canary_request(server: &MockServer, position: Position) -> Request {
                 .build()
                 .unwrap(),
         ),
-        Position::Bearer | Position::Header | Position::Basic => request,
+        Position::Bearer | Position::Header => request,
     }
 }
 

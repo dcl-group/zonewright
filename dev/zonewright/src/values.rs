@@ -27,6 +27,11 @@
 //!
 //! acme-dns does not use this layer: it has no read (design section 11.3).
 
+// Design section 9.2: each client uses one of the three shapes, so builds without
+// `all-providers` allow the unused ones; the build with all providers does not, so that code no
+// provider uses is found.
+#![cfg_attr(not(feature = "all-providers"), allow(dead_code))]
+
 use std::future::Future;
 
 use crate::error::{Error, Operation};

@@ -17,7 +17,7 @@ use tokio::time::Instant;
 
 use crate::context::Context;
 use crate::error::{Error, ErrorKind};
-use crate::http::Http;
+use crate::http::{Http, SendError};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
@@ -33,12 +33,6 @@ use super::state::{Outcome, State};
 // Source: server `util.go`, `validTXT`: exactly 43 characters, all matching `[A-Za-z0-9_-]`
 // (`SanitizeString` in `pkg/acmedns/util.go` removes everything else).
 const VALUE_LEN: usize = 43;
-
-/// The text of the transport's error for a request that never reached the provider because no
-/// connection could be established (`src/http/retry.rs`, `Failure::from_reqwest`, for a
-/// `reqwest` error with `is_connect()`). A unit test below drives the transport against a closed
-/// port and fails if the text changes.
-const NOT_CONNECTED: &str = "could not connect to the provider";
 
 /// The detail of every zone of a `check` report: what `check` cannot do.
 const UNTESTED: &str = "the credentials were not tested: the only authenticated acme-dns request \
@@ -127,27 +121,26 @@ fn acceptable(value: &Txt) -> Option<&str> {
     }
 }
 
-/// True when the error says the request did not change anything at the server: it was refused
-/// before it was sent, no connection could be established, or the server answered with a
-/// refusal. Anything else (a timeout, a connection lost after it was established, a 5xx, an
-/// answer that cannot be read) leaves the outcome unknown.
+/// True when the error says the request did not change anything at the server: the transport
+/// knows it never reached the server (refused before it was sent, or no connection could be
+/// established), or the server answered with a refusal. Anything else (a timeout, a connection
+/// lost after it was established, a 5xx, an answer that cannot be read) leaves the outcome
+/// unknown.
 ///
 /// A failed connection must count as a refusal: as an unknown outcome it would stay in the memory
 /// as an unconfirmed send, and next to a live neighbor every repeat within the memory's lifetime
 /// would be suppressed and reported `Accepted`, although the value never reached the server.
-fn refused(error: &Error) -> bool {
-    match error {
-        Error::Transient { detail } => detail.as_str() == NOT_CONNECTED,
-        _ => matches!(
-            error.kind(),
+fn refused(error: &SendError) -> bool {
+    error.certainly_unsent()
+        || matches!(
+            error.error().kind(),
             ErrorKind::Auth
                 | ErrorKind::Forbidden
                 | ErrorKind::RateLimited
                 | ErrorKind::Rejected
                 | ErrorKind::Config
                 | ErrorKind::InvalidInput
-        ),
-    }
+        )
 }
 
 fn invalid(text: &'static str) -> Error {
@@ -263,7 +256,9 @@ impl Provider for AcmeDns {
         };
         self.state
             .finish(server, name, text, outcome, begin.displaced, Instant::now());
-        result.map(|()| AddOutcome::Accepted)
+        result
+            .map(|()| AddOutcome::Accepted)
+            .map_err(SendError::into_error)
     }
 }
 
@@ -286,9 +281,8 @@ mod tests {
     use super::*;
     use crate::http::testing::{context, options};
 
-    /// A connection that cannot be established is a refusal, with the transport's real error: a
-    /// change of the transport's text fails here instead of silently turning every failed
-    /// connection into an unknown outcome.
+    /// A connection that cannot be established is a refusal: the transport reports that the
+    /// request never reached the server.
     #[tokio::test]
     async fn a_failed_connection_is_a_refusal() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -308,12 +302,27 @@ mod tests {
             .store(registration, &"A".repeat(VALUE_LEN))
             .await
             .unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+        assert_eq!(e.error().kind(), ErrorKind::Transient, "{e:?}");
+        assert!(e.certainly_unsent(), "{e:?}");
         assert!(refused(&e), "{e:?}");
-        // Other transient errors leave the outcome unknown.
-        let other = Error::Transient {
+    }
+
+    /// A transient error after the request may have reached the server leaves the outcome
+    /// unknown; an answer that refuses the request is a refusal.
+    #[test]
+    fn only_certain_refusals_are_refusals() {
+        let transient = SendError::answered(Error::Transient {
             detail: Detail::constant("the request to the provider timed out"),
-        };
-        assert!(!refused(&other));
+        });
+        assert!(!refused(&transient));
+        let rejected = SendError::answered(Error::Rejected {
+            status: Some(400),
+            detail: Detail::constant("bad value"),
+        });
+        assert!(refused(&rejected));
+        let local = SendError::before_send(Error::Transient {
+            detail: Detail::constant("not sent"),
+        });
+        assert!(refused(&local));
     }
 }

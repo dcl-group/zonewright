@@ -80,31 +80,6 @@ impl RecordData {
         }
     }
 
-    /// Reads a value as a provider returned it (design section 4.9): the strict parser first,
-    /// with `origin` for providers that spell names relative to the zone (`None`: names are
-    /// absolute) and the client's reading rule for TXT; if that fails, the provider's text kept
-    /// as non-canonical data.
-    // TEMPORARY (core phase): no client reads records yet; the first ported client uses it.
-    #[allow(dead_code)]
-    pub(crate) fn from_provider(
-        rtype: RecordType,
-        text: &str,
-        origin: Option<&DomainName>,
-        txt: super::txt::TxtDialect,
-    ) -> RecordData {
-        let parsed = if rtype == RecordType::TXT {
-            txt.read(text)
-                .ok_or(RecordError::NotCanonical)
-                .and_then(|value| value.to_data())
-        } else {
-            match origin {
-                Some(origin) => RecordData::parse_relative(rtype, text, origin),
-                None => RecordData::parse(rtype, text),
-            }
-        };
-        parsed.unwrap_or_else(|_| RecordData::non_canonical(text))
-    }
-
     /// Parses this value's text as `rtype` for a typed view; `NotCanonical` for raw text.
     pub(crate) fn rdata(&self, rtype: RecordType) -> Result<Rdata, RecordError> {
         if !self.canonical {

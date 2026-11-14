@@ -38,23 +38,32 @@ mod id;
 mod meta;
 mod provider;
 
-// TEMPORARY (core phase): the locks and the TXT value layer are used by provider clients, none
-// of which is ported yet; until then only their unit tests use them.
-#[allow(dead_code)]
 mod locks;
-#[allow(dead_code)]
-mod values;
-
-// TEMPORARY (core phase): the scrubber has no user until the transport and the clients land.
-#[allow(dead_code)]
 mod redact;
+// The TXT value layer is the shared implementation of the clients' TXT value operations.
+#[cfg(any(
+    feature = "acme_dns",
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "rfc2136",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
+mod values;
 
 #[cfg(feature = "__http")]
 mod http;
 
-// TEMPORARY (core phase): nothing uses these modules until the transport and the clients land.
 #[cfg(feature = "__crypto")]
-#[allow(dead_code)]
 mod crypto;
 
 pub use context::{Context, ContextOptions};

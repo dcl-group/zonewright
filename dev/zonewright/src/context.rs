@@ -78,9 +78,9 @@ impl Context {
         })
     }
 
-    /// The options the context was built with.
-    // TEMPORARY (core phase): read by the transport and the RFC 2136 client, which come later.
-    #[allow(dead_code)]
+    /// The options the context was built with. Read by the HTTP transport's URL policy and the
+    /// RFC 2136 client.
+    #[cfg(any(feature = "__http", feature = "rfc2136"))]
     pub(crate) fn options(&self) -> &ContextOptions {
         &self.inner.options
     }
@@ -93,32 +93,41 @@ impl Context {
 
     /// The per-name locks. A client passes them to the TXT value layer, or takes a lock itself
     /// for a record-level write.
-    // TEMPORARY (core phase): used by the first client that is ported.
-    #[allow(dead_code)]
+    #[cfg(any(
+        feature = "acme_dns",
+        feature = "beget",
+        feature = "cloud_ru",
+        feature = "cloudflare",
+        feature = "digitalocean",
+        feature = "hetzner",
+        feature = "nicru",
+        feature = "regru",
+        feature = "rfc2136",
+        feature = "route53",
+        feature = "selectel_v2",
+        feature = "timeweb_cloud",
+        feature = "vk_cloud",
+        feature = "yandex_360",
+        feature = "yandex_cloud"
+    ))]
     pub(crate) fn locks(&self) -> &NameLocks {
         &self.inner.locks
     }
 
     /// The acme-dns client's memory.
     #[cfg(feature = "acme_dns")]
-    // TEMPORARY (core phase): used by the acme-dns client when it is ported.
-    #[allow(dead_code)]
     pub(crate) fn acme_dns(&self) -> &crate::providers::acme_dns::State {
         &self.inner.acme_dns
     }
 
     /// The nic.ru client's zone locks and staged-change marks.
     #[cfg(feature = "nicru")]
-    // TEMPORARY (core phase): used by the nic.ru client when it is ported.
-    #[allow(dead_code)]
     pub(crate) fn nicru(&self) -> &crate::providers::nicru::State {
         &self.inner.nicru
     }
 
     /// The Timeweb Cloud client's memory of created records.
     #[cfg(feature = "timeweb_cloud")]
-    // TEMPORARY (core phase): used by the Timeweb Cloud client when it is ported.
-    #[allow(dead_code)]
     pub(crate) fn timeweb_cloud(&self) -> &crate::providers::timeweb_cloud::State {
         &self.inner.timeweb_cloud
     }
@@ -195,7 +204,7 @@ mod tests {
         assert_eq!(options.request_timeout, Duration::from_secs(30));
         assert!(!options.loopback_only);
         let ctx = Context::new(options).unwrap();
-        assert_eq!(ctx.locks().len(), 0);
+        assert_eq!(ctx.inner.locks.len(), 0);
         let _clone = ctx.clone();
     }
 

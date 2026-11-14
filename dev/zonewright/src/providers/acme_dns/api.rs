@@ -42,7 +42,7 @@ use secrecy::ExposeSecret as _;
 use serde::Serialize;
 
 use crate::error::Error;
-use crate::http::{Endpoint, Http, Request};
+use crate::http::{Endpoint, Http, Request, Response, SendError};
 
 use super::config::Registration;
 
@@ -81,22 +81,26 @@ impl Api {
     }
 
     /// Sends `POST /update` once, whatever happens: it is a write, and a repeat of one that
-    /// reached the server could displace a live value (design sections 5.3 and 11.3).
-    async fn update(
-        &self,
-        registration: &Registration,
-        txt: &str,
-    ) -> Result<crate::http::Response, Error> {
+    /// reached the server could displace a live value (design sections 5.3 and 11.3). The error
+    /// says whether the request certainly never reached the server.
+    async fn update(&self, registration: &Registration, txt: &str) -> Result<Response, SendError> {
+        let request = self
+            .update_request(registration, txt)
+            .map_err(SendError::before_send)?;
+        self.http.try_send(&request).await
+    }
+
+    /// The request of `POST /update`.
+    fn update_request(&self, registration: &Registration, txt: &str) -> Result<Request, Error> {
         let url = self.endpoint.url().path("/update").build()?;
         let body = UpdateBody {
             subdomain: &registration.subdomain,
             txt,
         };
-        let request = Request::new(Method::POST, url)
+        Request::new(Method::POST, url)
             .secret_header(USER_HEADER, "", registration.username.expose_secret())?
             .secret_header(KEY_HEADER, "", registration.password.expose_secret())?
-            .json(&body)?;
-        self.http.send(&request).await
+            .json(&body)
     }
 
     /// Stores `value` in the registration. Any 2xx answer is success; the body is not needed.
@@ -104,12 +108,12 @@ impl Api {
         &self,
         registration: &Registration,
         value: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<(), SendError> {
         let response = self.update(registration, value).await?;
         if response.is_success() {
             Ok(())
         } else {
-            Err(self.http.reject(&response))
+            Err(SendError::answered(self.http.reject(&response)))
         }
     }
 }

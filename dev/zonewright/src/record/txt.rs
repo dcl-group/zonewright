@@ -108,6 +108,21 @@ impl Txt {
     }
 
     /// The canonical presentation text: quoted 255-octet chunks (design section 4.4).
+    #[cfg(any(
+        feature = "beget",
+        feature = "cloud_ru",
+        feature = "cloudflare",
+        feature = "digitalocean",
+        feature = "hetzner",
+        feature = "nicru",
+        feature = "regru",
+        feature = "route53",
+        feature = "selectel_v2",
+        feature = "timeweb_cloud",
+        feature = "vk_cloud",
+        feature = "yandex_360",
+        feature = "yandex_cloud"
+    ))]
     pub(crate) fn to_presentation(&self) -> String {
         let mut out = String::with_capacity(self.0.len() + 2);
         self.write_text(&mut out);
@@ -129,9 +144,23 @@ impl Txt {
 }
 
 /// How a provider's API spells TXT data (design section 4.4). Each client declares one reading
-/// rule and one writing rule; `Auto` is a reading rule only.
-// TEMPORARY (core phase): no client reads or writes TXT yet; the first ported client uses it.
-#[allow(dead_code)]
+/// rule and one writing rule; `Auto` is a reading rule only. Used by the HTTP clients that read
+/// TXT records (acme-dns reads nothing; RFC 2136 works with wire data).
+#[cfg(any(
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TxtDialect {
     /// Zone-file text: quoted character-strings with escapes. Read with the strict parser; write
@@ -141,11 +170,27 @@ pub(crate) enum TxtDialect {
     /// data as a string.
     Raw,
     /// Reading only: text that starts with `"` is `Presentation`, anything else `Raw`.
+    // Design section 9.2: a shared helper; a build whose only client reads raw text (nic.ru)
+    // does not construct it. The build with all providers does.
+    #[cfg_attr(not(feature = "all-providers"), allow(dead_code))]
     Auto,
 }
 
-// TEMPORARY (core phase): no client reads or writes TXT yet; the first ported client uses it.
-#[allow(dead_code)]
+#[cfg(any(
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
 impl TxtDialect {
     /// Decodes provider text. `None` when the text is not valid in this dialect; the caller then
     /// keeps the text as an opaque value (design sections 3.5 and 4.9).
@@ -179,6 +224,21 @@ impl TxtDialect {
 }
 
 #[cfg(test)]
+#[cfg(any(
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
 mod tests {
     use super::{Txt, TxtDialect};
 
@@ -226,26 +286,5 @@ mod tests {
             TxtDialect::Presentation.write(&binary).as_deref(),
             Some(r#""\255\000""#)
         );
-    }
-
-    #[test]
-    fn provider_text_falls_back_to_non_canonical() {
-        use crate::name::DomainName;
-        use crate::record::{RecordData, RecordType};
-        let zone = DomainName::parse("example.org").unwrap();
-        let a = RecordData::from_provider(RecordType::A, " 192.0.2.1 ", None, TxtDialect::Auto);
-        assert!(a.is_canonical());
-        assert_eq!(a.as_str(), "192.0.2.1");
-        let cname =
-            RecordData::from_provider(RecordType::CNAME, "www", Some(&zone), TxtDialect::Auto);
-        assert_eq!(cname.as_str(), "www.example.org.");
-        let odd =
-            RecordData::from_provider(RecordType::A, " not an address ", None, TxtDialect::Auto);
-        assert!(!odd.is_canonical());
-        assert_eq!(odd.as_str(), "not an address");
-        let raw = RecordData::from_provider(RecordType::TXT, "a b", None, TxtDialect::Raw);
-        assert_eq!(raw.as_str(), "\"a b\"");
-        let bad = RecordData::from_provider(RecordType::TXT, "a b", None, TxtDialect::Presentation);
-        assert!(!bad.is_canonical());
     }
 }

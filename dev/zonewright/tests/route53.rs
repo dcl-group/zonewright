@@ -1297,15 +1297,23 @@ async fn route53_clock_skew_is_auth_with_a_hint() {
 #[tokio::test]
 async fn route53_errors_mapped() {
     let (mock, client) = setup().await;
-    mock.faults()
-        .push(Fault::on("GET", ZONES).respond(400, error_body("Throttling", "Rate exceeded")));
+    // A throttled read is retried like a 429; throttled on every attempt, it is `RateLimited`.
+    mock.faults().push(
+        Fault::on("GET", ZONES)
+            .times(3)
+            .respond(400, error_body("Throttling", "Rate exceeded")),
+    );
     let e = add(&client, "A").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::RateLimited, "{e:?}");
-    mock.faults().push(Fault::on("GET", RRSETS).respond(
-        400,
-        error_body("PriorRequestNotComplete", "still processing"),
-    ));
-    assert!(add(&client, "A").await.unwrap_err().is_retryable());
+    assert_eq!(mock.log().count(Some("GET"), ZONES), 3);
+    mock.faults()
+        .push(Fault::on("GET", RRSETS).times(3).respond(
+            400,
+            error_body("PriorRequestNotComplete", "still processing"),
+        ));
+    let e = add(&client, "A").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::RateLimited, "{e:?}");
+    assert!(e.is_retryable());
     mock.faults()
         .push(Fault::on("POST", CHANGE).respond(500, error_body("InternalFailure", "try again")));
     assert_eq!(
@@ -1334,6 +1342,62 @@ async fn route53_errors_mapped() {
     assert!(mock.control().rrset(NAME, "TXT").is_none());
     add(&client, "A").await.unwrap();
     assert_eq!(mock.control().txt_values(NAME), ["A"]);
+}
+
+/// Route 53 answers a refused request rate with HTTP 400 and `Throttling` or
+/// `PriorRequestNotComplete`. The transport treats it like a 429: a read is retried with
+/// back-off and the operation then succeeds.
+#[tokio::test]
+async fn route53_throttled_read_is_retried() {
+    let (mock, client) = setup().await;
+    mock.faults()
+        .push(Fault::on("GET", RRSETS).respond(400, error_body("Throttling", "Rate exceeded")));
+    add(&client, "AAA").await.unwrap();
+    assert_eq!(mock.log().count(Some("GET"), RRSETS), 2);
+    mock.faults().push(Fault::on("GET", RRSETS).respond(
+        400,
+        error_body("PriorRequestNotComplete", "still processing"),
+    ));
+    add(&client, "BBB").await.unwrap();
+    assert_eq!(mock.log().count(Some("GET"), RRSETS), 4);
+    assert_eq!(mock.control().txt_values(NAME), ["AAA", "BBB"]);
+}
+
+/// A throttled change batch is not repeated: it is sent once and the result is
+/// `RateLimited`, and nothing is written.
+#[tokio::test]
+async fn route53_throttled_write_is_sent_once() {
+    let (mock, client) = setup().await;
+    for code in ["Throttling", "PriorRequestNotComplete"] {
+        mock.faults()
+            .push(Fault::on("POST", CHANGE).respond(400, error_body(code, "slow down")));
+        let before = writes(&mock);
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::RateLimited, "{code}: {e:?}");
+        assert_eq!(writes(&mock), before + 1, "{code}");
+        assert!(mock.control().rrset(NAME, "TXT").is_none(), "{code}");
+    }
+}
+
+/// Every attempt is signed when it is sent: a read repeated after two 5xx answers (back-off of
+/// at least 1.5 s in all) carries a later `x-amz-date` than its first attempt, and the mock
+/// accepts its signature.
+#[tokio::test]
+async fn route53_each_attempt_is_signed_anew() {
+    let (mock, client) = setup().await;
+    mock.faults()
+        .push(Fault::on("GET", RRSETS).times(2).status(503));
+    add(&client, "AAA").await.unwrap();
+    let reads = mock.log().matching(Some("GET"), RRSETS);
+    assert_eq!(reads.len(), 3);
+    let first = reads[0].header("x-amz-date").unwrap().to_owned();
+    let last = reads[2].header("x-amz-date").unwrap().to_owned();
+    assert!(last > first, "{first} {last}");
+    assert_ne!(
+        reads[0].header("authorization"),
+        reads[2].header("authorization")
+    );
+    assert_eq!(mock.control().txt_values(NAME), ["AAA"]);
 }
 
 /// A 5xx on a read is retried; three in a row are `Transient`.

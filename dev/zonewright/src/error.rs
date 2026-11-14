@@ -321,8 +321,23 @@ impl Error {
     ///
     /// The text is built from the position only. The deserializer's own message is not used: it
     /// can quote the input.
-    // Called by provider clients only; unused in a build without one.
-    #[allow(dead_code)]
+    #[cfg(any(
+        feature = "acme_dns",
+        feature = "beget",
+        feature = "cloud_ru",
+        feature = "cloudflare",
+        feature = "digitalocean",
+        feature = "hetzner",
+        feature = "nicru",
+        feature = "regru",
+        feature = "rfc2136",
+        feature = "route53",
+        feature = "selectel_v2",
+        feature = "timeweb_cloud",
+        feature = "vk_cloud",
+        feature = "yandex_360",
+        feature = "yandex_cloud"
+    ))]
     pub(crate) fn settings_syntax(line: usize, column: usize) -> Error {
         Error::Config {
             detail: Detail::new(&format!(

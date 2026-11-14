@@ -5,7 +5,8 @@
 //! - An idempotent request is retried after a connection or timeout error and after a 5xx
 //!   answer. Back-off before attempt `n + 1` is `500 ms × n` plus a random 0–25 %.
 //! - A request that is not idempotent is sent once; whatever goes wrong becomes the error.
-//! - 429: the wait comes from `Retry-After` (seconds or an HTTP date) or `RateLimit-Reset`. An
+//! - 429, and any answer the client's rate-limit classifier marks (`HttpBuilder::rate_limit`):
+//!   the wait comes from `Retry-After` (seconds or an HTTP date) or `RateLimit-Reset`. An
 //!   idempotent request with attempts left sleeps for a wait of at most [`MAX_INLINE_WAIT`] and
 //!   retries, or uses the back-off when no wait is given; otherwise `Error::RateLimited`.
 //! - 401 to a request made with a token from a [`TokenSource`]: the token's generation is
@@ -17,6 +18,10 @@
 //!   `Transient`; every other status goes back to the client.
 //! - Refusals by the URL policy at send time (`loopback_only`, no CA certificates) are never
 //!   retried and contact nothing.
+//! - A request with a finisher (`Request::finish_with`) is completed for every attempt, right
+//!   before it is sent, from exactly what that attempt sends.
+//! - [`Http::try_send`] reports with the error whether the request certainly never reached the
+//!   provider ([`SendError::certainly_unsent`]).
 //!
 //! One `DEBUG` event per attempt, target `zonewright::http`, with the fields `provider`,
 //! `method`, `path` (no query string), `status` (absent when there was no answer), `attempt`
@@ -35,7 +40,9 @@ use crate::error::Error;
 use crate::redact::Detail;
 
 use super::Http;
-use super::request::{AuthMode, BODY_LIMIT, BODY_TOO_LARGE, Request, Response, TokenAuth};
+use super::request::{
+    AuthMode, BODY_LIMIT, BODY_TOO_LARGE, Outgoing, Request, Response, TokenAuth,
+};
 use super::tls::NO_CA_CERTIFICATES;
 use super::token::{Lease, Token, TokenSource};
 use super::url::is_loopback_literal;
@@ -64,16 +71,77 @@ struct TokenUse<'a, F> {
 /// The fetch type of a call without a token; never called.
 type NoFetch = fn() -> std::future::Ready<Result<Token, Error>>;
 
+/// The error of [`Http::try_send`]: the operation's error, and whether the request certainly
+/// never reached the provider.
+#[derive(Debug)]
+pub(crate) struct SendError {
+    error: Error,
+    unsent: bool,
+}
+
+impl SendError {
+    /// An error a client met before it handed the request to the transport (building the URL
+    /// or the body): nothing was sent.
+    pub(crate) fn before_send(error: Error) -> SendError {
+        SendError {
+            error,
+            unsent: true,
+        }
+    }
+
+    /// An error a client made of an answer the transport passed on: the request was sent.
+    pub(crate) fn answered(error: Error) -> SendError {
+        SendError {
+            error,
+            unsent: false,
+        }
+    }
+
+    /// The operation's error, the same [`Http::send`] returns.
+    pub(crate) fn error(&self) -> &Error {
+        &self.error
+    }
+
+    /// The operation's error.
+    pub(crate) fn into_error(self) -> Error {
+        self.error
+    }
+
+    /// True only when it is certain that no byte of the request reached the provider in any
+    /// attempt: the request was refused by a check before any connection (the URL policy, a
+    /// header value it cannot carry, a token that could not be obtained, a finisher that
+    /// failed), or every attempt failed while its connection was being established (TCP
+    /// connect or TLS handshake, before the request is written). False whenever that is not
+    /// certain: a timeout or a broken connection after the connection was established, any
+    /// answer, a refused certificate (in TLS 1.3 the server can refuse the client certificate
+    /// after the client has started to send).
+    pub(crate) fn certainly_unsent(&self) -> bool {
+        self.unsent
+    }
+}
+
+impl From<SendError> for Error {
+    fn from(e: SendError) -> Error {
+        e.error
+    }
+}
+
 /// Why an attempt produced no usable answer.
 enum Failure {
     /// No answer, or an answer cut off: connection refused or broken, timeout. Retryable for
     /// an idempotent request. The text is a constant; the status is that of an answer whose
-    /// body was cut off.
-    Network(&'static str, Option<u16>),
+    /// body was cut off. `unsent` is true only for a failure to establish the connection.
+    Network {
+        text: &'static str,
+        status: Option<u16>,
+        unsent: bool,
+    },
     /// The answer's body is over [`BODY_LIMIT`].
     TooLarge { status: u16 },
     /// The request could not be built (a header value the client set is unusable).
     Build,
+    /// The request's finisher failed; nothing was sent.
+    Finish(Error),
     /// TLS certificate verification failed, on either side. Repeating it gives the same answer.
     Certificate,
 }
@@ -82,21 +150,38 @@ impl Failure {
     fn from_reqwest(e: &reqwest::Error, status: Option<u16>) -> Failure {
         // Only the classification of a `reqwest` error is used, never its text: it can contain
         // the URL with its query string.
+        //
+        // `is_connect` is true only for an error of the connector (TCP connect, TLS handshake,
+        // a connect timeout), which runs before the request is written; a request on a reused
+        // connection does not go through the connector. A certificate failure is classified
+        // first and never counts as unsent.
+        let unsent = status.is_none() && e.is_connect();
+        let network = |text: &'static str| Failure::Network {
+            text,
+            status,
+            unsent,
+        };
         if e.is_builder() {
             Failure::Build
         } else if certificate_failure(e) {
             Failure::Certificate
         } else if e.is_timeout() {
-            Failure::Network("the request to the provider timed out", status)
+            network("the request to the provider timed out")
         } else if e.is_connect() {
-            Failure::Network("could not connect to the provider", status)
+            network("could not connect to the provider")
         } else if e.is_body() || e.is_decode() {
-            Failure::Network(
-                "the connection broke while the provider's answer was read",
-                status,
-            )
+            network("the connection broke while the provider's answer was read")
         } else {
-            Failure::Network("the request to the provider failed", status)
+            network("the request to the provider failed")
+        }
+    }
+
+    /// True when the attempt certainly wrote nothing of the request.
+    fn unsent(&self) -> bool {
+        match self {
+            Failure::Network { unsent, .. } => *unsent,
+            Failure::Build | Failure::Finish(_) => true,
+            Failure::TooLarge { .. } | Failure::Certificate => false,
         }
     }
 }
@@ -149,7 +234,20 @@ impl Http {
     /// Sends `request` with the client's static credential (if any) under the rules of the
     /// module documentation.
     pub(crate) async fn send(&self, request: &Request) -> Result<Response, Error> {
-        self.run::<NoFetch, _>(request, None).await
+        self.try_send(request).await.map_err(SendError::into_error)
+    }
+
+    /// [`Http::send`], with the error saying whether the request certainly never reached the
+    /// provider. For a client that must tell a write that was refused from one whose outcome is
+    /// unknown.
+    pub(crate) async fn try_send(&self, request: &Request) -> Result<Response, SendError> {
+        let mut sent = false;
+        self.run::<NoFetch, _>(request, None, &mut sent)
+            .await
+            .map_err(|error| SendError {
+                error,
+                unsent: !sent,
+            })
     }
 
     /// Sends `request` with a token from `tokens`, sent as `auth` says. `fetch` obtains a new
@@ -171,13 +269,17 @@ impl Http {
             auth,
             fetch: &fetch,
         };
-        self.run(request, Some(token)).await
+        let mut sent = false;
+        self.run(request, Some(token), &mut sent).await
     }
 
+    /// The attempts of one request. `sent` becomes true as soon as an attempt may have written
+    /// any of the request.
     async fn run<F, Fut>(
         &self,
         request: &Request,
         token: Option<TokenUse<'_, F>>,
+        sent: &mut bool,
     ) -> Result<Response, Error>
     where
         F: Fn() -> Fut,
@@ -209,12 +311,18 @@ impl Http {
                 gate.wait().await;
             }
             let started = Instant::now();
-            let result = self.attempt(request, token_header, attempt).await;
+            let mut result = self.attempt(request, token_header).await;
+            if !matches!(&result, Err(failure) if failure.unsent()) {
+                *sent = true;
+            }
+            if let Ok(response) = &mut result {
+                response.token_generation = lease.as_ref().map(|used| used.generation);
+            }
             let status = match &result {
                 Ok(response) => Some(response.status),
                 Err(Failure::TooLarge { status }) => Some(*status),
-                Err(Failure::Network(_, status)) => *status,
-                Err(Failure::Certificate | Failure::Build) => None,
+                Err(Failure::Network { status, .. }) => *status,
+                Err(Failure::Certificate | Failure::Build | Failure::Finish(_)) => None,
             };
             self.trace(request, status, attempt, started.elapsed());
             let retry_left = request.idempotent && attempt < MAX_ATTEMPTS;
@@ -242,7 +350,8 @@ impl Http {
                         detail: Detail::constant("the HTTP request could not be built"),
                     });
                 }
-                Err(Failure::Network(text, _)) => {
+                Err(Failure::Finish(error)) => return Err(error),
+                Err(Failure::Network { text, .. }) => {
                     if retry_left {
                         tokio::time::sleep(backoff(attempt)).await;
                         continue;
@@ -256,6 +365,22 @@ impl Http {
             let status = response.status;
             if request.keep.contains(&status) {
                 return Ok(response);
+            }
+            let rate_limited =
+                status == 429 || self.rate_limit.is_some_and(|classify| classify(&response));
+            if rate_limited {
+                let wait = rate_wait(&response.headers, jiff::Timestamp::now())
+                    .map(|wait| wait.min(MAX_REPORTED_WAIT));
+                match wait {
+                    // A zero or past wait still backs off, so that a provider answering
+                    // `Retry-After: 0` does not get three requests in a few milliseconds.
+                    Some(wait) if retry_left && wait <= MAX_INLINE_WAIT => {
+                        tokio::time::sleep(wait.max(backoff(attempt))).await;
+                    }
+                    None if retry_left => tokio::time::sleep(backoff(attempt)).await,
+                    _ => return Err(Error::RateLimited { retry_after: wait }),
+                }
+                continue;
             }
             match status {
                 300..=399 => {
@@ -291,19 +416,6 @@ impl Http {
                     return Err(Error::Forbidden {
                         detail: self.body_detail(&response),
                     });
-                }
-                429 => {
-                    let wait = rate_wait(&response.headers, jiff::Timestamp::now())
-                        .map(|wait| wait.min(MAX_REPORTED_WAIT));
-                    match wait {
-                        // A zero or past wait still backs off, so that a provider answering
-                        // `Retry-After: 0` does not get three requests in a few milliseconds.
-                        Some(wait) if retry_left && wait <= MAX_INLINE_WAIT => {
-                            tokio::time::sleep(wait.max(backoff(attempt))).await;
-                        }
-                        None if retry_left => tokio::time::sleep(backoff(attempt)).await,
-                        _ => return Err(Error::RateLimited { retry_after: wait }),
-                    }
                 }
                 500..=599 => {
                     if retry_left {
@@ -368,7 +480,6 @@ impl Http {
         &self,
         request: &Request,
         token: Option<(HeaderName, HeaderValue)>,
-        attempt: u32,
     ) -> Result<Response, Failure> {
         let mut outgoing = reqwest::Request::new(request.method.clone(), request.url.clone());
         let headers = outgoing.headers_mut();
@@ -390,6 +501,20 @@ impl Http {
             headers.insert(CONTENT_TYPE, content_type);
             *outgoing.body_mut() = Some(reqwest::Body::from(body.clone()));
         }
+        // Last, so that what it computes covers exactly the method, URL and body of this
+        // attempt. The headers it returns replace any of the same name.
+        if let Some(finisher) = &request.finisher {
+            let attempt = Outgoing {
+                method: &request.method,
+                url: &request.url,
+                body: request.body.as_ref().map_or(&[], |(_, body)| body.as_ref()),
+            };
+            let added = finisher.finish(&attempt).map_err(Failure::Finish)?;
+            let headers = outgoing.headers_mut();
+            for (name, value) in added {
+                headers.insert(name, value);
+            }
+        }
         let answer = self
             .transport
             .client
@@ -403,7 +528,7 @@ impl Http {
             status,
             headers,
             body,
-            attempt,
+            token_generation: None,
         })
     }
 

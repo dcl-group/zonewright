@@ -198,17 +198,6 @@ fn verified_flags_equal_providers_md() {
 
 // ---- Metadata ----------------------------------------------------------------------------------
 
-/// The client of `id` is still the placeholder of the core phase.
-fn is_placeholder(id: ProviderId) -> bool {
-    let path = manifest_dir()
-        .join("src/providers")
-        .join(id.as_str())
-        .join("client.rs");
-    std::fs::read_to_string(path)
-        .map(|text| text.starts_with("// PLACEHOLDER:"))
-        .unwrap_or(false)
-}
-
 #[test]
 fn metadata_is_sane() {
     for &id in ProviderId::ALL {
@@ -315,16 +304,212 @@ fn capabilities_are_consistent() {
         if caps.preconditions == Preconditions::Atomic && caps.set_rrset {
             assert!(caps.atomic_rrset_write, "{id}");
         }
-        if is_placeholder(id) {
-            for op in OPERATIONS {
-                if op != Operation::Check {
-                    assert!(!caps.supports(op), "{id}: placeholder announces {op}");
-                }
-            }
-            assert_eq!(caps.record_types, TypeSet::Listed(&[]), "{id}");
-            assert_eq!(caps.txt_values, ValueGuarantee::NotOffered, "{id}");
+    }
+}
+
+// ---- Metadata fields and configuration types ---------------------------------------------------
+
+/// The keys of the provider's `…Config` type: `settings` deserialized into it and serialized
+/// again. Every field of the type is serialized (none is skipped), so these are all its keys.
+/// `None` when the provider is not compiled in.
+fn config_type_keys(
+    id: ProviderId,
+    #[allow(unused_variables)] // Reason: unused in a build without providers.
+    settings: &str,
+) -> Option<BTreeSet<String>> {
+    #[allow(dead_code)] // Reason: unused in a build without providers.
+    fn keys<T: serde::de::DeserializeOwned + serde::Serialize>(settings: &str) -> BTreeSet<String> {
+        let config: T = serde_json::from_str(settings).unwrap();
+        match serde_json::to_value(&config).unwrap() {
+            serde_json::Value::Object(map) => map.keys().cloned().collect(),
+            other => panic!("the settings type serializes to {other}"),
         }
     }
+    #[allow(unused_imports)] // Reason: unused in a build without providers.
+    use zonewright::providers::*;
+    match id {
+        #[cfg(feature = "acme_dns")]
+        ProviderId::AcmeDns => Some(keys::<acme_dns::AcmeDnsConfig>(settings)),
+        #[cfg(feature = "beget")]
+        ProviderId::Beget => Some(keys::<beget::BegetConfig>(settings)),
+        #[cfg(feature = "cloud_ru")]
+        ProviderId::CloudRu => Some(keys::<cloud_ru::CloudRuConfig>(settings)),
+        #[cfg(feature = "cloudflare")]
+        ProviderId::Cloudflare => Some(keys::<cloudflare::CloudflareConfig>(settings)),
+        #[cfg(feature = "digitalocean")]
+        ProviderId::DigitalOcean => Some(keys::<digitalocean::DigitalOceanConfig>(settings)),
+        #[cfg(feature = "hetzner")]
+        ProviderId::Hetzner => Some(keys::<hetzner::HetznerConfig>(settings)),
+        #[cfg(feature = "nicru")]
+        ProviderId::Nicru => Some(keys::<nicru::NicruConfig>(settings)),
+        #[cfg(feature = "regru")]
+        ProviderId::Regru => Some(keys::<regru::RegruConfig>(settings)),
+        #[cfg(feature = "rfc2136")]
+        ProviderId::Rfc2136 => Some(keys::<rfc2136::Rfc2136Config>(settings)),
+        #[cfg(feature = "route53")]
+        ProviderId::Route53 => Some(keys::<route53::Route53Config>(settings)),
+        #[cfg(feature = "selectel_v2")]
+        ProviderId::SelectelV2 => Some(keys::<selectel_v2::SelectelV2Config>(settings)),
+        #[cfg(feature = "timeweb_cloud")]
+        ProviderId::TimewebCloud => Some(keys::<timeweb_cloud::TimewebCloudConfig>(settings)),
+        #[cfg(feature = "vk_cloud")]
+        ProviderId::VkCloud => Some(keys::<vk_cloud::VkCloudConfig>(settings)),
+        #[cfg(feature = "yandex_360")]
+        ProviderId::Yandex360 => Some(keys::<yandex_360::Yandex360Config>(settings)),
+        #[cfg(feature = "yandex_cloud")]
+        ProviderId::YandexCloud => Some(keys::<yandex_cloud::YandexCloudConfig>(settings)),
+        _ => None,
+    }
+}
+
+/// The field names of the provider's `…Credentials` type, read from its definition in
+/// `src/providers/<id>/config.rs`. The credentials types hold secrets and are not
+/// serializable, so their fields are read from the source; a serde attribute that renames a
+/// field would make the names differ from the keys and fails the scan.
+fn credentials_type_fields(id: ProviderId) -> BTreeSet<String> {
+    let path = manifest_dir()
+        .join("src/providers")
+        .join(id.as_str())
+        .join("config.rs");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let start = text
+        .lines()
+        .position(|line| line.starts_with("pub struct ") && line.contains("Credentials {"))
+        .unwrap_or_else(|| panic!("{}: no pub struct …Credentials", path.display()));
+    let mut fields = BTreeSet::new();
+    for line in text.lines().skip(start + 1) {
+        let line = line.trim();
+        if line == "}" {
+            break;
+        }
+        assert!(
+            !(line.starts_with("#[serde") && (line.contains("rename") || line.contains("alias"))),
+            "{}: a credentials field is renamed",
+            path.display()
+        );
+        if let Some(rest) = line.strip_prefix("pub ") {
+            let name = rest.split(':').next().unwrap().trim();
+            fields.insert(name.to_owned());
+        }
+    }
+    assert!(
+        !fields.is_empty(),
+        "{}: no credentials field",
+        path.display()
+    );
+    fields
+}
+
+/// `text` (a JSON object) without `key`, or with `key` set to `value`.
+fn edit_object(text: &str, key: &str, value: Option<serde_json::Value>) -> String {
+    let mut object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(text).unwrap();
+    match value {
+        Some(value) => object.insert(key.to_owned(), value),
+        None => object.remove(key),
+    };
+    serde_json::Value::Object(object).to_string()
+}
+
+/// Every metadata field is a key of the provider's `…Config` type (non-secret) or of its
+/// `…Credentials` type (secret), and every key of those types is a metadata field. Checked with
+/// the types themselves (the settings type serialized, the credentials type read from its
+/// definition) and by building the client through `AnyProvider::from_json` from the sample
+/// configuration with one key removed, added or put into the wrong object at a time: a
+/// required key is required, an optional key with a default accepts it, a secret key is refused
+/// in the settings, and an unknown settings key is refused. All misses are reported together.
+#[test]
+fn metadata_fields_equal_the_configuration_types() {
+    // No request is made: the clients are only built. A context without `loopback_only`, so
+    // that default endpoints (public https URLs) are accepted.
+    let ctx = zonewright::Context::new(zonewright::ContextOptions::default()).unwrap();
+    let build = |id: ProviderId, settings: &str, credentials: &str| {
+        AnyProvider::from_json(id, settings, &credentials.to_owned().into(), &ctx)
+    };
+    let mut misses: Vec<String> = Vec::new();
+    for &id in ProviderId::ALL.iter().filter(|id| id.available()) {
+        let meta = id.meta();
+        let (settings, credentials) = common::sample_config(id);
+        let settings_fields: BTreeSet<String> = meta
+            .fields
+            .iter()
+            .filter(|f| !f.secret)
+            .map(|f| f.key.to_owned())
+            .collect();
+        let secret_fields: BTreeSet<String> = meta
+            .fields
+            .iter()
+            .filter(|f| f.secret)
+            .map(|f| f.key.to_owned())
+            .collect();
+        let config_keys = config_type_keys(id, settings).unwrap();
+        if config_keys != settings_fields {
+            misses.push(format!(
+                "{id}: settings fields {settings_fields:?} differ from the config type's keys {config_keys:?}"
+            ));
+        }
+        let credential_keys = credentials_type_fields(id);
+        if credential_keys != secret_fields {
+            misses.push(format!(
+                "{id}: secret fields {secret_fields:?} differ from the credentials type's fields {credential_keys:?}"
+            ));
+        }
+        if let Err(e) = build(id, settings, credentials) {
+            misses.push(format!("{id}: the sample configuration is refused: {e}"));
+            continue;
+        }
+        for field in meta.fields {
+            let key = field.key;
+            let (object, other) = if field.secret {
+                (credentials, settings)
+            } else {
+                (settings, credentials)
+            };
+            let with = |text: &str| {
+                if field.secret {
+                    build(id, other, text)
+                } else {
+                    build(id, text, other)
+                }
+            };
+            if field.required {
+                match with(&edit_object(object, key, None)) {
+                    Err(e) if e.kind() == ErrorKind::Config => {}
+                    Err(e) => misses.push(format!("{id}.{key}: removed, {e:?}")),
+                    Ok(_) => misses.push(format!("{id}.{key}: required, but accepted without it")),
+                }
+            } else if let Some(default) = field.default {
+                let value = match field.kind {
+                    FieldKind::Integer { .. } => {
+                        serde_json::Value::from(default.parse::<i64>().unwrap())
+                    }
+                    _ => serde_json::Value::from(default),
+                };
+                if let Err(e) = with(&edit_object(object, key, Some(value))) {
+                    misses.push(format!("{id}.{key}: its default is refused: {e}"));
+                }
+            }
+            if field.secret {
+                let misplaced = edit_object(settings, key, Some(serde_json::Value::from("x")));
+                match build(id, &misplaced, credentials) {
+                    Err(e) if e.kind() == ErrorKind::Config => {}
+                    other => misses.push(format!(
+                        "{id}.{key}: a secret key in the settings is not refused: {:?}",
+                        other.map(drop)
+                    )),
+                }
+            }
+        }
+        let unknown = edit_object(
+            settings,
+            "zz_not_a_field",
+            Some(serde_json::Value::from("x")),
+        );
+        if build(id, &unknown, credentials).is_ok() {
+            misses.push(format!("{id}: an unknown settings key is accepted"));
+        }
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n"));
 }
 
 // ---- Behavior agrees with capabilities ---------------------------------------------------------
@@ -378,13 +563,38 @@ async fn call(client: &AnyProvider, op: Operation) -> Result<(), Error> {
 }
 
 /// Every operation whose capability flag is false returns `Unsupported` for that provider and
-/// operation. The context refuses non-loopback connections and no client is pointed at a mock,
-/// so no request can leave the test either way.
+/// operation, before any request: every endpoint of the sample configuration points at a
+/// loopback port with a TCP listener and a UDP socket, and neither sees anything.
 #[tokio::test]
 async fn unsupported_operations_return_unsupported() {
     let ctx = context();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    tcp.set_nonblocking(true).unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let udp = std::net::UdpSocket::bind(addr).unwrap();
+    udp.set_nonblocking(true).unwrap();
+    let assert_untouched = |what: &str| {
+        let would_block =
+            |e: std::io::Error| assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{what}: {e}");
+        match tcp.accept() {
+            Ok(_) => panic!("{what}: a TCP connection was made"),
+            Err(e) => would_block(e),
+        }
+        let mut buf = [0u8; 512];
+        match udp.recv_from(&mut buf) {
+            Ok(_) => panic!("{what}: a UDP datagram was sent"),
+            Err(e) => would_block(e),
+        }
+    };
     for &id in ProviderId::ALL.iter().filter(|id| id.available()) {
-        let client = sample_client(id, &ctx).unwrap();
+        let (settings, credentials) = common::sample_config(id);
+        assert!(
+            settings.contains("127.0.0.1:9"),
+            "{id}: sample has no endpoint"
+        );
+        let settings = settings.replace("127.0.0.1:9", &addr.to_string());
+        let client =
+            AnyProvider::from_json(id, &settings, &credentials.to_owned().into(), &ctx).unwrap();
         assert_eq!(client.id(), id);
         assert!(std::ptr::eq(client.capabilities(), &id.meta().capabilities));
         assert!(!format!("{client:?}").is_empty());
@@ -405,6 +615,7 @@ async fn unsupported_operations_return_unsupported() {
                 }
                 other => panic!("{id} {op}: expected Unsupported, got {other:?}"),
             }
+            assert_untouched(&format!("{id} {op}"));
         }
     }
 }
@@ -607,14 +818,12 @@ fn provider_sources_contain(id: ProviderId, needle: &str) -> bool {
         .any(|path| std::fs::read_to_string(path).unwrap().contains(needle))
 }
 
-/// Every provider whose client is ported defines the tests that sections 12.2 and 12.3 require
-/// in its own test file. Placeholders are skipped; the scan applies as soon as one is replaced.
+/// Every provider defines the tests that sections 12.2 and 12.3 require in its own test file.
+/// Every missing test of every provider is reported together.
 #[test]
 fn provider_test_files_define_the_required_tests() {
+    let mut missing: Vec<String> = Vec::new();
     for &id in ProviderId::ALL {
-        if is_placeholder(id) {
-            continue;
-        }
         let caps = &id.meta().capabilities;
         let mut required: Vec<&str> = vec!["no_secret_in_logs"];
         // RFC 2136 has no HTTP echo; it has its own secret test (design section 12.2).
@@ -662,7 +871,10 @@ fn provider_test_files_define_the_required_tests() {
         let text = std::fs::read_to_string(&path).unwrap();
         for suffix in required {
             let name = format!("fn {}_{suffix}(", id.as_str());
-            assert!(text.contains(&name), "{}: missing {name}", path.display());
+            if !text.contains(&name) {
+                missing.push(format!("{}: missing {name}", path.display()));
+            }
         }
     }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
 }

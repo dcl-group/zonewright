@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
@@ -34,25 +35,6 @@ pub(crate) fn sensitive_value(prefix: &str, secret: &[u8]) -> Option<HeaderValue
     let mut value = HeaderValue::from_maybe_shared(encode::wiped(buf)).ok()?;
     value.set_sensitive(true);
     Some(value)
-}
-
-/// `Basic` credentials for an `Authorization` header: `base64(user ":" password)`, in a
-/// zeroizing buffer of exactly its length.
-pub(crate) fn basic_credentials(user: &str, password: &str) -> Zeroizing<String> {
-    use base64::Engine as _;
-    let mut plain = Zeroizing::new(Vec::with_capacity(user.len() + 1 + password.len()));
-    plain.extend_from_slice(user.as_bytes());
-    plain.push(b':');
-    plain.extend_from_slice(password.as_bytes());
-    let len = base64::encoded_len(plain.len(), true).unwrap_or(0);
-    let mut out = Zeroizing::new(vec![0u8; len]);
-    let written = base64::engine::general_purpose::STANDARD
-        .encode_slice(&*plain, &mut out)
-        .unwrap_or(0);
-    out.truncate(written);
-    // Base64 output is ASCII.
-    let text = String::from_utf8(std::mem::take(&mut *out)).unwrap_or_default();
-    Zeroizing::new(text)
 }
 
 /// How a token from a [`TokenSource`](super::token::TokenSource) is sent: the header and the
@@ -97,6 +79,33 @@ pub(crate) enum AuthMode {
     Anonymous,
 }
 
+/// What one attempt of a request sends, as a [`Finish`] sees it: the method, the URL with its
+/// query string, and the body (empty when there is none). The `Host` header the attempt carries
+/// is derived from the URL.
+pub(crate) struct Outgoing<'a> {
+    /// The method.
+    pub(crate) method: &'a Method,
+    /// The URL, query string included.
+    pub(crate) url: &'a Url,
+    /// The body; empty when the request has none.
+    pub(crate) body: &'a [u8],
+}
+
+/// Completes every attempt of a request right before it is sent, with headers computed from
+/// exactly what that attempt sends: a signature over the current time, for example. The
+/// transport inserts the returned headers after all others, replacing any of the same name, and
+/// adds none of its own that the finisher could cover except `Host` (from the URL), `Accept`,
+/// `Content-Type`, `Content-Length` and `User-Agent`.
+///
+/// A header that carries a secret is built with [`sensitive_value`], as for
+/// [`Request::secret_header`]; a secret that an API can echo is registered with the client's
+/// scrubber when the client is built. A failure is the request's error: nothing is sent, and
+/// the request is not retried.
+pub(crate) trait Finish: Send + Sync {
+    /// The headers to add to this attempt.
+    fn finish(&self, attempt: &Outgoing<'_>) -> Result<Vec<(HeaderName, HeaderValue)>, Error>;
+}
+
 /// One HTTP request as a client describes it. The transport builds a fresh `reqwest` request
 /// from it for every attempt; the body is shared, not copied.
 ///
@@ -110,6 +119,7 @@ pub(crate) struct Request {
     pub(super) body: Option<(&'static str, Bytes)>,
     pub(super) auth: AuthMode,
     pub(super) keep: Vec<u16>,
+    pub(super) finisher: Option<Arc<dyn Finish>>,
 }
 
 impl fmt::Debug for Request {
@@ -118,6 +128,7 @@ impl fmt::Debug for Request {
             .field("method", &self.method)
             .field("path", &self.url.path())
             .field("idempotent", &self.idempotent)
+            .field("finished", &self.finisher.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -136,6 +147,7 @@ impl Request {
             body: None,
             auth: AuthMode::Client,
             keep: Vec::new(),
+            finisher: None,
         }
     }
 
@@ -218,6 +230,12 @@ impl Request {
         self
     }
 
+    /// Completes every attempt with `finisher` right before it is sent (see [`Finish`]).
+    pub(crate) fn finish_with(mut self, finisher: Arc<dyn Finish>) -> Request {
+        self.finisher = Some(finisher);
+        self
+    }
+
     /// The URL path, for `tracing`: never the query string.
     pub(crate) fn path(&self) -> &str {
         self.url.path()
@@ -233,7 +251,8 @@ pub(crate) struct Response {
     pub(super) status: u16,
     pub(super) headers: HeaderMap,
     pub(super) body: Bytes,
-    pub(super) attempt: u32,
+    /// The generation of the cached token the request carried, if it carried one.
+    pub(super) token_generation: Option<u64>,
 }
 
 impl fmt::Debug for Response {
@@ -248,13 +267,6 @@ impl Response {
     /// The HTTP status.
     pub(crate) fn status(&self) -> u16 {
         self.status
-    }
-
-    /// The attempt that produced this answer, from 1. Above 1, earlier attempts of the same
-    /// request got no usable answer and may have been executed: a repeated delete by identifier
-    /// answered "not found" is a success (design section 5.3).
-    pub(crate) fn attempt(&self) -> u32 {
-        self.attempt
     }
 
     /// True for 2xx.
@@ -371,16 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn basic_credentials_are_base64() {
-        // RFC 7617 section 2's example.
-        assert_eq!(
-            basic_credentials("Aladdin", "open sesame").as_str(),
-            "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
-        );
-        assert_eq!(basic_credentials("", "").as_str(), "Og==");
-    }
-
-    #[test]
     fn request_debug_shows_no_secret() {
         let url = Url::parse("http://127.0.0.1:1/zones?key=query-canary").unwrap();
         let req = Request::new(Method::POST, url)
@@ -428,7 +430,7 @@ mod tests {
             status: 200,
             headers: HeaderMap::new(),
             body: Bytes::from_static(b"{\"secret\": \"body-canary\""),
-            attempt: 1,
+            token_generation: None,
         };
         let e = response
             .json::<serde_json::Value>("the answer is not in the expected form")

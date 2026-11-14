@@ -19,7 +19,25 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::Mutex as AsyncMutex;
+#[cfg(any(
+    feature = "acme_dns",
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "rfc2136",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
+use tokio::sync::OwnedMutexGuard;
 
 use crate::name::DomainName;
 
@@ -46,7 +64,24 @@ impl NameLocks {
     }
 
     /// Waits until no other holder of `name` remains and returns the guard. The lock is held
-    /// until the guard is dropped.
+    /// until the guard is dropped. Taken by provider clients only.
+    #[cfg(any(
+        feature = "acme_dns",
+        feature = "beget",
+        feature = "cloud_ru",
+        feature = "cloudflare",
+        feature = "digitalocean",
+        feature = "hetzner",
+        feature = "nicru",
+        feature = "regru",
+        feature = "rfc2136",
+        feature = "route53",
+        feature = "selectel_v2",
+        feature = "timeweb_cloud",
+        feature = "vk_cloud",
+        feature = "yandex_360",
+        feature = "yandex_cloud"
+    ))]
     pub(crate) async fn lock(&self, name: &DomainName) -> NameGuard {
         let entry = {
             let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
@@ -76,6 +111,23 @@ impl NameLocks {
 }
 
 /// Holds one name lock. Dropping it releases the lock.
+#[cfg(any(
+    feature = "acme_dns",
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "rfc2136",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
 #[must_use = "the lock is released when the guard is dropped"]
 pub(crate) struct NameGuard {
     // Field order matters: the mutex guard is released before the ticket removes the entry.
@@ -83,6 +135,23 @@ pub(crate) struct NameGuard {
     _ticket: Ticket,
 }
 
+#[cfg(any(
+    feature = "acme_dns",
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "rfc2136",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
 impl fmt::Debug for NameGuard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NameGuard").finish_non_exhaustive()
@@ -93,12 +162,46 @@ impl fmt::Debug for NameGuard {
 /// it. Every clone of an entry's `Arc` taken from the map is taken under the map's mutex, and the
 /// count is checked under the same mutex, so an entry is never removed while someone is about to
 /// wait on it.
+#[cfg(any(
+    feature = "acme_dns",
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "rfc2136",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
 struct Ticket {
     map: Arc<Mutex<LockMap>>,
     name: DomainName,
     entry: Option<Arc<AsyncMutex<()>>>,
 }
 
+#[cfg(any(
+    feature = "acme_dns",
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "rfc2136",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
 impl Drop for Ticket {
     fn drop(&mut self) {
         drop(self.entry.take());
@@ -113,6 +216,23 @@ impl Drop for Ticket {
 }
 
 #[cfg(test)]
+#[cfg(any(
+    feature = "acme_dns",
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "rfc2136",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

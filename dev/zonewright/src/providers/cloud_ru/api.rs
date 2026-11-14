@@ -378,12 +378,7 @@ impl Api {
     /// Exchanges the access key for a new token, even when a valid one is cached: proves that
     /// the key is accepted now. The new token replaces the cached one.
     pub(super) async fn authenticate(&self) -> Result<(), Error> {
-        let lease = self.tokens.get(|| self.fetch()).await?;
-        if !lease.fresh {
-            // The cached token proves nothing about the key as it is now.
-            self.tokens.invalidate(lease.generation).await;
-            self.tokens.get(|| self.fetch()).await?;
-        }
+        self.tokens.renew(|| self.fetch()).await?;
         Ok(())
     }
 

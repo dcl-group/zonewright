@@ -31,10 +31,11 @@
 //! [troubleshooting]: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-troubleshooting.html
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use reqwest::header::{AUTHORIZATION, HeaderName};
+use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use reqwest::{Method, Url};
 use secrecy::{ExposeSecret as _, SecretString};
 use zeroize::Zeroizing;
@@ -43,8 +44,11 @@ use crate::crypto::sigv4;
 use crate::error::Error;
 use crate::http::encode::{self, xml_escape};
 use crate::http::pager::MAX_PAGES;
+use crate::http::request::sensitive_value;
 use crate::http::url::UrlBuilder;
-use crate::http::{Attempt, Endpoint, Http, PollStep, Poller, Request, Response, path_id};
+use crate::http::{
+    Attempt, Endpoint, Finish, Http, Outgoing, PollStep, Poller, Request, Response, path_id,
+};
 use crate::name::DomainName;
 use crate::redact::Detail;
 
@@ -98,9 +102,13 @@ const AUTH_CODES: [&str; 8] = [
     "InvalidSignatureException",
 ];
 
-/// Error codes of a refused request rate.
-// Source: Quotas ("HTTP 400 ... a Code element with a value of Throttling" and
-// "PriorRequestNotComplete"); Common errors (`ThrottlingException`, 400).
+/// Error codes of a refused request rate. An HTTP 400 answer with one of them is a rate-limit
+/// answer, which the transport treats like a 429 ([`throttled`]).
+// Source: Quotas (https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/DNSLimitations.html,
+// "HTTP 400 ... a Code element with a value of Throttling" and "PriorRequestNotComplete");
+// API reference, `ChangeResourceRecordSets`, errors (`PriorRequestNotComplete`, HTTP 400);
+// Common errors (https://docs.aws.amazon.com/Route53/latest/APIReference/CommonErrors.html,
+// `ThrottlingException`, 400).
 const RATE_CODES: [&str; 3] = [
     "Throttling",
     "ThrottlingException",
@@ -206,11 +214,7 @@ pub(super) enum Submitted {
 pub(super) struct Api {
     http: Http,
     base: Endpoint,
-    /// `host[:port]` as the `Host` header carries it.
-    host: String,
-    access_key_id: String,
-    secret: SecretString,
-    session_token: Option<SecretString>,
+    signer: Arc<Signer>,
     poller: Poller,
 }
 
@@ -218,9 +222,93 @@ impl fmt::Debug for Api {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Api")
             .field("base", &self.base)
-            .field("access_key_id", &self.access_key_id)
+            .field("access_key_id", &self.signer.access_key_id)
             .finish_non_exhaustive()
     }
+}
+
+/// Signs every attempt of a request with SigV4, right before the transport sends it, over
+/// exactly what the attempt sends: its method, the `Host` derived from its URL, its path and
+/// query string, and the hash of its body, with an `x-amz-date` from the clock at that moment.
+/// A repeated attempt therefore carries a date of its own instead of the first attempt's.
+///
+/// The secret key and the session token are registered with the client's scrubber when the
+/// client is built; `Authorization` and `X-Amz-Security-Token` are secret headers.
+struct Signer {
+    access_key_id: String,
+    secret: SecretString,
+    session_token: Option<SecretString>,
+}
+
+impl Finish for Signer {
+    fn finish(&self, attempt: &Outgoing<'_>) -> Result<Vec<(HeaderName, HeaderValue)>, Error> {
+        let unsigned = || Error::InvalidInput {
+            detail: Detail::constant("the request could not be signed"),
+        };
+        let host = host_header(attempt.url).ok_or_else(unsigned)?;
+        // Every path the client builds consists of unreserved characters and `/`, for which
+        // the canonical URI (each segment encoded twice for services other than S3) is the
+        // path itself.
+        let path = attempt.url.path();
+        if !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.~/".contains(&b))
+        {
+            return Err(unsigned());
+        }
+        // `Api::url` checked that the query string is the canonical one.
+        let query = attempt.url.query().unwrap_or("");
+        let payload = sigv4::payload_hash(attempt.body);
+        let amz_date = jiff::Timestamp::now()
+            .strftime("%Y%m%dT%H%M%SZ")
+            .to_string();
+        let keys = sigv4::Keys {
+            access_key_id: &self.access_key_id,
+            secret: &self.secret,
+            session_token: self.session_token.as_ref(),
+        };
+        let signing = sigv4::Request {
+            method: attempt.method.as_str(),
+            host: &host,
+            path,
+            query,
+            headers: &[],
+            payload_hash: &payload,
+        };
+        let authorization: Zeroizing<String> =
+            sigv4::authorization(&signing, &keys, SCOPE, &amz_date).map_err(|_| unsigned())?;
+        let secret = |value: &str| sensitive_value("", value.as_bytes()).ok_or_else(unsigned);
+        let mut headers = vec![
+            (
+                X_AMZ_DATE,
+                HeaderValue::from_str(&amz_date).map_err(|_| unsigned())?,
+            ),
+            (AUTHORIZATION, secret(&authorization)?),
+        ];
+        if let Some(token) = &self.session_token {
+            headers.push((X_AMZ_SECURITY_TOKEN, secret(token.expose_secret())?));
+        }
+        Ok(headers)
+    }
+}
+
+/// `host[:port]` as the `Host` header of a request to `url` carries it: the port only when it
+/// is not the scheme's default (the URL parser drops a default port).
+fn host_header(url: &Url) -> Option<String> {
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => Some(format!("{host}:{port}")),
+        (Some(host), None) => Some(host.to_owned()),
+        (None, _) => None,
+    }
+}
+
+/// True for a rate-limit answer: HTTP 400 with one of [`RATE_CODES`]. Registered with the
+/// transport, which then treats it exactly like a 429 (design section 5.3): an idempotent read
+/// is retried within the bounds with back-off, and anything else is `Error::RateLimited`. Only
+/// the code is read; nothing of the body leaves this function.
+pub(super) fn throttled(response: &Response) -> bool {
+    response.status() == 400
+        && aws_error(&response.text()).is_some_and(|(code, _)| RATE_CODES.contains(&code.as_str()))
 }
 
 impl Api {
@@ -233,34 +321,30 @@ impl Api {
         session_token: Option<SecretString>,
         poll_interval: Duration,
     ) -> Result<Api, Error> {
-        let url = base.as_url();
-        let host = match (url.host_str(), url.port()) {
-            (Some(host), Some(port)) => format!("{host}:{port}"),
-            (Some(host), None) => host.to_owned(),
-            (None, _) => {
-                return Err(Error::Config {
-                    detail: Detail::constant("base_url is not a valid absolute URL with a host"),
-                });
-            }
-        };
+        if host_header(base.as_url()).is_none() {
+            return Err(Error::Config {
+                detail: Detail::constant("base_url is not a valid absolute URL with a host"),
+            });
+        }
         Ok(Api {
             http,
             base,
-            host,
-            access_key_id,
-            secret,
-            session_token,
+            signer: Arc::new(Signer {
+                access_key_id,
+                secret,
+                session_token,
+            }),
             poller: Poller::new(poll_interval, MAX_POLLS),
         })
     }
 
-    /// A URL below the endpoint with `query`, and its canonical query string. The parameters
-    /// are sorted by name, and the URL is checked to carry exactly the string that is signed.
+    /// A URL below the endpoint with `query`. The parameters are sorted by name, and the URL is
+    /// checked to carry exactly the canonical query string, which the signer signs as it is.
     fn url(
         &self,
         path: impl FnOnce(UrlBuilder) -> UrlBuilder,
         query: &mut [(&'static str, &str)],
-    ) -> Result<(Url, String), Error> {
+    ) -> Result<Url, Error> {
         query.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(b.1)));
         let mut builder = path(self.base.url());
         for (key, value) in query.iter() {
@@ -273,66 +357,20 @@ impl Api {
                 detail: Detail::constant("the request URL does not carry the signed query string"),
             });
         }
-        Ok((url, canonical))
+        Ok(url)
     }
 
-    /// A request signed with SigV4: `x-amz-date` from the clock, `Authorization` and the
-    /// session token as secret headers, the payload hash over exactly the body sent.
-    ///
-    /// Signed once per call: the transport repeats an idempotent request with the same
-    /// headers, which stay valid for minutes (the transport has no hook to sign each attempt).
-    /// A 403 is kept for the client's own classification (signature errors are `Auth`).
-    fn signed(
-        &self,
-        method: Method,
-        url: Url,
-        query: &str,
-        body: Option<Bytes>,
-    ) -> Result<Request, Error> {
-        let unsigned = || Error::InvalidInput {
-            detail: Detail::constant("the request could not be signed"),
-        };
-        // Every path the client builds consists of unreserved characters and `/`, for which
-        // the canonical URI (each segment encoded twice for services other than S3) is the
-        // path itself.
-        let path = url.path().to_owned();
-        if !path
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.~/".contains(&b))
-        {
-            return Err(unsigned());
-        }
-        let payload = sigv4::payload_hash(body.as_deref().unwrap_or_default());
-        let amz_date = jiff::Timestamp::now()
-            .strftime("%Y%m%dT%H%M%SZ")
-            .to_string();
-        let keys = sigv4::Keys {
-            access_key_id: &self.access_key_id,
-            secret: &self.secret,
-            session_token: self.session_token.as_ref(),
-        };
-        let signing = sigv4::Request {
-            method: method.as_str(),
-            host: &self.host,
-            path: &path,
-            query,
-            headers: &[],
-            payload_hash: &payload,
-        };
-        let authorization: Zeroizing<String> =
-            sigv4::authorization(&signing, &keys, SCOPE, &amz_date).map_err(|_| unsigned())?;
+    /// A request signed with SigV4 on every attempt ([`Signer`]). A 403 is kept for the
+    /// client's own classification (signature errors are `Auth`).
+    fn signed(&self, method: Method, url: Url, body: Option<Bytes>) -> Request {
         let mut request = Request::new(method, url)
             .accept(encode::XML)
             .keep_status(403)
-            .header_text(X_AMZ_DATE, &amz_date)?
-            .secret_header(AUTHORIZATION, "", &authorization)?;
-        if let Some(token) = &self.session_token {
-            request = request.secret_header(X_AMZ_SECURITY_TOKEN, "", token.expose_secret())?;
-        }
+            .finish_with(self.signer.clone());
         if let Some(body) = body {
             request = request.body(encode::XML, body);
         }
-        Ok(request)
+        request
     }
 
     /// Sends a signed `GET` (idempotent).
@@ -341,10 +379,8 @@ impl Api {
         path: impl FnOnce(UrlBuilder) -> UrlBuilder,
         query: &mut [(&'static str, &str)],
     ) -> Result<Response, Error> {
-        let (url, canonical) = self.url(path, query)?;
-        let request = self
-            .signed(Method::GET, url, &canonical, None)?
-            .idempotent();
+        let url = self.url(path, query)?;
+        let request = self.signed(Method::GET, url, None).idempotent();
         self.http.send(&request).await
     }
 
@@ -553,12 +589,12 @@ impl Api {
         zone_id: &str,
         changes: &[Change<'_>],
     ) -> Result<Submitted, Error> {
-        let (url, canonical) = self.url(
+        let url = self.url(
             |u| u.path("/2013-04-01/hostedzone").id(zone_id).path("/rrset/"),
             &mut [],
         )?;
         let body = Bytes::from(change_batch(changes).into_bytes());
-        let request = self.signed(Method::POST, url, &canonical, Some(body))?;
+        let request = self.signed(Method::POST, url, Some(body));
         let response = self.http.send(&request).await?;
         if response.status() == 404 {
             return Ok(Submitted::ZoneMissing);

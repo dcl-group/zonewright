@@ -27,8 +27,21 @@ pub use svcb::{SvcParam, Svcb};
 pub use tlsa::Tlsa;
 pub use ttl::Ttl;
 pub use txt::Txt;
-// TEMPORARY (core phase): no client reads or writes TXT yet; the first ported client uses it.
-#[allow(unused_imports)]
+#[cfg(any(
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
 pub(crate) use txt::TxtDialect;
 
 use crate::name::NameError;

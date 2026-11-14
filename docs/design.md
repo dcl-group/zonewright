@@ -1674,14 +1674,17 @@ a whole rrset, which can hold values another writer added after the read: it is 
   Back-off before attempt `n + 1` is `500 ms × n` plus a random 0–25 %.
 - A non-idempotent request is sent once. Whatever goes wrong becomes the operation's error;
   repeating the operation is safe because it starts with a read (section 3.2).
-- 429 and other rate-limit answers: the wait is taken from `Retry-After` (delay-seconds or an HTTP
-  date in the IMF-fixdate form; the obsolete RFC 850 and asctime forms are not read) or
-  `RateLimit-Reset` (a value above 10⁹ is a Unix time, as Hetzner sends it, a smaller one
-  delay-seconds). For an idempotent request with attempts left and a wait of at most 30 s, the
-  transport sleeps for the wait or the back-off, whichever is longer, and retries, so a wait of zero
-  or a time in the past does not produce three requests in a few milliseconds; without a header it
-  uses the back-off. Otherwise the result is `Error::RateLimited { retry_after }`, with the wait
-  clamped to 24 hours so that a caller can add it to an `Instant`.
+- 429 and other rate-limit answers: a client declares the answers it treats as rate limits besides
+  429 with a classifier (`HttpBuilder::rate_limit`; Route 53 answers HTTP 400 with the codes
+  `Throttling` and `PriorRequestNotComplete`), and such an answer is handled exactly like a 429. The
+  wait is taken from `Retry-After` (delay-seconds or an HTTP date in the IMF-fixdate form; the
+  obsolete RFC 850 and asctime forms are not read) or `RateLimit-Reset` (a value above 10⁹ is a Unix
+  time, as Hetzner sends it, a smaller one delay-seconds). For an idempotent request with attempts
+  left and a wait of at most 30 s, the transport sleeps for the wait or the back-off, whichever is
+  longer, and retries, so a wait of zero or a time in the past does not produce three requests in a
+  few milliseconds; without a header it uses the back-off. Otherwise the result is
+  `Error::RateLimited { retry_after }`, with the wait clamped to 24 hours so that a caller can add
+  it to an `Instant`.
 - A request that fails because a redirect was refused, because `loopback_only` or the endpoint
   binding of section 5.2 blocked it, or because a TLS certificate was refused (the server's, or the
   client certificate by the server) is never retried. A refused certificate is `Error::Config`: the
@@ -1697,6 +1700,18 @@ a whole rrset, which can hold values another writer added after the read: it is 
   before they expire, so this path is for revoked tokens, not for normal expiry.
 - A delete of one record by identifier that is repeated and answered "not found" is a success
   (section 3.5).
+- A request can carry a finisher (`Request::finish_with`), which the transport calls for every
+  attempt right before it is sent, with exactly the method, URL and body of that attempt; the
+  headers it returns are inserted last. Route 53 signs with it, so every attempt carries its own
+  `x-amz-date` and a signature over what is sent. A finisher that fails is the request's error and
+  nothing is sent.
+- `Http::try_send` returns, with the error, whether the request certainly never reached the
+  provider: refused before any connection (the URL policy, a header value, a failed token fetch or
+  finisher), or every attempt failed while its connection was being established (TCP connect or TLS
+  handshake, a connect timeout included). A timeout or broken connection after the connection was
+  established, any answer, and a refused certificate are never "certainly unsent". acme-dns uses it
+  to tell a refused write from one whose outcome is unknown (section 11.3). The public `Error`
+  carries no such flag.
 
 ### 5.4 Responses
 
@@ -1796,6 +1811,12 @@ canary credentials, and asserts that the log is not empty and contains none of t
   state that a cancelled fetch can leave half-written. Every token has a generation number, and a
   401 invalidates only the generation the failed request used, so a late 401 for an old token does
   not discard a fresh one. What happens to the request after a 401 is the retry rule of section 5.3.
+  A provider that rejects a token in an answer the transport passes on (nic.ru's error 4097 in a
+  `200` body) discards exactly the token that answer was sent with (`TokenSource::discard_rejected`:
+  every response to a request with a cached token records the token's generation). A connection
+  check forces a new exchange with `TokenSource::renew`, which discards the cached token and fetches
+  under the source's lock, so a cached token never stands in for credentials that are no longer
+  accepted.
 - `Keystone`: the OpenStack Identity v3 password exchange with project scope, shared by Selectel v2
   and VK Cloud. The request body, which carries the password, is built once into a zeroizing buffer;
   `400` and `401` are `Error::Auth`.
@@ -2865,15 +2886,23 @@ For every client, in its own test file, where the operation exists:
 - `<id>_writes_are_sent_once`, for every client that writes: with a `502`, a `429` and a `401`
   injected on each write request, the request log holds exactly one such request per operation.
 - `<id>_unsupported_operations_send_nothing`, for every client with an unsupported operation.
+- For Route 53, a throttled read (HTTP 400 `Throttling` or `PriorRequestNotComplete`) is retried and
+  a throttled change batch is sent once and returns `RateLimited`.
 
 `tests/conformance.rs` holds the checks that span providers: `parse(as_str(id)) == id` for all IDs,
-serde round trip, the literal table of section 2.4, the comparison with `PROVIDERS.md`, every
-metadata field key present in the corresponding `Config` or `Credentials` type, an unsupported
-operation returning `Unsupported` with zero requests, every default endpoint being `https`, a scan
-that no file under `src/providers/` calls `Detail::new` or a text-taking `Error` constructor, and a
-scan that every provider's test file defines the required test names of sections 12.2 and 12.3 (with
-an explicit list of the exceptions: `acme_dns` has no removal, `rfc2136` has its own secret test).
-The scan is what keeps "tests cover this for every client" true when a sixteenth provider is added.
+serde round trip, the literal table of section 2.4, the comparison with `PROVIDERS.md`, the metadata
+fields equal to the keys of the corresponding types (the non-secret keys equal the keys of the
+`Config` type, read by serializing it; the secret keys equal the fields of the `Credentials` type,
+read from its definition; and, through `AnyProvider::from_json` from the sample configuration with
+one key changed at a time, a required key is required, an optional default is accepted, a secret key
+and an unknown key are refused in the settings), an unsupported operation returning `Unsupported`
+with zero requests (every endpoint of the sample configuration points at a loopback TCP listener and
+UDP socket that must see nothing), every default endpoint being `https`, a scan that no file under
+`src/providers/` calls `Detail::new` or a text-taking `Error` constructor, and a scan that every
+provider's test file defines the required test names of sections 12.2 and 12.3 (with an explicit
+list of the exceptions: `acme_dns` has no removal, `rfc2136` has its own secret test), which reports
+every missing name of every provider at once. The scan is what keeps "tests cover this for every
+client" true when a sixteenth provider is added.
 
 The generic value layer is additionally tested against an in-memory backend for all three native
 shapes, including duplicates of a value, non-plain values and failures injected between the read and

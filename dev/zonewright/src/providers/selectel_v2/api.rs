@@ -219,12 +219,7 @@ impl Api {
     /// Exchanges the credentials for a new token, even when a valid one is cached: proves that
     /// they are accepted now. The new token replaces the cached one.
     pub(super) async fn authenticate(&self) -> Result<(), Error> {
-        let lease = self.tokens.get(|| self.fetch()).await?;
-        if !lease.fresh {
-            // The cached token proves nothing about the credentials as they are now.
-            self.tokens.invalidate(lease.generation).await;
-            self.tokens.get(|| self.fetch()).await?;
-        }
+        self.tokens.renew(|| self.fetch()).await?;
         Ok(())
     }
 

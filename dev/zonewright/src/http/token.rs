@@ -140,7 +140,29 @@ impl TokenSource {
             });
         }
         // Dropping this future here releases the lock and leaves the slot as it was.
-        let Token { secret, lifetime } = fetch().await?;
+        let token = fetch().await?;
+        Ok(self.store(&mut slot, token))
+    }
+
+    /// A new token from `fetch`, even when a valid one is cached: for a connection check, which
+    /// must prove that the credentials are accepted now. The cached token is discarded before
+    /// the fetch, so a failed or cancelled fetch leaves the source empty, and the next caller
+    /// fetches again. Concurrent callers of [`TokenSource::get`] wait for this fetch and use its
+    /// token.
+    pub(crate) async fn renew<F, Fut>(&self, fetch: F) -> Result<Lease, Error>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Token, Error>>,
+    {
+        let mut slot = self.slot.lock().await;
+        *slot = None;
+        let token = fetch().await?;
+        Ok(self.store(&mut slot, token))
+    }
+
+    /// Stores a token just fetched under a new generation and returns its lease.
+    fn store(&self, slot: &mut Option<Cached>, token: Token) -> Lease {
+        let Token { secret, lifetime } = token;
         let lifetime = lifetime.unwrap_or(DEFAULT_LIFETIME);
         if lifetime < SHORT_LIFETIME {
             tracing::warn!(
@@ -156,11 +178,11 @@ impl TokenSource {
             refresh_at: now + self.renew_after(lifetime),
             generation,
         });
-        Ok(Lease {
+        Lease {
             token: secret,
             generation,
             fresh: true,
-        })
+        }
     }
 
     /// The scrubber slot of this source's tokens: the transport registers each token it uses
@@ -174,6 +196,16 @@ impl TokenSource {
         let mut slot = self.slot.lock().await;
         if slot.as_ref().is_some_and(|c| c.generation == generation) {
             *slot = None;
+        }
+    }
+
+    /// Discards the cached token if it is still the one `response` answered: for a provider that
+    /// rejects a token with an answer the transport passes on (not a 401). `response` comes from
+    /// [`Http::send_with_token`](super::Http::send_with_token) with this source; for any other
+    /// response nothing happens. A token another call has fetched meanwhile is kept.
+    pub(crate) async fn discard_rejected(&self, response: &super::Response) {
+        if let Some(generation) = response.token_generation {
+            self.invalidate(generation).await;
         }
     }
 
@@ -235,6 +267,73 @@ mod tests {
         }
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(fresh, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renew_fetches_even_when_a_token_is_cached() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let source = TokenSource::new(None);
+        let first = source.get(|| counting(&count, None)).await.unwrap();
+        assert_eq!(first.token.expose_secret(), "tok-1");
+        let renewed = source.renew(|| counting(&count, None)).await.unwrap();
+        assert!(renewed.fresh);
+        assert_eq!(renewed.token.expose_secret(), "tok-2");
+        assert_eq!(renewed.generation, 2);
+        // The new token replaced the cached one.
+        let cached = source.get(|| counting(&count, None)).await.unwrap();
+        assert!(!cached.fresh);
+        assert_eq!(cached.token.expose_secret(), "tok-2");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        // A late invalidation of the old generation keeps the new token.
+        source.invalidate(first.generation).await;
+        assert!(!source.get(|| counting(&count, None)).await.unwrap().fresh);
+        // With an empty source, renew is one fetch.
+        let empty = TokenSource::new(None);
+        assert!(empty.renew(|| counting(&count, None)).await.unwrap().fresh);
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_or_cancelled_renew_leaves_the_source_empty() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let source = TokenSource::new(None);
+        source.get(|| counting(&count, None)).await.unwrap();
+        let e = source
+            .renew(|| async { Err::<Token, _>(Error::auth("refused")) })
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Auth);
+        // The token cached before proves nothing now: the next caller fetches.
+        let lease = source.get(|| counting(&count, None)).await.unwrap();
+        assert!(lease.fresh);
+        assert_eq!(lease.token.expose_secret(), "tok-2");
+        // A renew dropped while it fetches stores nothing.
+        let renew = source.renew(|| counting(&count, None));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), renew)
+                .await
+                .is_err()
+        );
+        assert!(source.get(|| counting(&count, None)).await.unwrap().fresh);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callers_wait_for_a_renew_and_use_its_token() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(TokenSource::new(None));
+        source.get(|| counting(&count, None)).await.unwrap();
+        let renewing = {
+            let source = source.clone();
+            let count = count.clone();
+            tokio::spawn(async move { source.renew(|| counting(&count, None)).await.unwrap() })
+        };
+        tokio::task::yield_now().await;
+        let waiting = source.get(|| counting(&count, None)).await.unwrap();
+        let renewed = renewing.await.unwrap();
+        assert_eq!(renewed.token.expose_secret(), "tok-2");
+        assert_eq!(waiting.token.expose_secret(), "tok-2");
+        assert!(!waiting.fresh);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]

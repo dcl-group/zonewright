@@ -1,26 +1,31 @@
 //! Cryptographic helpers for provider authentication. Backend: `aws-lc-rs` only.
 //!
-//! Private to the crate: TSIG for RFC 2136 uses the HMAC functions, Route 53 uses [`sigv4`], and
-//! Yandex Cloud uses `Ps256Key`. Nothing here is part of the public API.
+//! Private to the crate: TSIG for RFC 2136 uses the HMAC functions, Route 53 uses `sigv4`, and
+//! Yandex Cloud uses `Ps256Key`. Nothing here is part of the public API. Each part is compiled
+//! with the provider that uses it.
 //!
-//! `Ps256Key` reads PEM with `rustls-pki-types`, which is a dependency of the internal `__http`
-//! feature, so it is compiled only when `__http` is enabled as well. Its one user, Yandex Cloud,
-//! enables both.
+//! `Ps256Key` reads PEM with `rustls-pki-types`, a dependency of the internal `__http` feature,
+//! which Yandex Cloud enables.
+
+// Design section 9.2: the helpers here are shared by several providers and not all of them are
+// used by each, so builds without `all-providers` allow unused code; the build with all
+// providers does not, so that a helper no provider uses is found.
+#![cfg_attr(not(feature = "all-providers"), allow(dead_code))]
 
 mod hmac;
-#[cfg(feature = "__http")]
+#[cfg(feature = "yandex_cloud")]
 mod ps256;
+#[cfg(feature = "route53")]
 pub(crate) mod sigv4;
 
-// TEMPORARY (core phase): the re-exports have no user until the TSIG and Yandex Cloud clients
-// land; `dead_code` on the module does not cover unused imports. Remove with the first user.
-#[allow(unused_imports)]
-pub(crate) use hmac::{hmac_sha256, hmac_sha256_verify, hmac_sha512, hmac_sha512_verify};
-#[cfg(feature = "__http")]
-#[allow(unused_imports)]
+#[cfg(any(feature = "rfc2136", feature = "route53"))]
+pub(crate) use hmac::hmac_sha256;
+#[cfg(feature = "rfc2136")]
+pub(crate) use hmac::{hmac_sha256_verify, hmac_sha512, hmac_sha512_verify};
+#[cfg(feature = "yandex_cloud")]
 pub(crate) use ps256::Ps256Key;
 
-use aws_lc_rs::{constant_time, digest};
+use aws_lc_rs::digest;
 
 /// Why a key could not be used or a signature could not be made. No variant carries input:
 /// neither key material nor the text it was read from.
@@ -53,11 +58,6 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
         *dst = *src;
     }
     out
-}
-
-/// Constant time in the contents; the lengths are not hidden.
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    constant_time::verify_slices_are_equal(a, b).is_ok()
 }
 
 /// Lowercase hexadecimal.
@@ -99,15 +99,6 @@ mod tests {
             hex_lower(&sha256(b"abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-    }
-
-    #[test]
-    fn ct_eq_compares_contents_and_lengths() {
-        assert!(ct_eq(b"", b""));
-        assert!(ct_eq(b"abc", b"abc"));
-        assert!(!ct_eq(b"abc", b"abd"));
-        assert!(!ct_eq(b"abc", b"ab"));
-        assert!(!ct_eq(b"", b"a"));
     }
 
     #[test]

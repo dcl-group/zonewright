@@ -58,14 +58,6 @@ pub(crate) fn next_page_of_total(page: u32, total_pages: u32) -> Option<u32> {
     (page < total_pages).then(|| page.saturating_add(1))
 }
 
-/// Offset with a total item count: the next offset, if any. A page that brought no items ends
-/// the listing, so that a total that does not match the items cannot loop.
-pub(crate) fn next_offset_of_total(offset: u64, received: usize, total: u64) -> Option<u64> {
-    let received = u64::try_from(received).unwrap_or(u64::MAX);
-    let next = offset.saturating_add(received);
-    (received > 0 && next < total).then_some(next)
-}
-
 /// A page token, where an absent or empty token means the last page.
 pub(crate) fn next_token(token: Option<String>) -> Option<String> {
     token.filter(|t| !t.is_empty())
@@ -139,9 +131,6 @@ mod tests {
         assert_eq!(next_page_of_total(1, 3), Some(2));
         assert_eq!(next_page_of_total(3, 3), None);
         assert_eq!(next_page_of_total(1, 0), None);
-        assert_eq!(next_offset_of_total(0, 100, 250), Some(100));
-        assert_eq!(next_offset_of_total(200, 50, 250), None);
-        assert_eq!(next_offset_of_total(100, 0, 250), None);
         assert_eq!(next_token(Some("abc".to_owned())).as_deref(), Some("abc"));
         assert_eq!(next_token(Some(String::new())), None);
         assert_eq!(next_token(None), None);

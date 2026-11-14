@@ -181,11 +181,7 @@ impl Api {
     /// Exchanges the credentials for a new token, even when a valid one is cached: proves that
     /// they are accepted now. The new token replaces the cached one.
     pub(super) async fn authenticate(&self) -> Result<(), Error> {
-        let lease = self.tokens.get(|| self.fetch()).await?;
-        if !lease.fresh {
-            self.tokens.invalidate(lease.generation).await;
-            self.tokens.get(|| self.fetch()).await?;
-        }
+        self.tokens.renew(|| self.fetch()).await?;
         Ok(())
     }
 
@@ -212,12 +208,9 @@ impl Api {
             match self.answer(&response, empty_ok)? {
                 Answer::Success(text) => return Ok(text),
                 Answer::TokenRejected => {
-                    // The token this call used is the cached one, unless another call has
-                    // replaced it meanwhile; then the fresh one is kept.
-                    let lease = self.tokens.get(|| self.fetch()).await?;
-                    if !lease.fresh {
-                        self.tokens.invalidate(lease.generation).await;
-                    }
+                    // Discards exactly the token this request carried; one that another call
+                    // has fetched meanwhile is kept.
+                    self.tokens.discard_rejected(&response).await;
                     if renewed {
                         return Err(Error::Auth {
                             detail: Detail::constant(
@@ -592,8 +585,6 @@ fn protocol(text: &'static str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
-
     use super::*;
 
     #[test]

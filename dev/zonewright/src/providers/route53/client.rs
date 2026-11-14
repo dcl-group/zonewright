@@ -81,7 +81,8 @@ impl Route53 {
         let mut http = Http::builder(ctx, ProviderId::Route53)
             .endpoint(&settings.api)
             .secret(secret_access_key.expose_secret())
-            .message(api::error_message);
+            .message(api::error_message)
+            .rate_limit(api::throttled);
         if let Some(token) = &token {
             http = http.secret(token.expose_secret());
         }
