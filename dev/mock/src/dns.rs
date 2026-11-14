@@ -253,6 +253,75 @@ pub enum Action {
     Raw(Vec<u8>),
     /// Answer normally and append these records to the answer section.
     Extra(Vec<Record>),
+    /// Answer with the records the data gives, but with this response code (for example
+    /// NXDOMAIN together with records of the asked type).
+    AnswerWithRcode(u16),
+    /// Never answer and, over TCP, keep the connection open.
+    Stall,
+    /// The normal answer with one header or question field changed. With `then_answer`, over
+    /// UDP, the unchanged answer follows.
+    Altered {
+        /// The change.
+        change: Change,
+        /// Also send the unchanged answer after the altered one (UDP only).
+        then_answer: bool,
+    },
+}
+
+/// A change applied to an encoded answer by [`Action::Altered`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// The QR flag cleared: the message claims to be a query.
+    NotResponse,
+    /// This opcode (0 to 15) instead of QUERY.
+    Opcode(u8),
+    /// This question type instead of the asked one.
+    QuestionType(u16),
+    /// This question class instead of IN.
+    QuestionClass(u16),
+    /// The question name in upper case (records compressed against it follow).
+    UpperCaseQuestion,
+    /// The TC flag set, the content unchanged.
+    Truncated,
+}
+
+impl Change {
+    /// Applies the change to `octets`, an answer whose question name is `name_len` octets long
+    /// and written uncompressed at offset 12.
+    fn apply(&self, octets: &mut [u8], name_len: usize) {
+        let question = 12 + name_len;
+        match self {
+            Change::NotResponse => {
+                if let Some(flags) = octets.get_mut(2) {
+                    *flags &= !0x80;
+                }
+            }
+            Change::Opcode(opcode) => {
+                if let Some(flags) = octets.get_mut(2) {
+                    *flags = (*flags & !0x78) | ((opcode & 0x0f) << 3);
+                }
+            }
+            Change::QuestionType(rtype) => put_u16(octets, question, *rtype),
+            Change::QuestionClass(class) => put_u16(octets, question + 2, *class),
+            Change::UpperCaseQuestion => {
+                if let Some(name) = octets.get_mut(12..question) {
+                    // Length octets are at most 63, below every ASCII letter.
+                    name.make_ascii_uppercase();
+                }
+            }
+            Change::Truncated => {
+                if let Some(flags) = octets.get_mut(2) {
+                    *flags |= 0x02;
+                }
+            }
+        }
+    }
+}
+
+fn put_u16(octets: &mut [u8], at: usize, value: u16) {
+    if let Some(slot) = octets.get_mut(at..at + 2) {
+        slot.copy_from_slice(&value.to_be_bytes());
+    }
 }
 
 /// A behavior for the next matching queries.
@@ -706,6 +775,8 @@ struct Plan {
     send: Vec<Outgoing>,
     /// Over TCP: close the connection without an answer.
     close: bool,
+    /// Send nothing and, over TCP, keep the connection open.
+    stall: bool,
 }
 
 /// Decides how to answer one request.
@@ -774,7 +845,7 @@ fn plan(state: &Arc<Mutex<State>>, octets: &[u8], proto: Proto, source: SocketAd
             octets,
             other_source: false,
         }],
-        close: false,
+        ..Plan::default()
     };
     let encode_full = |resolution: &Resolution, truncate: bool| {
         encode(&request, resolution, recursive, truncate, limit)
@@ -865,6 +936,27 @@ fn plan(state: &Arc<Mutex<State>>, octets: &[u8], proto: Proto, source: SocketAd
             resolution.answers.extend(extra);
             one(encode_full(&resolution, false))
         }
+        Some(Action::AnswerWithRcode(rcode)) => {
+            resolution.rcode = rcode;
+            one(encode_full(&resolution, false))
+        }
+        Some(Action::Stall) => Plan {
+            stall: true,
+            ..Plan::default()
+        },
+        Some(Action::Altered {
+            change,
+            then_answer,
+        }) => {
+            let real = encode_full(&resolution, false);
+            let mut altered = real.clone();
+            if request.has_question {
+                change.apply(&mut altered, request.raw_name.len());
+            } else {
+                change.apply(&mut altered, 0);
+            }
+            spoofed(delay, proto, altered, real, then_answer, false)
+        }
     }
 }
 
@@ -889,7 +981,7 @@ fn spoofed(
     Plan {
         delay,
         send,
-        close: false,
+        ..Plan::default()
     }
 }
 
@@ -1168,6 +1260,12 @@ async fn serve_connection(mut stream: TcpStream, source: SocketAddr, state: Arc<
         let plan = plan(&state, &octets, Proto::Tcp, source);
         if let Some(delay) = plan.delay {
             tokio::time::sleep(delay).await;
+        }
+        if plan.stall {
+            // Hold the connection open without answering until the client gives up.
+            let mut rest = [0u8; 512];
+            while matches!(stream.read(&mut rest).await, Ok(n) if n > 0) {}
+            return;
         }
         if plan.close {
             return;

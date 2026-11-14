@@ -112,13 +112,16 @@ impl Transport for NetTransport {
         let name = wire_to_name(&ask.name)?;
         let (mut query, mut id) = encode_query(&name, ask, true)?;
         let mut answer = udp(server, &query, id, ask).await?;
-        if answer.message.metadata.response_code == ResponseCode::FormErr {
+        if let Udp::Answer(received) = &answer
+            && received.message.metadata.response_code == ResponseCode::FormErr
+        {
             (query, id) = encode_query(&name, ask, false)?;
             answer = udp(server, &query, id, ask).await?;
         }
-        if answer.message.metadata.truncation {
-            answer = tcp(server, &query, id, ask).await?;
-        }
+        let answer = match answer {
+            Udp::Answer(received) if !received.message.metadata.truncation => received,
+            Udp::Answer(_) | Udp::Truncated => tcp(server, &query, id, ask).await?,
+        };
         reply_from(&answer)
     }
 }
@@ -128,6 +131,20 @@ struct Received {
     message: Message,
     raw: Vec<u8>,
 }
+
+/// What one UDP exchange produced.
+enum Udp {
+    /// An answer to the question.
+    Answer(Received),
+    /// A response with the query's ID and the TC flag that could not be decoded: a server may
+    /// cut a message anywhere when it truncates (RFC 2181 section 9). The question goes to TCP,
+    /// where the answer is checked in full.
+    Truncated,
+}
+
+/// The QR and TC flags in the third octet of a message header.
+const FLAG_QR: u8 = 0x80;
+const FLAG_TC: u8 = 0x02;
 
 /// Builds the query message; returns its octets and its ID.
 ///
@@ -221,7 +238,7 @@ fn matches(message: &Message, id: u16, ask: &Ask) -> bool {
 /// One exchange over a new UDP socket bound to the wildcard address and connected to `server`.
 /// Datagrams from another address, with another ID or another question are ignored; the
 /// caller's timeout ends the wait.
-async fn udp(server: SocketAddr, query: &[u8], id: u16, ask: &Ask) -> Result<Received, Failure> {
+async fn udp(server: SocketAddr, query: &[u8], id: u16, ask: &Ask) -> Result<Udp, Failure> {
     let bind: SocketAddr = if server.is_ipv4() {
         (Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
@@ -260,12 +277,20 @@ async fn udp(server: SocketAddr, query: &[u8], id: u16, ask: &Ask) -> Result<Rec
         }
         match Message::from_vec(octets) {
             Ok(message) if matches(&message, id, ask) => {
-                return Ok(Received {
+                return Ok(Udp::Answer(Received {
                     message,
                     raw: octets.to_vec(),
-                });
+                }));
             }
             Ok(_) => continue,
+            Err(_)
+                if ours
+                    && octets
+                        .get(2)
+                        .is_some_and(|f| f & (FLAG_QR | FLAG_TC) == FLAG_QR | FLAG_TC) =>
+            {
+                return Ok(Udp::Truncated);
+            }
             Err(_) if ours => {
                 return Err(Failure::malformed("the answer could not be decoded"));
             }
@@ -304,6 +329,11 @@ async fn tcp(server: SocketAddr, query: &[u8], id: u16, ask: &Ask) -> Result<Rec
         return Err(Failure::malformed(
             "the TCP answer does not match the question",
         ));
+    }
+    // There is no larger transport to retry on: a truncated TCP answer is incomplete, and an
+    // incomplete rrset must not be read as the whole one.
+    if message.metadata.truncation {
+        return Err(Failure::malformed("the TCP answer is truncated"));
     }
     Ok(Received { message, raw })
 }

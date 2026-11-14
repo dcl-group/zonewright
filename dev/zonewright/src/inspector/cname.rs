@@ -191,6 +191,21 @@ mod tests {
         assert!(e.cname(&name()).await.is_err());
     }
 
+    #[test]
+    fn a_resolver_listed_twice_cannot_make_a_quorum_alone() {
+        let (r1, r2) = (addr(1), addr(2));
+        for resolvers in [vec![r1, r1], vec![r1, r2, r1]] {
+            assert!(
+                matches!(
+                    Engine::new(config_with(resolvers.clone()), Fake::default()),
+                    Err(crate::inspector::InspectorError::Config { detail })
+                        if detail.contains("more than once")
+                ),
+                "{resolvers:?}"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_cname_at_another_owner_is_no_vote_for_a_target() {
         let (r1, r2) = (addr(1), addr(2));

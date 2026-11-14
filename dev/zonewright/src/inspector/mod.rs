@@ -23,8 +23,11 @@
 //! runtime with the I/O and time drivers enabled.
 //!
 //! Events go to the `tracing` target `zonewright::inspector`: one `DEBUG` event per question
-//! with the server address, the record type, the kind of answer and the duration, and `WARN`
-//! events for name-server addresses discovery refused. They carry no record values.
+//! with the server address, the record type, the recursion flag, the kind of answer and the
+//! duration — no question name and no record value — and one `WARN` event per name-server
+//! address discovery refused, with the zone, the NS name, the address and the reason. NS names
+//! and their addresses are public delegation data, not secrets; no event carries a value of a
+//! record the application asks about.
 
 mod answer;
 mod cname;
@@ -185,11 +188,28 @@ pub enum InspectorError {
         /// What is wrong.
         detail: String,
     },
-    /// Discovery found no server to ask.
+    /// Discovery could not establish the complete list of servers: no resolver returned an NS
+    /// set for the zone, no resolver answered an address question for one of its NS names, a
+    /// resolver returned an unreadable value, or the discovery timeout passed. Usually
+    /// transient; nothing is cached.
     #[error("no usable name servers for zone {zone}: {detail}")]
     NoNameServers {
         /// The zone.
         zone: DomainName,
+        /// Why.
+        detail: String,
+    },
+    /// An NS name of the zone has no address that can be asked: the resolvers answered that it
+    /// has none in the configured address families, or every address it has is refused by the
+    /// address policy. The server list would be incomplete, so discovery fails rather than
+    /// leave the server out. Another [`IpFamilies`] choice, `allow_private_addresses` or a
+    /// static list may help.
+    #[error("name server {name} of zone {zone} has no usable address: {detail}")]
+    NameServerWithoutAddress {
+        /// The zone.
+        zone: DomainName,
+        /// The NS name.
+        name: TargetName,
         /// Why.
         detail: String,
     },
@@ -230,11 +250,20 @@ impl InspectorError {
             detail: bounded(detail),
         }
     }
+
+    fn without_address(zone: &DomainName, name: &TargetName, detail: &str) -> InspectorError {
+        InspectorError::NameServerWithoutAddress {
+            zone: zone.clone(),
+            name: name.clone(),
+            detail: bounded(detail),
+        }
+    }
 }
 
 impl Inspector {
     /// An inspector with this configuration. Fails with [`InspectorError::Config`] for a zero
-    /// timeout, `max_servers` of zero, more than 16 resolvers, recursive discovery without
+    /// timeout, `max_servers` of zero, more than 16 resolvers, a resolver listed twice,
+    /// recursive discovery without
     /// resolvers, or a static list that is empty or longer than `max_servers`.
     ///
     /// No socket is opened here.
@@ -266,8 +295,9 @@ impl Inspector {
         self.engine.query_recursive(question).await
     }
 
-    /// One round: every question at every name server of the zone, all at once. The answers of
-    /// a server are in the order of `questions`. 1 to 32 questions, every name within the zone.
+    /// One round: every question at every name server of the zone, at most 128 questions in
+    /// flight at a time. The answers of a server are in the order of `questions`. 1 to 32
+    /// questions, every name within the zone, at most 1,024 questions in all.
     pub async fn observe(
         &self,
         zone: &DomainName,
@@ -278,7 +308,9 @@ impl Inspector {
 
     /// Polls until every name server of the zone satisfies every expectation in the same round
     /// (design section 8.6). At least one round runs; the last round starts no later than
-    /// `options.timeout` after the start. Dropping the future cancels every query it started.
+    /// `options.timeout` after the start. An `options.interval` below
+    /// [`WaitOptions::MIN_INTERVAL`] is [`InspectorError::InvalidInput`]. Dropping the future
+    /// cancels every query it started.
     pub async fn wait(
         &self,
         zone: &DomainName,

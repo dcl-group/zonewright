@@ -74,7 +74,8 @@ impl NameServer {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct InspectorConfig {
-    /// Recursive resolvers, tried in order. Default: [`PUBLIC_RESOLVERS`]. At most 16.
+    /// Recursive resolvers, tried in order. Default: [`PUBLIC_RESOLVERS`]. At most 16, each
+    /// address once.
     pub resolvers: Vec<SocketAddr>,
     /// How name servers are found. Default: [`NsDiscovery::Recursive`].
     pub discovery: NsDiscovery,
@@ -88,9 +89,11 @@ pub struct InspectorConfig {
     pub max_servers: usize,
     /// Limit for the whole discovery of one zone's servers. Default 10 s.
     pub discovery_timeout: Duration,
-    /// Accept discovered name-server addresses in private ranges (RFC 1918, RFC 4193, RFC
-    /// 6598). Default false. Loopback, link-local, unspecified, multicast and broadcast
-    /// addresses are refused regardless.
+    /// Accept discovered name-server addresses in private ranges (RFC 1918, RFC 6598, RFC 4193
+    /// and the deprecated site-local `fec0::/10`), also when embedded in an IPv6 address.
+    /// Default false. Loopback, link-local, unspecified, multicast, broadcast, reserved,
+    /// benchmarking and IETF protocol-assignment addresses are refused regardless (design
+    /// section 8.3).
     pub allow_private_addresses: bool,
 }
 
@@ -126,6 +129,17 @@ impl InspectorConfig {
         }
         if self.resolvers.len() > MAX_RESOLVERS {
             return fail("more than 16 resolvers");
+        }
+        // A resolver listed twice would count twice toward the CNAME quorum (design 8.7).
+        for (at, resolver) in self.resolvers.iter().enumerate() {
+            if self
+                .resolvers
+                .iter()
+                .skip(at + 1)
+                .any(|other| other == resolver)
+            {
+                return fail("a resolver is listed more than once");
+            }
         }
         match &self.discovery {
             NsDiscovery::Recursive => {

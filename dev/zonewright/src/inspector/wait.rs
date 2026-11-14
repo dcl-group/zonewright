@@ -2,7 +2,8 @@
 
 use std::time::Duration;
 
-use futures_util::future::join_all;
+use futures_util::StreamExt;
+use futures_util::stream;
 use tokio::time::Instant;
 
 use super::answer::Mode;
@@ -16,6 +17,8 @@ use crate::name::DomainName;
 pub(crate) const MAX_QUESTIONS: usize = 32;
 /// Most questions in one round: servers times distinct questions.
 pub(crate) const MAX_QUESTIONS_PER_ROUND: usize = 1024;
+/// Most questions of one round in flight at the same time; each holds one socket.
+pub(crate) const QUESTIONS_AT_ONCE: usize = 128;
 /// Largest accepted jitter.
 const MAX_JITTER_PERCENT: u8 = 50;
 
@@ -26,13 +29,18 @@ pub struct WaitOptions {
     /// Total time to wait, counted from the start of the first round. At least one round always
     /// runs.
     pub timeout: Duration,
-    /// Pause between rounds. Default 5 s.
+    /// Pause between rounds. Default 5 s; at least [`WaitOptions::MIN_INTERVAL`].
     pub interval: Duration,
     /// The pause varies by up to this percentage either way. Default 20; at most 50.
     pub jitter_percent: u8,
 }
 
 impl WaitOptions {
+    /// The shortest accepted `interval`, 1 s. A round can ask up to 1024 questions of servers
+    /// the application does not run; a shorter interval is
+    /// [`InspectorError::InvalidInput`]. With the largest jitter the shortest pause is 500 ms.
+    pub const MIN_INTERVAL: Duration = Duration::from_secs(1);
+
     /// Options with this timeout, a 5 s interval and 20 % jitter.
     #[must_use]
     pub fn new(timeout: Duration) -> WaitOptions {
@@ -175,16 +183,26 @@ pub(crate) fn pause(interval: Duration, jitter_percent: u8, remaining: Duration)
 }
 
 impl<T: Transport> Engine<T> {
-    /// Every question at every server, all at once. The answers of a server are in the order of
-    /// `asks`.
+    /// Every question at every server, at most [`QUESTIONS_AT_ONCE`] in flight. The answers of
+    /// a server are in the order of `asks`.
     async fn round(&self, servers: &[NameServer], asks: &[Ask]) -> Vec<Vec<Answer>> {
-        join_all(servers.iter().map(|server| {
-            join_all(
-                asks.iter()
-                    .map(|ask| self.ask(server.addr, ask, Mode::Server)),
-            )
-        }))
-        .await
+        // Built with loops rather than closures: a closure here makes the future's `Send`
+        // bound fail to be proven for every lifetime.
+        let mut pending = Vec::with_capacity(servers.len().saturating_mul(asks.len()));
+        for server in servers {
+            for ask in asks {
+                pending.push(self.ask(server.addr, ask, Mode::Server));
+            }
+        }
+        let flat: Vec<Answer> = stream::iter(pending)
+            .buffered(QUESTIONS_AT_ONCE)
+            .collect()
+            .await;
+        let mut flat = flat.into_iter();
+        servers
+            .iter()
+            .map(|_| flat.by_ref().take(asks.len()).collect())
+            .collect()
     }
 
     /// Fails when a round would hold more than 1024 questions.
@@ -217,6 +235,9 @@ impl<T: Transport> Engine<T> {
     ) -> Result<super::Report, InspectorError> {
         if options.jitter_percent > MAX_JITTER_PERCENT {
             return Err(InspectorError::invalid("jitter_percent is more than 50"));
+        }
+        if options.interval < WaitOptions::MIN_INTERVAL {
+            return Err(InspectorError::invalid("interval is shorter than 1 s"));
         }
         let asks = validate_questions(zone, expectations.iter().map(|e| &e.question))?;
         for expectation in expectations {
@@ -617,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_round_sends_every_question_to_every_server_at_once() {
+    async fn a_round_runs_at_most_128_questions_at_once_and_keeps_the_order() {
         let servers: Vec<SocketAddr> = (1..=32).map(addr).collect();
         let e = engine(&servers);
         *e.transport.delay.lock().unwrap() = Duration::from_secs(1);
@@ -629,15 +650,79 @@ mod tests {
                 )
             })
             .collect();
+        // Each server answers each question with a value that names both.
+        for (s, server) in servers.iter().enumerate() {
+            for i in 0..32u8 {
+                let owner = format!("n{i}.example.org");
+                e.transport.reply(
+                    *server,
+                    &owner,
+                    RecordType::A,
+                    ok(vec![rec(
+                        &owner,
+                        RecordType::A,
+                        60,
+                        &format!("198.51.{}.{i}", s + 1),
+                    )]),
+                );
+            }
+        }
         let started = Instant::now();
         let observed = e.observe(&zone(), &questions).await.unwrap();
-        assert_eq!(started.elapsed(), Duration::from_secs(1));
-        assert_eq!(observed.len(), 32);
-        assert!(observed.iter().all(|(_, answers)| answers.len() == 32));
+        // 1024 questions, 128 at a time, one second each.
+        assert_eq!(started.elapsed(), Duration::from_secs(8));
         assert_eq!(
             e.transport.peak.load(std::sync::atomic::Ordering::SeqCst),
-            1024
+            QUESTIONS_AT_ONCE
         );
+        assert_eq!(observed.len(), 32);
+        for (s, (server, answers)) in observed.iter().enumerate() {
+            assert_eq!(server.addr, servers[s]);
+            assert_eq!(answers.len(), 32);
+            for (i, answer) in answers.iter().enumerate() {
+                let expected = data(RecordType::A, &format!("198.51.{}.{i}", s + 1));
+                assert!(
+                    matches!(answer, Answer::Records { records, .. } if records == &vec![expected]),
+                    "{s} {i} {answer:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interval_below_one_second_is_refused_and_one_second_is_the_pace() {
+        let s1 = addr(1);
+        let e = engine(&[s1]);
+        e.transport.reply(s1, name(), RecordType::TXT, nodata());
+        let expectations = [Expectation::new(
+            question(),
+            Condition::Present(vec![txt("v")]),
+        )];
+        // A latency, so that a wait that wrongly accepted a zero interval would still advance
+        // the paused clock and end in a timeout instead of spinning.
+        *e.transport.delay.lock().unwrap() = Duration::from_millis(100);
+        for short in [Duration::ZERO, Duration::from_millis(999)] {
+            let mut options = WaitOptions::new(Duration::from_secs(10));
+            options.interval = short;
+            assert!(
+                matches!(
+                    e.wait(&zone(), &expectations, &options).await,
+                    Err(InspectorError::InvalidInput { detail }) if detail.contains("interval")
+                ),
+                "{short:?}"
+            );
+        }
+        assert_eq!(e.transport.total_calls(), 0);
+        *e.transport.delay.lock().unwrap() = Duration::ZERO;
+        let mut options = WaitOptions::new(Duration::from_secs(10));
+        options.interval = WaitOptions::MIN_INTERVAL;
+        options.jitter_percent = 0;
+        let err = e.wait(&zone(), &expectations, &options).await.unwrap_err();
+        let InspectorError::Timeout { report } = err else {
+            panic!("expected a timeout");
+        };
+        // Rounds at 0, 1, ..., 10 s.
+        assert_eq!(report.rounds, 11);
     }
 
     #[tokio::test(start_paused = true)]

@@ -111,12 +111,19 @@ fn classify_reply(reply: &Reply, ask: &Ask, mode: Mode) -> Answer {
             .iter()
             .filter(|record| record.owner == current && record.rtype == ask.rtype)
             .collect();
-        // RFC 6604: the response code describes the last name of a chain. An NXDOMAIN from a
-        // name server for a name that is itself a CNAME is reported as that CNAME, below.
-        let nxdomain_here = reply.rcode == NXDOMAIN && mode == Mode::Server;
-        if !records.is_empty() && !nxdomain_here {
+        if !records.is_empty() {
+            // RFC 6604: the response code describes the last name of a chain, and that name
+            // cannot both have this rrset and not exist. Neither reading is safe: reported as
+            // a failure, which satisfies no condition (absence included).
+            if reply.rcode == NXDOMAIN {
+                return Answer::Failed(
+                    "an NXDOMAIN answer holds records of the asked type for the name".to_owned(),
+                );
+            }
             return rrset(&records);
         }
+        // An NXDOMAIN from a name server for a name that is itself a CNAME is reported as that
+        // CNAME, below (RFC 6604).
         if ask.rtype == CNAME {
             break;
         }
@@ -297,6 +304,32 @@ mod tests {
             classify(Ok(reply(0, true, vec![])), &q, SERVER),
             Answer::NoData
         );
+        // NXDOMAIN with records of the asked type at the asked name is contradictory: a
+        // failure, not absence, from a server and from a resolver (also at the end of a chain).
+        let txt = rec("a.example.org", RecordType::TXT, 60, "\"v\"");
+        for mode in [SERVER, RESOLVER] {
+            assert!(
+                matches!(
+                    classify(Ok(reply(3, true, vec![txt.clone()])), &q, mode),
+                    Answer::Failed(detail) if detail.contains("NXDOMAIN")
+                ),
+                "{mode:?}"
+            );
+        }
+        let chained = vec![
+            rec("a.example.org", RecordType::CNAME, 60, "b.example.net."),
+            rec("b.example.net", RecordType::TXT, 60, "\"v\""),
+        ];
+        assert!(matches!(
+            classify(Ok(reply(3, false, chained)), &q, RESOLVER),
+            Answer::Failed(_)
+        ));
+        // Asking for the CNAME itself with NXDOMAIN is contradictory too.
+        let cname_nx = rec("a.example.org", RecordType::CNAME, 60, "b.example.net.");
+        assert!(matches!(
+            classify(Ok(reply(3, true, vec![cname_nx])), &q_cname, SERVER),
+            Answer::Failed(_)
+        ));
         // A CNAME at another owner is ignored.
         let foreign = rec("x.example.org", RecordType::CNAME, 60, "b.example.net.");
         assert_eq!(

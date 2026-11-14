@@ -15,14 +15,14 @@ use std::time::{Duration, Instant};
 
 use zonewright::dns01::{CnameError, CnameLookup, follow_cname};
 use zonewright::inspector::{
-    Answer, Condition, Expectation, Inspector, InspectorConfig, InspectorError, NameServer,
-    NsDiscovery, Question, Report, WaitOptions,
+    Answer, Condition, Expectation, Inspector, InspectorConfig, InspectorError, IpFamilies,
+    NameServer, NsDiscovery, Question, Report, WaitOptions,
 };
 use zonewright::{DomainName, RecordData, RecordType, TargetName};
 use zonewright_mock::dns::{
-    Action, Data, DnsMock, Fault, NOTIMP, Proto, REFUSED, Role, SERVFAIL, TYPE_A, TYPE_AAAA,
-    TYPE_CAA, TYPE_CNAME, TYPE_HTTPS, TYPE_MX, TYPE_NS, TYPE_PTR, TYPE_SOA, TYPE_SRV, TYPE_SVCB,
-    TYPE_TLSA, TYPE_TXT,
+    Action, Change, Data, DnsMock, Fault, NOTIMP, NXDOMAIN, Proto, REFUSED, Role, SERVFAIL, TYPE_A,
+    TYPE_AAAA, TYPE_CAA, TYPE_CNAME, TYPE_HTTPS, TYPE_MX, TYPE_NS, TYPE_PTR, TYPE_SOA, TYPE_SRV,
+    TYPE_SVCB, TYPE_TLSA, TYPE_TXT,
 };
 
 const ZONE: &str = "example.test";
@@ -695,11 +695,14 @@ async fn discovery_through_resolvers_returns_every_address_on_port_53() {
 
 #[tokio::test]
 async fn private_and_loopback_name_servers_are_refused_by_default() {
-    let resolver = delegation_resolver(&[[127, 0, 0, 1], [10, 0, 0, 7]]).await;
+    // ns1: 127.0.0.1 and 192.0.2.5; ns2: 10.0.0.7.
+    let resolver = delegation_resolver(&[[127, 0, 0, 1], [10, 0, 0, 7], [192, 0, 2, 5]]).await;
     let inspector = resolver_inspector(&[resolver.addr()]);
+    // ns2 is left without an address: the discovery fails and names it.
     let err = inspector.name_servers(&name(ZONE)).await.unwrap_err();
     assert!(
-        matches!(&err, InspectorError::NoNameServers { .. }),
+        matches!(&err, InspectorError::NameServerWithoutAddress { name, .. }
+            if name.as_str() == "ns2.example.net."),
         "{err:?}"
     );
 
@@ -709,21 +712,28 @@ async fn private_and_loopback_name_servers_are_refused_by_default() {
     let inspector = Inspector::new(config).unwrap();
     let servers = inspector.name_servers(&name(ZONE)).await.unwrap();
     let addrs: Vec<String> = servers.iter().map(|s| s.addr.to_string()).collect();
-    assert_eq!(addrs, vec!["10.0.0.7:53".to_owned()]);
+    assert_eq!(
+        addrs,
+        vec!["192.0.2.5:53".to_owned(), "10.0.0.7:53".to_owned()]
+    );
 }
 
 #[tokio::test]
 async fn discovery_moves_on_to_the_next_resolver_and_is_bounded_in_time() {
     let silent = silent_socket().await;
-    let good = delegation_resolver(&[[192, 0, 2, 1]]).await;
+    // One address per NS name: a name without one would fail the discovery.
+    let good = delegation_resolver(&[[192, 0, 2, 1], [198, 51, 100, 2]]).await;
     let inspector = resolver_inspector(&[silent.local_addr().unwrap(), good.addr()]);
     let servers = inspector.name_servers(&name(ZONE)).await.unwrap();
-    assert_eq!(servers.len(), 1);
+    assert_eq!(servers.len(), 2);
 
+    // Three distinct silent resolvers: a resolver may be listed only once.
+    let silent2 = silent_socket().await;
+    let silent3 = silent_socket().await;
     let mut config = resolver_config(&[
         silent.local_addr().unwrap(),
-        silent.local_addr().unwrap(),
-        silent.local_addr().unwrap(),
+        silent2.local_addr().unwrap(),
+        silent3.local_addr().unwrap(),
     ]);
     config.query_timeout = Duration::from_millis(300);
     config.discovery_timeout = Duration::from_millis(500);
@@ -800,6 +810,12 @@ fn invalid_configurations_are_refused() {
     c.resolvers = vec!["127.0.0.1:53".parse().unwrap(); 17];
     assert!(refused(c));
     let mut c = InspectorConfig::default();
+    c.resolvers = vec![
+        "127.0.0.1:53".parse().unwrap(),
+        "127.0.0.1:53".parse().unwrap(),
+    ];
+    assert!(refused(c));
+    let mut c = InspectorConfig::default();
     c.discovery = NsDiscovery::Static(Vec::new());
     assert!(refused(c));
     let mut c = InspectorConfig::default();
@@ -863,8 +879,10 @@ async fn run(case: &Case, scenario: Scenario) -> (Result<Report, InspectorError>
         question(CHALLENGE, RecordType::TXT),
         case.condition.clone(),
     )];
+    // The shortest interval; the pause is cut at the deadline, so the second round starts at
+    // 600 ms.
     let mut options = WaitOptions::new(Duration::from_millis(600));
-    options.interval = Duration::from_millis(50);
+    options.interval = WaitOptions::MIN_INTERVAL;
     let zone = name(ZONE);
     let wait = inspector.wait(&zone, &expectations, &options);
     let catch_up = async {
@@ -968,7 +986,7 @@ async fn the_total_wait_is_bounded_by_timeout_plus_one_query() {
         Condition::Present(vec![txt("v")]),
     )];
     let mut options = WaitOptions::new(Duration::from_millis(500));
-    options.interval = Duration::from_millis(100);
+    options.interval = WaitOptions::MIN_INTERVAL;
     let started = Instant::now();
     let err = inspector
         .wait(&name(ZONE), &expectations, &options)
@@ -1034,20 +1052,23 @@ async fn dropping_a_wait_stops_its_queries() {
         Condition::Present(vec![txt("never")]),
     )];
     let mut options = WaitOptions::new(Duration::from_secs(60));
-    options.interval = Duration::from_millis(20);
+    options.interval = WaitOptions::MIN_INTERVAL;
+    options.jitter_percent = 0;
     let zone = name(ZONE);
     let wait = inspector.wait(&zone, &expectations, &options);
+    // Rounds at 0 and 1 s; dropped at 1.2 s, before the third.
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), wait)
+        tokio::time::timeout(Duration::from_millis(1200), wait)
             .await
             .is_err()
     );
     // A UDP query sent just before the drop may reach the mock's log only after the drop, the
-    // more so on a loaded machine, so the count is taken once the log has been quiet for five
-    // polling intervals; a wait that kept running would ask every 20 ms and never get there.
+    // more so on a loaded machine, so the count is taken once the log has been quiet for
+    // 100 ms; then the test waits longer than an interval, in which a wait that kept running
+    // would have asked again.
     let asked = settled_log_len(&mock).await;
     assert!(asked >= 2);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
         mock.log().len(),
         asked,
@@ -1227,5 +1248,280 @@ async fn events_carry_the_server_type_kind_and_duration_but_no_values_or_names()
     assert!(
         !text.contains("secret-token-value"),
         "no value anywhere: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Answer acceptance over the wire
+
+#[tokio::test]
+async fn answers_with_another_qr_opcode_type_or_class_are_ignored() {
+    let mock = authoritative().await;
+    mock.add(CHALLENGE, TYPE_TXT, 60, Data::txt(&[b"v"]));
+    let inspector =
+        Inspector::new(static_config(&[mock.addr()], Duration::from_millis(300))).unwrap();
+    let q = question(CHALLENGE, RecordType::TXT);
+    let changes = [
+        Change::NotResponse,
+        Change::Opcode(2),
+        Change::QuestionType(TYPE_A),
+        Change::QuestionClass(3),
+    ];
+    for change in &changes {
+        mock.push(
+            Fault::new(Action::Altered {
+                change: change.clone(),
+                then_answer: true,
+            })
+            .proto(Proto::Udp),
+        );
+        let answer = inspector.query_server(mock.addr(), &q).await;
+        assert_eq!(records(&answer), &[txt("v")], "{change:?} then the answer");
+    }
+    for change in &changes {
+        mock.push(
+            Fault::new(Action::Altered {
+                change: change.clone(),
+                then_answer: false,
+            })
+            .proto(Proto::Udp),
+        );
+        let answer = inspector.query_server(mock.addr(), &q).await;
+        assert_eq!(answer, Answer::Timeout, "{change:?} alone");
+    }
+}
+
+#[tokio::test]
+async fn the_question_name_is_matched_case_insensitively() {
+    let mock = authoritative().await;
+    mock.add(CHALLENGE, TYPE_TXT, 60, Data::txt(&[b"v"]));
+    let inspector = static_inspector(&[mock.addr()]);
+    let q = question(CHALLENGE, RecordType::TXT);
+    for proto in [Proto::Udp, Proto::Tcp] {
+        if proto == Proto::Tcp {
+            mock.push(Fault::new(Action::Truncate).proto(Proto::Udp));
+        }
+        mock.push(
+            Fault::new(Action::Altered {
+                change: Change::UpperCaseQuestion,
+                then_answer: false,
+            })
+            .proto(proto),
+        );
+        let answer = inspector.query_server(mock.addr(), &q).await;
+        assert_eq!(records(&answer), &[txt("v")], "{proto:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_truncated_tcp_answer_fails_the_question() {
+    let mock = authoritative().await;
+    mock.add(CHALLENGE, TYPE_TXT, 60, Data::txt(&[b"v"]));
+    mock.push(Fault::new(Action::Truncate).proto(Proto::Udp));
+    mock.push(
+        Fault::new(Action::Altered {
+            change: Change::Truncated,
+            then_answer: false,
+        })
+        .proto(Proto::Tcp),
+    );
+    let inspector = static_inspector(&[mock.addr()]);
+    let answer = inspector
+        .query_server(mock.addr(), &question(CHALLENGE, RecordType::TXT))
+        .await;
+    assert!(
+        matches!(&answer, Answer::Failed(detail) if detail.contains("truncated")),
+        "{answer:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_udp_answer_that_does_not_decode_goes_to_tcp() {
+    let mock = authoritative().await;
+    mock.add(CHALLENGE, TYPE_TXT, 60, Data::txt(&[b"v"]));
+    // QR, AA and TC; one question announced, the message cut inside its name.
+    let mut cut = vec![0, 0, 0x86, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    cut.extend_from_slice(b"\x0e_acme-chal");
+    mock.push(Fault::new(Action::Raw(cut)).proto(Proto::Udp));
+    let inspector = static_inspector(&[mock.addr()]);
+    let answer = inspector
+        .query_server(mock.addr(), &question(CHALLENGE, RecordType::TXT))
+        .await;
+    assert_eq!(records(&answer), &[txt("v")]);
+    let protos: Vec<Proto> = mock.log().iter().map(|q| q.proto).collect();
+    assert_eq!(protos, vec![Proto::Udp, Proto::Tcp]);
+
+    // Without the TC flag the same cut message fails the question.
+    let mut cut = vec![0, 0, 0x84, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    cut.extend_from_slice(b"\x0e_acme-chal");
+    mock.push(Fault::new(Action::Raw(cut)).proto(Proto::Udp));
+    let answer = inspector
+        .query_server(mock.addr(), &question(CHALLENGE, RecordType::TXT))
+        .await;
+    assert!(matches!(answer, Answer::Failed(_)), "{answer:?}");
+}
+
+#[tokio::test]
+async fn a_stalled_tcp_retry_is_bounded_by_the_query_timeout() {
+    let mock = authoritative().await;
+    mock.add(CHALLENGE, TYPE_TXT, 60, Data::txt(&[b"v"]));
+    mock.push(Fault::new(Action::Truncate).proto(Proto::Udp));
+    mock.push(Fault::new(Action::Stall).proto(Proto::Tcp));
+    let inspector =
+        Inspector::new(static_config(&[mock.addr()], Duration::from_millis(300))).unwrap();
+    let started = Instant::now();
+    let answer = inspector
+        .query_server(mock.addr(), &question(CHALLENGE, RecordType::TXT))
+        .await;
+    let elapsed = started.elapsed();
+    assert_eq!(answer, Answer::Timeout);
+    assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    let protos: Vec<Proto> = mock.log().iter().map(|q| q.proto).collect();
+    assert_eq!(protos, vec![Proto::Udp, Proto::Tcp]);
+}
+
+#[tokio::test]
+async fn nxdomain_with_records_of_the_asked_type_is_not_absence() {
+    let mock = authoritative().await;
+    mock.add(CHALLENGE, TYPE_TXT, 60, Data::txt(&[b"token"]));
+    mock.push(Fault::new(Action::AnswerWithRcode(NXDOMAIN)).always());
+    let inspector = static_inspector(&[mock.addr()]);
+    let q = question(CHALLENGE, RecordType::TXT);
+    let answer = inspector.query_server(mock.addr(), &q).await;
+    assert!(
+        matches!(&answer, Answer::Failed(detail) if detail.contains("NXDOMAIN")),
+        "{answer:?}"
+    );
+    for condition in [
+        Condition::Absent(vec![txt("token")]),
+        Condition::Exact(Vec::new()),
+    ] {
+        let result = inspector
+            .wait(
+                &name(ZONE),
+                &[Expectation::new(q.clone(), condition.clone())],
+                &WaitOptions::new(Duration::ZERO),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(InspectorError::Timeout { .. })),
+            "{condition:?}: {result:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Discovery never shortens the list
+
+#[tokio::test]
+async fn an_ns_name_whose_address_no_resolver_answers_fails_the_discovery_uncached() {
+    let r1 = delegation_resolver(&[[192, 0, 2, 1], [198, 51, 100, 2]]).await;
+    let r2 = delegation_resolver(&[[192, 0, 2, 1], [198, 51, 100, 2]]).await;
+    for resolver in [&r1, &r2] {
+        resolver.push(
+            Fault::new(Action::Rcode(SERVFAIL))
+                .name("ns2.example.net")
+                .rtype(TYPE_A),
+        );
+    }
+    let inspector = resolver_inspector(&[r1.addr(), r2.addr()]);
+    let err = inspector.name_servers(&name(ZONE)).await.unwrap_err();
+    assert!(
+        matches!(&err, InspectorError::NoNameServers { detail, .. }
+            if detail.contains("ns2.example.net.") && detail.contains("no resolver answered")),
+        "{err:?}"
+    );
+    assert_eq!(r1.count("ns2.example.net", TYPE_A), 1);
+    assert_eq!(r2.count("ns2.example.net", TYPE_A), 1);
+    // A wait over the same discovery fails too: it never reports success without a server.
+    for resolver in [&r1, &r2] {
+        resolver.push(
+            Fault::new(Action::Rcode(SERVFAIL))
+                .name("ns2.example.net")
+                .rtype(TYPE_A),
+        );
+    }
+    let result = inspector
+        .wait(
+            &name(ZONE),
+            &[Expectation::new(
+                question(CHALLENGE, RecordType::TXT),
+                Condition::Exact(Vec::new()),
+            )],
+            &WaitOptions::new(Duration::ZERO),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(InspectorError::NoNameServers { .. })),
+        "{result:?}"
+    );
+    // Nothing was cached: the next call asks again and gets every server.
+    let servers = inspector.name_servers(&name(ZONE)).await.unwrap();
+    assert_eq!(servers.len(), 2);
+    assert_eq!(r1.count(ZONE, TYPE_NS), 3);
+}
+
+#[tokio::test]
+async fn an_ns_name_without_an_address_in_the_families_is_named_in_the_error() {
+    let resolver = DnsMock::start(Role::Recursive).await;
+    resolver.add(ZONE, TYPE_NS, 300, Data::name("ns1.example.net"));
+    resolver.add(ZONE, TYPE_NS, 300, Data::name("v6only.example.net"));
+    resolver.add("ns1.example.net", TYPE_A, 300, Data::a([192, 0, 2, 1]));
+    resolver.add(
+        "v6only.example.net",
+        TYPE_AAAA,
+        300,
+        Data::aaaa("2001:db8::53".parse().unwrap()),
+    );
+    let inspector = resolver_inspector(&[resolver.addr()]);
+    let err = inspector.name_servers(&name(ZONE)).await.unwrap_err();
+    assert!(
+        matches!(&err, InspectorError::NameServerWithoutAddress { name, detail, .. }
+            if name.as_str() == "v6only.example.net." && detail.contains("families")),
+        "{err:?}"
+    );
+    // With both families every NS name has an address.
+    let mut config = resolver_config(&[resolver.addr()]);
+    config.ip_families = IpFamilies::Both;
+    let inspector = Inspector::new(config).unwrap();
+    let servers = inspector.name_servers(&name(ZONE)).await.unwrap();
+    let addrs: Vec<String> = servers.iter().map(|s| s.addr.to_string()).collect();
+    assert_eq!(
+        addrs,
+        vec!["192.0.2.1:53".to_owned(), "[2001:db8::53]:53".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn an_interval_below_the_floor_is_invalid_input() {
+    let mock = authoritative().await;
+    let inspector = static_inspector(&[mock.addr()]);
+    let mut options = WaitOptions::new(Duration::from_secs(5));
+    options.interval = Duration::from_millis(50);
+    let result = inspector
+        .wait(
+            &name(ZONE),
+            &[Expectation::new(
+                question(CHALLENGE, RecordType::TXT),
+                Condition::Exact(Vec::new()),
+            )],
+            &options,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(InspectorError::InvalidInput { .. })),
+        "{result:?}"
+    );
+    assert!(mock.log().is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_resolvers_are_a_configuration_error() {
+    let resolver = DnsMock::start(Role::Recursive).await;
+    let result = Inspector::new(resolver_config(&[resolver.addr(), resolver.addr()]));
+    assert!(
+        matches!(result, Err(InspectorError::Config { .. })),
+        "{result:?}"
     );
 }
