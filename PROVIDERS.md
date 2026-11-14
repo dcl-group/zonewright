@@ -43,8 +43,7 @@ None yet.
 
 ## Planned
 
-| Provider | ID  | Notes |
-| -------- | --- | ----- |
+None.
 
 "An earlier version was proven" does not make the client verified here: it is verified again once it
 is implemented in this crate.
