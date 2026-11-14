@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method};
@@ -31,6 +32,10 @@ pub struct LoggedRequest {
     pub status: Option<u16>,
     /// Whether an injected fault took this request.
     pub faulted: bool,
+    /// When the harness received the request (its body read, before any fault or the router ran),
+    /// on the real clock. A test measures the spacing of retries from these instants rather than
+    /// from the total time of a call, which also counts the client's own work.
+    pub received: Instant,
     /// Identity that survives [`RequestLog::clear`], for updating the status.
     uid: u64,
 }
@@ -52,6 +57,7 @@ impl LoggedRequest {
             body,
             status: None,
             faulted: false,
+            received: Instant::now(),
             uid: 0,
         }
     }

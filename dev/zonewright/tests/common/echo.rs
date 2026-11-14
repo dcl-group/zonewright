@@ -7,7 +7,16 @@
 //! The base of every `<id>_secret_echo` test: run the client against an echo server for each of
 //! [`dialects`], with the [`CANARIES`] as credentials, and pass every error text, `Debug`
 //! output and `ZoneCheck::detail` to [`assert_clean`].
+//!
+//! Such a test starts one echo server and one `Context` (`common::context()`) and gives every
+//! case its configuration with `EchoServer::reset` (`echo.reset(dialect.echo(status))`), building
+//! the case's client on that context. The cases then share one pooled loopback connection instead
+//! of opening one or more each: a server or a context per case leaves a socket in `TIME_WAIT` per
+//! case, and a few overlapping test runs exhaust the ephemeral ports (`AddrNotAvailable`).
+//! [`Dialect::echo`] returns the configuration only, for that reason. The rest of a case does not
+//! change: a fresh client per case, and the log and the fault queue start empty after `reset`.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -57,7 +66,8 @@ pub struct Dialect {
 }
 
 impl Dialect {
-    /// An echo server answering `status` in this dialect, not started yet.
+    /// An echo server answering `status` in this dialect, not started yet: hand it to the test's
+    /// running server with `EchoServer::reset` rather than starting a server per case.
     pub fn echo(&self, status: u16) -> Echo {
         Echo::new(status)
             .spelling(self.spelling)
@@ -241,8 +251,74 @@ pub fn spellings(secret: &str) -> Vec<String> {
     out
 }
 
+/// What [`find_secret`] looks for, prepared once per set of secrets.
+struct Needles {
+    /// Every fragment of [`FRAGMENT`] bytes, on character boundaries, of every spelling.
+    fragments: HashSet<[u8; FRAGMENT]>,
+    /// The spellings that have no such fragment (shorter than one), matched whole.
+    whole: Vec<String>,
+}
+
+/// The [`Needles`] of `secrets`, built on first use and kept for the process: the secret tests
+/// check thousands of texts against the same few secrets.
+fn needles(secrets: &[&str]) -> Arc<Needles> {
+    static CACHE: OnceLock<Mutex<HashMap<Vec<String>, Arc<Needles>>>> = OnceLock::new();
+    let key: Vec<String> = secrets.iter().map(|s| (*s).to_owned()).collect();
+    let mut cache = CACHE
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("needle cache poisoned");
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            let mut fragments = HashSet::new();
+            let mut whole = Vec::new();
+            for secret in secrets {
+                for spelling in spellings(secret) {
+                    let mut any = false;
+                    for start in 0..spelling.len().saturating_sub(FRAGMENT - 1) {
+                        if let Some(fragment) = spelling.get(start..start + FRAGMENT) {
+                            let mut bytes = [0u8; FRAGMENT];
+                            bytes.copy_from_slice(fragment.as_bytes());
+                            fragments.insert(bytes);
+                            any = true;
+                        }
+                    }
+                    if !any {
+                        whole.push(spelling);
+                    }
+                }
+            }
+            Arc::new(Needles { fragments, whole })
+        })
+        .clone()
+}
+
 /// The first spelling, or fragment of a spelling, of any of `secrets` found in `text`.
+///
+/// A spelling in `text` contains its fragments, so the text is first scanned once for any
+/// fragment (a set lookup per byte); only a text that holds one is searched again, spelling by
+/// spelling, to name what was found. The result is the same as that search alone, which costs
+/// a substring search per fragment and was most of the run time of the secret tests.
 pub fn find_secret(text: &str, secrets: &[&str]) -> Option<String> {
+    let needles = needles(secrets);
+    let hit = text.as_bytes().windows(FRAGMENT).any(|window| {
+        <[u8; FRAGMENT]>::try_from(window).is_ok_and(|w| needles.fragments.contains(&w))
+    }) || needles.whole.iter().any(|s| text.contains(s.as_str()));
+    if !hit {
+        return None;
+    }
+    let found = find_secret_slowly(text, secrets);
+    assert!(
+        found.is_some(),
+        "the fragment scan and the full search disagree on {text:?}"
+    );
+    found
+}
+
+/// [`find_secret`] by a substring search for every spelling and every fragment. Public so that
+/// the transport's tests can check that both agree.
+pub fn find_secret_slowly(text: &str, secrets: &[&str]) -> Option<String> {
     for secret in secrets {
         for spelling in spellings(secret) {
             if text.contains(&spelling) {

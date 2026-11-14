@@ -7,6 +7,12 @@
 //! whenever the runtime waits, including while it waits for a loopback socket, which could fire
 //! a request timeout before the answer is read. Tests without sockets (token cache, gate,
 //! poller, pager) use a paused clock in their own modules.
+//!
+//! On the real clock, a loaded machine can stall any step by a second or more, so no assertion
+//! here depends on a narrow margin: a lower bound is tight only where it is what the test is
+//! about (a back-off, a `Retry-After`, pacing), an upper bound is generous and far below the
+//! competing event it rules out (a stall of an hour, a timeout of minutes), and what can be
+//! counted (attempts, connections) is counted instead of timed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,7 +38,7 @@ use super::keystone::{Keystone, ProjectScope, X_AUTH_TOKEN};
 use super::request::{BODY_LIMIT, Request, TokenAuth};
 use super::testing::echo::{
     CANARIES, CANARY_KEY, CANARY_PASSWORD, CANARY_TOKEN, CANARY_USER, Dialect, LogCapture,
-    REDACTED, WITHHELD, assert_clean, dialects,
+    REDACTED, WITHHELD, assert_clean, dialects, find_secret, find_secret_slowly, spellings,
 };
 use super::testing::{self, SilentServer, TlsServer};
 use super::tls::{self, Trust};
@@ -175,8 +181,9 @@ async fn https_fails_without_the_extra_root() {
     let server = TlsServer::start(vec![leaf], key);
     let http = default_http();
     // Idempotent, yet a refused certificate is not retried: the next attempt would be refused
-    // the same way.
-    let started = Instant::now();
+    // the same way. The error comes back only after the last attempt, so one connection proves
+    // a single attempt (and no back-off before a second one); counting replaces the former
+    // 400 ms bound on the elapsed time, which a slow handshake under load could exceed.
     let e = http
         .send(&Request::get(url(&server.url())))
         .await
@@ -186,7 +193,6 @@ async fn https_fails_without_the_extra_root() {
     assert!(e.to_string().contains("certificate"), "{e}");
     assert_eq!(server.connections.load(Ordering::SeqCst), 1);
     assert_eq!(server.answered.load(Ordering::SeqCst), 0);
-    assert!(started.elapsed() < Duration::from_millis(400));
 }
 
 #[tokio::test]
@@ -386,7 +392,9 @@ async fn loopback_only_refuses_before_any_connection() {
         let e = http.send(&Request::get(url(&raw))).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Config, "{raw}");
         assert!(!e.is_retryable());
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // A refusal takes microseconds; an attempt would end in `Transient` (checked above)
+        // after the connect timeout. The bound is generous so that a loaded machine passes.
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!e.to_string().contains("example") && !e.to_string().contains("192.0.2.1"));
     }
     assert_eq!(server.connections(), 0);
@@ -430,19 +438,40 @@ async fn connect_timeout_is_transient() {
     let silent = SilentServer::start();
     let ctx = testing::context(ContextOptions {
         connect_timeout: Duration::from_millis(300),
-        request_timeout: Duration::from_secs(30),
+        request_timeout: LONG_TIMEOUT,
         ..testing::options()
     });
     let http = testing::http(&ctx, |b| b);
     // The TCP connection is accepted; the TLS handshake never completes, and the connect
-    // timeout covers it.
+    // timeout covers it. The request timeout, which would also say "timed out", is minutes
+    // away, so the generous bound still tells the two apart.
     let started = Instant::now();
     let request = Request::new(Method::POST, url(&format!("https://{}/x", silent.addr)));
     let e = http.send(&request).await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Transient, "{e}");
     assert!(e.to_string().contains("timed out"), "{e}");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < GENEROUS);
     assert_eq!(silent.connections.load(Ordering::SeqCst), 1);
+}
+
+/// A request timeout no test waits for: a timeout that must not be the one that fires.
+const LONG_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// A pause no test waits for: a server that stalls this long never answers within a test.
+const STALL: Duration = Duration::from_secs(3600);
+
+/// The upper bound of a call that must end at a short timeout or at once rather than at a
+/// [`LONG_TIMEOUT`] or after a [`STALL`]: far above any delay a loaded machine adds, far below
+/// what it rules out.
+const GENEROUS: Duration = Duration::from_secs(60);
+
+/// A handle on a context with [`LONG_TIMEOUT`] as the request timeout.
+fn long_timeout_http() -> Http {
+    let ctx = testing::context(ContextOptions {
+        request_timeout: LONG_TIMEOUT,
+        ..testing::options()
+    });
+    testing::http(&ctx, |b| b)
 }
 
 fn short_timeout_http() -> Http {
@@ -456,31 +485,27 @@ fn short_timeout_http() -> Http {
 #[tokio::test]
 async fn request_timeout_is_transient() {
     let server = ok_server().await;
-    server
-        .faults()
-        .push(Fault::any().always().delay(Duration::from_secs(10)));
+    server.faults().push(Fault::any().always().delay(STALL));
     let http = short_timeout_http();
     let started = Instant::now();
     let e = http.send(&post(&server, "/slow")).await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Transient, "{e}");
     assert!(e.to_string().contains("timed out"), "{e}");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < GENEROUS);
     assert_eq!(server.log().len(), 1);
 }
 
 #[tokio::test]
 async fn slow_headers_hit_the_request_timeout() {
     let server = ok_server().await;
-    server.faults().push(
-        Fault::any()
-            .always()
-            .slow_headers(200, Duration::from_secs(10), "{}"),
-    );
+    server
+        .faults()
+        .push(Fault::any().always().slow_headers(200, STALL, "{}"));
     let http = short_timeout_http();
     let started = Instant::now();
     let e = http.send(&post(&server, "/slow")).await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Transient, "{e}");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < GENEROUS);
 }
 
 /// A raw answer: `head`, then `body`, then a pause far longer than the test; the connection
@@ -489,7 +514,7 @@ fn stalled(head: String, body: Vec<u8>) -> Fault {
     Fault::any().raw(vec![
         (Duration::ZERO, Bytes::from(head)),
         (Duration::ZERO, Bytes::from(body)),
-        (Duration::from_secs(3600), Bytes::from_static(b"never")),
+        (STALL, Bytes::from_static(b"never")),
     ])
 }
 
@@ -501,14 +526,15 @@ async fn declared_oversized_body_is_refused_without_reading_it() {
             .to_owned(),
         Vec::new(),
     ));
+    // A client that read the body would wait for the stall or its long request timeout.
     let started = Instant::now();
-    let e = default_http()
+    let e = long_timeout_http()
         .send(&get(&server, "/big"))
         .await
         .unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Protocol, "{e}");
     assert!(e.to_string().contains("4 MiB"), "{e}");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < GENEROUS);
     // Not retried, although the request is idempotent.
     assert_eq!(server.log().len(), 1);
 }
@@ -525,12 +551,12 @@ async fn chunked_oversized_body_is_refused_at_the_limit() {
         chunk,
     ));
     let started = Instant::now();
-    let e = default_http()
+    let e = long_timeout_http()
         .send(&get(&server, "/big"))
         .await
         .unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Protocol, "{e}");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < GENEROUS);
 }
 
 #[tokio::test]
@@ -584,10 +610,20 @@ async fn idempotent_requests_retry_5xx_with_backoff() {
     let response = default_http().send(&get(&server, "/x")).await.unwrap();
     let elapsed = started.elapsed();
     assert_eq!(response.status(), 200);
-    assert_eq!(server.log().len(), 3);
-    // 500 ms and 1000 ms, each plus up to 25 %.
-    assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
-    assert!(elapsed < Duration::from_millis(1875 + 1000), "{elapsed:?}");
+    let log = server.log().entries();
+    assert_eq!(log.len(), 3);
+    // 500 ms and 1000 ms, each plus up to 25 %, between the arrivals of the attempts: tight
+    // lower bounds per gap, which also show that the wait grows. The jitter's upper end is
+    // checked without a clock in `retry::tests::backoff_grows_with_jitter_of_a_quarter`; here
+    // the upper bound only rules out a wait of another order, with room for a loaded machine.
+    let first = log[1].received - log[0].received;
+    let second = log[2].received - log[1].received;
+    assert!(first >= Duration::from_millis(500), "{first:?}");
+    assert!(second >= Duration::from_millis(1000), "{second:?}");
+    assert!(
+        elapsed < Duration::from_millis(1875) + GENEROUS / 4,
+        "{elapsed:?}"
+    );
 }
 
 #[tokio::test]
@@ -715,10 +751,12 @@ fn http_date_in(seconds: i64) -> String {
 #[tokio::test]
 async fn retry_after_http_date_within_the_bound_is_honored() {
     let server = ok_server().await;
+    // Started before the date is computed: the date is absolute, so a stall between the two
+    // shortens the wait that remains, but not the time from here to the retry.
+    let started = Instant::now();
     server
         .faults()
         .push(Fault::any().rate_limited(&http_date_in(3)));
-    let started = Instant::now();
     let response = default_http().send(&get(&server, "/x")).await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(server.log().len(), 2);
@@ -740,15 +778,19 @@ async fn retry_after_beyond_the_bound_is_rate_limited() {
     assert_eq!(server.log().len(), 1);
 
     let server = ok_server().await;
+    let started = Instant::now();
     server
         .faults()
         .push(Fault::any().rate_limited(&http_date_in(300)));
     let e = http.send(&get(&server, "/x")).await.unwrap_err();
+    let elapsed = started.elapsed();
     assert_eq!(e.kind(), ErrorKind::RateLimited);
     let wait = e.retry_after().unwrap();
+    // The date has a resolution of one second; whatever time the call took is gone from the
+    // wait, so the lower bound moves with it instead of assuming the call took under 3 s.
     assert!(
-        wait > Duration::from_secs(297) && wait <= Duration::from_secs(300),
-        "{wait:?}"
+        wait + elapsed > Duration::from_secs(298) && wait <= Duration::from_secs(300),
+        "{wait:?} after {elapsed:?}"
     );
     assert_eq!(server.log().len(), 1);
 }
@@ -1232,7 +1274,7 @@ async fn huge_waits_are_reported_clamped() {
 async fn a_body_that_stalls_or_trickles_hits_the_request_timeout() {
     let http = short_timeout_http();
     let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n";
-    // Ten bytes, then nothing.
+    // Ten bytes, then nothing for an hour.
     let server = ok_server().await;
     server
         .faults()
@@ -1241,16 +1283,19 @@ async fn a_body_that_stalls_or_trickles_hits_the_request_timeout() {
     let e = http.send(&post(&server, "/x")).await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Transient, "{e}");
     assert!(e.to_string().contains("timed out"), "{e}");
-    assert!(started.elapsed() < Duration::from_secs(3));
-    // One byte every 100 ms: each read makes progress, the whole request does not finish.
+    assert!(started.elapsed() < GENEROUS);
+    // One byte every 100 ms for 300 bytes: each read makes progress, and the whole body would
+    // arrive after 30 s, so a timeout per read would let the call succeed (the `unwrap_err`
+    // fails) and a total timeout ends it at 400 ms, far below the bound.
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 300\r\n\r\n";
     let server = ok_server().await;
     let mut chunks = vec![(Duration::ZERO, Bytes::from_static(head.as_bytes()))];
-    chunks.extend((0..100).map(|_| (Duration::from_millis(100), Bytes::from_static(b" "))));
+    chunks.extend((0..300).map(|_| (Duration::from_millis(100), Bytes::from_static(b" "))));
     server.faults().push(Fault::any().raw(chunks));
     let started = Instant::now();
     let e = http.send(&post(&server, "/x")).await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Transient, "{e}");
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 #[tokio::test]
@@ -1310,7 +1355,7 @@ async fn a_connect_timeout_is_certainly_unsent() {
     let silent = SilentServer::start();
     let ctx = testing::context(ContextOptions {
         connect_timeout: Duration::from_millis(300),
-        request_timeout: Duration::from_secs(30),
+        request_timeout: LONG_TIMEOUT,
         ..testing::options()
     });
     let http = testing::http(&ctx, |b| b);
@@ -1354,9 +1399,7 @@ async fn a_request_that_may_have_reached_the_server_is_never_unsent() {
     }
     // A request timeout after the request was written.
     let server = ok_server().await;
-    server
-        .faults()
-        .push(Fault::any().always().delay(Duration::from_secs(10)));
+    server.faults().push(Fault::any().always().delay(STALL));
     let e = short_timeout_http()
         .try_send(&post(&server, "/slow"))
         .await
@@ -1696,11 +1739,14 @@ fn precise(position: Position, dialect: &Dialect) -> bool {
 
 #[tokio::test]
 async fn secrets_never_reach_errors() {
+    // One server and one context for every case: the server is reconfigured per case and every
+    // handle reuses the context's pooled connection (see `EchoServer::reset`).
     let ctx = testing::context(testing::options());
+    let echo = Echo::new(200).start().await;
     let mut precise_cases = 0;
     for dialect in dialects() {
         for status in [400, 401, 403, 429, 500] {
-            let echo = dialect.echo(status).start().await;
+            echo.reset(dialect.echo(status));
             for position in POSITIONS {
                 let http = canary_http(&ctx, &echo, position);
                 let request = canary_request(&echo, position);
@@ -1731,9 +1777,10 @@ async fn secrets_never_reach_errors() {
 #[tokio::test]
 async fn tokens_obtained_at_run_time_never_reach_errors() {
     let ctx = testing::context(testing::options());
+    let echo = Echo::new(200).start().await;
     for dialect in dialects() {
         for status in [400, 401, 500] {
-            let echo = dialect.echo(status).start().await;
+            echo.reset(dialect.echo(status));
             let http = canary_http(&ctx, &echo, Position::Form);
             let tokens = TokenSource::new(None);
             let token_url = echo.token_url();
@@ -1771,9 +1818,10 @@ async fn keystone_password_and_token_never_reach_errors() {
     let ctx = testing::context(testing::options());
     // 400, 401 and 403, each answered at once: the exchange is idempotent, and a 5xx would be
     // retried with back-off for every dialect. The 5xx path is the same transport code.
+    let echo = Echo::new(200).start().await;
     for dialect in dialects() {
         for status in [400, 401, 403] {
-            let echo = dialect.echo(status).start().await;
+            echo.reset(dialect.echo(status));
             let http = testing::http(&ctx, |b| b.secret(CANARY_PASSWORD).secret(CANARY_USER));
             let identity = Endpoint::parse("auth_url", &echo.url("/v3"), &ctx).unwrap();
             let keystone = Keystone::new(
@@ -1794,6 +1842,42 @@ async fn keystone_password_and_token_never_reach_errors() {
     }
 }
 
+/// The fast scan of `find_secret` finds exactly what the full search finds: every spelling and
+/// every fragment of every canary, alone and inside other text, and nothing in texts that hold
+/// only shorter pieces of them or none at all.
+#[test]
+fn the_secret_scan_agrees_with_the_full_search() {
+    let mut texts = vec![
+        String::new(),
+        "status 400: request refused".to_owned(),
+        format!("{REDACTED} and {WITHHELD}"),
+    ];
+    for canary in CANARIES {
+        for spelling in spellings(canary) {
+            texts.push(format!("before {spelling} after"));
+            let chars: Vec<char> = spelling.chars().collect();
+            for width in [7, 8] {
+                for start in (0..chars.len().saturating_sub(width)).step_by(9) {
+                    let piece: String = chars[start..start + width].iter().collect();
+                    texts.push(format!("x{piece}y"));
+                }
+            }
+        }
+    }
+    let mut found = 0;
+    for text in &texts {
+        let fast = find_secret(text, &CANARIES);
+        assert_eq!(fast, find_secret_slowly(text, &CANARIES), "{text:?}");
+        found += usize::from(fast.is_some());
+    }
+    // Both outcomes occur, so the comparison is not vacuous.
+    assert!(
+        found > 100 && found < texts.len(),
+        "{found} of {}",
+        texts.len()
+    );
+}
+
 /// Field names the transport's request events may carry.
 const EVENT_FIELDS: [&str; 7] = [
     "message",
@@ -1812,15 +1896,16 @@ async fn nothing_secret_reaches_tracing() {
     let ctx = testing::context(testing::options());
     let (capture, _guard) = LogCapture::install();
     // Success, 401 and 500, with the canaries in every position.
+    let echo = Echo::new(200).start().await;
     for status in [200, 401, 500] {
-        let echo = Echo::new(status).start().await;
+        echo.reset(Echo::new(status));
         for position in POSITIONS {
             let http = canary_http(&ctx, &echo, position);
             let _ = error_of(&http, &canary_request(&echo, position)).await;
         }
     }
     // A token obtained at run time, then a 401 for it and a 500.
-    let echo = Echo::new(200).start().await;
+    echo.reset(Echo::new(200));
     let http = canary_http(&ctx, &echo, Position::Form);
     let tokens = TokenSource::new(None);
     let token_url = echo.token_url();

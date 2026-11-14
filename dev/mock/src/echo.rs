@@ -30,11 +30,21 @@
 //! Together these produce every spelling the client's redaction must recognize. The server is an
 //! ordinary [`MockServer`], so its request log shows that the endpoints were reached and its fault
 //! queue works as usual.
+//!
+//! # One server for many cases
+//!
+//! A secret test runs hundreds of cases (dialect × status × request kind). Starting a server per
+//! case costs at least one TCP connection per case, and every closed loopback connection holds an
+//! ephemeral port in `TIME_WAIT` for a while (30 seconds on macOS, out of about 16,000 ports);
+//! overlapping test runs then fail with `AddrNotAvailable`. Start one server per test instead and
+//! give each case its configuration with [`EchoServer::reset`]: the port and the open
+//! connections stay, so clients built on one shared `Context` keep reusing the same pooled
+//! connection, while the log and the fault queue start empty for the case.
 
 use std::fmt;
 use std::fmt::Write as _;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -240,23 +250,34 @@ impl Echo {
 
     /// Starts the server.
     pub async fn start(self) -> EchoServer {
-        let token_path = self.token_path.clone();
         let issued_token = self.issued_token.clone();
-        let router = Router::new().fallback(echo).with_state(Arc::new(self));
+        let config: Config = Arc::new(Mutex::new(Arc::new(self)));
+        let router = Router::new().fallback(echo).with_state(config.clone());
         EchoServer {
             server: MockServer::start(router).await,
-            token_path,
+            config,
             issued_token,
         }
     }
 }
 
+/// The configuration a running server answers with; [`EchoServer::reset`] replaces it.
+type Config = Arc<Mutex<Arc<Echo>>>;
+
 /// A running echo server. Dereferences to its [`MockServer`] for the log and the fault queue.
-#[derive(Debug)]
 pub struct EchoServer {
     server: MockServer,
-    token_path: String,
+    config: Config,
     issued_token: String,
+}
+
+impl fmt::Debug for EchoServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EchoServer")
+            .field("server", &self.server)
+            .field("config", &self.current())
+            .finish_non_exhaustive()
+    }
 }
 
 impl EchoServer {
@@ -265,9 +286,40 @@ impl EchoServer {
         Echo::new(status).start().await
     }
 
+    /// Answers every following request with `echo` instead of the configuration the server was
+    /// started or last reset with, and empties the request log and the fault queue, so that the
+    /// next case starts as on a fresh server. The address, the port and the open connections
+    /// stay: a client on the same `Context` reuses its pooled connection instead of opening a new
+    /// one, which is the point (see the module documentation).
+    ///
+    /// Call it between cases, when no request is in flight: a request still in flight would be
+    /// answered by either configuration and could be logged after the log was emptied.
+    ///
+    /// # Panics
+    ///
+    /// If `echo` hands out a different token than the server was started with: the token is
+    /// fixed for the life of the server, so that [`EchoServer::issued_token`] stays valid.
+    pub fn reset(&self, echo: Echo) {
+        assert_eq!(
+            echo.issued_token, self.issued_token,
+            "the issued token of an echo server is fixed when it starts"
+        );
+        *self.config.lock().expect("echo configuration poisoned") = Arc::new(echo);
+        self.server.log().clear();
+        self.server.faults().clear();
+    }
+
+    /// The configuration in effect.
+    fn current(&self) -> Arc<Echo> {
+        self.config
+            .lock()
+            .expect("echo configuration poisoned")
+            .clone()
+    }
+
     /// The URL of the token endpoint: the base URL followed by the token path.
     pub fn token_url(&self) -> String {
-        self.server.url(&self.token_path)
+        self.server.url(&self.current().token_path)
     }
 
     /// The token the token endpoint hands out.
@@ -277,11 +329,12 @@ impl EchoServer {
 
     /// Number of requests to the token endpoint.
     pub fn token_requests(&self) -> usize {
+        let token_path = self.current().token_path.clone();
         self.server
             .log()
             .entries()
             .iter()
-            .filter(|r| r.path.starts_with(&self.token_path))
+            .filter(|r| r.path.starts_with(&token_path))
             .count()
     }
 
@@ -300,12 +353,13 @@ impl Deref for EchoServer {
 }
 
 async fn echo(
-    State(cfg): State<Arc<Echo>>,
+    State(config): State<Config>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let cfg = config.lock().expect("echo configuration poisoned").clone();
     let path = uri.path().to_owned();
     if path.starts_with(&cfg.token_path) {
         return (cfg.token_render)(&cfg.issued_token);

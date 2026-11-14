@@ -563,6 +563,72 @@ async fn echo_issues_tokens_and_echoes_them_back() {
     assert_eq!(echo.api_requests(), 1);
 }
 
+/// Sends one keep-alive request on `stream` and reads exactly one answer (by its
+/// `content-length`), leaving the connection open.
+async fn send_on(stream: &mut TcpStream, method: &str, path: &str) -> Answer {
+    tokio::time::timeout(TIMEOUT, async {
+        let head =
+            format!("{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-length: 0\r\n\r\n");
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "the server closed a keep-alive connection");
+            raw.extend_from_slice(&buf[..n]);
+            let answer = Answer::parse(raw.clone());
+            if let Some(len) = answer.header("content-length")
+                && answer.body.len() >= len.parse::<usize>().unwrap()
+            {
+                return answer;
+            }
+        }
+    })
+    .await
+    .expect("answer within the timeout")
+}
+
+#[tokio::test]
+async fn echo_reset_reconfigures_without_a_new_connection() {
+    let echo = EchoServer::start(400).await;
+    let mut stream = TcpStream::connect(echo.addr()).await.unwrap();
+    let a = send_on(&mut stream, "GET", "/zones").await;
+    assert_eq!(a.status, Some(400));
+    assert_eq!(a.header("content-type"), Some("application/json"));
+    assert_eq!(echo.api_requests(), 1);
+    echo.faults().push(Fault::any().status(599));
+
+    // A new status, renderer, spelling and token path; the log and the faults start empty.
+    echo.reset(
+        Echo::new(403)
+            .render(echo::text())
+            .spelling(Spelling::FormPlus)
+            .token_path("/oauth/token"),
+    );
+    assert!(echo.log().is_empty());
+    assert_eq!(echo.faults().pending(), 0);
+    assert!(echo.token_url().ends_with("/oauth/token"));
+    let a = send_on(&mut stream, "GET", "/zones?a=b").await;
+    assert_eq!(a.status, Some(403));
+    assert!(
+        a.body_str().starts_with("request+GET+%2Fzones"),
+        "{}",
+        a.body_str()
+    );
+    let a = send_on(&mut stream, "POST", "/oauth/token").await;
+    assert_eq!(a.status, Some(201));
+    assert_eq!((echo.api_requests(), echo.token_requests()), (1, 1));
+    // Both cases were served on the one connection.
+    assert_eq!(echo.connections(), 1);
+}
+
+#[tokio::test]
+#[should_panic(expected = "the issued token of an echo server is fixed")]
+async fn echo_reset_keeps_the_issued_token() {
+    let echo = EchoServer::start(400).await;
+    echo.reset(Echo::new(400).issued_token("another"));
+}
+
 #[tokio::test]
 async fn echo_custom_token_path_and_value() {
     let echo = Echo::new(401)

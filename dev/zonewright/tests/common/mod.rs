@@ -10,6 +10,12 @@ use zonewright::{AnyProvider, Context, ContextOptions, DomainName, Error, Provid
 
 /// A context for tests: connections to anything but loopback addresses are refused, so a test
 /// that forgets to point a client at a mock fails instead of contacting a provider.
+///
+/// Clients built on one context share its connection pool. A test that builds many clients
+/// against one server (the secret tests build one per case) builds them on one context, so that
+/// they reuse a connection instead of each opening, and on drop closing, its own. A context
+/// belongs to the runtime of the test that built it: its pooled connections are tasks of that
+/// runtime, so it is not shared between tests.
 pub fn context() -> Context {
     let mut options = ContextOptions::default();
     options.loopback_only = true;
