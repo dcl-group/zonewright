@@ -15,6 +15,16 @@
 //!   otherwise 60 to 86400) and answers `200` with the record; TXT `content` must consist of
 //!   quoted character strings of at most 255 bytes each; names are in Punycode;
 //! - `DELETE /zones/{zone}/dns_records/{record}` answers `200` with `result: {id}`;
+//! - `PATCH /zones/{zone}/dns_records/{record}` changes the fields it names and answers `200`
+//!   with the record;
+//! - A and AAAA take an address in `content`, CNAME, NS and PTR a host name, MX a host name and
+//!   `priority` (0 to 65535, required); CAA, SRV and TLSA take `data` (`flags`/`tag`/`value`,
+//!   `priority`/`weight`/`port`/`target`, `usage`/`selector`/`matching_type`/`certificate`) and
+//!   their `content` is read-only;
+//! - "A/AAAA records cannot exist on the same name as CNAME records. NS records cannot exist on
+//!   the same name as any other record type";
+//! - a record carries `proxied` (default false), `settings`, `comment` and `tags`, and A and AAAA
+//!   `private_routing`; a proxied record's TTL is automatic and cannot be edited;
 //! - the identifiers are 32 characters at most.
 //!
 //! Answers this mock invents because the documentation is silent (the schema names only the
@@ -32,7 +42,19 @@
 //! - a `per_page` outside the documented range answers `400`, code `9000`;
 //! - the page count of an empty listing is `0`;
 //! - a zone that is not `active` is listed with its status and its record paths answer as
-//!   usual.
+//!   usual;
+//! - a host name in `content` or `data.target` must be lowercase letters, digits, `-`, `_` and
+//!   `*` in dot-separated labels, without a trailing dot (stricter than "a valid hostname"); a
+//!   TLSA `certificate` must be non-empty hex; a request that sends `content` for CAA, SRV or
+//!   TLSA, a record type other than A, AAAA, CAA, CNAME, MX, NS, PTR, SRV, TLSA and TXT, a
+//!   `proxied: true` on a type other than A, AAAA and CNAME, a TTL other than `1` on a proxied
+//!   record, a second CNAME at a name, or a `PATCH` that names another type answers `400`, code
+//!   `9000`;
+//! - the formatted `content` of a CAA record is `<flags> <tag> "<value>"`, of a TLSA record
+//!   `<usage> <selector> <matching type> <certificate>` (the SRV form, `<weight> <port>
+//!   <target>`, is the one of the provider's record type reference);
+//! - a listed record carries `data` only for the types that take it;
+//! - a `PATCH` of an unknown record answers `404`, code `81044`.
 //!
 //! Error texts are invented.
 //!
@@ -111,6 +133,68 @@ pub struct Record {
     pub content: String,
     /// TTL in seconds; `1` is automatic.
     pub ttl: u32,
+    /// The MX preference.
+    pub priority: Option<u16>,
+    /// The components of a CAA, SRV or TLSA record.
+    pub data: Option<Value>,
+    /// Proxied.
+    pub proxied: bool,
+    /// Private routing (A and AAAA).
+    pub private_routing: bool,
+    /// The settings object.
+    pub settings: Value,
+    /// The comment.
+    pub comment: Option<String>,
+    /// The tags.
+    pub tags: Vec<String>,
+}
+
+impl Record {
+    /// A record with every optional field at its default; the caller sets the rest.
+    fn bare() -> Record {
+        Record {
+            id: String::new(),
+            zone_id: String::new(),
+            name: String::new(),
+            rtype: String::new(),
+            content: String::new(),
+            ttl: 1,
+            priority: None,
+            data: None,
+            proxied: false,
+            private_routing: false,
+            settings: json!({}),
+            comment: None,
+            tags: Vec::new(),
+        }
+    }
+
+    /// The record as the API lists it.
+    fn to_json(&self) -> Value {
+        let mut out = json!({
+            "id": self.id,
+            "zone_id": self.zone_id,
+            "type": self.rtype,
+            "name": self.name,
+            "content": self.content,
+            "ttl": self.ttl,
+            "proxied": self.proxied,
+            "proxiable": matches!(self.rtype.as_str(), "A" | "AAAA" | "CNAME"),
+            "settings": self.settings,
+            "comment": self.comment,
+            "tags": self.tags,
+        });
+        if let Some(priority) = self.priority {
+            out["priority"] = json!(priority);
+        }
+        if let Some(data) = &self.data {
+            out["data"] = data.clone();
+        }
+        if matches!(self.rtype.as_str(), "A" | "AAAA") {
+            out["private_routing"] = json!(self.private_routing);
+        }
+        out
+    }
 }
 
 #[derive(Debug)]
@@ -121,6 +205,8 @@ struct Inner {
     next_id: u64,
     /// When set, no page holds more items than this, whatever `per_page` says.
     page_cap: Option<usize>,
+    /// When set, the record listing ignores its `name` and `type` filters.
+    ignore_filters: bool,
 }
 
 impl Inner {
@@ -174,6 +260,7 @@ impl CloudflareMock {
             records: Vec::new(),
             next_id: 0,
             page_cap: None,
+            ignore_filters: false,
         };
         for name in &seed.zones {
             let id = inner.new_id();
@@ -192,7 +279,7 @@ impl CloudflareMock {
             )
             .route(
                 "/client/v4/zones/{zone}/dns_records/{record}",
-                axum::routing::delete(record_delete),
+                axum::routing::delete(record_delete).patch(record_update),
             )
             .with_state(state.clone());
         Self {
@@ -292,6 +379,12 @@ impl Control {
         lock(&self.state).page_cap = Some(n);
     }
 
+    /// Makes the record listing ignore its `name` and `type` filters and return every record of
+    /// the zone (a test switch for a filter looser than documented, not an invented answer).
+    pub fn set_ignore_filters(&self, ignore: bool) {
+        lock(&self.state).ignore_filters = ignore;
+    }
+
     /// Every record.
     pub fn records(&self) -> Vec<Record> {
         lock(&self.state).records.clone()
@@ -340,6 +433,56 @@ impl Control {
             rtype: rtype.to_owned(),
             content: content.to_owned(),
             ttl,
+            ..Record::bare()
+        });
+        id
+    }
+
+    /// Creates a record in zone `zone` directly from a JSON object in the API's form (`type`,
+    /// `name`, and any of `content`, `priority`, `data`, `ttl`, `proxied`, `private_routing`,
+    /// `settings`, `comment`, `tags`), as another writer would. Nothing is validated; a missing
+    /// `content` is computed for CAA, SRV and TLSA. Returns the record's identifier.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such zone, or `type` or `name` is missing.
+    pub fn insert_json(&self, zone: &str, record: &Value) -> String {
+        let zone_id = self.zone_id(zone);
+        let mut inner = lock(&self.state);
+        let id = inner.new_id();
+        let rtype = record["type"].as_str().expect("type").to_owned();
+        let data = record.get("data").cloned();
+        let content = record["content"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| data.as_ref().and_then(|d| formatted(&rtype, d)))
+            .unwrap_or_default();
+        inner.records.push(Record {
+            id: id.clone(),
+            zone_id,
+            name: normalize(record["name"].as_str().expect("name")),
+            rtype,
+            content,
+            ttl: record["ttl"]
+                .as_u64()
+                .and_then(|t| u32::try_from(t).ok())
+                .unwrap_or(1),
+            priority: record["priority"]
+                .as_u64()
+                .and_then(|p| u16::try_from(p).ok()),
+            data,
+            proxied: record["proxied"].as_bool().unwrap_or(false),
+            private_routing: record["private_routing"].as_bool().unwrap_or(false),
+            settings: record.get("settings").cloned().unwrap_or_else(|| json!({})),
+            comment: record["comment"].as_str().map(str::to_owned),
+            tags: record["tags"]
+                .as_array()
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(|t| t.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
         });
         id
     }
@@ -496,23 +639,16 @@ async fn records_list(
     let name_filter = query
         .get("name")
         .or_else(|| query.get("name.exact"))
-        .map(|name| normalize(name));
+        .map(|name| normalize(name))
+        .filter(|_| !inner.ignore_filters);
+    let type_filter = query.get("type").filter(|_| !inner.ignore_filters);
     let all: Vec<Value> = inner
         .records
         .iter()
         .filter(|r| r.zone_id == zone)
-        .filter(|r| query.get("type").is_none_or(|t| *t == r.rtype))
+        .filter(|r| type_filter.is_none_or(|t| *t == r.rtype))
         .filter(|r| name_filter.as_ref().is_none_or(|name| *name == r.name))
-        .map(|r| {
-            json!({
-                "id": r.id,
-                "zone_id": zone,
-                "type": r.rtype,
-                "name": r.name,
-                "content": r.content,
-                "ttl": r.ttl,
-            })
-        })
+        .map(Record::to_json)
         .collect();
     let (items, info) = page_of(&all, per_page, page);
     success(json!(items), Some(info))
@@ -556,6 +692,203 @@ fn valid_txt_content(content: &str) -> bool {
     true
 }
 
+/// The record types this mock accepts in a write.
+const WRITABLE: &[&str] = &[
+    "A", "AAAA", "CAA", "CNAME", "MX", "NS", "PTR", "SRV", "TLSA", "TXT",
+];
+
+/// A host name as this mock accepts it (see the module documentation).
+fn valid_host(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_*".contains(&b))
+        })
+}
+
+/// A number field of `data` within `0..=max`.
+fn data_number(data: &Value, key: &str, max: u64) -> Option<u64> {
+    data.get(key).and_then(Value::as_u64).filter(|n| *n <= max)
+}
+
+/// The formatted content of a record with `data`, or `None` when `data` is not valid for the
+/// type.
+fn formatted(rtype: &str, data: &Value) -> Option<String> {
+    match rtype {
+        "CAA" => {
+            let flags = data_number(data, "flags", 255)?;
+            let tag = data.get("tag").and_then(Value::as_str)?;
+            let value = data.get("value").and_then(Value::as_str)?;
+            (!tag.is_empty()).then(|| format!("{flags} {tag} \"{value}\""))
+        }
+        "SRV" => {
+            data_number(data, "priority", 65_535)?;
+            let weight = data_number(data, "weight", 65_535)?;
+            let port = data_number(data, "port", 65_535)?;
+            let target = data.get("target").and_then(Value::as_str)?;
+            valid_host(target).then(|| format!("{weight} {port} {target}"))
+        }
+        "TLSA" => {
+            let usage = data_number(data, "usage", 255)?;
+            let selector = data_number(data, "selector", 255)?;
+            let matching = data_number(data, "matching_type", 255)?;
+            let certificate = data.get("certificate").and_then(Value::as_str)?;
+            (!certificate.is_empty()
+                && certificate.len() % 2 == 0
+                && certificate.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| format!("{usage} {selector} {matching} {certificate}"))
+        }
+        _ => None,
+    }
+}
+
+/// Checks the per-type fields of `record` (type, content, priority, data, TTL, proxied) and
+/// fills in the formatted content of the types with `data`.
+fn validate_fields(record: &mut Record) -> Result<(), Response> {
+    let rtype = record.rtype.as_str();
+    if !WRITABLE.contains(&rtype) {
+        return Err(bad_request("this record type is not supported by the mock"));
+    }
+    if record.ttl != 1 && !(60..=86_400).contains(&record.ttl) {
+        return Err(bad_request("invalid ttl"));
+    }
+    if record.proxied {
+        if !matches!(rtype, "A" | "AAAA" | "CNAME") {
+            return Err(bad_request("this record type cannot be proxied"));
+        }
+        if record.ttl != 1 {
+            return Err(bad_request("the TTL of a proxied record is automatic"));
+        }
+    }
+    let content = record.content.as_str();
+    let valid = match rtype {
+        "A" => content.parse::<std::net::Ipv4Addr>().is_ok(),
+        "AAAA" => content.parse::<std::net::Ipv6Addr>().is_ok(),
+        "CNAME" | "NS" | "PTR" => valid_host(content),
+        "MX" => valid_host(content) && record.priority.is_some(),
+        "TXT" => valid_txt_content(content),
+        _ => true,
+    };
+    if !valid {
+        return Err(bad_request("the content is not valid for the record type"));
+    }
+    if matches!(rtype, "CAA" | "SRV" | "TLSA") {
+        let Some(content) = record.data.as_ref().and_then(|d| formatted(rtype, d)) else {
+            return Err(bad_request("the data is not valid for the record type"));
+        };
+        record.content = content;
+    } else if record.data.is_some() {
+        return Err(bad_request("this record type takes no data"));
+    }
+    Ok(())
+}
+
+/// Checks the rules between records of one name, for `record` replacing the record with the
+/// same identifier, if any.
+fn validate_neighbors(inner: &Inner, record: &Record) -> Result<(), Response> {
+    let others: Vec<&Record> = inner
+        .records
+        .iter()
+        .filter(|r| r.zone_id == record.zone_id && r.name == record.name && r.id != record.id)
+        .collect();
+    let rtype = record.rtype.as_str();
+    let clash = others.iter().any(|r| {
+        let other = r.rtype.as_str();
+        (rtype == "CNAME" && matches!(other, "A" | "AAAA" | "CNAME"))
+            || (other == "CNAME" && matches!(rtype, "A" | "AAAA"))
+            || (rtype == "NS" && other != "NS")
+            || (other == "NS" && rtype != "NS")
+    });
+    if clash {
+        return Err(bad_request(
+            "the record cannot exist next to the other records of the name",
+        ));
+    }
+    if others.iter().any(|r| {
+        r.rtype == record.rtype
+            && r.content == record.content
+            && r.priority == record.priority
+            && r.data == record.data
+    }) {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            81058,
+            "An identical record already exists.",
+        ));
+    }
+    Ok(())
+}
+
+/// The fields of a write body that the client may send, applied to `record`.
+fn apply_body(record: &mut Record, body: &Value) -> Result<(), Response> {
+    let object = body
+        .as_object()
+        .ok_or_else(|| bad_request("the body is not an object"))?;
+    for (key, value) in object {
+        match key.as_str() {
+            "type" | "name" => {}
+            "content" => {
+                if matches!(record.rtype.as_str(), "CAA" | "SRV" | "TLSA") {
+                    return Err(bad_request("content is read-only for this record type"));
+                }
+                record.content = value
+                    .as_str()
+                    .ok_or_else(|| bad_request("content must be a string"))?
+                    .to_owned();
+            }
+            "ttl" => {
+                record.ttl = value
+                    .as_u64()
+                    .and_then(|t| u32::try_from(t).ok())
+                    .ok_or_else(|| bad_request("invalid ttl"))?;
+            }
+            "priority" => {
+                record.priority = Some(
+                    value
+                        .as_u64()
+                        .and_then(|p| u16::try_from(p).ok())
+                        .ok_or_else(|| bad_request("invalid priority"))?,
+                );
+            }
+            "data" => record.data = Some(value.clone()),
+            "proxied" => {
+                record.proxied = value
+                    .as_bool()
+                    .ok_or_else(|| bad_request("proxied must be a boolean"))?;
+            }
+            "private_routing" => {
+                if !matches!(record.rtype.as_str(), "A" | "AAAA") {
+                    return Err(bad_request("private_routing is for A and AAAA records"));
+                }
+                record.private_routing = value
+                    .as_bool()
+                    .ok_or_else(|| bad_request("private_routing must be a boolean"))?;
+            }
+            "settings" => {
+                if !value.is_object() {
+                    return Err(bad_request("settings must be an object"));
+                }
+                record.settings = value.clone();
+            }
+            "comment" => record.comment = value.as_str().map(str::to_owned),
+            "tags" => {
+                record.tags = value
+                    .as_array()
+                    .ok_or_else(|| bad_request("tags must be an array"))?
+                    .iter()
+                    .filter_map(|t| t.as_str().map(str::to_owned))
+                    .collect();
+            }
+            _ => return Err(bad_request("unknown field")),
+        }
+    }
+    Ok(())
+}
+
 async fn record_create(
     State(state): State<Shared>,
     headers: HeaderMap,
@@ -572,14 +905,16 @@ async fn record_create(
     let Ok(body) = serde_json::from_slice::<Value>(&body) else {
         return bad_request("the body is not JSON");
     };
-    let (Some(rtype), Some(name), Some(content), Some(ttl)) = (
+    let (Some(rtype), Some(name), Some(_)) = (
         body["type"].as_str(),
         body["name"].as_str(),
-        body["content"].as_str(),
         body["ttl"].as_u64(),
     ) else {
-        return bad_request("type, name, content and ttl are required");
+        return bad_request("type, name and ttl are required");
     };
+    if !matches!(rtype, "CAA" | "SRV" | "TLSA") && body["content"].as_str().is_none() {
+        return bad_request("content is required");
+    }
     let name = normalize(name);
     if name != zone_name && !name.ends_with(&format!(".{zone_name}")) {
         return bad_request("the name is outside the zone");
@@ -587,44 +922,68 @@ async fn record_create(
     if !name.is_ascii() {
         return bad_request("names are in Punycode");
     }
-    let Ok(ttl) = u32::try_from(ttl) else {
-        return bad_request("invalid ttl");
-    };
-    if ttl != 1 && !(60..=86_400).contains(&ttl) {
-        return bad_request("invalid ttl");
-    }
-    if rtype == "TXT" && !valid_txt_content(content) {
-        return bad_request("TXT content must be quoted character strings of up to 255 bytes");
-    }
-    if inner
-        .records
-        .iter()
-        .any(|r| r.zone_id == zone && r.name == name && r.rtype == rtype && r.content == content)
-    {
-        return failure(
-            StatusCode::BAD_REQUEST,
-            81058,
-            "An identical record already exists.",
-        );
-    }
-    let id = inner.new_id();
-    let record = Record {
-        id,
+    let mut record = Record {
         zone_id: zone.clone(),
         name,
         rtype: rtype.to_owned(),
-        content: content.to_owned(),
-        ttl,
+        ..Record::bare()
     };
-    let answer = json!({
-        "id": record.id,
-        "zone_id": zone,
-        "type": record.rtype,
-        "name": record.name,
-        "content": record.content,
-        "ttl": record.ttl,
-    });
+    if let Err(response) = apply_body(&mut record, &body)
+        .and_then(|()| validate_fields(&mut record))
+        .and_then(|()| validate_neighbors(&inner, &record))
+    {
+        return response;
+    }
+    record.id = inner.new_id();
+    let answer = record.to_json();
     inner.records.push(record);
+    success(answer, None)
+}
+
+async fn record_update(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((zone, id)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> Response {
+    let mut inner = lock(&state);
+    if let Err(response) = authenticate(&inner, &headers) {
+        return response;
+    }
+    if inner.zone(&zone).is_none() {
+        return unknown_zone();
+    }
+    let Some(index) = inner
+        .records
+        .iter()
+        .position(|r| r.zone_id == zone && r.id == id)
+    else {
+        return failure(StatusCode::NOT_FOUND, 81044, "Record does not exist.");
+    };
+    let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+        return bad_request("the body is not JSON");
+    };
+    let mut record = inner.records[index].clone();
+    if body
+        .get("type")
+        .is_some_and(|t| t.as_str() != Some(record.rtype.as_str()))
+    {
+        return bad_request("the type of a record cannot change");
+    }
+    if body
+        .get("name")
+        .is_some_and(|n| n.as_str().map(normalize).as_deref() != Some(record.name.as_str()))
+    {
+        return bad_request("the mock does not rename records");
+    }
+    if let Err(response) = apply_body(&mut record, &body)
+        .and_then(|()| validate_fields(&mut record))
+        .and_then(|()| validate_neighbors(&inner, &record))
+    {
+        return response;
+    }
+    let answer = record.to_json();
+    inner.records[index] = record;
     success(answer, None)
 }
 

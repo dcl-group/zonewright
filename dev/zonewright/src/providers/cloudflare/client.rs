@@ -12,10 +12,13 @@ use crate::http::{Http, ZoneCache, path_id};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
-use crate::values;
+use crate::{rrsets, values};
 
 use super::api::{self, Api};
 use super::config::{self, CloudflareConfig, CloudflareCredentials};
@@ -29,6 +32,10 @@ const ZONE_NOT_ACTIVE: &str = "the zone is not active at the provider";
 /// individual record: TXT value operations create one record per value and delete only the
 /// records that hold the value, by identifier, so a writer outside this process cannot lose a
 /// value to this client (`ValueGuarantee::PerValue`); a duplicate of a value is possible.
+/// Record-level writes read the rrset, then create the missing records and only then delete
+/// the surplus ones, under the per-name lock of the [`Context`]; a change by a writer outside
+/// this process between that read and the writes is not detected
+/// (`Preconditions::ReadThenWrite`).
 ///
 /// Zone identifiers are cached for the life of the client; a stale one is detected and
 /// resolved again.
@@ -187,6 +194,40 @@ impl Provider for Cloudflare {
             names.insert(name);
         }
         Ok(names.into_iter().map(ZoneInfo::new).collect())
+    }
+
+    /// Every record of the zone, all pages, grouped into rrsets. Types outside the record-level
+    /// type list are listed too.
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_per_record(self, zone, name, rtype).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        rrsets::set_per_record(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_per_record(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(

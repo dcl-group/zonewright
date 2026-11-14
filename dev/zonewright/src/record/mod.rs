@@ -21,7 +21,11 @@ pub use caa::Caa;
 pub use data::RecordData;
 pub use mx::Mx;
 pub use rrset::RrSet;
-#[cfg(any(feature = "selectel_v2", feature = "digitalocean"))]
+#[cfg(any(
+    feature = "selectel_v2",
+    feature = "digitalocean",
+    feature = "cloudflare"
+))]
 pub(crate) use rrset::singleton;
 pub use rtype::RecordType;
 pub use srv::Srv;

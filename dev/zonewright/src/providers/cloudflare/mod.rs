@@ -5,10 +5,14 @@
 //! `CloudflareConfig` and credentials `CloudflareCredentials`, is compiled with the cargo
 //! feature `cloudflare`.
 //!
-//! This version offers `check`, `list_zones` and the TXT value operations. The TXT value
-//! operations accept plain values only; the API's unit is the individual record, so they create
-//! and delete single records and never touch a foreign value (see
-//! [`ValueGuarantee::PerValue`](crate::ValueGuarantee::PerValue)).
+//! This version offers `check`, `list_zones`, the record-level operations (`list_rrsets`,
+//! `get_rrset`, `set_rrset`, `delete_rrset`) for A, AAAA, CAA, CNAME, MX, NS, PTR, SRV, TLSA and
+//! TXT, and the TXT value operations. The TXT value operations accept plain values only; the
+//! API's unit is the individual record, so they create and delete single records and never touch
+//! a foreign value (see [`ValueGuarantee::PerValue`](crate::ValueGuarantee::PerValue)). A
+//! record-level replacement is several requests, creates before deletes, after a read that
+//! evaluates the expectation (see
+//! [`Preconditions::ReadThenWrite`](crate::Preconditions::ReadThenWrite)).
 
 pub(crate) mod meta;
 
@@ -18,6 +22,8 @@ mod api;
 mod client;
 #[cfg(feature = "cloudflare")]
 mod config;
+#[cfg(feature = "cloudflare")]
+mod records;
 #[cfg(feature = "cloudflare")]
 mod txt;
 

@@ -86,7 +86,11 @@ impl RecordData {
     /// as non-canonical data, trimmed of surrounding whitespace. Never fails and never "fixes up"
     /// text the parser refuses.
     // Used by the clients with record-level operations (`crate::rrsets`).
-    #[cfg(any(feature = "selectel_v2", feature = "digitalocean"))]
+    #[cfg(any(
+        feature = "selectel_v2",
+        feature = "digitalocean",
+        feature = "cloudflare"
+    ))]
     pub(crate) fn from_provider(
         rtype: RecordType,
         text: &str,
@@ -507,7 +511,11 @@ fn parse_generic(tokens: &[Token<'_>]) -> Result<Vec<u8>, RecordError> {
 }
 
 #[cfg(test)]
-#[cfg(any(feature = "selectel_v2", feature = "digitalocean"))]
+#[cfg(any(
+    feature = "selectel_v2",
+    feature = "digitalocean",
+    feature = "cloudflare"
+))]
 mod tests {
     use super::RecordData;
     use crate::name::DomainName;

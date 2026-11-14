@@ -16,6 +16,7 @@
 //! | list zones    | `GET /zones?name&per_page&page`                            | 200     |
 //! | list records  | `GET /zones/{zone}/dns_records?type&name&per_page&page`    | 200     |
 //! | create record | `POST /zones/{zone}/dns_records`                           | 200     |
+//! | update record | `PATCH /zones/{zone}/dns_records/{record}`                 | 200     |
 //! | delete record | `DELETE /zones/{zone}/dns_records/{record}`                | 200     |
 //!
 //! The schema documents the answers of a failed call as the failure envelope under the
@@ -110,9 +111,13 @@ impl Zone {
 }
 
 /// A DNS record as the listing returns it; other fields are ignored.
-// Source: the schema, `dns-records_TXTRecord`: `content` (quoted character strings), `name`
-// ("Complete DNS record name, including the zone name, in Punycode"), `ttl`, `type`; the record
-// response adds `id`.
+// Source: the schema, `dns-records_dns-record-response`: every record has `id`, `type`, `name`
+// ("Complete DNS record name, including the zone name, in Punycode"), `content`, `data`, `ttl`,
+// `proxied` and `settings` (all required in the answer); `priority` is shared by MX
+// (`dns-records_MXRecord`), `private_routing` by A and AAAA (`dns-records_ARecord`,
+// `dns-records_AAAARecord`). Everything but `id`, `type` and `name` is optional here, so that one
+// odd record cannot fail a whole listing: what is missing makes that record's value
+// non-canonical (`records.rs`).
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct Record {
     /// The record's identifier.
@@ -122,15 +127,33 @@ pub(super) struct Record {
     pub(super) rtype: String,
     /// The owner name, in Punycode, without the trailing dot.
     pub(super) name: String,
-    /// The value in the API's text form.
-    pub(super) content: String,
+    /// The value in the API's text form; for the types with `data` a formatted, read-only text.
+    #[serde(default)]
+    pub(super) content: Option<String>,
+    /// The MX preference.
+    #[serde(default)]
+    pub(super) priority: Option<serde_json::Value>,
+    /// The components of a structured type (CAA, SRV, TLSA, ...).
+    #[serde(default)]
+    pub(super) data: Option<serde_json::Value>,
     /// TTL in seconds; `1` means automatic.
     #[serde(default)]
     pub(super) ttl: Option<u32>,
+    /// Whether the record is proxied by the provider.
+    #[serde(default)]
+    pub(super) proxied: Option<bool>,
+    /// Private network routing to the origin (A and AAAA).
+    #[serde(default)]
+    pub(super) private_routing: Option<bool>,
+    /// The record's settings object.
+    #[serde(default)]
+    pub(super) settings: Option<serde_json::Value>,
 }
 
-/// The body of `POST /zones/{zone}/dns_records`.
-// Source: the schema, `dns-records_TXTRecord` and `dns-records_dns-record-shared-fields`.
+/// The body of `POST /zones/{zone}/dns_records`. Absent fields are not sent.
+// Source: the schema, `dns-records_dns-record-post` (one of the per-type record schemas, each
+// `dns-records_dns-record-shared-fields` plus `type`, and `content`, `data` or `priority` by
+// type).
 #[derive(Serialize)]
 pub(super) struct NewRecord<'a> {
     /// The record type.
@@ -138,10 +161,51 @@ pub(super) struct NewRecord<'a> {
     pub(super) rtype: &'a str,
     /// The owner name, in Punycode.
     pub(super) name: &'a str,
-    /// The value: quoted character strings.
-    pub(super) content: &'a str,
+    /// The value, for the types that take `content`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) content: Option<&'a str>,
+    /// The MX preference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) priority: Option<u16>,
+    /// The components, for the types that take `data`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) data: Option<&'a serde_json::Value>,
     /// TTL in seconds, or `1` for automatic.
     pub(super) ttl: u32,
+    /// Proxied, sent only when taken over from the existing records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) proxied: Option<bool>,
+    /// Private routing, sent only when taken over from the existing records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) private_routing: Option<bool>,
+    /// Settings, sent only when taken over from the existing records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) settings: Option<&'a serde_json::Value>,
+}
+
+/// The body of `PATCH /zones/{zone}/dns_records/{record}`: the type and only the fields that
+/// change. Absent fields are not sent and keep their value.
+// Source: the schema, `PATCH /zones/{zone_id}/dns_records/{dns_record_id}` ("Update an existing
+// DNS record", as opposed to `PUT`, "Overwrite an existing DNS record"); its body
+// `dns-records_dns-record-patch` has the same per-type schemas as a create, none of whose
+// fields is required.
+#[derive(Serialize)]
+pub(super) struct RecordPatch<'a> {
+    /// The record type, unchanged.
+    #[serde(rename = "type")]
+    pub(super) rtype: &'a str,
+    /// New content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) content: Option<&'a str>,
+    /// New MX preference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) priority: Option<u16>,
+    /// New components.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) data: Option<&'a serde_json::Value>,
+    /// New TTL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ttl: Option<u32>,
 }
 
 /// The answer to a write.
@@ -212,29 +276,36 @@ impl Api {
         self.list(url, None).await
     }
 
-    /// Every TXT record at `name` in zone `zone_id`, all pages. The caller compares names
-    /// exactly. A `404` means the zone does not exist (a stale identifier) and is
-    /// `Error::ZoneNotFound` for `zone`.
+    /// Every record in zone `zone_id`, all pages, of type `rtype` and at `name` where they are
+    /// given. The caller compares names and types exactly. A `404` means the zone does not
+    /// exist (a stale identifier) and is `Error::ZoneNotFound` for `zone`.
     // Source: the schema, `GET /zones/{zone_id}/dns_records` with `type`, `name` ("Exact value of
     // the DNS record name. This is a convenience alias for `name.exact`"), `per_page`, `page`.
     // Assumption (not documented): a missing zone is answered `404`; the schema names the
-    // failure class `4XX` only. If the API answers otherwise, the read phase in `txt.rs` still
-    // looks the zone up again after any refusal under a cached identifier; nothing is written.
-    pub(super) async fn txt_records(
+    // failure class `4XX` only. If the API answers otherwise, the read phase in `txt.rs` and
+    // `records.rs` still looks the zone up again after any refusal under a cached identifier;
+    // nothing is written.
+    pub(super) async fn records(
         &self,
         zone: &DomainName,
         zone_id: &str,
-        name: &str,
+        name: Option<&str>,
+        rtype: Option<&str>,
     ) -> Result<Vec<Record>, Error> {
         let url = |page: u32| {
-            self.base
+            let mut url = self
+                .base
                 .url()
                 .path("/zones")
                 .id(zone_id)
-                .path("/dns_records")
-                .query("type", TXT)
-                .query("name", name)
-                .query("per_page", &RECORD_PAGE.to_string())
+                .path("/dns_records");
+            if let Some(rtype) = rtype {
+                url = url.query("type", rtype);
+            }
+            if let Some(name) = name {
+                url = url.query("name", name);
+            }
+            url.query("per_page", &RECORD_PAGE.to_string())
                 .query("page", &page.to_string())
                 .build()
         };
@@ -258,6 +329,31 @@ impl Api {
         let response = self
             .http
             .send(&Request::new(Method::POST, url).json(record)?)
+            .await?;
+        Ok(self.written(&response))
+    }
+
+    /// Changes the fields of one record that `patch` names. Sent once, like every write that is
+    /// not a delete by identifier (design section 5.3).
+    // Source: the schema, `PATCH /zones/{zone_id}/dns_records/{dns_record_id}`; the success
+    // answer is `200`.
+    pub(super) async fn update_record(
+        &self,
+        zone_id: &str,
+        record_id: &str,
+        patch: &RecordPatch<'_>,
+    ) -> Result<Written, Error> {
+        let url = self
+            .base
+            .url()
+            .path("/zones")
+            .id(zone_id)
+            .path("/dns_records")
+            .id(record_id)
+            .build()?;
+        let response = self
+            .http
+            .send(&Request::new(Method::PATCH, url).json(patch)?)
             .await?;
         Ok(self.written(&response))
     }

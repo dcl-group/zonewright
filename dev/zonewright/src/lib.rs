@@ -64,7 +64,11 @@ mod values;
 
 // The record-level layer is the shared implementation of the clients' record-level operations;
 // compiled with the providers whose clients implement them.
-#[cfg(any(feature = "selectel_v2", feature = "digitalocean"))]
+#[cfg(any(
+    feature = "selectel_v2",
+    feature = "digitalocean",
+    feature = "cloudflare"
+))]
 mod rrsets;
 
 #[cfg(feature = "__http")]

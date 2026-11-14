@@ -27,13 +27,14 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, Txt, TxtDialect};
+use crate::record::{Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
 use super::api::{NewRecord, TXT, Written};
 use super::client::Cloudflare;
 use super::config::TTL_AUTOMATIC;
+use super::records::read_ttl;
 
 /// How TXT content is read.
 const READ: TxtDialect = TxtDialect::Auto;
@@ -89,8 +90,13 @@ impl PerRecord for Cloudflare {
         let record = NewRecord {
             rtype: TXT,
             name: name.without_dot(),
-            content: &content,
+            content: Some(&content),
+            priority: None,
+            data: None,
             ttl: self.new_ttl(ttl),
+            proxied: None,
+            private_routing: None,
+            settings: None,
         };
         match self.api.create_record(&zone_id, &record).await? {
             Written::Done => Ok(()),
@@ -160,46 +166,27 @@ impl PerRecord for Cloudflare {
 
 impl Cloudflare {
     /// The read phase under the zone cache: the TXT records of `name` in the zone `id`, or
-    /// `Stale` when the API does not know the zone (`404`) or refuses a read made with a cached
-    /// identifier.
+    /// `Stale` when the zone identifier may be stale (see `records.rs`, `fetch`).
     async fn read_txt(
         &self,
         zone: &DomainName,
         name: &DomainName,
         id: ZoneId,
     ) -> Result<Attempt<Vec<TxtRecord<String>>>, Error> {
-        match self.api.txt_records(zone, &id.id, name.without_dot()).await {
-            // The API's name filter is case-insensitive and may be looser than exact: the names
-            // are compared again here.
-            Ok(records) => Ok(Attempt::Done(
+        Ok(match self.fetch(zone, id, Some(name), Some(TXT)).await? {
+            Attempt::Done(records) => Attempt::Done(
                 records
                     .into_iter()
-                    .filter(|r| r.rtype == TXT && DomainName::parse(&r.name).as_ref() == Ok(name))
                     .map(|r| TxtRecord {
-                        value: READ.read(&r.content),
-                        ttl: r
-                            .ttl
-                            .filter(|&ttl| ttl != TTL_AUTOMATIC)
-                            .and_then(|ttl| Ttl::from_secs(ttl).ok()),
+                        // A record without content holds no value this client can match.
+                        value: r.content.as_deref().and_then(|c| READ.read(c)),
+                        ttl: read_ttl(&r),
                         handle: r.id,
                     })
                     .collect(),
-            )),
-            Err(Error::ZoneNotFound { .. }) => Ok(Attempt::Stale),
-            // Assumption (not documented): the schema names no status for a zone identifier
-            // the API no longer knows, so `404` may not be what a stale one gets. Any refusal
-            // of a read made with a cached identifier is therefore treated as possibly stale:
-            // the zone is looked up again and the read repeated once. Reads change nothing, so
-            // being wrong costs one lookup; a refusal under a fresh identifier is the error.
-            Err(
-                Error::Rejected {
-                    status: Some(400..=499),
-                    ..
-                }
-                | Error::Forbidden { .. },
-            ) if !id.fresh => Ok(Attempt::Stale),
-            Err(e) => Err(e),
-        }
+            ),
+            Attempt::Stale => Attempt::Stale,
+        })
     }
 
     /// The TTL of a new record: the caller's, else the configured one for a new rrset; the TTL

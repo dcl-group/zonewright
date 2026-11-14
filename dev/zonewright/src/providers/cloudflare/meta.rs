@@ -4,9 +4,9 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and
-//! the TXT value operations on plain values. The record-level operations are not written yet, so
-//! their flags are false and `record_types` is empty.
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones`, the
+//! record-level operations for the types whose fields the sources establish (see the client's
+//! `records.rs`) and the TXT value operations on plain values.
 
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use crate::meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
     ValueGuarantee,
 };
+use crate::record::RecordType;
 
 /// The metadata of Cloudflare.
 pub(crate) static META: ProviderMeta = ProviderMeta {
@@ -63,27 +64,46 @@ const FIELDS: &[ConfigField] = &[
 /// What this version of the crate implements for Cloudflare.
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: true,
-    list_rrsets: false,
-    get_rrset: false,
-    set_rrset: false,
-    delete_rrset: false,
+    list_rrsets: true,
+    get_rrset: true,
+    set_rrset: true,
+    delete_rrset: true,
     add_txt_value: true,
     remove_txt_value: true,
-    record_types: TypeSet::Listed(&[]),
+    // The types whose fields the provider's documentation or dns-update establish for reading
+    // and writing (the client's `records.rs`). SSHFP, HTTPS, SVCB and the other types the API
+    // knows appear in a listing only. The API has no SOA record.
+    record_types: TypeSet::Listed(&[
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::CAA,
+        RecordType::CNAME,
+        RecordType::MX,
+        RecordType::NS,
+        RecordType::PTR,
+        RecordType::SRV,
+        RecordType::TLSA,
+        RecordType::TXT,
+    ]),
+    // Every listed type can be written; the apex NS set is refused by the record layer.
     read_only_types: &[],
     // The API documents TXT content as quoted character strings, but how it treats quotes,
     // backslashes and non-ASCII bytes inside them is not established (design section 4.4).
     txt_plain_only: true,
     // Every value is a record of its own; requests name only our records (design section 3.5).
     txt_values: ValueGuarantee::PerValue,
+    // The expectation is evaluated on a read; the writes carry no condition.
     preconditions: Preconditions::ReadThenWrite,
-    // Individual records with IDs: a replacement is several requests.
+    // Individual records with IDs: a replacement is several requests (the batch endpoint is not
+    // used, see the client's `records.rs`).
     atomic_rrset_write: false,
     ttl: TtlSupport::PerRecord {
         min: 60,
         max: 86_400,
     },
-    // A TTL of 1 means "automatic" (design section 3.6).
+    // A TTL of 1 means "automatic" (design section 3.6); such a record reads as no TTL, and a
+    // set can be created with it through the `ttl` setting only. The TTL of a proxied record is
+    // always automatic and cannot be requested.
     provider_default_ttl: true,
     asynchronous: false,
 };
