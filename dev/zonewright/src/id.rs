@@ -47,7 +47,7 @@ pub enum ProviderId {
 }
 
 impl ProviderId {
-    /// Every identifier, in the order of the table in `PROVIDERS.md`. Complete in every build.
+    /// Every identifier, in alphabetical order of the persisted strings. Complete in every build.
     pub const ALL: &'static [ProviderId] = &[
         ProviderId::AcmeDns,
         ProviderId::Beget,

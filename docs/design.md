@@ -1,7 +1,7 @@
 # zonewright design
 
-Status: proposal for review. No crate code exists yet. This document is what the crate is
-implemented from; where it and the code later disagree, one of them is fixed in the same change.
+Status: describes the crate as implemented in `dev/zonewright` (version 0.1.0, not released yet).
+Where this document and the code disagree, one of them is fixed in the same change.
 
 Binding rules live in [`AGENTS.md`](../AGENTS.md) (settled decisions, hard rules, engineering
 rules). They are referred to here as "decision N" and "hard rule N" and are not repeated. The list
@@ -12,7 +12,8 @@ Conventions used below:
 - "Client" is the code that talks to one provider. "Application" is the program that uses the crate.
 - "An earlier TXT-only implementation" and "an earlier record-level implementation" are the two
   bodies of prior code this crate replaces. They are sources of behavior, not of API shape.
-- Code blocks are the intended public signatures. Private items are described in prose.
+- Code blocks show the public signatures as implemented; doc comments and `#[must_use]` are left
+  out. Private items are described in prose.
 - Facts about dependencies were checked on 2026-11-14 against the published crate sources; the
   checks that were run are listed in section 9.4.
 
@@ -43,7 +44,10 @@ configuration fields.
 
 ## 2. Public API
 
-Everything below is re-exported from the crate root unless a module path is shown.
+Everything below is re-exported from the crate root unless a module path is shown. Names and records
+are also reachable through the public modules `name` and `record`; the provider clients and their
+configuration types live in `providers::<id>`; `dns01` (section 7) and `inspector` (section 8,
+feature `inspector`) are modules too.
 
 ### 2.1 Names
 
@@ -110,11 +114,12 @@ pub enum NameError {
 
 Parsing rules, in order:
 
-1. The input is not trimmed. Leading or trailing whitespace is `BadCharacter`; callers trim where
-   their source needs it.
-2. `"."` is the root. Otherwise one trailing dot is removed if present; an empty remainder is
-   `Empty`. A name with and without the trailing dot parses to the same value: every `DomainName` is
-   absolute. Relative names enter only through `from_relative`.
+1. `"."` is the root.
+2. The input is not trimmed. An ASCII character other than a letter, a digit, `-`, `_`, `*` and `.`
+   is `BadCharacter` before any other processing, so leading or trailing whitespace is
+   `BadCharacter`; callers trim where their source needs it. One trailing dot is removed if present;
+   an empty remainder is `Empty`. A name with and without the trailing dot parses to the same value:
+   every `DomainName` is absolute. Relative names enter only through `from_relative`.
 3. All input goes through the same IDNA processing (`idna::domain_to_ascii`: UTS 46 without the STD3
    ASCII restrictions). ASCII is lowercased, U-labels become A-labels, and a label that starts with
    `xn--` must be valid Punycode whether or not the rest of the name is ASCII. Failure is `Idna`.
@@ -192,20 +197,23 @@ impl<'de> serde::Deserialize<'de> for RecordType {}  // through FromStr
 ```
 
 The crate carries the complete mnemonic table of the IANA "Resource Record (RR) TYPEs" registry as
-of the release, as a generated table with the registry's date recorded in the source; the constants
-above are only the types that also have a canonical form (section 4.3). `Display` prints the
-registry mnemonic for a registered code and `TYPE<code>` (RFC 3597) for any other. `FromStr` is
-case-insensitive and accepts the registry mnemonics, the two pseudo-type names and `TYPE<code>`;
-`TYPE1` and `A` are the same value. Any other string is an error: a typo is not a new type. A code
-the registry does not know yet is always expressible as `TYPE<code>`. Refreshing the table changes
-how a code is printed and parsed, not which values exist.
+of the release, as a hand-maintained table (`MNEMONICS` in `record/rtype.rs`) with the registry's
+date and source recorded next to it; the constants above are only the types that also have a
+canonical form (section 4.3). `Display` prints the registry mnemonic for a registered code and
+`TYPE<code>` (RFC 3597) for any other. One departure: code 255, which the registry spells `*`, is
+printed as `ANY`; both `ANY` and `*` are accepted on input. `FromStr` is case-insensitive and
+accepts the registry mnemonics, the two pseudo-type names and `TYPE<code>`; `TYPE1` and `A` are the
+same value. Any other string is an error: a typo is not a new type. A code the registry does not
+know yet is always expressible as `TYPE<code>`. Refreshing the table changes how a code is printed
+and parsed, not which values exist.
 
 A provider can still report a type under a name that is neither in the registry nor one of the
 pseudo-types (a product-specific record kind). Such an rrset cannot be a `RrSet`; a listing reports
 it separately instead of dropping it (`ZoneListing::skipped`, section 2.6).
 
-Query-only and meta types (OPT, TSIG, TKEY, IXFR, AXFR, ANY) are representable but rejected by every
-operation with `Error::InvalidInput`.
+Code 0, OPT (41) and the range 128 ..= 255 that RFC 6895 section 3.1 reserves for query and meta
+types (TKEY, TSIG, IXFR, AXFR, MAILB, MAILA, ANY and future ones) are representable but rejected by
+every operation with `Error::InvalidInput`.
 
 ```rust
 /// Time to live in seconds, 0 ..= 2^31 - 1 (RFC 2181 section 8).
@@ -329,7 +337,7 @@ TLSA are fixed by their RFCs, so these structs are exhaustive.
 
 ```rust
 /// TXT data as one byte string: the concatenation of the record's character-strings.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Txt(/* private Vec<u8> */);
 impl Txt {
     /// At most 65279 octets (the most that fits one RDATA after splitting into 255-octet
@@ -390,7 +398,7 @@ pub enum ProviderId {
 }
 
 impl ProviderId {
-    /// Every identifier, in the order of the table in PROVIDERS.md. Complete in every build.
+    /// Every identifier, in alphabetical order of the persisted strings. Complete in every build.
     pub const ALL: &'static [ProviderId];
     /// The persisted string. Never changes for an existing variant.
     pub const fn as_str(self) -> &'static str;
@@ -458,6 +466,10 @@ pub struct ProviderMeta {
     pub fields: &'static [ConfigField],
     pub capabilities: Capabilities,
 }
+impl ProviderMeta {
+    /// The field with this key, if any.
+    pub fn field(&self, key: &str) -> Option<&'static ConfigField>;
+}
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -506,20 +518,30 @@ pub struct Capabilities {
     pub txt_values: ValueGuarantee,
     pub preconditions: Preconditions,
     /// Replacing an rrset is one request at the provider. False where the API works with
-    /// individual records and a replacement is several requests.
+    /// individual records (or individual values) and a replacement is several requests, and
+    /// where the API cannot replace a set at all. For a provider without record-level operations
+    /// in this crate, the flag says what a set replacement is at the provider's API.
     pub atomic_rrset_write: bool,
         pub ttl: TtlSupport,
     /// The provider can choose a TTL itself: an rrset or a record can have no explicit TTL at the
     /// provider (an "automatic" TTL, or a zone default that applies while none is stored). Such
-    /// an rrset reads as `ttl() == None`. True for every `TtlSupport::NotSettable` provider.
+    /// an rrset reads as `ttl() == None`, and a write without a TTL leaves the provider's choice
+    /// in place. True for every `TtlSupport::NotSettable` provider. Where it is false, a write of
+    /// `ttl() == None` keeps the TTL as read and a new rrset gets the client's `ttl` setting
+    /// (section 3.6). Whether the `ttl` setting can itself spell "let the provider choose" is per
+    /// provider (Cloudflare: 1; Timeweb Cloud: unset).
     pub provider_default_ttl: bool,
     /// Writes complete through a provider-side operation that the client polls.
     pub asynchronous: bool,
 }
 
 impl Capabilities {
+    /// The operation is offered; `Operation::Check` always is.
     pub fn supports(&self, operation: Operation) -> bool;
+    /// In `record_types` and not a query or meta type (section 2.2). `AnyWithCode` excludes the
+    /// pseudo-types, which have no code.
     pub fn can_read(&self, rtype: RecordType) -> bool;
+    /// `can_read` and not in `read_only_types`.
     pub fn can_write(&self, rtype: RecordType) -> bool;
 }
 
@@ -554,6 +576,10 @@ pub enum TtlSupport {
     /// The provider chooses the TTL; a requested TTL is refused.
     NotSettable,
 }
+impl TtlSupport {
+    /// `secs` is within the bounds; always false for `NotSettable`.
+    pub fn accepts(&self, secs: u32) -> bool;
+}
 
 /// How far "a TXT value operation never overwrites or deletes a foreign value" holds when
 /// someone outside this process writes to the same rrset at the same time (section 3.5).
@@ -579,12 +605,16 @@ pub enum ValueGuarantee {
 pub enum Operation {
     Check, ListZones, ListRrsets, GetRrset, SetRrset, DeleteRrset, AddTxtValue, RemoveTxtValue,
 }
-impl std::fmt::Display for Operation {}  // "check", "list_zones", ...
+impl Operation {
+    /// Stable snake_case identifier: "check", "list_zones", ...
+    pub const fn as_str(self) -> &'static str;
+}
+impl std::fmt::Display for Operation {}  // as_str()
 ```
 
 Capabilities are per provider, not per client instance, and describe this version of the crate: a
-provider whose record-level client is not written yet has `list_rrsets == false` and so on. They are
-the same whether or not the provider's feature is enabled.
+provider without record-level operations in this crate (acme-dns, Beget) has `list_rrsets == false`
+and so on. They are the same whether or not the provider's feature is enabled.
 
 An unsupported operation is reported in exactly one way:
 `Err(Error::Unsupported { provider, operation })`, or
@@ -664,7 +694,8 @@ pub trait Provider: Send + Sync {
 `check` is the only method without a default body. Every other method has a default that returns
 `Error::Unsupported` for its operation, so a client implements exactly what its capabilities
 announce. The trait is declared with `-> impl Future<Output = …> + Send` so the futures are `Send`
-by contract; implementations write `async fn`. There is no `async-trait` and no `dyn Provider`.
+by contract; implementations write `async fn`. There is no `async-trait` and no `dyn Provider`. The
+checks every operation makes before any request, and their order, are in section 3.1.
 
 The trait is not sealed: an application can implement it for a test double. Everything an
 implementation has to return can be built outside the crate: the report types below have `new`
@@ -781,6 +812,7 @@ pub enum SkipReason {
 impl CheckReport { pub fn new(credentials_verified: bool, zones: Vec<ZoneCheck>) -> CheckReport; }
 impl ZoneCheck { pub fn new(zone: DomainName, found: bool, detail: Option<Detail>) -> ZoneCheck; }
 impl ZoneInfo { pub fn new(name: DomainName) -> ZoneInfo; }
+/// Sorts `rrsets` by name, then type.
 impl ZoneListing { pub fn new(rrsets: Vec<RrSet>, skipped: Vec<SkippedRrset>) -> ZoneListing; }
 impl SkippedRrset {
     pub fn new(name: DomainName, type_name: &str, reason: SkipReason) -> SkippedRrset;
@@ -827,8 +859,9 @@ with a `#[cfg]` on each arm.
 ```rust
 /// State shared by all clients of one process: the HTTP client, the per-name locks and the
 /// process-local memory of the providers that need one. Cheap to clone.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Context { /* private Arc */ }
+impl std::fmt::Debug for Context {}  // the options and the locks, nothing else
 
 impl Context {
     pub fn new(options: ContextOptions) -> Result<Context, Error>;
@@ -852,15 +885,21 @@ pub struct ContextOptions {
 impl Default for ContextOptions {}
 ```
 
+`Context::new` checks the options and fails with `Error::Config` for an empty or longer user agent
+suffix or one outside printable ASCII, a zero timeout, and, when an HTTP provider is compiled in, an
+extra root certificate that is not a usable DER trust anchor. It makes no connection and needs no
+`tokio` runtime.
+
 The application creates one `Context` per process and builds every client from it. Per-name
 serialization (hard rule 2) holds between clients that share a `Context` and not between clients
 built from different ones (section 3.3).
 
-Each provider module has the same three public types. Shown for one provider with a static token and
-one with required settings:
+Each provider module has the same three public types (Yandex Cloud adds `AuthorizedKey`, the typed
+form of its key file). Shown for one provider with a static token and one with required settings:
 
 ```rust
-// zonewright::providers::cloudflare — compiled with feature "cloudflare"
+// zonewright::providers::cloudflare — the module exists in every build (its metadata);
+// these types are compiled with feature "cloudflare"
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -912,11 +951,14 @@ Rules that hold for every provider module:
   object are a compatibility surface once released, because applications persist them: a key is
   never renamed or given a different meaning. The keys of the earlier TXT-only implementation are
   kept where a provider had one (section 11.3 lists the differences).
-- `…Credentials` holds every field in a `secrecy` wrapper, including values that are identifiers
-  rather than secrets but arrive in the secret object. It implements `Deserialize` and nothing that
-  can print or serialize its contents; unknown keys are ignored. A credentials object that does not
-  deserialize yields `Error::Config` with a fixed text naming the expected keys, never the
-  deserializer's message, which can quote input.
+- `…Credentials` holds every field in a `secrecy` wrapper (optional secrets as
+  `Option<SecretString>`, Yandex Cloud's key as `AuthorizedKey`, a struct of wrapped fields),
+  including values that are identifiers rather than secrets but arrive in the secret object. A
+  credentials type with optional secrets has a second constructor that takes them
+  (`RegruCredentials::with_client_certificate`, `Route53Credentials::with_session_token`). It
+  implements `Deserialize` and nothing that can print or serialize its contents; unknown keys are
+  ignored. A credentials object that does not deserialize yields `Error::Config` with a fixed text
+  naming the expected keys, never the deserializer's message, which can quote input.
 - No configuration error quotes a value. A settings object that does not deserialize yields
   `Error::Config` whose text is fixed apart from the line and column of the problem and, for a
   missing required key, that key's name (a constant of the crate). An unknown key is reported by
@@ -927,7 +969,10 @@ Rules that hold for every provider module:
 - Defaults are declared per field (`#[serde(default = "…")]`). A config in which every field has a
   default may use the container-level `#[serde(default)]` with a hand-written `Default`, as
   `CloudflareConfig` does. A config with required fields has no `Default` impl and no
-  container-level default, so a missing required key is an error, not an empty string.
+  container-level default, so a missing required key is an error, not an empty string. Yandex
+  Cloud's requirement is one of two keys (`folder_id` or `zone_ids`): its config has per-field
+  defaults, a `Default` impl and a `new(folder_id)`, and the client's `new` checks that one of the
+  two is set.
 - `new` validates everything that can be validated without the network: URL policy (section 5.1),
   ranges, identifier formats, key material. It makes no request.
 - A client type implements `Debug` by hand, printing non-secret settings only. It does not implement
@@ -1054,12 +1099,15 @@ impl ErrorKind {
     /// Stable snake_case identifier: "config", "not_compiled", ..., "protocol".
     pub const fn as_str(self) -> &'static str;
 }
+impl std::fmt::Display for ErrorKind {}  // as_str()
 
 /// Bounded text taken from a provider's answer or composed by the client.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Detail(/* private */);
 impl Detail {
-    /// Replaces control characters by spaces and truncates to 512 bytes. It does not know any
+    /// Replaces control characters, line and paragraph separators and bidirectional formatting
+    /// characters by spaces and truncates to at most 512 bytes on a character boundary. It does
+    /// not know any
     /// secret: whoever calls it is responsible for the text containing none.
     pub fn new(text: &str) -> Detail;
     pub fn as_str(&self) -> &str;
@@ -1073,11 +1121,12 @@ Properties:
 - `Error` is `Clone + Send + Sync + 'static`. It has no `source()`: the errors of the HTTP stack are
   not exposed, and their text can contain a URL with a query string.
 - `Detail` is at most 512 bytes and contains no control characters, whoever built it.
-- Inside the crate a `Detail` comes from exactly two places: a constant text, or
-  `Scrubber::detail(&str)`, which applies the redaction of section 5.5 before the bounding. Provider
-  clients do not call `Detail::new` or the public `Error` constructors that take text; a source scan
-  in the conformance tests fails if a file under `src/providers/` does. This is the mechanism behind
-  hard rule 1 for errors; the tests of section 12.2 check its result.
+- Inside the crate a `Detail` comes from three places: a constant text; text composed only of
+  constants, static key names and numbers (`Error::settings_syntax`, the transport's configuration
+  errors); or `Scrubber::detail(&str)`, which applies the redaction of section 5.5 before the
+  bounding. Provider clients do not call `Detail::new` or the public `Error` constructors that take
+  text; a source scan in the conformance tests fails if a file under `src/providers/` does. This is
+  the mechanism behind hard rule 1 for errors; the tests of section 12.2 check its result.
 - `Detail::new` and the `Error` constructors are public so that the trait can be implemented outside
   the crate (a test double has to return errors). They bound and clean the text and nothing more.
   There is no scrubber behind them, so keeping secrets out of that text is the caller's duty.
@@ -1204,25 +1253,36 @@ of `rrset`. How it is carried out depends on the provider's native unit:
   can end in `PreconditionFailed`; if the second write is refused as well, the result is
   `Error::Conflict`.
 - Rrset APIs with an unconditional whole-set write (`Preconditions::ReadThenWrite`: Selectel v2,
-  Cloud.ru, Beget): one request carries the full new set, and the comparison in step 2 and the write
-  in step 4 are separate requests. A change made by another process between them is overwritten and
-  not detected. To keep that window at one round trip, the transport does not repeat such a write on
-  its own (section 5.3): a failed write is the operation's error, and the caller's repeat starts
-  with a fresh read.
-- Per-record APIs (`atomic_rrset_write == false`): the client computes the difference between the
-  records read and the records wanted, creates the missing ones and deletes the extra ones by their
-  identifiers. Records present in both are not touched. All requests are computed from the one read
-  and handed to the client as a whole before the first is sent, so a request the client knows the
-  API refuses ends the operation with nothing written. They are sent in a fixed order: records in
-  the order of the read, new values in the order of the requested set. For types that allow only one
-  record (CNAME, SOA, DNAME, ALIAS, ANAME), two published records never exist, not even for one
-  request: surplus records are deleted first, and the last of them is updated in place to the new
-  value if the API can; otherwise the new value is created after the deletes. For all other types
-  the order is: enabling of disabled records with a requested value, TTL changes, creates, deletes;
-  so the name never loses all its values. A TTL change is applied to every record. The sequence is
-  not atomic: if it fails part-way the rrset holds a mixture, the error is returned, and repeating
-  the call completes the change because step 1 reads the mixture and step 4 computes the remaining
-  difference.
+  Cloud.ru, Hetzner): one request carries the full new set (at Hetzner, a TTL change of an existing
+  rrset is a second request, the `change_ttl` action, so its `atomic_rrset_write` is false), and the
+  comparison in step 2 and the write in step 4 are separate requests. A change made by another
+  process between them is overwritten and not detected. To keep that window at one round trip, the
+  transport does not repeat such a write on its own (section 5.3): a failed write is the operation's
+  error, and the caller's repeat starts with a fresh read.
+- Per-record APIs (Cloudflare, DigitalOcean, nic.ru, reg.ru, Timeweb Cloud, VK Cloud, Yandex 360):
+  the client computes the difference between the records read and the records wanted, creates the
+  missing ones and deletes the extra ones by their identifiers. Records present in both are not
+  touched. All requests are computed from the one read and handed to the client as a whole (the
+  `check_plan` hook) before the first is sent, so a request the client knows the API refuses ends
+  the operation with nothing written. They are sent in a fixed order: records in the order of the
+  read, new values in the order of the requested set. For types that allow only one record (CNAME,
+  SOA, DNAME, ALIAS, ANAME), two published records never exist, not even for one request: surplus
+  records are deleted first, and the last of them is updated in place to the new value if the API
+  can; otherwise the new value is created after the deletes. For all other types the order is:
+  enabling of disabled records with a requested value, TTL changes, creates, deletes; so the name
+  never loses all its values. A TTL change is applied to every record. The sequence is not atomic:
+  if it fails part-way the rrset holds a mixture, the error is returned, and repeating the call
+  completes the change because step 1 reads the mixture and step 4 computes the remaining
+  difference. A name that holds several published records of a singleton type (which `get_rrset`
+  answers with `Error::Protocol`, since the model cannot hold it) is repaired by `set_rrset` and
+  `delete_rrset` instead of refused: the rrset counts as present and equal to no set, the surplus
+  records are deleted first, and a record that already holds the requested value is the one kept.
+- At a name where the client's read shows a CNAME (hook `holds_cname`) or other data (hook
+  `holds_other_data`), a `set_rrset` of other data, or of a CNAME, is `Error::InvalidInput` after
+  the read and before any write. Where the read does not tell, the write is sent and a refusal by
+  the provider is mapped as any other. A whole-set client can also ask for a second read immediately
+  before each write (hook `reread_before_write`, used by Cloud.ru); a change since the first read is
+  then `Error::Conflict` with nothing written.
 
 Attributes of existing records that the model does not carry (a per-record disabled flag, a comment,
 a description) are preserved by a write wherever the API returns them. A requested value that exists
@@ -1327,10 +1387,12 @@ Rules common to all of them:
   flag is false. The application decides that a missing removal is acceptable there (the server
   keeps the two most recent values); the crate does not report a success it did not perform.
 
-The value operations are implemented once, generically, over a private trait with the three native
-shapes (per-record, value-level calls, whole-set replace); a client supplies the reads and writes of
-its API. The outcome computation and the foreign-value rules are therefore the same code for every
-provider and are tested once against an in-memory backend in addition to the per-provider tests.
+The value operations are implemented once, generically (`values.rs`), over three private traits on a
+common base trait `TxtBase`, one per native shape: `PerRecord` (which RFC 2136 also uses),
+`ValueCalls` and `WholeSet`; a client supplies the reads and writes of its API. acme-dns, which has
+no read, is outside this layer. The outcome computation and the foreign-value rules are therefore
+the same code for every provider and are tested once against an in-memory backend in addition to the
+per-provider tests.
 
 ### 3.6 TTL policy
 
@@ -1750,10 +1812,11 @@ a whole rrset, which can hold values another writer added after the read: it is 
 - A response body is read up to 4 MiB; a larger one is `Error::Protocol` whose detail names the
   limit. The cap applies to error bodies too.
 - Listings read at most 1000 pages; reaching the page limit is `Error::Protocol` whose detail names
-  it. Page sizes are those of the earlier implementations, which are the documented maxima where a
-  source states one: 1000 rrsets (Selectel v2), 1000 record sets (Yandex Cloud), 100 records
-  (Cloudflare, Cloud.ru, Timeweb Cloud), 200 (DigitalOcean), 50 (Hetzner zones, Yandex 360). With
-  1000 pages the smallest of these still covers 50 000 entries. A client whose provider returns a
+  it. Page sizes are the documented maxima where a source states one, otherwise the documented
+  default: 1000 rrsets (Selectel v2), 1000 record sets (Yandex Cloud), 100 records (Cloudflare
+  records, Cloud.ru, Timeweb Cloud), 200 (DigitalOcean), 300 rrsets and 100 zones (Route 53), 50
+  (Hetzner zones and rrsets, Cloudflare zones, Yandex 360 records), 10 (Yandex 360 domains). With
+  1000 pages the smallest of these still covers 10 000 entries. A client whose provider returns a
   whole zone in one response (VK Cloud's TXT list, reg.ru, nic.ru) is bounded by the 4 MiB cap
   alone, and its rustdoc says so. Raising either constant is not a breaking change. A zone beyond
   them fails to list with an error that says why; it is never returned in part.
@@ -1821,7 +1884,9 @@ Never written to `tracing`, at any level: request or response bodies, any header
 
 `WARN` events exist for conditions an operator should see and carry no request data: no system CA
 certificates; acme-dns about to evict an older value; an inspector name server skipped by the
-address policy.
+address policy; a zone listing that holds rrsets the record model cannot represent (target
+`zonewright::rrsets`, fields `provider` and `skipped`); a token whose stated lifetime is implausibly
+short (field `lifetime_s`, section 5.7).
 
 A test installs a subscriber at `TRACE`, drives a client through success, 401 and 500 paths with
 canary credentials, and asserts that the log is not empty and contains none of the canaries (section
@@ -1833,30 +1898,33 @@ canary credentials, and asserts that the log is not empty and contains none of t
   grant, access-key exchange). The fetch returns the token and its lifetime. The token is renewed
   ahead of time: at the expiry minus `max(10 min, 5 % of the lifetime)`, but at most half the
   lifetime, optionally capped by a maximum age (50 min for Yandex Cloud); a token without a stated
-  expiry is assumed to live 1 h. A short-lived token is therefore still cached for half its life; a
-  lifetime under two minutes (a system clock that runs ahead makes a stated expiry look close) is
-  logged as one `WARN` event per token, with the lifetime and nothing else. Expiry timestamps are
-  parsed with the private `jiff` dependency and turned into `tokio::time::Instant` deadlines
-  immediately. Single flight: the fetch runs inside the first caller's future while it holds the
-  source's async lock, and the others wait for the lock. If that future is dropped mid-fetch, the
-  lock is released with nothing stored and the next waiter fetches; there is no detached task and no
-  state that a cancelled fetch can leave half-written. Every token has a generation number, and a
-  401 invalidates only the generation the failed request used, so a late 401 for an old token does
-  not discard a fresh one. What happens to the request after a 401 is the retry rule of section 5.3.
-  A provider that rejects a token in an answer the transport passes on (nic.ru's error 4097 in a
-  `200` body) discards exactly the token that answer was sent with (`TokenSource::discard_rejected`:
-  every response to a request with a cached token records the token's generation). A connection
-  check forces a new exchange with `TokenSource::renew`, which discards the cached token and fetches
-  under the source's lock, so a cached token never stands in for credentials that are no longer
-  accepted.
+  expiry is assumed to live 1 h, and a stated lifetime longer than 30 days is taken as 30 days. A
+  short-lived token is therefore still cached for half its life; a lifetime under two minutes (a
+  system clock that runs ahead makes a stated expiry look close) is logged as one `WARN` event per
+  token, with the lifetime and nothing else. Expiry timestamps are parsed with the private `jiff`
+  dependency and turned into a lifetime at once; the `tokio::time::Instant` deadline is computed
+  when the token is stored. Single flight: the fetch runs inside the first caller's future while it
+  holds the source's async lock, and the others wait for the lock. If that future is dropped
+  mid-fetch, the lock is released with nothing stored and the next waiter fetches; there is no
+  detached task and no state that a canceled fetch can leave half-written. Every token has a
+  generation number, and a 401 invalidates only the generation the failed request used, so a late
+  401 for an old token does not discard a fresh one. What happens to the request after a 401 is the
+  retry rule of section 5.3. A provider that rejects a token in an answer the transport passes on
+  (nic.ru's error 4097 in a `200` body) discards exactly the token that answer was sent with
+  (`TokenSource::discard_rejected`: every response to a request with a cached token records the
+  token's generation). A connection check forces a new exchange with `TokenSource::renew`, which
+  discards the cached token and fetches under the source's lock, so a cached token never stands in
+  for credentials that are no longer accepted.
 - `Keystone`: the OpenStack Identity v3 password exchange with project scope, shared by Selectel v2
   and VK Cloud. The request body, which carries the password, is built once into a zeroizing buffer;
   `400` and `401` are `Error::Auth`.
 - `RateGate`: at most one request per configured interval per client, for providers with
   undocumented limits (reg.ru 1000 ms, Beget 1000 ms, nic.ru 500 ms; `min_request_interval_ms`).
 - `Poller`: the bounded polling of section 3.7.
-- `Pager`: page loops for the cursor styles in use (page number with total pages, next-page number,
-  offset with total, offset with next offset, page token), each with a hard page limit.
+- `pager::collect`: one page loop over a cursor the client defines (page number, offset, token),
+  with the hard limit `MAX_PAGES` = 1000 and `Error::Protocol` for a cursor that does not advance;
+  the helpers `next_page_of_total` and `next_token` compute the common cursors. Route 53, whose
+  cursor is a next name and type, runs its own loop on the same limit.
 - `ZoneCache`: section 3.8. Only the read phase is repeated after a stale identifier: the cache runs
   the client's read and returns the identifier it ended with, and the client performs its write
   afterwards, outside the cache, so a write never runs twice. A write answered "not found" evicts
@@ -1880,9 +1948,15 @@ pub(crate) fn hmac_sha512(key: &[u8], data: &[u8]) -> [u8; 64];
 /// Constant time in the contents; false for a tag of the wrong length.
 pub(crate) fn hmac_sha256_verify(key: &[u8], data: &[u8], tag: &[u8]) -> bool;
 pub(crate) fn hmac_sha512_verify(key: &[u8], data: &[u8], tag: &[u8]) -> bool;
-/// Constant time in the contents; the lengths are not hidden.
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool;
+/// Into a caller's buffer, so that SigV4's derived keys stay in zeroizing memory.
+pub(crate) fn hmac_sha256_into(key: &[u8], data: &[u8], out: &mut [u8; 32]);
 pub(crate) fn hex_lower(data: &[u8]) -> String;
+pub(crate) fn push_hex_byte(out: &mut String, byte: u8, uppercase: bool);
+
+/// Why a key could not be used or a signature could not be made. Fixed texts; no variant
+/// carries input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum KeyError { Pem, UnsupportedKey, Sign, Date, Request }
 
 /// An RSA private key for RSASSA-PSS with SHA-256 (JWS "PS256"). Parsed once.
 pub(crate) struct Ps256Key(/* aws_lc_rs::signature::RsaKeyPair */);
@@ -1922,7 +1996,8 @@ pub(crate) fn authorization(
 
 Notes:
 
-- Backend calls: `aws_lc_rs::digest`, `aws_lc_rs::hmac`, `aws_lc_rs::constant_time`,
+- Backend calls: `aws_lc_rs::digest`, `aws_lc_rs::hmac` (tag verification through
+  `aws_lc_rs::hmac::verify`, which is constant time),
   `aws_lc_rs::signature::{RsaKeyPair, RSA_PSS_SHA256}`, `aws_lc_rs::rand::SystemRandom`. PEM is read
   with `rustls-pki-types` (`PrivateKeyDer::from_pem_slice`), which distinguishes the two labels and
   skips text outside the section; a PKCS#8 body goes to `RsaKeyPair::from_pkcs8`, a PKCS#1 body to
@@ -1940,12 +2015,14 @@ Test vectors, all taken from their published sources and cited in the test code:
 
 - HMAC-SHA-256 and HMAC-SHA-512: RFC 4231 test cases 1, 2, 3, 4, 6 and 7, plus negative verification
   (flipped bit, wrong key, truncated tag, changed message).
-- SHA-256: the NIST example digests of the empty message and of `"abc"`.
+- SHA-256: the NIST example digest of `"abc"`, and the digest of the empty message as the payload
+  hash of the AWS SigV4 suite's `get-vanilla` case.
 - SigV4: from the AWS Signature Version 4 test suite, `get-vanilla` (canonical request, string to
   sign and authorization) and `get-vanilla-query-order-key-case`, which the earlier implementation
-  already carries, plus one POST case with a body and one session-token case from the same suite,
-  copied from the suite's files and named after them in the test code; plus checks that the secret
-  and the token do not occur in the output.
+  already carries, plus `post-x-www-form-urlencoded`, `get-vanilla-with-session-token`,
+  `post-sts-header-before` and `get-header-value-trim` from the same suite, copied from the suite's
+  files and named after them in the test code; plus checks that the secret and the token do not
+  occur in the output.
 - PS256: signatures are randomized, so the test is a round trip: generate a 2048-bit key in the
   test, sign, verify with `RSA_PSS_2048_8192_SHA256`, which requires the salt length to equal the
   digest length; plus rejection of an EC key, of garbage and of a truncated PEM, each without
@@ -1979,7 +2056,10 @@ pub trait CnameLookup {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{detail}")]
 pub struct LookupError { /* private */ }
-impl LookupError { pub fn new(detail: impl Into<String>) -> LookupError; }
+impl LookupError {
+    pub fn new(detail: impl Into<String>) -> LookupError;
+    pub fn detail(&self) -> &str;
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2029,7 +2109,7 @@ fails only when the result would be too long.
 `follow_cname` asks `lookup` for `start`, then for each target in turn. A target equal to any name
 already seen, including `start`, is `Loop`. A chain of exactly `max_links` links is accepted; one
 more is `TooLong`. A lookup error stops with `Lookup`, the only retryable case; its detail is
-truncated to 512 bytes and stripped of control characters.
+bounded as a `Detail` is (section 2.9): cut to 512 bytes, control characters replaced by spaces.
 
 ### 7.3 Zone selection
 
@@ -2040,7 +2120,7 @@ asking a provider; the application supplies the zones it knows.
 
 ### 7.4 What is deliberately not here
 
-- CAA tree climbing (RFC 8659 section 3) and any judgement on whether a CA may issue. That decides
+- CAA tree climbing (RFC 8659 section 3) and any judgment of whether a CA may issue. That decides
   what a zone should contain. The typed `Caa` record and the inspector's generic queries are what an
   application needs to build it.
 - "The CNAME target must not be a zone apex" and similar rules about where challenges may be
@@ -2089,7 +2169,7 @@ pub struct Inspector { /* private */ }
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct InspectorConfig {
-    /// Recursive resolvers, tried in order. Default: PUBLIC_RESOLVERS.
+    /// Recursive resolvers, tried in order. Default: PUBLIC_RESOLVERS. At most 16, each once.
     pub resolvers: Vec<std::net::SocketAddr>,
     pub discovery: NsDiscovery,
     /// Address families of discovered name servers to query. Default: V4.
@@ -2100,9 +2180,9 @@ pub struct InspectorConfig {
     pub ns_cache_ttl: std::time::Duration,
     /// Upper bound on the name servers (addresses) of one zone. Default 32.
     pub max_servers: usize,
-        /// Limit for the whole discovery of one zone's servers. Default 10 s.
+    /// Limit for the whole discovery of one zone's servers. Default 10 s.
     pub discovery_timeout: std::time::Duration,
-    /// Accept discovered name-server addresses in private ranges. Default false.
+    /// Accept discovered name-server addresses in private ranges (section 8.3). Default false.
     pub allow_private_addresses: bool,
 }
 impl Default for InspectorConfig {}
@@ -2126,7 +2206,7 @@ pub enum IpFamilies { V4, V6, Both }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct NameServer {
-        /// The NS name, when known.
+    /// The NS name, when known.
     pub name: Option<TargetName>,
     pub addr: std::net::SocketAddr,
 }
@@ -2144,7 +2224,7 @@ pub enum Answer {
     /// The name exists, there is no rrset of this type.
     NoData,
     NxDomain,
-        /// The name is a CNAME; the server did not answer the question itself.
+    /// The name is a CNAME; the server did not answer the question itself.
     Cname(TargetName),
     Refused,
     ServFail,
@@ -2174,12 +2254,16 @@ pub struct Expectation { pub question: Question, pub condition: Condition }
 pub struct WaitOptions {
     /// Total time to wait. At least one round always runs.
     pub timeout: std::time::Duration,
-    /// Pause between rounds. Default 5 s.
+    /// Pause between rounds. Default 5 s; at least MIN_INTERVAL.
     pub interval: std::time::Duration,
     /// The pause varies by up to this percentage either way. Default 20; at most 50.
     pub jitter_percent: u8,
 }
-impl WaitOptions { pub fn new(timeout: std::time::Duration) -> WaitOptions; }
+impl WaitOptions {
+    /// 1 s.
+    pub const MIN_INTERVAL: std::time::Duration;
+    pub fn new(timeout: std::time::Duration) -> WaitOptions;
+}
 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -2208,8 +2292,12 @@ pub enum InspectorError {
     Config { detail: String },
     #[error("invalid request: {detail}")]
     InvalidInput { detail: String },
+    /// The complete server list could not be established; transient, nothing cached.
     #[error("no usable name servers for zone {zone}: {detail}")]
     NoNameServers { zone: DomainName, detail: String },
+    /// An NS name has no address that can be asked (none in the families, or all refused).
+    #[error("name server {name} of zone {zone} has no usable address: {detail}")]
+    NameServerWithoutAddress { zone: DomainName, name: TargetName, detail: String },
     #[error("zone {zone} has {count} name server addresses, more than the configured limit")]
     TooManyNameServers { zone: DomainName, count: usize },
     #[error("expectations not met within the timeout")]
@@ -2261,24 +2349,49 @@ most 512 bytes without control characters.
    name given must be the zone.
 2. If the set has more than 16 distinct NS names: `TooManyNameServers`, before any address lookup.
 3. For each NS name, ask for `A` and/or `AAAA` according to `ip_families`, taking the answers of the
-   first resolver that answers. At most 8 of these lookups run at a time. At most 8 addresses per
-   name and family are used; more is `TooManyNameServers`.
-4. Drop addresses that are unspecified, loopback, link-local, multicast or broadcast, including the
-   IPv4-mapped forms of these, and, unless `allow_private_addresses` is set, private (RFC 1918),
-   unique-local (RFC 4193) and shared (RFC 6598) addresses. Each dropped address and each NS name
-   left without an address is logged at `WARN`. The default is to drop private addresses: the
-   answers of a discovered server end up in reports, and a zone's NS records should not be able to
-   point this process at hosts inside its own network. A deployment whose authoritative servers are
+   first resolver that answers; a negative answer (NODATA, NXDOMAIN) is an answer. At most 8 of
+   these lookups run at a time. At most 8 addresses per name and family are used; more is
+   `TooManyNameServers`. When no resolver answers for a name and family, the addresses of that name
+   are not established: `NoNameServers`, naming the NS name. An NS value or an address that cannot
+   be read makes that resolver's NS answer unusable (step 1) or fails the discovery with
+   `NoNameServers` (step 3); nothing is skipped.
+4. Apply the address policy. It follows the IANA special-purpose address registries for IPv4 and
+   IPv6 and the IPv6 address space registry:
+   - Always refused: unspecified (`0.0.0.0/8`, `::`), loopback, link-local, multicast, `240.0.0.0/4`
+     with the limited broadcast address, `192.0.0.0/24` (IETF protocol assignments, its two anycast
+     entries included), `192.88.99.0/24` (deprecated 6to4 relay anycast), `198.18.0.0/15`
+     (benchmarking), every IPv6 address outside the global unicast space `2000::/3` other than the
+     embedding forms below (this covers `100::/64`, `100:0:0:1::/64`, `64:ff9b:1::/48`,
+     `5f00::/16`), and the parts of `2001::/23` the registry does not mark globally reachable
+     (`2001:2::/48`, `2001:10::/28` and the unassigned rest).
+   - Refused unless `allow_private_addresses` is set: private use (RFC 1918), shared (RFC 6598),
+     unique-local (RFC 4193) and the deprecated site-local `fec0::/10`.
+   - IPv6 forms that embed an IPv4 address get the IPv4 rules for that address: IPv4-mapped
+     `::ffff:0:0/96`, IPv4-compatible `::/96`, the NAT64 well-known prefix `64:ff9b::/96`, 6to4
+     `2002::/16`, and Teredo `2001::/32` (the server address and the de-obfuscated client address).
+   - Accepted: the documentation blocks (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`,
+     `2001:db8::/32`, `3fff::/20`). They are routed nowhere, so a query to them times out and
+     satisfies nothing, and they cannot point the process at a host of its own network.
+
+   Each refused address is logged at `WARN`. The default is to refuse private addresses: the answers
+   of a discovered server end up in reports, and a zone's NS records should not be able to point
+   this process at hosts inside its own network. A deployment whose authoritative servers are
    internal sets the option or uses a static list (open point 16).
-5. Each remaining address becomes a `NameServer` on port 53. None left: `NoNameServers`. More than
-   `max_servers`: `TooManyNameServers`. The list is never truncated, because success means "every
-   server", and a silently shortened list would turn that into "some servers".
+
+5. Each remaining address becomes a `NameServer` on port 53. An NS name left without an address,
+   because the resolvers answered that it has none in the configured families or because the policy
+   refused every address it has, fails the discovery with `NameServerWithoutAddress`, which names
+   it: that server could not be asked, and leaving it out would let a wait succeed without it.
+   Another `ip_families` choice, the option or a static list resolves it. More than `max_servers`:
+   `TooManyNameServers`. The list is never truncated, because success means "every server", and a
+   silently shortened list would turn that into "some servers".
 6. Steps 1 to 5 together are bounded by `discovery_timeout`; when it passes, the result is
    `NoNameServers` with a detail that says so. With the defaults that is at most 3 + 16 × 2 × 3
    questions, each bounded by `query_timeout` as well.
 7. The result is cached per zone for `ns_cache_ttl`, at most 256 zones (the oldest entry is
-   evicted). Failures are not cached. Concurrent discoveries of one zone are not merged; each is
-   bounded on its own.
+   evicted). Only a complete list is cached; failures, and whatever a failed discovery found before
+   it failed, are not. Concurrent discoveries of one zone are not merged; each is bounded on its
+   own.
 
 `NsDiscovery::Static` uses the given list as is, without the address filter and without the cache:
 the application chose those addresses. It serves hidden primaries, split-horizon setups and tests.
@@ -2286,8 +2399,10 @@ More entries than `max_servers` is `InspectorError::Config`.
 
 ### 8.4 Queries
 
-- UDP first, with EDNS and a 1232-octet payload size. A truncated answer is repeated over TCP. A
-  `FORMERR` answer to a query with EDNS is repeated once without EDNS.
+- UDP first, with EDNS and a 1232-octet payload size. A truncated answer is repeated over TCP, also
+  when the truncated UDP message cannot be decoded (a datagram with the query's ID and the QR and TC
+  flags). A TCP answer with the TC flag is a failed query: it is incomplete and there is no larger
+  transport. A `FORMERR` answer to a query with EDNS is repeated once without EDNS.
 - Every question uses a new UDP socket, bound to the wildcard address with a port chosen by the
   operating system and connected to the server, and closed when the question is answered or times
   out. Sockets are not pooled or reused, so neither a source port nor an ID is shared between
@@ -2300,9 +2415,10 @@ More entries than `max_servers` is `InspectorError::Config`.
 - `query_timeout` bounds the whole question to one server, all of the above included.
 - To a name server: recursion not desired. The answer is classified as follows. Response code
   REFUSED or SERVFAIL: the variant of that name. Any other code than NOERROR and NXDOMAIN: `Failed`.
-  AA not set: `NotAuthoritative`. NXDOMAIN: `NxDomain`. Records of the asked type owned by the asked
-  name: `Records`. No such records but a CNAME owned by the asked name (and the question was not for
-  CNAME): `Cname`. Otherwise `NoData`.
+  AA not set: `NotAuthoritative`. Records of the asked type owned by the asked name: `Records`, or
+  `Failed` when the response code is NXDOMAIN (a contradiction that must not read as absence).
+  NXDOMAIN: `NxDomain`. No such records but a CNAME owned by the asked name (and the question was
+  not for CNAME): `Cname`. Otherwise `NoData`.
 - To a resolver: recursion desired; AA is not required. A CNAME chain inside the answer is followed
   within the answer (at most 8 links, loops rejected) to the records of the asked type.
 - The inspector does not validate DNSSEC and does not use DoT or DoH.
@@ -2338,30 +2454,33 @@ value is `InvalidInput`. `Present` and `Absent` need at least one value.
 
 `wait`:
 
-1. Validate: 1 to 32 expectations, every name within the zone. Discover the servers.
-2. A round asks every server every question concurrently (each question bounded by `query_timeout`),
-   evaluates the expectations and builds the report.
+1. Validate: 1 to 32 expectations, every name within the zone, `interval` at least
+   `WaitOptions::MIN_INTERVAL` (1 s; with the largest jitter the shortest pause is 500 ms; a round
+   can ask up to 1,024 questions of servers the application does not run). Discover the servers.
+2. A round asks every server every question, at most 128 questions at a time (each bounded by
+   `query_timeout`, each holding one socket), evaluates the expectations and builds the report.
 3. If every server satisfies every expectation in this round: `Ok(report)`.
 4. If the time since the start is at least `timeout`: `Err(Timeout { report })`.
 5. Sleep `interval`, varied uniformly by ±`jitter_percent`, but not past the deadline; go to 2.
 
 Properties: at least one round runs even with a zero timeout; the last round starts no later than
-`timeout` after the start, so the call returns within `timeout + query_timeout` plus discovery;
-every round asks every server again, so a server that had the value and lost it is seen (the earlier
-implementation stopped asking a server once it was satisfied, which is acceptable only for a value
-that is about to be consumed). A wait for several zones is several calls, which the application may
-run concurrently.
+`timeout` after the start, so the call returns within `timeout` plus one round (at most
+`ceil(servers × questions / 128) × query_timeout`) plus discovery; every round asks every server
+again, so a server that had the value and lost it is seen (the earlier implementation stopped asking
+a server once it was satisfied, which is acceptable only for a value that is about to be consumed).
+A wait for several zones is several calls, which the application may run concurrently.
 
 ### 8.7 CNAME lookup by quorum
 
 `Inspector` implements `dns01::CnameLookup` over the resolvers: it asks them in order for the CNAME
 of the name and stops when two agree (or when all have answered, if fewer than two are configured).
-A negative answer is a vote for "no CNAME". A CNAME record counts only if its owner is the asked
-name. Two different votes are an error at once; timeouts and failures are not votes; running out of
-resolvers before two agree is an error that says how many answered. One resolver's cache or one
-tampered answer therefore cannot redirect a challenge on its own. A target that is not a valid
-`DomainName` cannot be an owner name the challenge could be written at; it is reported as a lookup
-error.
+A resolver address may appear only once in the configuration (`Config` error otherwise), so one
+resolver cannot make a quorum alone. A negative answer is a vote for "no CNAME". A CNAME record
+counts only if its owner is the asked name. Two different votes are an error at once; timeouts and
+failures are not votes; running out of resolvers before two agree is an error that says how many
+answered. One resolver's cache or one tampered answer therefore cannot redirect a challenge on its
+own. A target that is not a valid `DomainName` cannot be an owner name the challenge could be
+written at; it is reported as a lookup error.
 
 ### 8.8 Bounds
 
@@ -2373,7 +2492,9 @@ error.
 | Time for one discovery                      | `discovery_timeout`, default 10 s          |
 | Concurrent address lookups during discovery | 8                                          |
 | Expectations or questions per call          | 32                                         |
-| Questions per round, all sent concurrently  | servers × questions ≤ 1024                 |
+| Questions per round                         | servers × questions ≤ 1024                 |
+| Questions of a round in flight at once      | 128                                        |
+| Pause between rounds                        | `interval` ≥ 1 s, ± up to 50 % jitter      |
 | Network exchanges per question              | 3 (UDP, UDP without EDNS, TCP)             |
 | Sockets per question                        | one new UDP socket, one new TCP connection |
 | Time per question                           | `query_timeout`, default 3 s               |
@@ -2392,20 +2513,29 @@ Points this section left open, as implemented:
 - A UDP reply that cannot be decoded or exceeds the size bound is a failed query when it carries the
   query's ID and is ignored otherwise. A TCP reply that does not match the query, and a failed TCP
   retry after a truncated UDP answer, are failed queries.
-- The address filter also refuses `0.0.0.0/8` and `240.0.0.0/4`.
+- The address policy of section 8.3, step 4, is the implementation's reading of the IANA registries
+  as updated 2025-10-09.
 - The wait timeout counts from the first round of queries, after discovery; discovery has its own
   deadline.
-- Refused as invalid input: jitter above 50 percent, expected values that have no wire form for the
-  question's type, pseudo-types and meta-types, more than 1,024 questions in one round. Refused as
-  configuration errors: zero timeouts, `max_servers` of zero, more than 16 resolvers, recursive
-  discovery without resolvers, an empty static list.
+- Refused as invalid input: jitter above 50 percent, an interval below 1 s, expected values that
+  have no wire form for the question's type, pseudo-types and meta-types, more than 1,024 questions
+  in one round. Refused as configuration errors: zero timeouts, `max_servers` of zero, more than 16
+  resolvers, a resolver listed twice, recursive discovery without resolvers, an empty static list.
 - The values of an answer are deduplicated and sorted; a TTL with the high bit set is read as zero
   (RFC 2181 section 8); identical questions are asked once per round.
 
 ### 8.10 Tracing and testing
 
-Events: target `zonewright::inspector`, `DEBUG` per query with server address, record type, answer
-kind and duration; no record values and no names beyond the zone.
+Events, target `zonewright::inspector`:
+
+- `DEBUG`, one per query: server address, record type, recursion flag, answer kind and duration. No
+  question name and no record value.
+- `WARN`, one per name-server address the policy refuses: the zone, the NS name, the address and the
+  reason.
+
+NS names and their addresses are public delegation data, not secrets (hard rule 1 concerns secrets).
+No event carries a value of a record the application asks about, and none carries a question name
+other than the zone.
 
 Testing without the network:
 
@@ -2424,11 +2554,11 @@ Testing without the network:
 
 No feature is enabled by default (decision 6).
 
-| Feature                | Enables                                              | Optional dependencies it turns on                                         |
-| ---------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------- |
-| one per provider (2.4) | that provider's client and its `AnyProvider` variant | see the feature list below                                                |
-| `all-providers`        | all fifteen provider features                        | their union                                                               |
-| `inspector`            | `zonewright::inspector`                              | `hickory-proto`, `futures-util`, `fastrand`; `tokio/net`, `tokio/io-util` |
+| Feature                | Enables                                              | Optional dependencies it turns on                                                    |
+| ---------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| one per provider (2.4) | that provider's client and its `AnyProvider` variant | see the feature list below                                                           |
+| `all-providers`        | all fifteen provider features                        | their union                                                                          |
+| `inspector`            | `zonewright::inspector`                              | `hickory-proto`, `futures-util`, `fastrand`, `tracing`; `tokio/net`, `tokio/io-util` |
 
 Provider feature names are the provider IDs, underscores included: `acme_dns`, `cloud_ru`,
 `selectel_v2`, `timeweb_cloud`, `vk_cloud`, `yandex_360`, `yandex_cloud` and the eight one-word IDs.
@@ -2438,11 +2568,11 @@ file. `all-providers` and `inspector` are the only other public features.
 Three private features group optional dependencies. Their names start with two underscores, they are
 documented as internal, and they are not part of the SemVer surface:
 
-| Private feature | Dependencies                                                                                     | Used by                              |
-| --------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------ |
-| `__http`        | `reqwest`, `rustls`, `rustls-platform-verifier`, `rustls-pki-types`, `bytes`, `jiff`, `fastrand` | every provider except `rfc2136`      |
-| `__crypto`      | `aws-lc-rs`                                                                                      | `rfc2136`, `route53`, `yandex_cloud` |
-| `__xml`         | `roxmltree`                                                                                      | `route53`, `nicru`                   |
+| Private feature | Dependencies                                                                                                              | Used by                              |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| `__http`        | `reqwest`, `rustls`, `rustls-platform-verifier`, `rustls-pki-types`, `bytes`, `jiff`, `fastrand`, `serde_json`, `tracing` | every provider except `rfc2136`      |
+| `__crypto`      | `aws-lc-rs`                                                                                                               | `rfc2136`, `route53`, `yandex_cloud` |
+| `__xml`         | `roxmltree`                                                                                                               | `route53`, `nicru`                   |
 
 ```toml
 [features]
@@ -2481,19 +2611,21 @@ __xml = ["dep:roxmltree"]
 
 ### 9.2 What compiles with no features
 
-Names, the record model with normalization and the typed records, `Ttl`, errors, `ProviderId`,
-metadata and capabilities of all fifteen providers, the `Provider` trait, `AnyProvider` (with no
-variants), `Context` (locks only), and `dns01`. Dependencies of that build: `serde`, `secrecy`,
-`zeroize`, `thiserror`, `idna`, `base64`, `tokio` with `sync` and `time`; `serde_json` and `tracing`
-come with the first HTTP provider, `rfc2136` or (`tracing` only) the inspector. No TLS stack, no C
-compilation.
+Names, the record model with normalization and the typed records, `Ttl`, errors and `Detail`,
+`ProviderId`, metadata and capabilities of all fifteen providers, the `Provider` trait,
+`AnyProvider` (with no variants), `Context` (options and locks only), and `dns01`. The TXT value
+layer (`values.rs`) comes with any provider feature, the record-level layer (`rrsets.rs`) with any
+provider except `acme_dns` and `beget`, and the scrubber (`redact/scrub.rs`) with `__http`.
+Dependencies of that build: `serde`, `secrecy`, `zeroize`, `thiserror`, `idna`, `base64`, `tokio`
+with `sync` and `time`; `serde_json` and `tracing` come with the first HTTP provider, `rfc2136` or
+(`tracing` only) the inspector. No TLS stack, no C compilation.
 
 An application that only needs the inspector enables `inspector` and gets `hickory-proto` and
 UDP/TCP sockets on top of that, still without a TLS stack.
 
-Shared helpers under `__http` are not all used by every provider. In builds without `all-providers`
-the `http`, `crypto` and helper modules allow `dead_code`; the build with all features does not, so
-code no provider uses is still found.
+Shared helpers are not all used by every provider. In builds without `all-providers`, `http/`,
+`crypto/`, `values.rs`, `rrsets.rs` and `redact/scrub.rs` allow `dead_code`; the build with all
+features does not, so code no provider uses is still found.
 
 ### 9.3 Dependencies
 
@@ -2531,9 +2663,10 @@ hickory-proto = { version = "0.26.3", default-features = false, features = ["std
 futures-util = { version = "0.3.34", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
-zonewright-mock = { path = "../mock" }
 serde_json = "1.0.154"
-tokio = { version = "1.54.1", features = ["macros", "rt", "test-util", "net", "io-util"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+zonewright-mock = { path = "../mock" }
+tokio = { version = "1.54.1", features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 ```
@@ -2573,12 +2706,19 @@ The mock crate (`publish = false`) depends on `axum` 0.8.9 with `default-feature
 features `http1`, `tokio`, `json`, `query`, `form`; `tokio`; `serde`; `serde_json`; `aws-lc-rs` (its
 own verification of SigV4, TSIG and PS256, independent of the crate under test); `base64`;
 `roxmltree`; `hickory-proto` with `std` only (the DNS server for the inspector tests). It does not
-depend on `zonewright`.
+depend on `zonewright`. It does not inherit `[workspace.lints]`: its own `[lints.rust]` denies
+`unsafe_code` and warns on `missing_docs`, and the workspace clippy denials do not apply to it.
+
+`tracing` is also a dev-dependency because the secret tests' `tracing` capture
+(`tests/common/echo.rs`) builds without any feature. The crate's manifest also sets
+`[package.metadata.docs.rs] all-features = true` and `[lints] workspace = true`.
 
 `cargo deny` (`dev/deny.toml`): `ring`, `openssl`, `openssl-sys` and `native-tls` are banned;
-`[graph] all-features = true`; wildcard versions denied; licenses allowed: MIT, Apache-2.0, ISC,
-Unicode-3.0, Unlicense, BSD-3-Clause, CDLA-Permissive-2.0. `openssl-probe`, a certificate-path
-helper pulled in by the platform verifier, is not OpenSSL and is not banned.
+`[graph] all-features = true`; wildcard versions denied except for path dependencies (the mock
+crate); duplicate versions are a warning; only the crates.io registry is allowed; licenses allowed:
+MIT, Apache-2.0, ISC, Unicode-3.0, Unlicense, BSD-3-Clause, CDLA-Permissive-2.0 (confidence 0.8).
+`openssl-probe`, a certificate-path helper pulled in by the platform verifier, is not OpenSSL and is
+not banned.
 
 ### 9.4 Checks behind this section
 
@@ -2605,81 +2745,108 @@ Read in source, not run: in `reqwest` 0.13.5, ALPN and `identity` are applied on
 in `rustls-platform-verifier` 0.7.1, `Verifier::new` fails on Unix-like systems when no CA
 certificate can be loaded and no extra root was given.
 
+Checked on the final manifest: `cargo deny check bans licenses sources` passes with
+`all-features = true`, with warnings for duplicate versions only; `ring` appears in `Cargo.lock`
+only as an optional dependency of `hickory-proto` and `rustls-webpki` that no enabled feature
+activates.
+
 Not checked: the mock crate's dependency set as a whole (only that `axum` 0.8.9 has the named
-features), Windows and Android builds, and `cargo deny` with `all-features = true` on the final
-manifest.
+features), Windows and Android builds. No CI configuration is part of the repository; the gates of
+section 12.6 are run by hand.
 
 ## 10. Layout
 
 ```text
+README.md, CHANGELOG.md, PROVIDERS.md, AGENTS.md, CLAUDE.md, LICENSE-MIT, LICENSE-APACHE,
+.gitignore, .prettierrc.json, .prettierignore
+docs/
+  design.md              this document
 dev/
   Cargo.toml             virtual workspace: members "zonewright", "mock"; resolver "3";
                          [workspace.package] edition, rust-version, license, repository;
-                         [workspace.lints]
+                         [workspace.lints.rust] and [workspace.lints.clippy] (section 12.6)
   Cargo.lock             committed
-  deny.toml
-  clippy.toml            lets tests use unwrap, expect, panic and indexing
+  deny.toml              section 9.3
+  clippy.toml            lets test code use unwrap, expect, panic, indexing, dbg and print
   zonewright/
-    Cargo.toml
+    Cargo.toml           features and dependencies (section 9); [lints] workspace = true
     src/
       lib.rs             module tree, re-exports, crate docs
-      name.rs            DomainName
+      name.rs            DomainName, TargetName
       record/            mod.rs, rtype.rs, ttl.rs, data.rs, rrset.rs, text.rs (tokenizer and
                          escapes), wire.rs, txt.rs, mx.rs, srv.rs, caa.rs, tlsa.rs, svcb.rs
       error.rs           Error, ErrorKind, Operation
-      redact.rs          Detail, Scrubber
+      redact.rs          Detail
+      redact/scrub.rs    Scrubber                                                 (__http)
       id.rs              ProviderId
       meta.rs            ProviderMeta, ConfigField, FieldKind, Capabilities
-      provider.rs        Provider, Expect, outcomes, CheckReport, ZoneInfo
+      provider.rs        Provider, Expect, outcomes, CheckReport, ZoneInfo, ZoneListing
       context.rs         Context, ContextOptions
       locks.rs           per-name locks
-      values.rs          the generic TXT value layer (section 3.5)
+      values.rs          the generic TXT value layer (section 3.5)          (any provider)
+      rrsets.rs          the record-level layer (sections 3.1-3.4, 3.6)     (any provider but
+                                                                            acme_dns, beget)
       dns01.rs
       http/              mod.rs, tls.rs, request.rs, retry.rs, token.rs, keystone.rs, gate.rs,
-                         poll.rs, pager.rs, zone_cache.rs, encode.rs, url.rs      (__http)
-      crypto/            mod.rs, hmac.rs, ps256.rs, sigv4.rs                      (__crypto)
+                         poll.rs, pager.rs, zone_cache.rs, encode.rs, url.rs;
+                         testing.rs and tests.rs (test builds only)               (__http)
+      crypto/            mod.rs, hmac.rs, ps256.rs (yandex_cloud),
+                         sigv4.rs (route53)                                       (__crypto)
       inspector/         mod.rs, config.rs, exchange.rs, discovery.rs, answer.rs,
-                         wait.rs, cname.rs                                        (inspector)
+                         wait.rs, cname.rs; testing.rs (test builds only)         (inspector)
       providers/
         mod.rs           one `pub mod` per provider; AnyProvider; the forwarding macro
         <id>/
-          mod.rs         `pub(crate) mod meta;` always; `mod client;` and re-exports behind
-                         the provider's feature
+          mod.rs         `pub(crate) mod meta;` always; the other modules and the re-exports
+                         (client, configuration types, `from_json`) behind the provider's feature
           meta.rs        the provider's ProviderMeta: fields, capabilities, defaults
-          client.rs      Config, Credentials, the client, its Provider impl
-          ...            further files as the client needs (rfc2136: wire.rs, tsig.rs)
+          config.rs      <Name>Config, <Name>Credentials
+          client.rs      the client and its Provider impl
+          api.rs         requests and answers of the provider's API (all but rfc2136)
+          records.rs     record-level operations (all but acme_dns, beget)
+          txt.rs         TXT value operations (all but acme_dns)
+          ...            further files as the client needs: acme_dns state.rs; cloud_ru
+                         content.rs, rrset.rs; hetzner, selectel_v2, yandex_cloud rrset.rs;
+                         route53 content.rs; rfc2136 transport.rs, tsig.rs, wire.rs;
+                         timeweb_cloud names.rs
     tests/
-      common/            mod.rs (context and client builders, canaries), echo.rs, live.rs
-      <id>.rs            one file per provider, `#![cfg(feature = "<id>")]`
-      conformance.rs     IDs, metadata, PROVIDERS.md, capability/behavior agreement, required
-                         tests
-      names.rs, records.rs, values.rs, dns01.rs, transport.rs, secret_types.rs, inspector.rs
-      fixtures/<id>/     synthetic fixtures, compared byte for byte
+      common/            mod.rs (context and client builders, sample configurations), echo.rs
+                         (canaries, echo dialects, tracing capture)
+      <id>.rs            one file per provider, `#![cfg(feature = "<id>")]`, live tests #[ignore]d
+      conformance.rs     IDs, metadata, PROVIDERS.md, capability/behavior agreement, source
+                         scans, required tests
+      names.rs, records.rs, dns01.rs, transport.rs, inspector.rs
   mock/
-    Cargo.toml           zonewright-mock, publish = false
+    Cargo.toml           zonewright-mock, publish = false; its own [lints.rust]
     src/
-      lib.rs             server start/stop, request log, fault injection
+      lib.rs             module tree, MockServer, re-exports
+      conn.rs            listener and connection type under every mock server
+      log.rs             request log
+      fault.rs           fault injection
       echo.rs            the echo server of section 12.2
       dns.rs             UDP+TCP DNS server for the inspector tests
       <id>.rs            one stateful mock per provider
+    tests/
+      harness.rs         tests of the mock servers themselves
 ```
+
+There is no fixtures directory: fixtures are written inline in the test files. There is no CI
+configuration.
 
 Ownership, so that fifteen providers can be written in parallel without touching the same file:
 
-- Shared files, edited only by the lead: everything outside `providers/<id>/`, `tests/<id>.rs`,
-  `tests/fixtures/<id>/` and `mock/src/<id>.rs`. That includes both `Cargo.toml` files,
-  `providers/mod.rs`, `id.rs`, `context.rs`, the whole `http/`, `crypto/`, `record/` and
-  `inspector/` trees, `tests/common/`, `mock/src/lib.rs`, and `PROVIDERS.md`, `CHANGELOG.md` and
-  this document.
+- Shared files, edited only by the lead: everything outside `providers/<id>/`, `tests/<id>.rs` and
+  `mock/src/<id>.rs`. That includes both `Cargo.toml` files, `providers/mod.rs`, `id.rs`,
+  `context.rs`, `values.rs`, `rrsets.rs`, the whole `http/`, `crypto/`, `record/`, `redact/` and
+  `inspector/` trees, `tests/common/`, the mock's `lib.rs`, `conn.rs`, `log.rs`, `fault.rs`,
+  `echo.rs`, `dns.rs` and `tests/harness.rs`, and `PROVIDERS.md`, `CHANGELOG.md` and this document.
 - Files of one provider, edited by the developer of that provider: `src/providers/<id>/**`,
-  `tests/<id>.rs`, `tests/fixtures/<id>/**`, `mock/src/<id>.rs`.
-- The core phase creates, for all fifteen providers, the feature, the `AnyProvider` variant, the
-  module with a complete `meta.rs` and a stub `client.rs` whose operations all return
-  `Error::Unsupported`, the empty test file and the empty mock module. A provider developer then
-  never needs a shared file. A need for a new shared helper, or a change to one, goes to the lead.
+  `tests/<id>.rs`, `mock/src/<id>.rs`.
+- Every provider has its feature, its `AnyProvider` variant, its module with a complete `meta.rs`,
+  its test file and its mock module, so a provider developer never needs a shared file. A need for a
+  new shared helper, or a change to one, goes to the lead.
 - Provider state that must outlive a client (nic.ru, acme-dns; section 11.3) is a type defined in
-  the provider's directory and held by `Context` in a field behind the provider's feature. The field
-  is added in the core phase.
+  the provider's directory and held by `Context` in a field behind the provider's feature.
 
 ## 11. Providers
 
@@ -2708,49 +2875,57 @@ repeats the note of `PROVIDERS.md`; it does not make a client verified.
 | `yandex_cloud`  | service-account key, PS256 JWT exchanged for an IAM token (≤ 12 h)         | rrset addressed by name and type                              | yes (public zones of the folder)  | `Conditional`                                              | `Atomic`                        | yes (operations)         |
 
 `txt_values` and `preconditions` are the capability values of section 2.5; what they mean for a
-concurrent writer outside the process is in sections 3.5 and 3.4. `preconditions` matters only once
-a provider has record-level operations; until then it is listed as what the provider's API allows.
-For acme-dns it has no meaning.
+concurrent writer outside the process is in sections 3.5 and 3.4. `preconditions` matters only for
+providers with record-level operations; for Beget, which has none in this crate, it is listed as
+what the provider's API allows. For acme-dns it has no meaning (the field holds `ReadThenWrite`).
 
-### 11.2 Support planned by this design
+### 11.2 Support in this version
 
 "TXT only until established" means: the record-level operations stay unsupported for this provider
 until its record-level API (endpoints, the shape of each record type, TTL rules) has been taken from
 the provider's documentation or observed against the live API, as hard rule 3 requires. Nothing in
 this table is a guess about such an API.
 
-| ID              | TXT values             | Record level                                                                             | Record types (record level)                                                                           | Default `ttl` setting | Default propagation timeout | TXT dialect, read / write                               | Source of API knowledge                                                                            |
-| --------------- | ---------------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | --------------------- | --------------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `acme_dns`      | add only; plain values | impossible: the API has no read, no delete and nothing but TXT                           | —                                                                                                     | not settable          | 60 s                        | none / Raw                                              | acme-dns README and server source                                                                  |
-| `beget`         | yes; plain values      | TXT only until established (what a write of one type does to other types is unconfirmed) | —                                                                                                     | 300                   | —                           | Auto / Raw                                              | Beget.API documentation, lego. Whether the API accepts POST is unconfirmed (section 13.4)          |
-| `cloud_ru`      | yes; plain values      | list, get, set, delete; GSLB records are skipped and refused                             | A, AAAA, CAA, CNAME, MX, NS, SPF, SRV, TXT                                                            | 60                    | —                           | Auto / Raw                                              | Evolution DNS OpenAPI specification and documentation                                              |
-| `cloudflare`    | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CAA, CNAME, MX, NS, PTR, SRV, TLSA, TXT                                                      | 120                   | 120 s                       | Auto / Presentation                                     | Cloudflare API v4 documentation, lego                                                              |
-| `digitalocean`  | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CAA, CNAME, MX, NS, SOA (read only), SRV, TXT                                                | 30                    | 120 s                       | Auto / Raw                                              | DigitalOcean API v2 reference, lego                                                                |
-| `hetzner`       | yes; plain values      | list, get, set, delete                                                                   | A, AAAA, CNAME, MX, NS, PTR, SOA (read only), SRV, TLSA, TXT                                          | 60                    | 120 s                       | Auto / Presentation                                     | Hetzner Cloud API reference, lego, hcloud-go schema                                                |
-| `nicru`         | yes; plain values      | list, get, set, delete; one commit per operation                                         | A, AAAA, CNAME, DNAME, MX, NS, PTR, SOA (read only), SRV, TXT                                         | 30                    | 1200 s                      | Raw / Raw                                               | lego and third-party clients; the official documentation was not readable                          |
-| `regru`         | yes; plain values      | list, get, set, delete for A, AAAA, TXT (several requests per set)                       | A, AAAA, TXT                                                                                          | not settable          | —                           | Auto / Raw                                              | lego and a third-party client library. Earlier version proven live                                 |
-| `rfc2136`       | yes                    | get, set, delete with server-checked prerequisites; listing impossible                   | any type with a wire form; SOA read only                                                              | 60                    | —                           | wire format                                             | RFC 2136, RFC 8945, RFC 7766, RFC 1035                                                             |
-| `route53`       | yes; plain values      | list, get, set, delete; alias and routing-policy sets are skipped and refused            | A, AAAA, CAA, CNAME, DS, HTTPS, MX, NAPTR, NS, PTR, SOA (read only), SPF, SRV, SSHFP, SVCB, TLSA, TXT | 60                    | 120 s                       | Auto / Presentation                                     | Amazon Route 53 API reference, lego                                                                |
-| `selectel_v2`   | yes; plain values      | list, get, set, delete                                                                   | A, AAAA, ALIAS, CAA, CNAME, MX, NS, SOA (read only), SRV, SSHFP, TXT                                  | 60                    | —                           | Auto / Presentation                                     | Selectel DNS API v2 and authorization documentation. Earlier TXT-level version proven live         |
-| `timeweb_cloud` | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CNAME, MX, TXT                                                                               | provider default      | —                           | Auto / Raw                                              | a client generated from the public OpenAPI description, lego                                       |
-| `vk_cloud`      | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CNAME, MX, NS, SRV, TXT                                                                      | 60                    | —                           | Auto / Raw                                              | the provider's published API description, lego                                                     |
-| `yandex_360`    | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CAA, CNAME, MX, SRV, TXT                                                                     | 300                   | —                           | Auto / Raw                                              | Yandex 360 API documentation, lego                                                                 |
-| `yandex_cloud`  | yes; plain values      | list, get, set, delete                                                                   | A, AAAA, ANAME, CAA, CNAME, HTTPS, MX, NS, PTR, SOA (read only), SRV, SVCB, TXT                       | 60                    | —                           | Auto / Raw for TXT values, Presentation at record level | Yandex Cloud DNS, IAM and Operation API documentation, lego. Earlier TXT-level version proven live |
+| ID              | TXT values             | Record level                                                                             | Record types (record level)                                                                           | Default `ttl` setting | Default propagation timeout | TXT dialect, read / write                               | Source of API knowledge                                                                   |
+| --------------- | ---------------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | --------------------- | --------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `acme_dns`      | add only; plain values | impossible: the API has no read, no delete and nothing but TXT                           | —                                                                                                     | not settable          | 60 s                        | none / Raw                                              | acme-dns README and server source                                                         |
+| `beget`         | yes; plain values      | TXT only until established (what a write of one type does to other types is unconfirmed) | —                                                                                                     | 300                   | —                           | Auto / Raw                                              | Beget.API documentation, lego. Whether the API accepts POST is unconfirmed (section 13.4) |
+| `cloud_ru`      | yes; plain values      | list, get, set, delete; GSLB records are skipped and refused                             | A, AAAA, CAA, CNAME, MX, NS, SPF, SRV, TXT                                                            | 60                    | —                           | Auto / Raw                                              | Evolution DNS OpenAPI specification and documentation                                     |
+| `cloudflare`    | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CAA, CNAME, MX, NS, PTR, SRV, TLSA, TXT                                                      | 120                   | 120 s                       | Auto / Presentation                                     | Cloudflare API v4 documentation, lego                                                     |
+| `digitalocean`  | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CAA, CNAME, MX, NS, SOA (read only), SRV, TXT                                                | 30                    | 120 s                       | Auto / Raw                                              | DigitalOcean API v2 reference, lego                                                       |
+| `hetzner`       | yes; plain values      | list, get, set, delete (a TTL change of an existing set is a second request)             | A, AAAA, CNAME, MX, NS, PTR, SOA (read only), SRV, TLSA, TXT                                          | 60                    | 120 s                       | Auto / Presentation                                     | Hetzner Cloud API reference, lego, hcloud-go schema                                       |
+| `nicru`         | yes; plain values      | list, get, set, delete; one commit per operation                                         | A, AAAA, CNAME, DNAME, MX, NS, PTR, SOA (read only), SRV, TXT                                         | 30                    | 1200 s                      | Raw / Raw                                               | lego and third-party clients; the official documentation was not readable                 |
+| `regru`         | yes; plain values      | list, get, set, delete for A, AAAA, TXT (several requests per set)                       | A, AAAA, TXT                                                                                          | not settable          | —                           | Auto / Raw                                              | lego and a third-party client library. Earlier version proven live                        |
+| `rfc2136`       | yes                    | get, set, delete with server-checked prerequisites; listing impossible                   | any type with a wire form; SOA read only                                                              | 60                    | —                           | wire format                                             | RFC 2136, RFC 8945, RFC 7766, RFC 1035                                                    |
+| `route53`       | yes; plain values      | list, get, set, delete; alias and routing-policy sets are skipped and refused            | A, AAAA, CAA, CNAME, DS, HTTPS, MX, NAPTR, NS, PTR, SOA (read only), SPF, SRV, SSHFP, SVCB, TLSA, TXT | 60                    | 120 s                       | Auto / Presentation                                     | Amazon Route 53 API reference, lego                                                       |
+| `selectel_v2`   | yes; plain values      | list, get, set, delete                                                                   | A, AAAA, ALIAS, CAA, CNAME, MX, NS, SOA (read only), SRV, SSHFP, TXT                                  | 60                    | —                           | Auto / Presentation                                     | Selectel DNS API v2 and authorization documentation. Earlier version proven live          |
+| `timeweb_cloud` | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CNAME, MX, TXT                                                                               | provider default      | —                           | Auto / Raw                                              | a client generated from the public OpenAPI description, lego                              |
+| `vk_cloud`      | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CNAME, MX, NS, SRV, TXT                                                                      | 60                    | —                           | Auto / Raw                                              | the provider's published API description, lego                                            |
+| `yandex_360`    | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CAA, CNAME, MX, SRV, TXT                                                                     | 300                   | —                           | Auto / Raw                                              | Yandex 360 API documentation, lego                                                        |
+| `yandex_cloud`  | yes; plain values      | list, get, set, delete                                                                   | A, AAAA, ANAME, CAA, CNAME, HTTPS, MX, NS, PTR, SOA (read only), SRV, SVCB, TXT                       | 60                    | —                           | Auto / Raw for TXT values, Presentation at record level | Yandex Cloud DNS, IAM and Operation API documentation, lego. Earlier version proven live  |
 
 Notes on the table:
 
 - "plain values" is `Capabilities::txt_plain_only` and concerns the TXT value operations. It is
   lifted per provider when the encoding of other values is established.
-- At record level, Selectel v2 and Yandex Cloud write TXT as quoted chunks of at most 255 octets.
-  The earlier record-level implementation establishes that form for printable ASCII without `"` and
-  `\` (SPF, DKIM, DMARC and similar values of any length). A value that would need an escape is
-  refused with `InvalidInput` until the provider's handling of escapes is established.
+- At record level, Selectel v2, Yandex Cloud, Cloudflare and Hetzner write TXT as quoted chunks of
+  at most 255 octets. For Selectel v2 and Yandex Cloud the earlier record-level implementation
+  establishes that form for printable ASCII without `"` and `\` (SPF, DKIM, DMARC and similar values
+  of any length). A value that would need an escape is refused with `InvalidInput` until the
+  provider's handling of escapes is established. Route 53 writes quoted strings with its documented
+  octal escapes and `\"`; a TXT value with a backslash is not sent. Cloud.ru writes the text itself
+  and refuses values that would need an escape. DigitalOcean, reg.ru, Timeweb Cloud, VK Cloud and
+  Yandex 360 write plain values only (`Txt::is_plain`), as their TXT value operations do.
 - TLSA is absent from both record-type lists because neither API accepts it; SOA is read-only
   everywhere, and the apex NS set is not writable (section 3.4).
 - Yandex Cloud writes plain TXT values unquoted in the value operations, as the version proven live
   did, and quoted canonical text at record level, as its documentation describes for values with
-  spaces. Both are read back with `Auto`.
-- The order in which further providers get record-level support is set by the maintainer.
+  spaces. The value operations read with `Auto`. The record level reads values in the master-file
+  format the documentation names: a name without the trailing dot inside a value is relative to the
+  zone, and unquoted TXT text with whitespace is several strings; other unquoted text is read as
+  with `Auto`.
+- Every provider whose API allows it has record-level operations. Beget waits until what a write of
+  one type does to the other types at a name is established (section 13.4).
 
 ### 11.3 Provider-specific design points
 
@@ -2772,7 +2947,7 @@ Behavior that the design fixes because the generic sections cannot:
 
 - `acme_dns`. The server keeps the two most recent values of a registration and has no read. A value
   sent while it is already in one slot overwrites the other slot, so a needless repeat can displace
-  a live neighbour (the wildcard and the base name of one certificate share a challenge name). The
+  a live neighbor (the wildcard and the base name of one certificate share a challenge name). The
   client therefore keeps, in `Context`, per server URL and name, at most two values this process
   sent, each with the time of the send and whether it was confirmed (a 2xx answer) or had an unknown
   outcome (timeout, connection lost, 5xx). An entry is forgotten 15 minutes after it was recorded,
@@ -2793,8 +2968,8 @@ Behavior that the design fixes because the generic sections cannot:
   sent "in their entirety, otherwise the rest will be deleted", and the write spelling of A and MX
   records is not documented. The client therefore writes TXT only and only at names that hold
   nothing but TXT. An outside writer's A or MX record added between the client's read and its write
-  is lost; this is part of open point 14. Credentials go in the POST body, never in the query
-  string.
+  is lost; this is part of open point 14. A name holds at most 10 TXT records, the API's limit per
+  type; a larger set is `InvalidInput`. Credentials go in the POST body, never in the query string.
 - `cloud_ru`. More than one TXT record for a name is `Error::Protocol`. A record marked read-only is
   `Error::Rejected`. A list field absent from a listing page is an empty page (the provider's API
   description does not mark it required, and Proto3 JSON omits empty repeated fields); a list given
@@ -2813,12 +2988,21 @@ Behavior that the design fixes because the generic sections cannot:
 - `nicru`. Changes are staged and published by a commit that covers the whole zone, including edits
   staged by anyone else. The client therefore (a) takes a per-zone lock in `Context` for the whole
   read, edit and commit; (b) refuses to work in a zone that has staged changes it did not make
-  (`Error::Rejected`, nothing committed); (c) records the zone as "has our staged changes" in
-  `Context` before it stages an edit and clears the mark after a successful commit, so that an
-  operation that failed or was dropped between the two is finished by the next operation instead of
-  being mistaken for a foreign edit; (d) tries the commit up to three times and returns
-  `Error::Transient` if all fail. The mark is process memory; after a restart a zone left with
-  staged changes needs a commit by hand.
+  (`Error::Rejected`, nothing committed); (c) marks the zone in `Context` before it stages an edit,
+  as pending commit, or, for an operation that failed before its commit, as pending rollback
+  (`POST …/rollback`), so that the next operation in the zone commits or rolls back accordingly
+  instead of mistaking the staged edits for a foreign edit; (d) tries the commit, or the rollback,
+  up to three times and returns `Error::Transient` if all fail. The mark is process memory; after a
+  restart a zone left with staged changes needs a commit or a rollback by hand. After an edit or a
+  record-level operation fails, the zone is listed again under the zone lock: without staged changes
+  the mark is cleared, with them the client commits (a single edit) or rolls back (a record-level
+  operation, which is never published half-applied); if the listing fails the mark stays for the
+  next operation. Reads (`get_rrset`, `list_rrsets`) take the zone lock too, first settle the
+  client's own leftovers as a write does, and refuse a zone with staged changes of others
+  (`Error::Rejected`), since the documentation does not say whether the listing shows staged or
+  published records. A record without a TTL takes the zone's default and reads as no TTL
+  (`provider_default_ttl`). A zone under a Secondary service, or listed under more than one
+  DNS-master service, is not usable.
 - `regru`. `check` calls the API's no-operation request, which the documentation describes as
   requiring valid credentials, on every call; `credentials_verified` is always true.
 - `beget`. `check` calls the domain listing, which like every method of the API requires the login
@@ -2828,21 +3012,26 @@ Behavior that the design fixes because the generic sections cannot:
   - Timeouts: `ContextOptions::connect_timeout` covers name resolution and the TCP connect;
     `ContextOptions::request_timeout` covers one exchange, from sending a message to having read the
     whole response. A response is at most 65535 octets by the framing. Queries and the single-RR add
-    and delete are idempotent on the server (RFC 2136 section 3.4.2) and get at most 3 attempts with
-    the back-off of section 5.3; `SERVFAIL` counts as a transient failure.
+    and delete of the TXT value operations are idempotent on the server (RFC 2136 section 3.4.2) and
+    get at most 3 attempts with the back-off of section 5.3; `SERVFAIL` counts as a transient
+    failure. Record-level updates, which carry value-dependent prerequisites, are sent once.
   - `ContextOptions::loopback_only`: a `server` that is not a loopback IP literal is `Error::Config`
     at construction. Host names are refused in that mode, since classifying one would need a lookup.
   - A response that is not signed with the key is `Error::Protocol` whatever its response code, so a
     forged negative answer cannot turn a removal into `NotPresent`. TSIG errors are `Error::Auth`,
     with a hint about clock skew for `BADTIME`. `NOTAUTH` is `ZoneNotFound`; `REFUSED` on an update
-    is `Forbidden`; `REFUSED` on the preceding query is tolerated and leads to the blind path of
-    section 3.5. The TSIG key is at least 16 octets.
+    is `Forbidden`; `REFUSED` on the query before a TXT value operation is tolerated and leads to
+    the blind path of section 3.5, while at record level it is `Forbidden`, since `SetOutcome` has
+    no blind outcome. The TSIG key is at least 16 octets.
   - Preconditions: the protocol's update prerequisites (RFC 2136 section 2.4) are evaluated by the
-    server atomically with the update, hence `Preconditions::Atomic`. The record-level operations,
-    when added, send `Expect::Absent` as "RRset does not exist" and `Expect::Matches`, as well as
-    the client's own read, as "RRset exists (value dependent)"; a failed prerequisite (`YXRRSET`,
-    `NXRRSET`) is handled as section 3.4 describes for a refused conditional write. A prerequisite
-    cannot express a TTL, so a TTL in `Matches` is compared by the client after its read.
+    server atomically with the update, hence `Preconditions::Atomic`. The record-level operations
+    send `Expect::Absent` as "RRset does not exist" and `Expect::Matches`, as well as the client's
+    own read, as "RRset exists (value dependent)"; a failed prerequisite (`YXRRSET`, `NXRRSET`) is
+    `Conflict`, and the layer repeats the operation once from a new read, which ends in
+    `PreconditionFailed` when the expectation no longer holds (section 3.4). A CNAME write also
+    carries "name is not in use"; its `YXDOMAIN` answer is `Rejected`. An update longer than 65535
+    octets is `InvalidInput`. A prerequisite cannot express a TTL, so a TTL in `Matches` is compared
+    by the client after its read.
   - The TXT value operations send single-RR changes (`PerValue`); deleting a whole rrset is never
     sent by them. An add carries one prerequisite, "no CNAME at the name" (RFC 2136 section 2.4.3):
     without it a server silently ignores a TXT add at a name that owns a CNAME (section 3.4.2.2),
@@ -2863,24 +3052,53 @@ Behavior that the design fixes because the generic sections cannot:
   of an existing rrset is not documented, so a refused create is followed by a read (section 3.5);
   the delete of the rrset is sent once. An update sends back the comment and, in the documented
   `X-Managed-By` header, the managing resource as read, since whether an update without them clears
-  them is not established. A listing ends when the items received reach its stated `count`; one that
-  stops short of it is `Error::Protocol`. A project given by name is scoped within the account's
-  Keystone domain, and the project ID the identity service states for the token tells the project's
-  zones from others; of several zones with the requested name, the one of that project is used.
-  `check` exchanges the credentials for a new token even when one is cached.
-- `timeweb_cloud`. Records are created and deleted with the `v2` calls
-  (`POST /v2/domains/{fqdn}/dns-records`, `DELETE /v2/domains/{fqdn}/dns-records/{id}`), where
-  `fqdn` is the owner name: the domain for the apex, the full name below it. The deprecated `v1`
-  create and delete are not used (section 13.4, item 12). The API has no `v2` listing; the client
-  reads the `GET /v1/domains/{fqdn}/dns-records` call, which is not marked deprecated, for the owner
-  name itself. The API description defines that listing as all records of that domain or subdomain,
-  so every record the client can create is in what it reads, and nothing is remembered between
-  operations. A `404` on the listing of a name below the zone, or on a create, is followed by a
-  lookup of the zone: a missing zone is `ZoneNotFound`; otherwise the name has no records (read) or
-  the provider refused the name (create, `Rejected`). No subdomain is created before a create: the
-  API description says one must exist, while lego does not create one and a user's run recorded in
-  its tracker succeeded without it. A listing of a name below the zone that states a record without
-  a name is `Protocol`.
+  them is not established. An rrset that a web resource manages (`managed_by` read) is never
+  deleted, neither by `delete_rrset` nor by the removal of its last TXT value: that is
+  `InvalidInput` before any write. A listing follows a positive `next_offset` until the items
+  received reach the stated `count`, and past it while pages still bring items and name a next
+  offset, since an earlier page's `count` may be stale; a listing that ends short of its `count` is
+  `Error::Protocol`. Inside a value, a name without the trailing dot, `@` and unquoted TXT text are
+  read as non-canonical data (section 4.9), since the sources do not say whether they are relative
+  to the zone. A project given by name is scoped within the account's Keystone domain, and the
+  project ID the identity service states for the token tells the project's zones from others; of
+  several zones with the requested name, the one of that project is used. `check` exchanges the
+  credentials for a new token even when one is cached.
+- `timeweb_cloud`. Records are created, updated and deleted with the `v2` calls
+  (`POST /v2/domains/{name}/dns-records`, `PATCH` and `DELETE /v2/domains/{name}/dns-records/{id}`),
+  where `name` is the owner name: the domain for the apex, the full name below it. The deprecated
+  `v1` create and delete are not used (section 13.4, item 12). The API has no `v2` listing; every
+  read uses the `v1` calls, which are not marked deprecated: `GET /v1/domains/{zone}` for the
+  subdomains the domain states, then `GET /v1/domains/{fqdn}/dns-records` for the zone and for each
+  of those subdomains. Each listed record is placed at its owner name by deciding, per listing,
+  whether it states names relative to the zone or in full (`names.rs`); a name that reads both ways
+  and that no listing settles is `Error::Protocol` on a read of it and is reported in `skipped` by a
+  zone listing. An empty or `@` name in the listing of a subdomain is `Protocol`. A `404` on the
+  domain's answer or on the zone's listing is `ZoneNotFound`; a `404` on a create is told apart by a
+  lookup of the zone (`ZoneNotFound`, or `Rejected` for a name the provider refused); a `404` on an
+  update is `Conflict`; a `404` on a delete counts as done once a new read no longer shows the
+  value. Nothing is remembered between operations. No subdomain is created before a create: the API
+  description says one must exist, while lego does not create one and a user's run recorded in its
+  tracker succeeded without it.
+- `cloudflare`. Record attributes the model does not carry (`comment`, `tags`, `proxied`,
+  `private_routing`, `settings`) survive: a record that keeps its value is not touched, and a TTL
+  change or the in-place change of a CNAME is a `PATCH` naming only that field. A new record in an
+  existing rrset takes over `proxied`, `private_routing` and `settings` when every record read
+  agrees on them; when they disagree, a write that has to create a record is `InvalidInput`. A TTL
+  of 1 means automatic and reads as no TTL; a requested TTL for a proxied record is `InvalidInput`.
+  Both refusals are made in the record layer's `check_plan` hook, over the whole plan, before any
+  write.
+- `digitalocean`. A host name stated as exactly `@` in the data of a CNAME, NS, MX or SRV record
+  reads as the domain's name.
+- `vk_cloud`. The documented update (`PUT`) carries no TTL and, for A, AAAA and SRV, no value, so a
+  replacement deletes and creates records, except a CNAME, which is replaced by one in-place `PUT`
+  of its target. A TTL change of a record that stays (a CNAME changed in place included) is refused
+  with `InvalidInput` in `check_plan`, before any write.
+- `yandex_360`. The listing has no filter by name or type and states names relative or in full; the
+  form is decided once per listing from what it states. A record whose dotless name reads as two
+  different names in a listing that does not decide the form is `Error::Protocol` for `get_rrset`,
+  `set_rrset`, `delete_rrset` and the TXT value operations, and is reported in `skipped` by
+  `list_rrsets`. Names are written relative to the domain, `@` for the apex. A CNAME is replaced in
+  place by the edit call.
 - `yandex_cloud`. The strict write must repeat the existing set exactly, including fields this crate
   does not model, so the client keeps the JSON object it read and sends that object as the deletion.
   TTL travels as a JSON string.
@@ -2928,20 +3146,23 @@ For every client, in its own test file:
   contain `[redacted]`, which proves the echo reached the error path and the test is not vacuous. It
   also asserts that the API endpoint, and for token clients the token endpoint, were actually
   reached. Every secret field of the credentials is covered.
-- RFC 2136 has no HTTP echo. Its equivalent asserts that the TSIG secret, in base64 and in hex, does
-  not occur in any error or `Debug` output across the error paths of its mock.
+- RFC 2136 has no HTTP echo. Its equivalent, `rfc2136_secret_not_in_errors`, asserts that the TSIG
+  secret, in base64 and in hex, does not occur in any error or `Debug` output across the error paths
+  of its mock.
 - `<id>_no_secret_in_logs`. A `tracing` subscriber at `TRACE` captures everything while the client
   goes through a success, a 401 and a 500; the capture must contain the transport's event and none
   of the canaries or issued tokens.
 
-Once for the crate: a compile-time test that no client type and no credentials type implements
-`Display` or `Serialize`; unit tests of the scrubber (every spelling, every decoded dialect, the
-truncated tail, run-time tokens per slot, its `Debug`); the transport's secret tests over every
-dialect and every credential position (bearer, custom header, form body, JSON body, query), which
-also require the message to be kept, with the canaries cut out in place, wherever the echo uses a
-spelling the scrubber knows exactly; a test that a redirect is not followed and that the address it
-points to receives no connection, with and without a client certificate; a source scan for
-`bearer_auth` and `basic_auth`.
+In every provider's test file, a compile-time check that its client type and its credentials type
+implement neither `Display` nor `Serialize`.
+
+Once for the crate: unit tests of the scrubber (every spelling, every decoded dialect, the truncated
+tail, run-time tokens per slot, its `Debug`); the transport's secret tests over every dialect and
+every credential position (bearer, custom header, form body, JSON body, query), which also require
+the message to be kept, with the canaries cut out in place, wherever the echo uses a spelling the
+scrubber knows exactly; a test that a redirect is not followed and that the address it points to
+receives no connection, with and without a client certificate (`src/http/tests.rs`); a source scan
+for `bearer_auth` and `basic_auth` (`tests/transport.rs`).
 
 ### 12.3 Invariant tests
 
@@ -2963,9 +3184,9 @@ For every client, in its own test file, where the operation exists:
 - For providers with record-level operations, `<id>_failed_expectation_is_precondition_failed`:
   `Expect::Absent` on an existing set and `Expect::Matches` on a changed one return
   `PreconditionFailed` and write nothing; and `<id>_listing_reports_skipped_sets`.
-- `<id>_stale_zone_id`: after the mock recreates the zone under a new identifier, the next operation
-  succeeds or fails cleanly and the one after it succeeds; a removal never reports `NotPresent` for
-  a value that is there.
+- `<id>_stale_zone_id`, for every client that caches zone identifiers: after the mock recreates the
+  zone under a new identifier, the next operation succeeds or fails cleanly and the one after it
+  succeeds; a removal never reports `NotPresent` for a value that is there.
 - `<id>_writes_are_sent_once`, for every client that writes: with a `502`, a `429` and a `401`
   injected on each write request, the request log holds exactly one such request per operation.
 - `<id>_unsupported_operations_send_nothing`, for every client with an unsupported operation.
@@ -2982,8 +3203,9 @@ and an unknown key are refused in the settings), an unsupported operation return
 with zero requests (every endpoint of the sample configuration points at a loopback TCP listener and
 UDP socket that must see nothing), every default endpoint being `https`, a scan that no file under
 `src/providers/` calls `Detail::new` or a text-taking `Error` constructor, and a scan that every
-provider's test file defines the required test names of sections 12.2 and 12.3 (with an explicit
-list of the exceptions: `acme_dns` has no removal, `rfc2136` has its own secret test), which reports
+provider's test file defines the required test names of sections 12.2 and 12.3, derived from the
+provider's capabilities (and, for `stale_zone_id`, from whether its sources use the zone-ID cache),
+with one explicit exception: `rfc2136` has its own secret test instead of `secret_echo`. It reports
 every missing name of every provider at once. The scan is what keeps "tests cover this for every
 client" true when a sixteenth provider is added.
 
@@ -3030,12 +3252,20 @@ run only by the maintainer. They read:
 - `ZONEWRIGHT_LIVE_<ID>_ZONE`: a zone the test may write to;
 
 with `<ID>` the provider ID in upper case (`ZONEWRIGHT_LIVE_SELECTEL_V2_ZONE`). A missing variable
-fails the test with a message naming it. The inspector's live test reads `ZONEWRIGHT_LIVE_ZONE`.
+fails the test with a message naming it. The inspector has no live test.
 
-A live test works only under a label it generates (`_zw-live-<random>` below the zone), registers
-every name it writes with a guard, and the harness runs the guard's cleanup after the test body
-whether it returned or panicked. Cleanup removes exactly the values the test added, with the value
-operations; it never deletes an rrset it did not create and never lists-and-deletes by pattern.
+A live test works only under labels it generates (`_zw-live-<random>` or `zw-live-<random>` below
+the zone). It runs its body as a separate task and afterwards, whether the body returned or
+panicked, cleans up: a TXT value test (`live_<id>_add_and_remove`) removes exactly the values it
+added, with the value operations; a record-level test (`live_<id>_record_round_trip`, or a
+record-level part of the TXT value test) deletes only the rrsets of its own generated name. Nothing
+is listed and deleted by pattern. acme-dns is the exception: it writes at the registration's own
+name and has no delete, so its test needs a registration set aside for testing.
+
+Every provider has a TXT value live test (`live_acme_dns_add` for acme-dns), and every provider with
+record-level operations has `live_<id>_record_round_trip`; the TXT value tests of Cloud.ru and
+reg.ru also carry a record-level part, and those of Selectel v2 and Cloud.ru a probe of two
+concurrent creates.
 
 A provider moves to "Verified against the live API" in `PROVIDERS.md`, and its `verified` flag turns
 true, only by the maintainer's commit after these tests passed.
@@ -3046,8 +3276,11 @@ true, only by the maintainer's commit after these tests passed.
 `cargo deny check`; `cargo test --all-features`; `cargo hack check --each-feature` over the public
 features and `cargo hack test --each-feature` likewise, plus the no-feature build; `cargo doc` with
 warnings denied; a build with the MSRV toolchain. Workspace lints: `unsafe_code = "deny"`,
-`missing_docs`, and the clippy lints `unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo`,
-`unimplemented` and `indexing_slicing` denied in library code and allowed in tests.
+`missing_docs` (a warning, denied by the gates), and the clippy lints `unwrap_used`, `expect_used`,
+`panic`, `unreachable`, `todo`, `unimplemented`, `indexing_slicing`, `dbg_macro`, `print_stdout` and
+`print_stderr` denied in library code; `clippy.toml` allows unwrap, expect, panic, indexing, `dbg!`
+and printing in test code. The gates are run by hand from `dev/`; no CI configuration is part of the
+repository.
 
 ## 13. Versioning, choices, open points
 
@@ -3076,8 +3309,8 @@ Before 1.0 a breaking change raises the second number. To keep that rare:
   `Condition`, `NsDiscovery`, `IpFamilies`, `InspectorError`.
 - `#[non_exhaustive]` structs: `ProviderMeta`, `ConfigField`, `Capabilities`, `CheckReport`,
   `ZoneCheck`, `ZoneInfo`, `ZoneListing`, `SkippedRrset`, `ContextOptions`, every `…Config` and
-  `…Credentials`, `CnameChain`, `InspectorConfig`, `NameServer`, `WaitOptions`, `ServerReport`,
-  `Report`.
+  `…Credentials`, `yandex_cloud::AuthorizedKey`, `CnameChain`, `InspectorConfig`, `NameServer`,
+  `WaitOptions`, `ServerReport`, `Report`.
 - Exhaustive on purpose: `Mx`, `Srv`, `Caa`, `Tlsa`, `Svcb`, `Question`, `Expectation`.
 - The `#[non_exhaustive]` structs that an implementation of `Provider` has to return (`CheckReport`,
   `ZoneCheck`, `ZoneInfo`, `ZoneListing`, `SkippedRrset`) have `new` constructors taking today's
@@ -3254,10 +3487,10 @@ Added after review:
    one-line change in the transport if the rule is meant to permit it. The same reading is applied
    to a 401 for a cached token: an idempotent request is repeated with a new token, a non-idempotent
    one is not and returns a retryable error (section 5.3). The earlier implementation repeated both.
-3. **Honest outcomes change three earlier behaviors**: acme-dns removal returns `Unsupported`
-   instead of "not present", and an acme-dns add always returns `Accepted`; blind RFC 2136 writes
-   return `Accepted` instead of a guessed outcome; `check` reports whether credentials were actually
-   tested. Applications ported from the earlier implementation must handle them.
+3. **Honest outcomes.** Settled in the code: acme-dns removal returns `Unsupported` and every
+   acme-dns add `Accepted`; blind RFC 2136 writes return `Accepted`; `check` reports in
+   `credentials_verified` whether credentials were actually tested. Applications ported from the
+   earlier implementation handle these three changes.
 4. **Default resolvers of the inspector.** Cloudflare, Google and Quad9 by default means the zone
    names an application inspects are sent to those services unless it configures others. The
    alternative is no default and a required list.
@@ -3273,13 +3506,12 @@ Added after review:
    client uses GET with credentials in the query string. It needs a live check before the client is
    relied on. If POST is not accepted, the choice is between sending the password in a URL and not
    supporting the provider; this design would not do the former without the maintainer's decision.
-9. **Order of record-level work** after Selectel v2 and Yandex Cloud, and for each further provider
-   whether its documentation is enough or a live observation is required first.
-10. **Trust anchors.** The crate trusts the platform's roots plus certificates the application
-    passes. It ships no certificates of its own. An application that needs additional national roots
-    supplies them through `ContextOptions`.
-11. **Strict settings.** An application that stores its own keys next to the provider's settings
-    must strip them before calling the crate. The alternative, ignoring unknown keys, hides typos.
+9. **Order of record-level work.** Settled in the code: every provider whose API allows it has
+   record-level operations (section 11.2). What remains is Beget, point 20.
+10. **Trust anchors.** Settled in the code: the crate trusts the platform's roots plus the
+    certificates passed in `ContextOptions::extra_root_certificates` and ships none of its own.
+11. **Strict settings.** Settled in the code: every `…Config` refuses unknown keys
+    (`deny_unknown_fields`), so an application strips its own keys before calling the crate.
 12. **Timeweb Cloud: decided by the maintainer on 2026-11-14 — the v2 endpoints only.** Records are
     written with v2. The API has no v2 listing, so reads use the v1 listing calls, which are not
     marked deprecated (section 11.3); say if that is not acceptable. The v1 writes, which the
@@ -3302,3 +3534,33 @@ Added after review:
 16. **Private name-server addresses are refused by default** in the inspector. Deployments whose
     authoritative servers are internal must set `allow_private_addresses` or use
     `NsDiscovery::Static`. The earlier implementation accepted them by default.
+17. **Value forms that only a live run shows.** Where the provider's sources are silent, the clients
+    assume a form and refuse what they cannot send safely: names in listings (trailing dot, relative
+    names, `@` for the apex) at DigitalOcean, Timeweb Cloud, VK Cloud, Yandex 360 and Yandex Cloud;
+    the spelling of TXT content in listings at reg.ru (a removal must repeat it exactly), Cloud.ru
+    and Selectel v2; how escapes inside TXT values are stored at Cloudflare, Hetzner, Route 53 and
+    Selectel v2. The `live_<id>_record_round_trip` tests exercise the common forms. Which providers
+    should be run first?
+18. **Timeweb Cloud subdomains.** Does a create at a name that is not yet a subdomain make one, and
+    does the zone's listing show records of subdomains? If neither, `list_rrsets` can miss such a
+    record. The client's `PATCH` assumes omitted fields are kept. A live run settles both.
+19. **VK Cloud in-place updates.** The documented update cannot change a TTL or the value of A, AAAA
+    and SRV records, so the client deletes and creates instead. If a live run shows `PUT` can,
+    should the client switch to in-place updates? Also unconfirmed: whether names such as
+    `_acme-challenge` and `*` pass the documented character rules.
+20. **Beget record level.** Record-level operations wait for what `changeRecords` does to the A and
+    MX records of a name it omits, and how A and MX are spelled on write (point 8 comes first: if
+    POST is refused, no call works).
+21. **Types listed but not written.** Each needs one observed answer to add: the NS value field at
+    Yandex 360; the value forms of CAA, DS, HTTPS and SVCB at Hetzner; the listing form of CAA,
+    CNAME, MX, NS and SRV at reg.ru; the SRV fields at Timeweb Cloud; DNAME, HTTPS and SVCB at
+    Selectel v2. Which of them does a consumer need?
+22. **nic.ru staging.** Whether the record listing shows staged or published records, and what
+    commit and rollback answer on a zone without staged changes, are not documented. A live run
+    settles both before the client is relied on.
+23. **RFC 2136 servers.** The messages and the TSIG computation are verified only against the
+    independent mock; BIND, Knot and PowerDNS have not been tried. A synthesized wildcard answer at
+    a name that does not exist looks like a value there, so an add can report `AlreadyPresent`
+    wrongly; without DNSSEC this cannot be detected. Is that limitation acceptable as documented?
+24. **reg.ru `INVALID_DOMAIN_NAME_FORMAT`** is classed as "zone not found" by assumption (the
+    documentation does not say when it is returned). Keep, or report it as `Rejected`?

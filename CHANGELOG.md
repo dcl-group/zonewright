@@ -6,93 +6,71 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
+The first version, 0.1.0. Not tagged yet.
+
 ### Added
 
-- Domain names (`DomainName`, `TargetName`) and the record model: `RecordType` as an open set,
-  `Ttl`, `RecordData` in canonical zone-file text form, `RrSet`, and typed views for TXT, MX, SRV,
-  CAA, TLSA and SVCB/HTTPS.
-- The provider API: `ProviderId`, provider metadata and capabilities, the `Provider` trait, the
-  `AnyProvider` dispatch enum, `Context`, and the typed `Error` with redacted detail.
-- DNS-01 helpers: challenge name, zone selection for a name.
-- HTTP transport for provider clients on `rustls` with `aws-lc-rs`; the crate installs no
-  process-wide crypto provider.
-- Selectel v2 client (`selectel_v2`): connection check, zone listing, TXT value operations.
-- Cloudflare client (`cloudflare`): connection check, zone listing, TXT value operations.
-- Yandex Cloud client (`yandex_cloud`): connection check, zone listing, TXT value operations with
-  conditional writes.
-- Route 53 client (`route53`): connection check, zone listing, TXT value operations with conditional
-  change batches.
-- DigitalOcean client (`digitalocean`): connection check, zone listing, TXT value operations.
-- VK Cloud client (`vk_cloud`): connection check, zone listing, TXT value operations.
-- RFC 2136 client (`rfc2136`): connection check and TXT value operations by dynamic update over TCP,
-  authenticated with TSIG.
-- Yandex 360 client (`yandex_360`): connection check, zone listing, TXT value operations.
-- Timeweb Cloud client (`timeweb_cloud`): connection check, zone listing, TXT value operations.
-- Cloud.ru client (`cloud_ru`): connection check, zone listing, TXT value operations.
-- Hetzner client (`hetzner`): connection check, zone listing, TXT value operations through
-  value-level rrset actions.
-- nic.ru client (`nicru`): connection check, zone listing, TXT value operations with a zone-wide
-  commit.
-- reg.ru client (`regru`): connection check, TXT value operations; optional TLS client certificate.
-- acme-dns client (`acme_dns`): adds TXT values through registrations; the API has no read and no
-  removal.
-- Beget client (`beget`): connection check, zone listing, TXT value operations at names that hold
-  only TXT records.
-- Propagation inspector (feature `inspector`): name-server discovery, queries for any record type at
-  each authoritative server or through recursive resolvers, waiting for a value to be present, for
-  an exact set or for absence, with a report per name server.
-- Record-level operations (`list_rrsets`, `get_rrset`, `set_rrset`, `delete_rrset` with
-  preconditions) for Selectel v2: A, AAAA, ALIAS, CAA, CNAME, MX, NS, SRV, SSHFP and TXT; SOA is
-  read only.
-- Record-level operations for DigitalOcean: A, AAAA, CAA, CNAME, MX, NS, SRV and TXT; SOA is read
-  only.
-- Record-level operations for Cloudflare: A, AAAA, CAA, CNAME, MX, NS, PTR, SRV, TLSA and TXT.
-  Record attributes the model does not carry (proxy status, comment, tags) are kept.
-- Record-level operations for Yandex Cloud: A, AAAA, ANAME, CAA, CNAME, HTTPS, MX, NS, PTR, SRV,
-  SVCB and TXT with provider-checked preconditions; SOA is read only.
-- Record-level operations for Route 53: A, AAAA, CAA, CNAME, DS, HTTPS, MX, NAPTR, NS, PTR, SPF,
-  SRV, SSHFP, SVCB, TLSA and TXT through conditional change batches; SOA is read only. Alias and
-  routing-policy record sets are reported as skipped and never written.
-- Record-level operations for RFC 2136: get, set and delete of an rrset of any type with a wire
-  form, with prerequisites checked by the server in the same update; listing is impossible in the
-  protocol.
-- Record-level operations for Hetzner: A, AAAA, CNAME, MX, NS, PTR, SRV, TLSA and TXT; SOA is read
-  only. A protected rrset is refused; record comments are kept.
-- Record-level operations for VK Cloud: A, AAAA, CNAME, MX, NS, SRV and TXT. A record is never
-  updated in place: the documented update cannot change a TTL.
-- Record-level operations for Cloud.ru: A, AAAA, CAA, CNAME, MX, NS, SPF, SRV and TXT, including
-  wildcard names. Records with GSLB links are reported as skipped and never written.
-- Record-level operations for Yandex 360: A, AAAA, CAA, CNAME, MX, SRV and TXT. NS records are
-  listed as skipped: the API documentation names no value field for them.
-- Record-level operations for Timeweb Cloud: A, AAAA, CNAME, MX and TXT; a zone listing reads the
-  zone and each of its subdomains.
-- Record-level operations for reg.ru: A, AAAA and TXT. Other types are listed but not written: the
-  documentation does not state how a listing spells their content, which a removal must repeat.
-- Record-level operations for nic.ru: A, AAAA, CNAME, DNAME, MX, NS, PTR, SRV and TXT; SOA is read
-  only. All edits of one operation are staged and published by one commit, or rolled back.
-
-### Changed
-
-- Cloud.ru, nic.ru, reg.ru, Timeweb Cloud and Yandex 360: `set_rrset` of a CNAME at a name that
-  holds other data, or of other data at a name that holds a CNAME, is `Error::InvalidInput` after
-  the read and before any write.
-- nic.ru: `Capabilities::provider_default_ttl` is true; a record without a TTL takes the zone's
-  default and reads as no TTL.
-- Route 53 and RFC 2136 accept a requested TTL from 0 to 2147483647; the `ttl` setting keeps its
-  narrower range.
-- A record-level `set_rrset` at a per-record API never publishes two records of a singleton type
-  (such as CNAME), and sends its requests in a fixed, documented order.
-- DigitalOcean record-level writes use the configured `ttl` when the records read state none.
-- Cloud.ru: adding or removing a TXT value at a record with GSLB links is refused.
-- Timeweb Cloud: records are created and deleted with the provider's v2 API instead of the
-  deprecated v1 calls, and the listing of the record's own name is read. The client no longer
-  remembers created record IDs, and `remove_txt_value` no longer returns `Accepted`. Settings and
-  credentials keys are unchanged.
-- `Rfc2136Config`: `algorithm` is a `String` and `ttl` a `u32` with the documented defaults; `null`
-  is still read as the default.
-- `Yandex360Config` no longer implements `Default`: `org_id` is required.
-
-### Fixed
-
-- DigitalOcean and Yandex 360: a record delete answered "not found" is confirmed by a read; while
-  the value is still published the result is `Error::Conflict` instead of success.
+- Names: `DomainName` for zone and owner names and `TargetName` for names inside record data, with
+  IDNA conversion, wildcard labels and `NameError`.
+- The record model: `RecordType` as an open set of type codes, `Ttl`, `RecordData` in normalized
+  zone-file text form (RFC 1035) with wire conversion, and `RrSet`, the unit of every record
+  operation; `RecordError`. Typed construction and parsing for TXT (`Txt`), MX (`Mx`), SRV (`Srv`),
+  CAA (`Caa`), TLSA (`Tlsa`) and SVCB/HTTPS (`Svcb`, `SvcParam`).
+- Provider identifiers: `ProviderId`, one variant per provider, with the persisted string, parsing
+  (`UnknownProviderId`) and `ProviderId::ALL`. The list is complete in every build, whatever
+  features are enabled.
+- Provider metadata and capabilities, present for every provider in every build: `ProviderMeta`
+  (name, `verified` flag, default propagation timeout, configuration fields as `ConfigField` and
+  `FieldKind`) and `Capabilities` (the operations offered, record types as a `TypeSet`, read-only
+  types, `TtlSupport`, `provider_default_ttl`, `Preconditions`, `ValueGuarantee` for the TXT value
+  operations, whether an rrset write is one request and whether writes are asynchronous at the
+  provider).
+- The `Provider` trait: `check`, `list_zones`, `list_rrsets`, `get_rrset`, `set_rrset`,
+  `delete_rrset`, `add_txt_value` and `remove_txt_value`, with `Expect` preconditions and the
+  results `CheckReport`, `ZoneCheck`, `ZoneInfo`, `ZoneListing` (with `SkippedRrset` and
+  `SkipReason` for rrsets the model cannot represent), `SetOutcome`, `DeleteOutcome`, `AddOutcome`
+  and `RemoveOutcome`. An operation a provider does not offer is `Error::Unsupported` before any
+  network request.
+- `AnyProvider`, an enum that dispatches to the clients compiled into the build, built from a
+  provider ID and JSON settings and credentials (`AnyProvider::from_json`).
+- `Context` and `ContextOptions`: the state shared by the clients of a process (HTTP client,
+  per-name locks, timeouts, user agent suffix, extra root certificates).
+- `Error` with `ErrorKind` (stable snake_case identifiers), `Operation`, `Error::is_retryable`, and
+  `Detail`, the redacted text an error carries.
+- DNS-01 helpers in the module `dns01`: `challenge_name` and `CHALLENGE_LABEL`; `follow_cname` over
+  the `CnameLookup` trait, with `CnameChain`, `CnameError`, `LookupError` and the default limit
+  `CNAME_CHAIN_MAX`; `select_zone` for the zone of a name.
+- Propagation inspector in the module `inspector` (feature `inspector`): `Inspector`, configured by
+  `InspectorConfig` (`NsDiscovery`, `NameServer`, `IpFamilies`, `PUBLIC_RESOLVERS`), discovers the
+  authoritative name servers of a zone, asks a `Question` of any record type at one server, at every
+  server or through recursive resolvers (`Answer`), and waits (`WaitOptions`, with a pause between
+  rounds of at least `WaitOptions::MIN_INTERVAL`, 1 s) until an `Expectation` with a `Condition`
+  (value present, exact set, absent) holds, with a `Report` and a `ServerReport` per name server.
+  Discovery fails with `InspectorError::NameServerWithoutAddress` instead of returning a shortened
+  server list when an NS name has no usable address. It also implements `CnameLookup`.
+- Features: one per provider, named like its ID; `all-providers`, which enables every provider;
+  `inspector`. No feature is enabled by default.
+- Configuration types per provider, in `providers::<id>`: a settings type and a credentials type,
+  deserialized from JSON (unknown settings keys are refused): `AcmeDnsConfig`/`AcmeDnsCredentials`,
+  `BegetConfig`/`BegetCredentials`, `CloudRuConfig`/`CloudRuCredentials`,
+  `CloudflareConfig`/`CloudflareCredentials`, `DigitalOceanConfig`/`DigitalOceanCredentials`,
+  `HetznerConfig`/`HetznerCredentials`, `NicruConfig`/`NicruCredentials`,
+  `RegruConfig`/`RegruCredentials`, `Rfc2136Config`/`Rfc2136Credentials`,
+  `Route53Config`/`Route53Credentials`, `SelectelV2Config`/`SelectelV2Credentials`,
+  `TimewebCloudConfig`/`TimewebCloudCredentials`, `VkCloudConfig`/`VkCloudCredentials`,
+  `Yandex360Config`/`Yandex360Credentials`, and `YandexCloudConfig`/`YandexCloudCredentials` with
+  `AuthorizedKey`.
+- Provider clients with TXT value operations and record-level operations: Selectel v2
+  (`selectel_v2`), Cloudflare (`cloudflare`), Yandex Cloud (`yandex_cloud`), Route 53 (`route53`),
+  DigitalOcean (`digitalocean`), VK Cloud (`vk_cloud`), RFC 2136 dynamic update with TSIG
+  (`rfc2136`, without zone or record listing), Yandex 360 (`yandex_360`), Timeweb Cloud
+  (`timeweb_cloud`), Cloud.ru (`cloud_ru`), Hetzner (`hetzner`), nic.ru (`nicru`) and reg.ru
+  (`regru`, without zone listing). The record types and limits of each are in `PROVIDERS.md`.
+- Provider clients with TXT value operations only: acme-dns (`acme_dns`, add only) and Beget
+  (`beget`).
+- Guarantees: HTTP clients use `reqwest` with `rustls` and `aws-lc-rs`; `ring`, OpenSSL and
+  `native-tls` are not in the dependency tree; the crate never installs a process-wide crypto
+  provider. Secrets are held in `secrecy` wrappers and never appear in `Debug` output, error text or
+  `tracing` events. The crate emits `tracing` events only, without request or response bodies or
+  headers.
+- Minimum supported Rust version 1.88, edition 2024.

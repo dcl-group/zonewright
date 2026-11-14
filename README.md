@@ -45,7 +45,8 @@ The provider IDs are listed in [`PROVIDERS.md`](./PROVIDERS.md).
 
 A client is built from the provider ID, a JSON object of settings and a JSON object of credentials,
 as an application would keep them in its own storage. Settings and credentials are different for
-each provider; `ProviderId::meta` describes the fields.
+each provider; `ProviderId::meta` describes the fields. The examples in this file need the features
+`cloudflare` and `inspector`, as in the installation snippet above.
 
 ```rust,no_run
 use secrecy::SecretString;
@@ -106,7 +107,8 @@ an application can map to its own error codes.
 With the `inspector` feature, `zonewright::inspector::Inspector` discovers the authoritative name
 servers of a zone, asks any record type at one server or at every server of the zone, and waits
 until an expectation holds (a value is present, the rrset is exactly a given set, or a value is
-absent) at all of them, reporting per name server. It needs a `tokio` runtime with the I/O and time
+absent) at all of them, reporting per name server. Discovery fails rather than return an incomplete
+list when a name server has no usable address. It needs a `tokio` runtime with the I/O and time
 drivers enabled and holds no secrets.
 
 ```rust,no_run
@@ -173,10 +175,10 @@ cargo deny check
 cargo test
 ```
 
-The gates are also run with no features, with each feature alone (`cargo hack --each-feature`) and
-with all features. The default test run needs no network: clients are tested against mocks with
-synthetic fixtures. Tests against a live API are `#[ignore]`d, read credentials from environment
-variables, and are run only by the maintainer.
+No CI configuration is part of the repository; the gates are run by hand, also with no features,
+with each feature alone (`cargo hack --each-feature`) and with all features. The default test run
+needs no network: clients are tested against mocks with synthetic fixtures. Tests against a live API
+are `#[ignore]`d, read credentials from environment variables, and are run only by the maintainer.
 
 ## License
 

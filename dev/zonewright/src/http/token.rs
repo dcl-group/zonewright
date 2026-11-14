@@ -7,7 +7,7 @@
 //! `WARN` event says so, without the token or the answer. Single flight: the fetch runs inside the first caller's future while it holds the
 //! source's async lock, and the others wait for the lock. If that future is dropped mid-fetch,
 //! the lock is released with nothing stored and the next waiter fetches; there is no detached
-//! task and no state a cancelled fetch can leave half-written. Every token has a generation
+//! task and no state a canceled fetch can leave half-written. Every token has a generation
 //! number, and invalidation names the generation, so a late 401 for an old token does not
 //! discard a fresh one.
 //!
@@ -146,7 +146,7 @@ impl TokenSource {
 
     /// A new token from `fetch`, even when a valid one is cached: for a connection check, which
     /// must prove that the credentials are accepted now. The cached token is discarded before
-    /// the fetch, so a failed or cancelled fetch leaves the source empty, and the next caller
+    /// the fetch, so a failed or canceled fetch leaves the source empty, and the next caller
     /// fetches again. Concurrent callers of [`TokenSource::get`] wait for this fetch and use its
     /// token.
     pub(crate) async fn renew<F, Fut>(&self, fetch: F) -> Result<Lease, Error>

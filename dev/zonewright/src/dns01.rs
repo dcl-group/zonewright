@@ -3,7 +3,7 @@
 //! Pure functions and one trait; no network code. The inspector implements [`CnameLookup`] when
 //! its feature is enabled; an application can implement it over any resolver.
 //!
-//! Deliberately not here: CAA tree climbing and any judgement on whether a CA may issue, rules
+//! Deliberately not here: CAA tree climbing and any judgment of whether a CA may issue, rules
 //! about where a challenge may be delegated (such as "the CNAME target must not be a zone apex"),
 //! and computing the TXT value from a key authorization. Those decide what a zone should contain
 //! or belong to ACME.
