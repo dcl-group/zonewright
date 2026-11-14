@@ -64,15 +64,24 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
             r#"{"project_id":"b5b7ffd4ef0547e5b222f44555df0000","username":"dns@example.test","identity_url":"http://127.0.0.1:9/identity/v3","dns_url":"http://127.0.0.1:9/public-dns/v2/dns"}"#,
             r#"{"password":"test-only-password"}"#,
         ),
+        ProviderId::Yandex360 => (
+            r#"{"org_id":"7654321","base_url":"http://127.0.0.1:9"}"#,
+            r#"{"oauth_token":"test-only-token"}"#,
+        ),
+        ProviderId::Rfc2136 => (
+            r#"{"server":"127.0.0.1:9","key_name":"zw-test-key"}"#,
+            r#"{"secret":"em9uZXdyaWdodC1zYW1wbGUtdHNpZy1zZWNyZXQtMzI="}"#,
+        ),
+        ProviderId::TimewebCloud => (
+            r#"{"base_url":"http://127.0.0.1:9/api"}"#,
+            r#"{"token":"test-only-token"}"#,
+        ),
         ProviderId::AcmeDns
         | ProviderId::Beget
         | ProviderId::CloudRu
         | ProviderId::Hetzner
         | ProviderId::Nicru
-        | ProviderId::Regru
-        | ProviderId::Rfc2136
-        | ProviderId::TimewebCloud
-        | ProviderId::Yandex360 => ("{}", "{}"),
+        | ProviderId::Regru => ("{}", "{}"),
         _ => panic!("no sample configuration for {id}"),
     }
 }
