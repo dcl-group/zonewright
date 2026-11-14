@@ -59,15 +59,17 @@ persists state:
 
 ## Repository layout
 
-Three top-level directories; they appear as the work reaches them.
+Top-level directories:
 
 - `docs/` — documentation. The design document is `docs/design.md`.
-- `dev/` — code. Cargo commands, including the gates, run from this directory.
-- `todo/` — short documents, one per concrete task. A task's file is deleted when the task is
-  closed; finished tasks are not archived here.
+- `dev/` — the Cargo workspace: `dev/zonewright` (the crate) and `dev/mock` (the mock provider
+  servers used by the tests, not published). Cargo commands, including the gates, run from `dev/`.
+- `todo/` — short documents, one per concrete task, created when the first task is filed. A task's
+  file is deleted when the task is closed; finished tasks are not archived here.
 
 Top-level files:
 
+- `README.md` — what the crate is and how to use it.
 - `PROVIDERS.md` — the list of providers and the state of each client.
 - `CHANGELOG.md` — what changed in each release.
 
@@ -112,6 +114,9 @@ maintainer can overrule it.
   optional feature.
 - Depend on `reqwest` with `default-features = false` and the `rustls-no-provider` feature (the name
   was checked against `reqwest` 0.13.5; check it again when the version changes).
+- `reqwest` with `rustls-no-provider` panics when it builds a client without a process-wide crypto
+  provider; the crate therefore passes its own `rustls::ClientConfig` with an explicit `aws-lc-rs`
+  provider.
 
 ## Hard rules
 
@@ -122,12 +127,15 @@ maintainer can overrule it.
    level: that is where credentials travel as plain strings, outside any wrapper. An event carries
    the method, the path without the query string, the status code and the duration.
 2. **Client invariants.** The name is inside the zone; a TXT value operation never overwrites an
-   rrset; someone else's value is never deleted; operations on one name are serialized.
+   rrset; someone else's value is never deleted; operations on one name are serialized. Where a
+   provider's API offers neither a per-value call nor a conditional write, these guarantees hold
+   within one process; the client's capabilities say so.
 3. **Nothing invented.** Provider endpoints, request shapes, limits and error codes come from the
-   provider's documentation, lego or `dns-update`, with a reference in the code, or from behavior a
-   developer observed while testing against the provider's live API, with a comment saying what was
-   observed and when. Where documentation and observed behavior disagree, the code follows the
-   observed behavior and the comment records the discrepancy.
+   provider's documentation, lego or `dns-update`, or the provider's own published client code (its
+   CLI, SDK or Terraform provider), with a reference in the code, or from behavior a developer
+   observed while testing against the provider's live API, with a comment saying what was observed
+   and when. Where documentation and observed behavior disagree, the code follows the observed
+   behavior and the comment records the discrepancy.
 4. **No real credentials** in code, tests, fixtures, logs or reports.
 5. **`ring`, OpenSSL and `native-tls` never appear in the dependency tree.** Enforced by
    `cargo deny`.
@@ -153,8 +161,9 @@ maintainer can overrule it.
   critical incompatibility with the rest of the stack that has to be waited out. Each such exception
   is recorded next to the version in `Cargo.toml` with its reason, and lifted when the reason is
   gone.
-- Gates: `cargo fmt --check`, `cargo clippy`, `cargo deny check`, `cargo test`. CI builds with no
-  features, with each feature alone and with all features (`cargo hack --each-feature`).
+- Gates: `cargo fmt --check`, `cargo clippy`, `cargo deny check`, `cargo test`, run from `dev/` with
+  no features, with each feature alone and with all features (`cargo hack --each-feature`). There is
+  no CI configuration in the repository yet; the gates are run by hand before every commit.
 
 ## Tests
 
@@ -209,6 +218,8 @@ Not formatted: `target/`, lock files, test fixtures (compared byte for byte).
   maintainer something works.
 - In reports, separate what was verified from what was inferred, and say plainly what is not done or
   not checked.
+- Agents that share a checkout keep scratch files and backups in a directory of their own, and never
+  run a formatter over the whole workspace while others are editing.
 
 ## Git
 
