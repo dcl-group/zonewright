@@ -14,8 +14,8 @@ use crate::redact::Detail;
 /// Default API endpoint.
 // Source: the public API description, https://timeweb.cloud/api-docs (OpenAPI `servers`:
 // `https://api.timeweb.cloud`, every path below `/api/`); lego
-// providers/dns/timewebcloud/internal/client.go:19 (`defaultBaseURL` with the `/api` part) and
-// line 44 (`v1/domains/{zone}/dns-records` below it).
+// providers/dns/timewebcloud/internal/client.go:19 at commit `012a2c1e01` (`defaultBaseURL`
+// with the `/api` part) and line 44 (`v2/domains/{fqdn}/dns-records` below it).
 pub(super) const DEFAULT_BASE_URL: &str = "https://api.timeweb.cloud/api";
 
 /// TTL range the client accepts for a setting or a request, in seconds.

@@ -1,35 +1,56 @@
-//! Mock of the Timeweb Cloud API (domains and their DNS records, `v1`).
+//! Mock of the Timeweb Cloud API: domains, their subdomains and DNS records, with the `v2`
+//! record create and delete and the `v1` listings.
 //!
 //! Shapes follow the provider's public API description, <https://timeweb.cloud/api-docs> (the
 //! OpenAPI document it is rendered from), the same source the client cites:
 //!
-//! - `GET /api/v1/domains`: `limit` (integer, default 100), `offset` (integer, default 0); the
-//!   answer holds `meta.total` and `domains` with `fqdn`.
-//! - `GET /api/v1/domains/{fqdn}/dns-records`: `limit`, `offset`; the answer holds `meta.total`
-//!   and `dns_records` with `type`, `id` (a number, nullable), `ttl` and `data` (`subdomain`,
-//!   `value`); documented errors `400`, `401`, `404`, `429`, `500`.
-//! - `POST /api/v1/domains/{fqdn}/dns-records`: `type` (one of `TXT`, `SRV`, `CNAME`, `AAAA`,
-//!   `MX`, `A`) and `value` required, `subdomain`, `priority` and `ttl` optional; `201` with a
-//!   `dns_record`.
-//! - `DELETE /api/v1/domains/{fqdn}/dns-records/{record_id}`: `204`.
+//! - `GET /api/v1/domains` (`getDomains`): `limit` (integer, default 100), `offset` (integer,
+//!   default 0); the answer holds `meta.total` and `domains`, each with `fqdn` and `subdomains`
+//!   (each with `fqdn`, `id`, `linked_ip`).
+//! - `GET /api/v1/domains/{fqdn}/dns-records` (`getDomainDNSRecords`): `fqdn` is the full name of
+//!   a domain or a subdomain; `limit`, `offset`; the answer holds `meta.total` and `dns_records`
+//!   with `type`, `id` (a number, nullable), `ttl` and `data` (`subdomain`, `value`); documented
+//!   errors `400`, `401`, `404`, `429`, `500`.
+//! - `POST /api/v2/domains/{fqdn}/dns-records` (`createDomainDNSRecordV2`): `fqdn` is the domain
+//!   for a record at the apex, else the full name of the subdomain. The body is one of the
+//!   documented per-type objects: `type` and `value` required for `A`, `AAAA`, `TXT`, `CNAME`;
+//!   `type`, `value` and `priority` for `MX`; `type`, `service`, `protocol`, `priority`, `port`
+//!   and `host` for `SRV`; `ttl` optional everywhere, `app_id` optional for `A`. `201` with a
+//!   `dns_record` (`id`, `type`, `fqdn` of the main domain, `data` with `value` and the
+//!   `subdomain` relative to the main domain, absent at the apex, `ttl`); documented errors
+//!   `400`, `401`, `404`, `409`, `429`, `500`.
+//! - `DELETE /api/v2/domains/{fqdn}/dns-records/{record_id}` (`deleteDomainDNSRecordV2`):
+//!   `record_id` an integer; `204`; documented errors `400`, `401`, `404`, `429`, `500`.
 //! - Every error body is `{status_code, error_code, message, response_id}`; `Authorization:
 //!   Bearer <token>` is required.
+//!
+//! The deprecated `v1` create and delete are not served: a client that sends them gets `405` (the
+//! listing's path exists for `GET` only) or `404`.
 //!
 //! Answers this mock invents because the documentation is silent, each chosen so that a client
 //! cannot rely on a lenient reading. A test that depends on one of them proves only how the
 //! client handles that answer, not that the provider gives it:
 //!
-//! - the form in which a listing states a record's `subdomain`: relative to the domain with
-//!   `null` for the apex (the default), or the full name ([`SubdomainForm`]);
-//! - the `subdomain` of a created record is read as the full name when it equals the domain or
-//!   ends with `.<domain>`, and otherwise as a name relative to the domain; a missing or empty
-//!   one is the apex;
+//! - the form in which a listing states a record's `subdomain`: relative to the main domain with
+//!   `null` for the apex (the default, as the `v2` record schema describes it), or the full name
+//!   ([`SubdomainForm`]);
+//! - which records a listing holds: the listing of a domain holds every record of the domain,
+//!   subdomains included; the listing of a subdomain holds the records at that name and at every
+//!   name below it; a listing of a name that is neither a domain of the account nor a subdomain
+//!   of one is `404`;
+//! - a create at a name that is not yet a subdomain creates the subdomain (lego creates records
+//!   at challenge names without creating a subdomain first), unless
+//!   [`Control::set_require_subdomain`] makes it `404`, as the documentation's "created
+//!   beforehand" could mean; a subdomain stays when its last record is deleted;
+//! - a delete names the record at the name it is at: another name, even of the same domain, is
+//!   `404`;
+//! - a body key that the type's documented object does not have is refused with `400`;
 //! - `limit` above 100 or below 1, an `offset` below 0, and a `limit` or `offset` that is not an
-//!   integer are refused with `400`; `meta.total` counts all the records of the domain;
+//!   integer are refused with `400`; `meta.total` counts all the records of the listing;
 //! - a `ttl` that is not a non-negative integer is refused with `400`; a record created without
 //!   `ttl` is listed without one (`null`);
-//! - the text and `error_code` of every error, and the status of a delete of a missing record
-//!   (`404`);
+//! - the text and `error_code` of every error, the status of a delete of a missing record
+//!   (`404`), and that the mock never answers `409`;
 //! - a record can be listed with `id` as a whole float (`1001.0`, [`Control::set_float_ids`]) or
 //!   with a `null` id ([`Control::set_null_id`]), both allowed by the schema's `number`,
 //!   `nullable`.
@@ -38,7 +59,7 @@
 //!
 //! ```text
 //! let mock = TimewebCloudMock::start(Seed::standard()).await;
-//! mock.faults().push(Fault::on("POST", "/api/v1/domains/*/dns-records").status(500));
+//! mock.faults().push(Fault::on("POST", "/api/v2/domains/*/dns-records").status(500));
 //! // ... drive the client against mock.base_url() ...
 //! assert_eq!(mock.control().txt_values("_acme-challenge.example.org"), ["v1"]);
 //! ```
@@ -47,7 +68,7 @@
 // boxing them would only add noise.
 #![allow(clippy::result_large_err)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -55,8 +76,8 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use serde_json::{Value, json};
+use axum::routing::{delete, get, post};
+use serde_json::{Map, Value, json};
 
 use crate::MockServer;
 
@@ -66,8 +87,19 @@ pub const API_PATH: &str = "/api";
 /// Largest `limit` the mock accepts (invented; the documentation states the default only).
 const MAX_LIMIT: u64 = 100;
 
-/// Record types the create accepts.
-const TYPES: [&str; 6] = ["TXT", "SRV", "CNAME", "AAAA", "MX", "A"];
+/// The documented create objects: type, required keys, optional keys.
+const SHAPES: [(&str, &[&str], &[&str]); 6] = [
+    ("A", &["type", "value"], &["ttl", "app_id"]),
+    ("AAAA", &["type", "value"], &["ttl"]),
+    ("TXT", &["type", "value"], &["ttl"]),
+    ("CNAME", &["type", "value"], &["ttl"]),
+    ("MX", &["type", "value", "priority"], &["ttl"]),
+    (
+        "SRV",
+        &["type", "service", "protocol", "priority", "port", "host"],
+        &["ttl"],
+    ),
+];
 
 /// The state the mock starts from.
 #[derive(Clone, Debug)]
@@ -91,9 +123,9 @@ impl Seed {
 /// The form in which a listing states a record's `subdomain`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubdomainForm {
-    /// Relative to the domain; `null` for the apex.
+    /// Relative to the main domain; `null` for the apex.
     Relative,
-    /// The full name without a trailing dot, the zone's own name for the apex.
+    /// The full name without a trailing dot, the domain's own name for the apex.
     Full,
 }
 
@@ -102,13 +134,13 @@ pub enum SubdomainForm {
 pub struct Record {
     /// The record's identifier.
     pub id: u64,
-    /// The domain, without a trailing dot.
+    /// The main domain, without a trailing dot.
     pub domain: String,
     /// The owner name relative to the domain; empty for the apex.
     pub subdomain: String,
     /// The record type.
     pub rtype: String,
-    /// The value.
+    /// The value (for `SRV`, the `host`).
     pub value: String,
     /// TTL in seconds; `None` when none was given.
     pub ttl: Option<u64>,
@@ -118,6 +150,8 @@ pub struct Record {
 struct Inner {
     token: String,
     domains: Vec<String>,
+    /// Subdomains: (domain, name relative to it).
+    subdomains: BTreeSet<(String, String)>,
     records: Vec<Record>,
     next_id: u64,
     /// Caps `limit`, to force small pages.
@@ -126,8 +160,28 @@ struct Inner {
     float_ids: bool,
     /// Records the listing shows with a `null` id.
     null_ids: HashSet<u64>,
-    /// Records the listing leaves out.
-    hidden: HashSet<u64>,
+    /// A create at a name that is not a subdomain yet is `404`.
+    require_subdomain: bool,
+}
+
+impl Inner {
+    /// The domain of the account that `fqdn` is, or is below, and the name relative to it
+    /// (empty for the domain itself). The longest matching domain wins.
+    fn locate(&self, fqdn: &str) -> Option<(String, String)> {
+        let fqdn = fqdn.to_lowercase();
+        self.domains
+            .iter()
+            .filter_map(|domain| {
+                let domain = domain.to_lowercase();
+                if fqdn == domain {
+                    Some((domain, String::new()))
+                } else {
+                    fqdn.strip_suffix(&format!(".{domain}"))
+                        .map(|rel| (domain.clone(), rel.to_owned()))
+                }
+            })
+            .max_by_key(|(domain, _)| domain.len())
+    }
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -166,23 +220,22 @@ impl TimewebCloudMock {
         let state = Arc::new(Mutex::new(Inner {
             token: seed.token,
             domains: seed.domains,
+            subdomains: BTreeSet::new(),
             records: Vec::new(),
             next_id: 1000,
             page_cap: None,
             form: SubdomainForm::Relative,
             float_ids: false,
             null_ids: HashSet::new(),
-            hidden: HashSet::new(),
+            require_subdomain: false,
         }));
         let router = Router::new()
             .route("/api/v1/domains", get(domains_list))
+            .route("/api/v1/domains/{fqdn}/dns-records", get(records_list))
+            .route("/api/v2/domains/{fqdn}/dns-records", post(record_create))
             .route(
-                "/api/v1/domains/{fqdn}/dns-records",
-                get(records_list).post(record_create),
-            )
-            .route(
-                "/api/v1/domains/{fqdn}/dns-records/{id}",
-                axum::routing::delete(record_delete),
+                "/api/v2/domains/{fqdn}/dns-records/{id}",
+                delete(record_delete),
             )
             .with_state(state.clone());
         Self {
@@ -230,8 +283,17 @@ impl Control {
             .collect()
     }
 
+    /// The full names of the subdomains, sorted.
+    pub fn subdomains(&self) -> Vec<String> {
+        lock(&self.state)
+            .subdomains
+            .iter()
+            .map(|(domain, rel)| format!("{rel}.{domain}"))
+            .collect()
+    }
+
     /// Adds a record directly, as another writer would. `name` is absolute or relative to the
-    /// domain. Returns the record's identifier.
+    /// domain; a name below the domain becomes a subdomain. Returns the record's identifier.
     pub fn insert_record(
         &self,
         domain: &str,
@@ -243,10 +305,16 @@ impl Control {
         let mut inner = lock(&self.state);
         inner.next_id += 1;
         let id = inner.next_id;
+        let subdomain = relative(name, domain);
+        if !subdomain.is_empty() {
+            inner
+                .subdomains
+                .insert((domain.to_owned(), subdomain.clone()));
+        }
         inner.records.push(Record {
             id,
             domain: domain.to_owned(),
-            subdomain: relative(name, domain),
+            subdomain,
             rtype: rtype.to_owned(),
             value: value.to_owned(),
             ttl,
@@ -260,12 +328,10 @@ impl Control {
     }
 
     /// Changes the record `id` in place, keeping its identifier, as another writer would with
-    /// the documented `PATCH /api/v1/domains/{fqdn}/dns-records/{record_id}`. `name` is
-    /// absolute or relative to the record's domain.
-    pub fn update_record(&self, id: u64, name: &str, value: &str) {
+    /// the documented `PATCH /api/v2/domains/{fqdn}/dns-records/{record_id}`.
+    pub fn update_record(&self, id: u64, value: &str) {
         let mut inner = lock(&self.state);
         if let Some(record) = inner.records.iter_mut().find(|r| r.id == id) {
-            record.subdomain = relative(name, &record.domain);
             record.value = value.to_owned();
         }
     }
@@ -307,9 +373,10 @@ impl Control {
         lock(&self.state).null_ids.insert(id);
     }
 
-    /// The listing leaves the record `id` out (it still exists and can be deleted by `id`).
-    pub fn hide_from_list(&self, id: u64) {
-        lock(&self.state).hidden.insert(id);
+    /// A create at a name that is not a subdomain yet is answered `404` instead of creating the
+    /// subdomain.
+    pub fn set_require_subdomain(&self, require: bool) {
+        lock(&self.state).require_subdomain = require;
     }
 }
 
@@ -403,12 +470,25 @@ async fn domains_list(
         Ok(paging) => paging,
         Err(response) => return response,
     };
-    let items: Vec<Value> = lock(&state)
+    let inner = lock(&state);
+    let items: Vec<Value> = inner
         .domains
         .iter()
         .enumerate()
-        .map(|(i, d)| json!({"id": i + 1, "fqdn": d, "subdomains": [], "linked_ip": null}))
+        .map(|(i, d)| {
+            let subdomains: Vec<Value> = inner
+                .subdomains
+                .iter()
+                .filter(|(domain, _)| domain == d)
+                .enumerate()
+                .map(|(j, (_, rel))| {
+                    json!({"id": 5000 + j, "fqdn": format!("{rel}.{d}"), "linked_ip": null})
+                })
+                .collect();
+            json!({"id": i + 1, "fqdn": d, "subdomains": subdomains, "linked_ip": null})
+        })
         .collect();
+    drop(inner);
     let total = items.len();
     axum::Json(json!({
         "meta": {"total": total},
@@ -429,6 +509,7 @@ fn id_json(inner: &Inner, id: u64) -> Value {
     }
 }
 
+/// A record as a listing states it.
 fn record_json(inner: &Inner, record: &Record) -> Value {
     let subdomain = match (inner.form, record.subdomain.is_empty()) {
         (SubdomainForm::Relative, true) => Value::Null,
@@ -441,6 +522,23 @@ fn record_json(inner: &Inner, record: &Record) -> Value {
         "type": record.rtype,
         "ttl": record.ttl,
         "data": {"subdomain": subdomain, "value": record.value},
+    })
+}
+
+/// A record as the `v2` create states it: the main domain in `fqdn`, the name relative to it
+/// in `data.subdomain`, absent at the apex.
+fn created_json(record: &Record) -> Value {
+    let mut data = Map::new();
+    data.insert("value".into(), json!(record.value));
+    if !record.subdomain.is_empty() {
+        data.insert("subdomain".into(), json!(record.subdomain));
+    }
+    json!({
+        "id": record.id,
+        "type": record.rtype,
+        "fqdn": record.domain,
+        "data": data,
+        "ttl": record.ttl,
     })
 }
 
@@ -458,13 +556,20 @@ async fn records_list(
         Err(response) => return response,
     };
     let inner = lock(&state);
-    if !inner.domains.contains(&fqdn) {
+    let Some((domain, rel)) = inner.locate(&fqdn) else {
         return not_found("Domain not found");
+    };
+    if !rel.is_empty() && !inner.subdomains.contains(&(domain.clone(), rel.clone())) {
+        return not_found("Subdomain not found");
     }
+    let below = format!(".{rel}");
     let items: Vec<Value> = inner
         .records
         .iter()
-        .filter(|r| r.domain == fqdn && !inner.hidden.contains(&r.id))
+        .filter(|r| {
+            r.domain == domain
+                && (rel.is_empty() || r.subdomain == rel || r.subdomain.ends_with(&below))
+        })
         .map(|r| record_json(&inner, r))
         .collect();
     let total = items.len();
@@ -474,6 +579,47 @@ async fn records_list(
         "response_id": "00000000-0000-0000-0000-00000000mock",
     }))
     .into_response()
+}
+
+/// The fields of a create body, checked against the documented object of its type.
+fn create_fields(body: &[u8]) -> Result<(String, String, Option<u64>), Response> {
+    let Ok(Value::Object(body)) = serde_json::from_slice::<Value>(body) else {
+        return Err(bad_request("the body is not a JSON object"));
+    };
+    let rtype = body.get("type").and_then(Value::as_str).unwrap_or("");
+    let Some((_, required, optional)) = SHAPES.iter().find(|(t, _, _)| *t == rtype) else {
+        return Err(bad_request(
+            "type is required and must be one of the record types",
+        ));
+    };
+    for key in *required {
+        if body.get(*key).is_none_or(Value::is_null) {
+            return Err(bad_request(&format!("{key} is required")));
+        }
+    }
+    if let Some(key) = body
+        .keys()
+        .find(|k| !required.contains(&k.as_str()) && !optional.contains(&k.as_str()))
+    {
+        return Err(bad_request(&format!("{key} is not a field of this type")));
+    }
+    let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_owned);
+    let value = if rtype == "SRV" {
+        text("host")
+    } else {
+        text("value")
+    };
+    let Some(value) = value else {
+        return Err(bad_request("value must be a string"));
+    };
+    let ttl = match body.get("ttl") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(ttl) => Some(ttl),
+            None => return Err(bad_request("ttl must be a non-negative integer")),
+        },
+    };
+    Ok((rtype.to_owned(), value, ttl))
 }
 
 async fn record_create(
@@ -486,40 +632,32 @@ async fn record_create(
         return response;
     }
     let mut inner = lock(&state);
-    if !inner.domains.contains(&fqdn) {
+    let Some((domain, rel)) = inner.locate(&fqdn) else {
         return not_found("Domain not found");
+    };
+    let (rtype, value, ttl) = match create_fields(&body) {
+        Ok(fields) => fields,
+        Err(response) => return response,
+    };
+    if !rel.is_empty() {
+        let key = (domain.clone(), rel.clone());
+        if !inner.subdomains.contains(&key) {
+            if inner.require_subdomain {
+                return not_found("Subdomain not found");
+            }
+            inner.subdomains.insert(key);
+        }
     }
-    let Ok(body) = serde_json::from_slice::<Value>(&body) else {
-        return bad_request("the body is not JSON");
-    };
-    let Some(rtype) = body["type"].as_str().filter(|t| TYPES.contains(t)) else {
-        return bad_request("type is required and must be one of the record types");
-    };
-    let Some(value) = body["value"].as_str() else {
-        return bad_request("value is required");
-    };
-    let subdomain = match body.get("subdomain") {
-        None | Some(Value::Null) => "",
-        Some(Value::String(s)) => s.as_str(),
-        Some(_) => return bad_request("subdomain must be a string"),
-    };
-    let ttl = match body.get("ttl") {
-        None | Some(Value::Null) => None,
-        Some(v) => match v.as_u64() {
-            Some(ttl) => Some(ttl),
-            None => return bad_request("ttl must be a non-negative integer"),
-        },
-    };
     inner.next_id += 1;
     let record = Record {
         id: inner.next_id,
-        domain: fqdn.clone(),
-        subdomain: relative(subdomain, &fqdn),
-        rtype: rtype.to_owned(),
-        value: value.to_owned(),
+        domain,
+        subdomain: rel,
+        rtype,
+        value,
         ttl,
     };
-    let created = record_json(&inner, &record);
+    let created = created_json(&record);
     inner.records.push(record);
     (
         StatusCode::CREATED,
@@ -540,14 +678,16 @@ async fn record_delete(
         return response;
     }
     let mut inner = lock(&state);
-    if !inner.domains.contains(&fqdn) {
+    let Some((domain, rel)) = inner.locate(&fqdn) else {
         return not_found("Domain not found");
-    }
+    };
     let Ok(id) = id.parse::<u64>() else {
         return bad_request("record_id must be an integer");
     };
     let before = inner.records.len();
-    inner.records.retain(|r| !(r.domain == fqdn && r.id == id));
+    inner
+        .records
+        .retain(|r| !(r.domain == domain && r.subdomain == rel && r.id == id));
     if inner.records.len() == before {
         return not_found("DNS record not found");
     }

@@ -5,61 +5,62 @@
 //! Sources (hard rule 3):
 //!
 //! - The public API description, <https://timeweb.cloud/api-docs> (the OpenAPI document it is
-//!   rendered from, read on 2026-11-14; the server is `https://api.timeweb.cloud`, authentication
-//!   is `http` scheme `bearer`):
-//!   - `GET /api/v1/domains` (`getDomains`): `limit` (integer, default 100) and `offset`
-//!     (integer, default 0); the answer holds `meta.total` and `domains`, each with `fqdn`
-//!     (both required by the schema).
-//!   - `GET /api/v1/domains/{fqdn}/dns-records` (`getDomainDNSRecords`, not marked deprecated):
-//!     `limit` and `offset` as above; the answer holds `meta.total` and `dns_records`, each with
-//!     `type` (`TXT`, `SRV`, `CNAME`, `AAAA`, `MX`, `A`), `id` (a number, nullable), `ttl` and
-//!     `data` with `subdomain` (nullable string), `value` and `priority`. Documented answers:
-//!     `200`, `400`, `401`, `404`, `429`, `500`.
-//!   - `POST /api/v1/domains/{fqdn}/dns-records` (`createDomainDNSRecord`, marked `deprecated`):
-//!     body `type` and `value` required, `subdomain`, `priority` and `ttl` optional; `201` with a
-//!     `dns_record` object (the record as listed); `400`, `401`, `404`, `429`, `500`.
-//!   - `DELETE /api/v1/domains/{fqdn}/dns-records/{record_id}` (`deleteDomainDNSRecord`, marked
-//!     `deprecated`): `204`; `400`, `401`, `404`, `429`, `500`.
+//!   rendered from, `https://timeweb.cloud/api-docs-data/bundle.json`, version `1.0.0`, read on
+//!   2026-11-14; the server is `https://api.timeweb.cloud`, authentication is `http` scheme
+//!   `bearer`):
+//!   - `GET /api/v1/domains` (`getDomains`, not marked deprecated): `limit` (integer, default
+//!     100) and `offset` (integer, default 0); the answer holds `meta.total` and `domains`, each
+//!     with `fqdn` (both required by the schema).
+//!   - `GET /api/v1/domains/{fqdn}/dns-records` (`getDomainDNSRecords`, not marked deprecated;
+//!     the API has no `v2` listing): "all user DNS records of a domain or subdomain", where
+//!     `fqdn` is "the full name of a domain or subdomain"; `limit` and `offset` as above; the
+//!     answer holds `meta.total` and `dns_records`, each with `type` (`TXT`, `SRV`, `CNAME`,
+//!     `AAAA`, `MX`, `A`), `id` (a number, nullable), `ttl` and `data` with `subdomain`
+//!     (nullable string, example `sub.somedomain.ru`), `value` and `priority`. Documented
+//!     answers: `200`, `400`, `401`, `404`, `429`, `500`.
+//!   - `POST /api/v2/domains/{fqdn}/dns-records` (`createDomainDNSRecordV2`): `fqdn` is the
+//!     domain's name for a record at the domain itself and the full name of the subdomain for a
+//!     record at a subdomain; the description adds that the subdomain must be created
+//!     beforehand with `POST /api/v1/domains/{fqdn}/subdomains/{subdomain}`. The TXT body is
+//!     `type` and `value` (required) and `ttl` (a number, "the record's lifetime in seconds");
+//!     there is no name field. `201` with `dns_record` (`id` a number, nullable; `type`; `fqdn`,
+//!     the main domain; `data.value`; `data.subdomain`, the name relative to the main domain,
+//!     absent at the domain itself; `ttl`). Documented answers: `201`, `400`, `401`, `404`,
+//!     `409`, `429`, `500`.
+//!   - `DELETE /api/v2/domains/{fqdn}/dns-records/{record_id}` (`deleteDomainDNSRecordV2`):
+//!     `fqdn` as for the create, `record_id` an integer; `204`; `400`, `401`, `404`, `429`,
+//!     `500`.
 //!   - The error body of every non-success answer: `status_code`, `error_code`, `message` (a
 //!     string or an array of strings) and `response_id`.
-//!   - The create's `subdomain` is described as the full name of the subdomain; the listing's
-//!     `data.subdomain` is described only as the subdomain, with the example
-//!     `sub.somedomain.ru`.
-//! - lego `providers/dns/timewebcloud`, as of commit `1991339cc1` ("fix subdomain support",
-//!   2026-02-12) and unchanged in these respects up to `c40c0a2a45` (2026-04-30):
-//!   `internal/client.go` `POST {base}/v1/domains/{zone}/dns-records` (line 44) and `DELETE
-//!   {base}/v1/domains/{zone}/dns-records/{id}` (line 64), the zone without its trailing dot;
-//!   `internal/types.go` the record body `type`, `value` and `subdomain` (lines 5 to 12, where
-//!   the comment on `SubDomain` says it is "the full name of a subdomain (not only the subdomain
-//!   label)"), the answer's `dns_record` key (line 15) and the error fields (lines 18 to 23);
-//!   `timewebcloud.go` the value unquoted and the challenge's full name without the trailing dot
-//!   in `subdomain` (lines 115 and 116). That commit replaced the relative label lego had sent
-//!   before, after a user observed on 2026-02-12 that records for names below a subdomain were
-//!   not created with it and were with the full name (lego issue 2844).
+//! - lego `providers/dns/timewebcloud` at commit `012a2c1e01` ("update API client to new API
+//!   version", 2026-05-22), unchanged in these respects at `7c184b4d1a` (2026-11-04):
+//!   `internal/client.go` `POST {base}/v2/domains/{fqdn}/dns-records` (line 44) and `DELETE
+//!   {base}/v2/domains/{fqdn}/dns-records/{id}` (line 64), the name without its trailing dot;
+//!   `timewebcloud.go` passes the challenge's full name (`info.EffectiveFQDN`) to both (lines 118
+//!   and 147) and sends the body `type` and `value` with the value unquoted (lines 113 to 116),
+//!   without creating a subdomain first; `internal/types.go` the `dns_record` key of the answer
+//!   (line 23) and the error fields (lines 26 to 31). The change followed lego issue 3119
+//!   (2026-05-22), where the deprecated `v1` create answered `400` `bad_subdomain_name` for
+//!   `_acme-challenge.<domain>`.
 //!
-//! Why the deprecated endpoints: the create and the delete in use are the v1 ones, which the API
-//! description marks as deprecated; the design keeps them as ported (design sections 11.2, 11.3
-//! and 13.4, item 12), and a live check decides when to move. The v2 create takes the record's
-//! full name in the path and, by its description, needs a subdomain created beforehand with a
-//! separate call (`POST /api/v1/domains/{fqdn}/subdomains/{subdomain}`); it has no listing of its
-//! own. Note that lego moved to the v2 create and delete on 2026-05-22 (commit `012a2c1e01`)
-//! after a user reported the v1 create answering `400` `bad_subdomain_name` for
-//! `_acme-challenge.<domain>` (lego issue 3119); a v1 refusal is `Error::Rejected` and writes
-//! nothing.
+//! The deprecated `v1` create and delete (`createDomainDNSRecord`, `deleteDomainDNSRecord`) are
+//! not used (design section 13.4, item 12).
 //!
 //! Endpoints used, all below the `base_url`:
 //!
-//! | Call          | Request                                         | Success   |
-//! | ------------- | ----------------------------------------------- | --------- |
-//! | probe         | `GET /v1/domains?limit=1&offset=0`              | 200       |
-//! | list domains  | `GET /v1/domains?limit&offset`                  | 200, page |
-//! | zone exists   | `GET /v1/domains/{fqdn}/dns-records?limit=1&offset=0` | 200 |
-//! | list records  | `GET /v1/domains/{fqdn}/dns-records?limit&offset` | 200, page |
-//! | create record | `POST /v1/domains/{fqdn}/dns-records`           | 201       |
-//! | delete record | `DELETE /v1/domains/{fqdn}/dns-records/{id}`    | 204       |
+//! | Call          | Request                                                | Success   |
+//! | ------------- | ------------------------------------------------------ | --------- |
+//! | probe         | `GET /v1/domains?limit=1&offset=0`                     | 200       |
+//! | list domains  | `GET /v1/domains?limit&offset`                         | 200, page |
+//! | zone exists   | `GET /v1/domains/{zone}/dns-records?limit=1&offset=0`  | 200       |
+//! | list records  | `GET /v1/domains/{name}/dns-records?limit&offset`      | 200, page |
+//! | create record | `POST /v2/domains/{name}/dns-records`                  | 201       |
+//! | delete record | `DELETE /v2/domains/{name}/dns-records/{id}`           | 204       |
+//!
+//! `{name}` is the record's owner name: the zone itself, or the full name below it.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reqwest::{Method, Url};
 use serde::de::DeserializeOwned;
@@ -148,9 +149,10 @@ pub(super) struct Domain {
     pub(super) fqdn: String,
 }
 
-/// The body of `POST /v1/domains/{fqdn}/dns-records`.
-// Source: the create's request schema (`type` and `value` required; `subdomain`, `ttl`
-// optional); lego types.go lines 5 to 12 sends `type`, `value` and `subdomain`.
+/// The body of `POST /v2/domains/{fqdn}/dns-records`.
+// Source: the create's TXT request object (`type` and `value` required, `ttl` optional, no
+// other field); lego types.go lines 5 to 8 sends `type` and `value`. The owner name is the
+// path, not a body field.
 #[derive(Serialize)]
 pub(super) struct NewRecord<'a> {
     /// The record type.
@@ -158,14 +160,6 @@ pub(super) struct NewRecord<'a> {
     pub(super) rtype: &'a str,
     /// The value.
     pub(super) value: &'a str,
-    /// The owner name in full, without the trailing dot: the API description calls the field
-    /// the full name of the subdomain, and lego sent the challenge's full name in this form
-    /// (providers/dns/timewebcloud/timewebcloud.go line 116 at commit `c40c0a2a45`, see the
-    /// module documentation).
-    // Assumption (not documented): that the same form names the zone apex. The challenge names
-    // this crate writes are never the apex; a wrong reading would put our own record at a
-    // different name and never touch another one.
-    pub(super) subdomain: &'a str,
     /// TTL in seconds; left out when the caller has none to give.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ttl: Option<u32>,
@@ -174,10 +168,11 @@ pub(super) struct NewRecord<'a> {
 /// The answer to a create.
 #[derive(Debug)]
 pub(super) enum Created {
-    /// The provider accepted the record; its identifier, when the answer states one.
-    Done(Option<u64>),
-    /// `404`: the domain does not exist (any more); nothing was written.
-    NotFound,
+    /// The provider accepted the record.
+    Done,
+    /// `404`: the domain, or the name as a subdomain of it, is unknown to the provider; nothing
+    /// was written. Carries the provider's refusal, for when the domain exists.
+    NotFound(Error),
 }
 
 /// The answer to a delete.
@@ -209,12 +204,6 @@ impl Api {
         Api { http, base }
     }
 
-    /// The endpoint as text, the part of a remembered record's key that tells servers apart.
-    /// A validated endpoint has no user info and no query, so this holds no secret.
-    pub(super) fn endpoint_key(&self) -> &str {
-        self.base.as_url().as_str()
-    }
-
     /// `GET /v1/domains?limit=1&offset=0`: a real authenticated request that names no zone, so
     /// a success proves that the token is accepted now. The answer must have the listing's
     /// shape.
@@ -227,10 +216,13 @@ impl Api {
         read_page::<Domain>(&response, "domains").map(|_| ())
     }
 
-    /// Whether the domain exists in the account: `GET .../dns-records?limit=1&offset=0`, where
-    /// `404` is "no".
+    /// Whether the domain exists in the account: `GET /v1/domains/{zone}/dns-records` with
+    /// `limit=1&offset=0`, where `404` is "no".
+    // Assumption (not documented): that `404` on a domain's listing means that the account has
+    // no such domain (the status is documented, its meaning is not). Being wrong reports a zone
+    // as missing, or a write as refused; nothing is written either way.
     pub(super) async fn zone_exists(&self, zone: &DomainName) -> Result<bool, Error> {
-        let url = self.records_url(zone, 1, 0).build()?;
+        let url = paging(self.records_path(zone), 1, 0).build()?;
         let response = self.http.send(&Request::get(url)).await?;
         if response.status() == 404 {
             return Ok(false);
@@ -243,66 +235,88 @@ impl Api {
 
     /// Every domain of the account, all pages.
     pub(super) async fn domains(&self) -> Result<Vec<Domain>, Error> {
-        self.list(
-            |offset| self.domains_url(PAGE_SIZE, offset).build(),
-            "domains",
-            None,
-        )
-        .await
+        let listed = self
+            .list(
+                |offset| self.domains_url(PAGE_SIZE, offset).build(),
+                "domains",
+            )
+            .await?;
+        listed.ok_or_else(|| protocol("the provider answered \"not found\" to its domain listing"))
     }
 
-    /// Every record of the zone, of every type, all pages. The API has no filter by type or
-    /// name, so the caller selects. A `404` is `Error::ZoneNotFound` for `zone`.
-    // Source: the listing's parameters are the path, `limit` and `offset` only.
-    pub(super) async fn records(&self, zone: &DomainName) -> Result<Vec<Record>, Error> {
-        self.list(
-            |offset| self.records_url(zone, PAGE_SIZE, offset).build(),
-            "dns_records",
-            Some(zone),
-        )
-        .await
-    }
-
-    /// Creates a record. Sent once: a create is not idempotent, and a repeat after an unknown
-    /// outcome could add a second copy (design section 5.3). A `404` is [`Created::NotFound`];
-    /// another refusal is an error.
-    pub(super) async fn create_record(
+    /// Every record the API lists for `name`, of every type, all pages: `GET
+    /// /v1/domains/{name}/dns-records`, the listing of the domain when `name` is the zone and
+    /// the listing of the subdomain otherwise, the same name the create and the delete are
+    /// addressed to. The API has no filter by type, so the caller selects.
+    ///
+    /// A `404` for the zone is `Error::ZoneNotFound`. A `404` for a name below the zone says
+    /// that the provider has no subdomain of that name; then the zone is looked up, and the
+    /// answer is no records when it exists and `Error::ZoneNotFound` when it does not.
+    // Source: the listing's `fqdn` is the full name of a domain or subdomain, and it lists all
+    // the records of that domain or subdomain; its parameters are the path, `limit` and
+    // `offset` only.
+    // Assumption (not documented): that `404` for a name below an existing domain means that
+    // no record exists at that name. Being wrong can make an add create a second copy of our own
+    // value, or a removal report `NotPresent` while our record stays; it never deletes or
+    // overwrites anything.
+    pub(super) async fn records(
         &self,
         zone: &DomainName,
+        name: &DomainName,
+    ) -> Result<Vec<Record>, Error> {
+        let listed = self
+            .list(
+                |offset| paging(self.records_path(name), PAGE_SIZE, offset).build(),
+                "dns_records",
+            )
+            .await?;
+        match listed {
+            Some(records) => Ok(records),
+            None if name != zone && self.zone_exists(zone).await? => Ok(Vec::new()),
+            None => Err(Error::zone_not_found(zone.clone())),
+        }
+    }
+
+    /// Creates a record at `name`. Sent once: a create is not idempotent, and a repeat after an
+    /// unknown outcome could add a second copy (design section 5.3). A `404` is
+    /// [`Created::NotFound`]; another refusal is an error.
+    pub(super) async fn create_record(
+        &self,
+        name: &DomainName,
         record: &NewRecord<'_>,
     ) -> Result<Created, Error> {
         #[derive(Deserialize)]
         struct Answer {
-            dns_record: Written,
+            // Only the presence of the record is checked: the schema requires it.
+            #[serde(rename = "dns_record")]
+            _record: Written,
         }
         #[derive(Deserialize)]
         struct Written {
             // Only the presence of the type is checked: the schema requires it.
             #[serde(rename = "type")]
             _rtype: String,
-            #[serde(default)]
-            id: Option<Value>,
         }
-        let url = self.zone_url(zone).build()?;
+        let url = self.v2_records_path(name).build()?;
         let response = self
             .http
             .send(&Request::new(Method::POST, url).json(record)?)
             .await?;
         if response.status() == 404 {
-            return Ok(Created::NotFound);
+            return Ok(Created::NotFound(self.http.reject(&response)));
         }
         if !response.is_success() {
             return Err(self.refusal(&response));
         }
-        let answer: Answer =
+        let _: Answer =
             response.json("the provider's answer to a create is not in the expected form")?;
-        Ok(Created::Done(answer.dns_record.id.as_ref().and_then(whole)))
+        Ok(Created::Done)
     }
 
-    /// Deletes one record by its identifier. Idempotent: repeating it leaves the same state, so
+    /// Deletes the record `id` at `name`. Idempotent: repeating it leaves the same state, so
     /// the transport may retry it.
-    pub(super) async fn delete_record(&self, zone: &DomainName, id: u64) -> Result<Deleted, Error> {
-        let url = self.zone_url(zone).id(&id.to_string()).build()?;
+    pub(super) async fn delete_record(&self, name: &DomainName, id: u64) -> Result<Deleted, Error> {
+        let url = self.v2_records_path(name).id(&id.to_string()).build()?;
         let response = self
             .http
             .send(&Request::new(Method::DELETE, url).idempotent())
@@ -321,37 +335,37 @@ impl Api {
         paging(self.base.url().path("/v1/domains"), limit, offset)
     }
 
-    /// `/v1/domains/{fqdn}/dns-records` with the zone name without its trailing dot (lego
-    /// client.go lines 44 and 64).
-    fn zone_url(&self, zone: &DomainName) -> UrlBuilder {
+    /// `/v1/domains/{name}/dns-records`, the name without its trailing dot.
+    fn records_path(&self, name: &DomainName) -> UrlBuilder {
         self.base
             .url()
             .path("/v1/domains")
-            .segment(zone.without_dot())
+            .segment(name.without_dot())
             .path("/dns-records")
     }
 
-    fn records_url(&self, zone: &DomainName, limit: u64, offset: u64) -> UrlBuilder {
-        paging(self.zone_url(zone), limit, offset)
+    /// `/v2/domains/{name}/dns-records`, the name without its trailing dot (lego client.go lines
+    /// 44 and 64).
+    fn v2_records_path(&self, name: &DomainName) -> UrlBuilder {
+        self.base
+            .url()
+            .path("/v2/domains")
+            .segment(name.without_dot())
+            .path("/dns-records")
     }
 
     /// Reads every page of a listing; `url` builds the URL of an offset, `key` is the field that
-    /// holds the items. A `404` is `Error::ZoneNotFound` for `zone` when one is given, else a
-    /// refusal.
+    /// holds the items. `None` when the first page is answered `404`.
     ///
-    /// Complete or an error. The listing is complete when the items received reach
-    /// the largest `meta.total` any page stated; fewer, an absent `meta.total`, an absent list field, or an empty page
-    /// before the total is reached is `Error::Protocol`.
+    /// Complete or an error. The listing is complete when the items received reach the largest
+    /// `meta.total` any page stated; fewer, an absent `meta.total`, an absent list field, an
+    /// empty page before the total is reached, or a `404` after the first page is
+    /// `Error::Protocol`.
     // Source: both listings' answers require `meta` (with `total`) and the list field.
     // Assumption (not documented): that `meta.total` counts all the items of the listing and
     // that `offset` skips that many of them. Being wrong makes a listing fail, never come back
     // shorter.
-    async fn list<T, U>(
-        &self,
-        url: U,
-        key: &'static str,
-        zone: Option<&DomainName>,
-    ) -> Result<Vec<T>, Error>
+    async fn list<T, U>(&self, url: U, key: &'static str) -> Result<Option<Vec<T>>, Error>
     where
         T: DeserializeOwned,
         U: Fn(u64) -> Result<Url, Error>,
@@ -359,15 +373,23 @@ impl Api {
         // The largest total any page stated: a later page that states less cannot end the
         // listing early.
         let stated = AtomicU64::new(0);
-        pager::collect(0u64, |offset| {
+        let missing = AtomicBool::new(false);
+        let items = pager::collect(0u64, |offset| {
             let url = url(offset);
-            let stated = &stated;
+            let (stated, missing) = (&stated, &missing);
             async move {
                 let response = self.http.send(&Request::get(url?)).await?;
-                if response.status() == 404
-                    && let Some(zone) = zone
-                {
-                    return Err(Error::zone_not_found(zone.clone()));
+                if response.status() == 404 {
+                    if offset == 0 {
+                        missing.store(true, Ordering::Relaxed);
+                        return Ok(Page {
+                            items: Vec::new(),
+                            next: None,
+                        });
+                    }
+                    return Err(protocol(
+                        "the provider's listing was answered \"not found\" before its end",
+                    ));
                 }
                 if !response.is_success() {
                     return Err(self.refusal(&response));
@@ -388,13 +410,20 @@ impl Api {
                 Ok(Page { items, next })
             }
         })
-        .await
+        .await?;
+        Ok(if missing.load(Ordering::Relaxed) {
+            None
+        } else {
+            Some(items)
+        })
     }
 
     /// An answer the client does not expect. 401, 403, 429 and 5xx were mapped by the transport
     /// already. A 4xx is the provider refusing the request, with the documented error body;
     /// anything else is an answer the client cannot interpret.
-    // Source: the statuses named for every operation are 400, 401, 404, 429 and 500.
+    // Source: the statuses named for every operation are 400, 401, 404, 429 and 500, and 409
+    // for the create. What a 409 to a create means is not described, so it is a refusal like
+    // the other 4xx: nothing is repeated.
     fn refusal(&self, response: &Response) -> Error {
         match response.status() {
             400..=499 => self.http.reject(response),
@@ -451,13 +480,14 @@ fn whole(value: &Value) -> Option<u64> {
 
 /// The names a record's stated `subdomain` can denote in `zone`.
 ///
-/// The create takes the full name (see [`NewRecord`]); what a listing states is not specified
-/// (the API description's only hint is the example `sub.somedomain.ru`), so both readings are
-/// accepted: the full name, and a name relative to the zone (zone-file rules, where an absent
-/// or `@` name is the zone itself).
-// Assumption (not documented): that a listing states either form. A name read wrongly is
-// never taken for ours unless the same text is also the name asked for, and a value is removed
-// only when its text equals ours as well.
+/// The listing's schema describes `data.subdomain` only as the subdomain, with the example
+/// `sub.somedomain.ru` (a full name); the `v2` record schema describes it as the name relative
+/// to the main domain (`sub` for `sub.example.com`), absent for a record at the domain itself.
+/// Both readings are accepted: the full name, and a name relative to the zone (zone-file rules,
+/// where an absent or `@` name is the zone itself).
+// Assumption (not documented): that a listing states one of these two forms. A name read
+// wrongly is never taken for ours unless the same text is also the name asked for, and a value
+// is removed only when its text equals ours as well.
 pub(super) fn stated_names(stated: Option<&str>, zone: &DomainName) -> Vec<DomainName> {
     let stated = stated.map_or("", str::trim);
     let mut names = Vec::with_capacity(2);

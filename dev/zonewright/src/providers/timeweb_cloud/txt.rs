@@ -2,23 +2,29 @@
 //!
 //! Every TXT value is a record of its own with an identifier, so a request names only our
 //! record and a foreign value cannot be part of it (`ValueGuarantee::PerValue`). The value
-//! layer takes the per-name lock, reads and decides; this file maps its calls onto the API:
+//! layer takes the per-name lock, reads and decides; this file maps its calls onto the API. All
+//! three calls are addressed to the owner name itself (the zone, or the full name below it):
 //!
-//! - read: `GET …/dns-records`, every page, the whole zone (the API has no filter), then the
-//!   records of type TXT at exactly the requested name, selected on the client's side;
-//! - create: `POST …/dns-records`, sent once, with the full name in `subdomain`, the value and
-//!   the TTL the value layer chose (the rrset's as read when the name has TXT records, else the
-//!   caller's, else the configured one, else none, so that the provider decides). The answer's
-//!   identifier is remembered in the `Context`;
-//! - delete: `DELETE …/dns-records/{id}`. An answer "not found" says that the record, or the
-//!   whole domain with it, is gone; a domain deleted and created again could hold the value
-//!   under a new identifier, so it counts as done only after a new read finds no record with the
-//!   value.
+//! - read: `GET /v1/domains/{name}/dns-records`, every page, then the records of type TXT at
+//!   exactly the requested name, selected on the client's side. The listing of a subdomain
+//!   holds all its records, so every record at the name is seen and no identifier needs to be
+//!   remembered between operations. A listing of a name below the zone that states a record
+//!   without a name is refused (`Error::Protocol`), since such a record could be at the name or
+//!   at the zone itself;
+//! - create: `POST /v2/domains/{name}/dns-records`, sent once, with the value and the TTL the
+//!   value layer chose (the rrset's as read when the name has TXT records, else the caller's,
+//!   else the configured one, else none, so that the provider decides). No subdomain is created
+//!   first, as lego does not create one (see the API module); if the provider insists, the
+//!   create is refused and nothing is written;
+//! - delete: `DELETE /v2/domains/{name}/dns-records/{id}`. An answer "not found" says that the
+//!   record, or the whole domain with it, is gone; a domain deleted and created again could hold
+//!   the value under a new identifier, so it counts as done only after a new read finds no record
+//!   with the value.
 //!
-//! TXT dialect (design sections 4.4 and 11.2): read `Auto`, write `Raw`. lego sent the value
-//! itself in `value`, unquoted (providers/dns/timewebcloud/timewebcloud.go line 115 at commit
-//! `c40c0a2a45`, the last one on the v1 endpoints). Plain values, the only ones the
-//! capabilities accept, need no escape.
+//! TXT dialect (design sections 4.4 and 11.2): read `Auto`, write `Raw`. The create's `value` is
+//! described as the record's text, and lego sends the value itself, unquoted
+//! (providers/dns/timewebcloud/timewebcloud.go line 115 at commit `012a2c1e01`). Plain values,
+//! the only ones the capabilities accept, need no escape.
 
 use crate::error::Error;
 use crate::id::ProviderId;
@@ -62,10 +68,15 @@ impl PerRecord for TimewebCloud {
         zone: &DomainName,
         name: &DomainName,
     ) -> Result<PerRecordRead<Option<u64>>, Error> {
-        let records = self
-            .api
-            .records(zone)
-            .await?
+        let listed = self.api.records(zone, name).await?;
+        if name != zone && listed.iter().any(states_no_name) {
+            return Err(Error::Protocol {
+                detail: Detail::constant(
+                    "the provider's listing of a subdomain states a record without its name",
+                ),
+            });
+        }
+        let records = listed
             .into_iter()
             .filter(|record| is_txt_at(record, zone, name))
             .map(|record| TxtRecord {
@@ -96,24 +107,17 @@ impl PerRecord for TimewebCloud {
         let record = NewRecord {
             rtype: TXT,
             value: &data,
-            subdomain: name.without_dot(),
             ttl,
         };
-        match self.api.create_record(zone, &record).await? {
-            Created::Done(id) => {
-                if let Some(id) = id {
-                    self.ctx.timeweb_cloud().remember(
-                        self.api.endpoint_key(),
-                        zone,
-                        name,
-                        value.as_bytes(),
-                        id,
-                    );
-                }
-                Ok(())
-            }
-            // The domain does not exist (any more): nothing was written.
-            Created::NotFound => Err(Error::zone_not_found(zone.clone())),
+        match self.api.create_record(name, &record).await? {
+            Created::Done => Ok(()),
+            // Nothing was written. Either the domain does not exist (any more), or the provider
+            // does not take the name as a subdomain of it; only a lookup tells them apart.
+            Created::NotFound(refusal) => Err(if self.api.zone_exists(zone).await? {
+                refusal
+            } else {
+                Error::zone_not_found(zone.clone())
+            }),
         }
     }
 
@@ -130,7 +134,7 @@ impl PerRecord for TimewebCloud {
                 ),
             });
         };
-        if let Deleted::NotFound = self.api.delete_record(zone, id).await? {
+        if let Deleted::NotFound = self.api.delete_record(name, id).await? {
             // The record is gone, or the domain is and was created again. Only a new read tells
             // them apart.
             let PerRecordRead::Records(now) = self.read(zone, name).await? else {
@@ -146,20 +150,20 @@ impl PerRecord for TimewebCloud {
                 });
             }
         }
-        self.ctx
-            .timeweb_cloud()
-            .forget(self.api.endpoint_key(), zone, id);
         Ok(())
     }
 }
 
 /// Whether a listed record is a TXT record at exactly `name`.
-pub(super) fn is_txt_at(record: &Record, zone: &DomainName, name: &DomainName) -> bool {
+fn is_txt_at(record: &Record, zone: &DomainName, name: &DomainName) -> bool {
     record.rtype == TXT && stated_names(record.subdomain(), zone).contains(name)
 }
 
-/// Whether a listed record is a TXT record at exactly `name` that holds `value`.
-pub(super) fn holds(record: &Record, zone: &DomainName, name: &DomainName, value: &Txt) -> bool {
-    is_txt_at(record, zone, name)
-        && record.value().and_then(|text| READ.read(text)).as_ref() == Some(value)
+/// Whether a listed record states no owner name (absent, empty or `@`), which in the listing of
+/// the zone is the zone itself.
+fn states_no_name(record: &Record) -> bool {
+    record
+        .subdomain()
+        .map(str::trim)
+        .is_none_or(|stated| stated.is_empty() || stated == "@")
 }

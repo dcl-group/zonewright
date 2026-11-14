@@ -39,10 +39,15 @@ const TOKEN: &str = "test-only-token";
 /// The owner name most tests write to.
 const NAME: &str = "_acme-challenge.example.org";
 
-/// Fault patterns of the mock's paths.
+/// Fault patterns of the mock's paths: the listings (`v1`), the create and the delete (`v2`).
 const DOMAINS: &str = "/api/v1/domains";
 const RECORDS: &str = "/api/v1/domains/*/dns-records";
-const RECORD: &str = "/api/v1/domains/*/dns-records/*";
+const CREATE: &str = "/api/v2/domains/*/dns-records";
+const RECORD: &str = "/api/v2/domains/*/dns-records/*";
+
+/// The listing of [`NAME`] and the listing of the zone, as paths.
+const NAME_LISTING: &str = "/api/v1/domains/_acme-challenge.example.org/dns-records";
+const ZONE_LISTING: &str = "/api/v1/domains/example.org/dns-records";
 
 fn zone() -> DomainName {
     dn("example.org")
@@ -92,7 +97,7 @@ async fn remove(client: &impl Provider, value: &str) -> Result<RemoveOutcome, Er
 /// Number of write requests the mock received.
 fn writes(mock: &TimewebCloudMock) -> usize {
     let log = mock.log();
-    log.count(Some("POST"), RECORDS) + log.count(Some("DELETE"), RECORD)
+    log.count(Some("POST"), CREATE) + log.count(Some("DELETE"), RECORD)
 }
 
 /// The settings JSON of `from_json` for `mock`.
@@ -280,7 +285,7 @@ async fn timeweb_cloud_secret_echo() {
                 let client = echo_client(&echo);
                 echo_round(&label, &client, write).await;
                 let (method, path) = match write {
-                    Write::Add => ("POST", RECORDS),
+                    Write::Add => ("POST", CREATE),
                     Write::Remove => ("DELETE", RECORD),
                 };
                 assert!(
@@ -313,7 +318,7 @@ async fn timeweb_cloud_no_secret_in_logs() {
     texts.push(format!("{e} | {e:?}"));
     mock.faults().clear();
 
-    mock.faults().push(Fault::on("POST", RECORDS).status(500));
+    mock.faults().push(Fault::on("POST", CREATE).status(500));
     let e = add(&client, "v3").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
     texts.push(format!("{e} | {e:?}"));
@@ -410,7 +415,7 @@ async fn timeweb_cloud_add_is_idempotent() {
         AddOutcome::AlreadyPresent
     );
     assert_eq!(writes(&mock), before);
-    assert_eq!(mock.log().count(Some("POST"), RECORDS), 2);
+    assert_eq!(mock.log().count(Some("POST"), CREATE), 2);
     assert_eq!(mock.control().txt_values(NAME), ["AAA", "BBB"]);
 }
 
@@ -556,7 +561,7 @@ async fn timeweb_cloud_concurrent_adds_are_serialized() {
     let a = client_with(&mock, TOKEN, &ctx);
     let b = client_with(&mock, TOKEN, &ctx);
     mock.faults()
-        .push(Fault::on("POST", RECORDS).delay(Duration::from_millis(300)));
+        .push(Fault::on("POST", CREATE).delay(Duration::from_millis(300)));
     let (zone, name, aaa, bbb) = (zone(), name(), txt("AAA"), txt("BBB"));
     let (ra, rb) = tokio::join!(
         a.add_txt_value(&zone, &name, &aaa, None),
@@ -576,7 +581,7 @@ async fn timeweb_cloud_concurrent_adds_are_serialized() {
 async fn timeweb_cloud_foreign_value_added_between_read_and_write_survives() {
     let (mock, client) = setup().await;
     let hook = mock.control().clone();
-    mock.faults().push(Fault::on("POST", RECORDS).run(move || {
+    mock.faults().push(Fault::on("POST", CREATE).run(move || {
         hook.insert_record("example.org", NAME, "TXT", "foreign", Some(600));
     }));
     add(&client, "ours").await.unwrap();
@@ -658,21 +663,21 @@ async fn timeweb_cloud_unsupported_operations_send_nothing() {
 #[tokio::test]
 async fn timeweb_cloud_writes_are_sent_once() {
     let (mock, client) = setup().await;
-    let posts = || mock.log().count(Some("POST"), RECORDS);
+    let posts = || mock.log().count(Some("POST"), CREATE);
 
-    mock.faults().push(Fault::on("POST", RECORDS).status(502));
+    mock.faults().push(Fault::on("POST", CREATE).status(502));
     let e = add(&client, "AAA").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
     assert_eq!(posts(), 1);
     assert!(mock.control().records().is_empty());
 
     mock.faults()
-        .push(Fault::on("POST", RECORDS).rate_limited("1"));
+        .push(Fault::on("POST", CREATE).rate_limited("1"));
     let e = add(&client, "AAA").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::RateLimited, "{e:?}");
     assert_eq!(posts(), 2);
 
-    mock.faults().push(Fault::on("POST", RECORDS).status(401));
+    mock.faults().push(Fault::on("POST", CREATE).status(401));
     let e = add(&client, "AAA").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Auth, "{e:?}");
     assert_eq!(posts(), 3);
@@ -682,7 +687,7 @@ async fn timeweb_cloud_writes_are_sent_once() {
     // adding a second copy.
     let hook = mock.control().clone();
     mock.faults().push(
-        Fault::on("POST", RECORDS)
+        Fault::on("POST", CREATE)
             .run(move || {
                 hook.insert_record("example.org", NAME, "TXT", "AAA", Some(60));
             })
@@ -699,7 +704,7 @@ async fn timeweb_cloud_writes_are_sent_once() {
     assert_eq!(mock.control().txt_values(NAME), ["AAA"]);
 
     // A create refused by the provider is not repeated either.
-    mock.faults().push(Fault::on("POST", RECORDS).respond(
+    mock.faults().push(Fault::on("POST", CREATE).respond(
         400,
         r#"{"status_code":400,"error_code":"bad_request","message":"refused","response_id":"r"}"#,
     ));
@@ -754,271 +759,184 @@ async fn timeweb_cloud_delete_by_id_is_retried() {
     assert_eq!(mock.control().txt_values(NAME), ["AAA"]);
 }
 
-// ---- Remembered records (design section 11.3) --------------------------------------------------
+// ---- Names and subdomains ----------------------------------------------------------------------
 
-/// A record this process created is removed by its remembered identifier when the listing does
-/// not show it; the entry is dropped afterwards, so the next removal sends nothing.
+/// The client keeps no memory: a client of another context removes a record it did not create,
+/// found in the listing of the name.
 #[tokio::test]
-async fn timeweb_cloud_remove_uses_the_remembered_id_when_the_listing_hides_the_record() {
-    let (mock, client) = setup().await;
-    let control = mock.control();
-    add(&client, "AAA").await.unwrap();
-    let id = control.records()[0].id;
-    control.hide_from_list(id);
-    assert_eq!(
-        remove(&client, "AAA").await.unwrap(),
-        RemoveOutcome::Accepted
-    );
-    assert!(control.records().is_empty());
-    let delete = mock.log().matching(Some("DELETE"), RECORD).pop().unwrap();
-    assert_eq!(
-        delete.path,
-        format!("/api/v1/domains/example.org/dns-records/{id}")
-    );
-    assert_eq!(
-        remove(&client, "AAA").await.unwrap(),
-        RemoveOutcome::NotPresent
-    );
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 1);
-}
-
-/// The memory belongs to the `Context`: another client of the same context uses it, a client of
-/// another context does not know the record.
-#[tokio::test]
-async fn timeweb_cloud_remembered_records_belong_to_the_context() {
+async fn timeweb_cloud_a_client_of_another_context_removes_the_record() {
     let mock = TimewebCloudMock::start(Seed::standard()).await;
-    let ctx = context();
-    let a = client_with(&mock, TOKEN, &ctx);
+    let a = client_with(&mock, TOKEN, &context());
     add(&a, "AAA").await.unwrap();
-    let id = mock.control().records()[0].id;
-    mock.control().hide_from_list(id);
-
-    let stranger = client_with(&mock, TOKEN, &context());
+    let b = client_with(&mock, TOKEN, &context());
     assert_eq!(
-        remove(&stranger, "AAA").await.unwrap(),
-        RemoveOutcome::NotPresent
+        remove(&b, "AAA").await.unwrap(),
+        RemoveOutcome::RrsetDeleted
     );
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 0);
-    assert_eq!(mock.control().records().len(), 1);
-
-    let b = client_with(&mock, TOKEN, &ctx);
-    assert_eq!(remove(&b, "AAA").await.unwrap(), RemoveOutcome::Accepted);
     assert!(mock.control().records().is_empty());
 }
 
-/// An entry is used only for the value, the name and the zone it was made for, and only after a
-/// complete listing showed no such value; a record that is gone is not an error.
-#[tokio::test]
-async fn timeweb_cloud_remembered_id_is_used_only_for_its_own_value() {
-    let (mock, client) = setup().await;
-    let control = mock.control();
-    add(&client, "AAA").await.unwrap();
-    let id = control.records()[0].id;
-    control.hide_from_list(id);
-
-    assert_eq!(
-        remove(&client, "BBB").await.unwrap(),
-        RemoveOutcome::NotPresent
-    );
-    assert_eq!(
-        client
-            .remove_txt_value(&zone(), &dn("_acme-challenge.www.example.org"), &txt("AAA"))
-            .await
-            .unwrap(),
-        RemoveOutcome::NotPresent
-    );
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 0);
-    assert_eq!(control.records().len(), 1);
-
-    // The record is gone already (deleted by someone else): the delete is answered 404, which
-    // is a success after the listing showed no value, and the entry is dropped.
-    control.delete_record(id);
-    assert_eq!(
-        remove(&client, "AAA").await.unwrap(),
-        RemoveOutcome::NotPresent
-    );
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 1);
-    assert_eq!(
-        remove(&client, "AAA").await.unwrap(),
-        RemoveOutcome::NotPresent
-    );
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 1);
-}
-
-/// A record the listing shows is removed through the listing, and its entry is dropped with it,
-/// so that a later hidden copy of the value is not removed by a stale identifier.
-#[tokio::test]
-async fn timeweb_cloud_a_removed_record_is_forgotten() {
-    let (mock, client) = setup().await;
-    let control = mock.control();
-    add(&client, "AAA").await.unwrap();
-    assert_eq!(
-        remove(&client, "AAA").await.unwrap(),
-        RemoveOutcome::RrsetDeleted
-    );
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 1);
-    // Someone else publishes the value and the listing hides it: not ours to delete.
-    let foreign = control.insert_record("example.org", NAME, "TXT", "AAA", Some(60));
-    control.hide_from_list(foreign);
-    assert_eq!(
-        remove(&client, "AAA").await.unwrap(),
-        RemoveOutcome::NotPresent
-    );
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 1);
-    assert_eq!(control.records().len(), 1);
-}
-
 /// The API changes a record in place under the same identifier. A record this process created
-/// and someone else then changed (another value, or another name) is not ours any more: the
-/// remembered identifier is listed, so it is never deleted from memory.
+/// and someone else then changed to another value is not ours any more and is not deleted.
 #[tokio::test]
-async fn timeweb_cloud_a_record_changed_in_place_is_not_deleted_by_its_remembered_id() {
+async fn timeweb_cloud_a_record_changed_in_place_is_not_removed() {
     let (mock, client) = setup().await;
     let control = mock.control();
     add(&client, "AAA").await.unwrap();
     let id = control.records()[0].id;
-    control.update_record(id, NAME, "foreign");
+    control.update_record(id, "foreign");
     assert_eq!(
         remove(&client, "AAA").await.unwrap(),
         RemoveOutcome::NotPresent
     );
     assert_eq!(mock.log().count(Some("DELETE"), RECORD), 0);
     assert_eq!(control.txt_values(NAME), ["foreign"]);
+}
 
-    add(&client, "BBB").await.unwrap();
-    let id = control.txt_records(NAME)[1].id;
-    control.update_record(id, "other.example.org", "BBB");
-    assert_eq!(
-        remove(&client, "BBB").await.unwrap(),
-        RemoveOutcome::NotPresent
-    );
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 0);
-    assert_eq!(control.txt_values("other.example.org"), ["BBB"]);
-    // The entries were dropped: hiding the records now changes nothing.
-    for record in control.records() {
-        control.hide_from_list(record.id);
-    }
+/// A name that is not a subdomain yet: its listing is answered 404, the zone is looked up and
+/// exists, so the name has no records. An add creates the record at the name; a removal sends no
+/// write.
+#[tokio::test]
+async fn timeweb_cloud_a_name_that_is_not_a_subdomain_yet_has_no_records() {
+    let (mock, client) = setup().await;
     assert_eq!(
         remove(&client, "AAA").await.unwrap(),
         RemoveOutcome::NotPresent
     );
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 0);
-    assert_eq!(control.records().len(), 2);
-}
-
-/// A listing with a record without an identifier cannot prove that a remembered identifier is
-/// absent from it, so nothing is deleted from memory.
-#[tokio::test]
-async fn timeweb_cloud_a_listing_without_identifiers_blocks_the_memory() {
-    let (mock, client) = setup().await;
-    let control = mock.control();
-    add(&client, "AAA").await.unwrap();
-    let id = control.records()[0].id;
-    control.hide_from_list(id);
-    let other = control.insert_record("example.org", "www", "A", "192.0.2.1", Some(600));
-    control.set_null_id(other);
+    assert_eq!(writes(&mock), 0);
+    let paths: Vec<_> = mock
+        .log()
+        .matching(Some("GET"), RECORDS)
+        .iter()
+        .map(|r| (r.path.clone(), r.query.clone().unwrap()))
+        .collect();
     assert_eq!(
-        remove(&client, "AAA").await.unwrap(),
-        RemoveOutcome::NotPresent
+        paths,
+        [
+            (NAME_LISTING.to_owned(), "limit=100&offset=0".to_owned()),
+            (ZONE_LISTING.to_owned(), "limit=1&offset=0".to_owned()),
+        ]
     );
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 0);
-    assert_eq!(control.records().len(), 2);
-}
-
-/// Every copy of the value this process created is remembered: a hidden record makes the next
-/// add create a second one, and the removal deletes both.
-#[tokio::test]
-async fn timeweb_cloud_every_remembered_copy_is_removed() {
-    let (mock, client) = setup().await;
-    let control = mock.control();
-    add(&client, "AAA").await.unwrap();
-    control.hide_from_list(control.records()[0].id);
+    assert!(mock.control().subdomains().is_empty());
     assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
-    control.hide_from_list(control.records()[1].id);
-    assert_eq!(
-        remove(&client, "AAA").await.unwrap(),
-        RemoveOutcome::Accepted
-    );
-    assert!(control.records().is_empty());
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 2);
+    assert_eq!(mock.control().subdomains(), [NAME]);
+    assert_eq!(mock.control().txt_values(NAME), ["AAA"]);
 }
 
-/// The value shows up in the listing between the value layer's read and the read made before
-/// a delete from memory: nothing is deleted by identifier and the removal asks to be repeated.
+/// The provider refuses a create at a name it does not take as a subdomain: the zone exists, so
+/// the refusal is the operation's error, with the provider's status; it is not repeated and
+/// nothing is written. When the zone is gone too, the error is `ZoneNotFound`.
 #[tokio::test]
-async fn timeweb_cloud_a_value_listed_before_the_delete_from_memory_is_a_conflict() {
+async fn timeweb_cloud_a_create_answered_not_found_is_told_apart() {
     let (mock, client) = setup().await;
-    let control = mock.control();
-    add(&client, "AAA").await.unwrap();
-    let id = control.records()[0].id;
-    control.hide_from_list(id);
-    let hook = control.clone();
+    mock.control().set_require_subdomain(true);
+    let e = add(&client, "AAA").await.unwrap_err();
+    match &e {
+        Error::Rejected { status, .. } => assert_eq!(*status, Some(404)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(mock.log().count(Some("POST"), CREATE), 1);
+    assert!(mock.control().records().is_empty());
+
+    // The domain is deleted between the read and the create.
+    mock.faults().push(Fault::on("POST", CREATE).status(404));
     mock.faults()
-        .push(Fault::on("GET", RECORDS).skip(1).run(move || {
-            hook.insert_record("example.org", NAME, "TXT", "AAA", Some(60));
-        }));
-    let e = remove(&client, "AAA").await.unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
-    assert_eq!(mock.log().count(Some("DELETE"), RECORD), 0);
-    assert_eq!(control.records().len(), 2);
+        .push(Fault::on("GET", ZONE_LISTING).skip(1).status(404));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert!(matches!(e, Error::ZoneNotFound { .. }), "{e:?}");
+    assert_eq!(mock.log().count(Some("POST"), CREATE), 2);
 }
 
-/// Clients of one `Context` pointed at different servers never use each other's identifiers:
-/// the memory is keyed by the endpoint too.
+/// The listing of a name below the zone that states a record without a name cannot say whether
+/// the record is at that name or at the zone itself: the operation fails and writes nothing.
+/// The same record in the listing of the zone is at the zone.
 #[tokio::test]
-async fn timeweb_cloud_remembered_records_belong_to_their_endpoint() {
-    let ctx = context();
-    let first = TimewebCloudMock::start(Seed::standard()).await;
-    let second = TimewebCloudMock::start(Seed::standard()).await;
-    // Both servers hand out the same identifiers. The second holds a foreign record with the
-    // value under the identifier the first will give ours; its listing hides it.
-    let foreign = second
-        .control()
-        .insert_record("example.org", NAME, "TXT", "AAA", Some(60));
-    second.control().hide_from_list(foreign);
-    let a = client_with(&first, TOKEN, &ctx);
-    add(&a, "AAA").await.unwrap();
-    assert_eq!(first.control().records()[0].id, foreign);
-    first.control().hide_from_list(foreign);
+async fn timeweb_cloud_a_subdomain_listing_without_names_is_protocol() {
+    let (mock, client) = setup().await;
+    for stated in ["null", r#""""#, r#""@""#] {
+        let body = format!(
+            r#"{{"meta":{{"total":1}},"dns_records":[{{"id":7,"type":"TXT","ttl":60,"data":{{"subdomain":{stated},"value":"AAA"}}}}]}}"#
+        );
+        mock.faults()
+            .push(Fault::on("GET", NAME_LISTING).respond(200, body.clone()));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{stated}: {e:?}");
+        mock.faults()
+            .push(Fault::on("GET", NAME_LISTING).respond(200, body.clone()));
+        let e = remove(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{stated}: {e:?}");
+        assert_eq!(writes(&mock), 0);
 
-    let b = client_with(&second, TOKEN, &ctx);
-    assert_eq!(remove(&b, "AAA").await.unwrap(), RemoveOutcome::NotPresent);
-    assert_eq!(second.log().count(Some("DELETE"), RECORD), 0);
-    assert_eq!(second.control().records().len(), 1);
-    assert_eq!(remove(&a, "AAA").await.unwrap(), RemoveOutcome::Accepted);
-    assert!(first.control().records().is_empty());
+        mock.faults()
+            .push(Fault::on("GET", ZONE_LISTING).respond(200, body.clone()));
+        assert_eq!(
+            client
+                .add_txt_value(&zone(), &zone(), &txt("AAA"), None)
+                .await
+                .unwrap(),
+            AddOutcome::AlreadyPresent,
+            "{stated}"
+        );
+    }
 }
 
 // ---- Requests, names and TTLs ------------------------------------------------------------------
 
 /// The requests as the documentation and lego describe them: the token in `Authorization`, the
-/// listing's paging, the create's fields with the full name, the delete by identifier.
+/// listing of the name with its paging, the `v2` create at the name with `type` and `value` and
+/// nothing else, the `v2` delete by identifier at the name. The apex is written at the domain.
+/// The deprecated `v1` writes are never sent.
 #[tokio::test]
 async fn timeweb_cloud_request_shapes() {
     let (mock, client) = setup().await;
     add(&client, "AAA").await.unwrap();
     let log = mock.log();
-    let list = log.matching(Some("GET"), RECORDS).pop().unwrap();
-    assert_eq!(list.path, "/api/v1/domains/example.org/dns-records");
+    let list = log.matching(Some("GET"), RECORDS).remove(0);
+    assert_eq!(list.path, NAME_LISTING);
     assert_eq!(list.query.as_deref(), Some("limit=100&offset=0"));
     assert_eq!(list.header("authorization"), Some("Bearer test-only-token"));
-    let post = log.matching(Some("POST"), RECORDS).pop().unwrap();
-    assert_eq!(post.path, "/api/v1/domains/example.org/dns-records");
+    let post = log.matching(Some("POST"), CREATE).pop().unwrap();
+    assert_eq!(
+        post.path,
+        "/api/v2/domains/_acme-challenge.example.org/dns-records"
+    );
     assert_eq!(post.header("authorization"), Some("Bearer test-only-token"));
     assert_eq!(
         post.body_json().unwrap(),
-        serde_json::json!({
-            "type": "TXT", "value": "AAA", "subdomain": "_acme-challenge.example.org"
-        })
+        serde_json::json!({ "type": "TXT", "value": "AAA" })
     );
     let id = mock.control().records()[0].id;
     remove(&client, "AAA").await.unwrap();
     let delete = log.matching(Some("DELETE"), RECORD).pop().unwrap();
     assert_eq!(
         delete.path,
-        format!("/api/v1/domains/example.org/dns-records/{id}")
+        format!("/api/v2/domains/_acme-challenge.example.org/dns-records/{id}")
     );
     assert!(delete.body.is_empty());
+
+    client
+        .add_txt_value(&zone(), &zone(), &txt("AAA"), None)
+        .await
+        .unwrap();
+    let list = log.matching(Some("GET"), RECORDS).pop().unwrap();
+    assert_eq!(list.path, ZONE_LISTING);
+    let post = log.matching(Some("POST"), CREATE).pop().unwrap();
+    assert_eq!(post.path, "/api/v2/domains/example.org/dns-records");
+    let id = mock.control().records()[0].id;
+    client
+        .remove_txt_value(&zone(), &zone(), &txt("AAA"))
+        .await
+        .unwrap();
+    let delete = log.matching(Some("DELETE"), RECORD).pop().unwrap();
+    assert_eq!(
+        delete.path,
+        format!("/api/v2/domains/example.org/dns-records/{id}")
+    );
+    assert!(mock.control().records().is_empty());
+
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        assert_eq!(log.count(Some(method), "/api/v1/**"), 0, "{method}");
+    }
 }
 
 /// Records are read back whatever the form of the stated name: relative, or the full name. The
@@ -1120,7 +1038,7 @@ async fn timeweb_cloud_ttl_policy() {
         .await
         .unwrap();
     assert_eq!(ttl("a.example.org"), None);
-    let post = mock.log().matching(Some("POST"), RECORDS).pop().unwrap();
+    let post = mock.log().matching(Some("POST"), CREATE).pop().unwrap();
     assert!(post.body_json().unwrap().get("ttl").is_none());
 
     configured
@@ -1170,7 +1088,7 @@ async fn timeweb_cloud_unreported_ttl_is_not_invented() {
     mock.control()
         .insert_record("example.org", NAME, "TXT", "foreign", None);
     assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Appended);
-    let post = mock.log().matching(Some("POST"), RECORDS).pop().unwrap();
+    let post = mock.log().matching(Some("POST"), CREATE).pop().unwrap();
     assert!(post.body_json().unwrap().get("ttl").is_none());
 }
 
@@ -1190,7 +1108,7 @@ async fn timeweb_cloud_identifiers_in_the_listing() {
     let delete = mock.log().matching(Some("DELETE"), RECORD).pop().unwrap();
     assert_eq!(
         delete.path,
-        format!("/api/v1/domains/example.org/dns-records/{id}")
+        format!("/api/v2/domains/_acme-challenge.example.org/dns-records/{id}")
     );
 
     control.set_float_ids(false);
@@ -1220,7 +1138,7 @@ async fn timeweb_cloud_listing_pages_by_offset() {
     control.insert_record("example.org", NAME, "TXT", "foreign-1", Some(60));
     control.insert_record("example.org", NAME, "TXT", "foreign-2", Some(60));
     control.insert_record("example.org", NAME, "TXT", "AAA", Some(60));
-    control.insert_record("example.org", "other.example.org", "TXT", "AAA", Some(60));
+    control.insert_record("example.org", &format!("x.{NAME}"), "TXT", "AAA", Some(60));
     assert_eq!(
         add(&client, "AAA").await.unwrap(),
         AddOutcome::AlreadyPresent
@@ -1241,6 +1159,7 @@ async fn timeweb_cloud_listing_pages_by_offset() {
         RemoveOutcome::Removed
     );
     assert_eq!(control.txt_values(NAME), ["foreign-1", "foreign-2"]);
+    assert_eq!(control.txt_values(&format!("x.{NAME}")), ["AAA"]);
 }
 
 /// A listing that stops short of the total it states, lacks the total or the list, or has an
@@ -1311,14 +1230,14 @@ async fn timeweb_cloud_list_zones_pages_by_offset() {
     );
 }
 
-/// A zone with more records than one page is read in full by a client that never saw the
+/// A listing with more records than one page is read in full by a client that never saw the
 /// records created: the identifiers come from the listing.
 #[tokio::test]
 async fn timeweb_cloud_a_new_client_finds_the_records_in_a_long_listing() {
     let (mock, client) = setup().await;
     let control = mock.control();
     for i in 0..7 {
-        control.insert_record("example.org", &format!("n{i}"), "TXT", "x", Some(60));
+        control.insert_record("example.org", &format!("n{i}.{NAME}"), "TXT", "x", Some(60));
     }
     control.set_page_cap(3);
     add(&client, "AAA").await.unwrap();
@@ -1407,10 +1326,15 @@ async fn timeweb_cloud_zone_not_found() {
         .await
         .unwrap_err();
     assert!(matches!(e, Error::ZoneNotFound { .. }), "{e:?}");
-    // The domain is deleted between the read and the create.
-    mock.faults().push(Fault::on("POST", RECORDS).status(404));
-    let e = add(&client, "AAA").await.unwrap_err();
+    // The zone itself as the name: no second lookup.
+    let before = mock.log().count(Some("GET"), RECORDS);
+    let e = client
+        .add_txt_value(&other, &other, &txt("v"), None)
+        .await
+        .unwrap_err();
     assert!(matches!(e, Error::ZoneNotFound { .. }), "{e:?}");
+    assert_eq!(mock.log().count(Some("GET"), RECORDS), before + 1);
+    assert_eq!(writes(&mock), 0);
 }
 
 #[tokio::test]
@@ -1419,7 +1343,8 @@ async fn timeweb_cloud_rate_limit() {
     mock.faults()
         .push(Fault::on("GET", RECORDS).rate_limited("1"));
     add(&client, "AAA").await.unwrap();
-    assert_eq!(mock.log().count(Some("GET"), RECORDS), 2);
+    // The listing of the name: the refused request and its repeat.
+    assert_eq!(mock.log().count(Some("GET"), NAME_LISTING), 2);
     mock.faults()
         .push(Fault::on("GET", RECORDS).rate_limited("120"));
     let e = add(&client, "BBB").await.unwrap_err();
@@ -1438,7 +1363,8 @@ async fn timeweb_cloud_server_errors_are_retried_then_transient() {
     let e = add(&client, "BBB").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
     assert!(e.is_retryable());
-    assert_eq!(mock.log().count(Some("GET"), RECORDS), 5);
+    // The listing of the name: two requests for the first add, three for the second.
+    assert_eq!(mock.log().count(Some("GET"), NAME_LISTING), 5);
 }
 
 /// The provider's refusals are `Rejected` with the status and its message; a status the client
@@ -1446,7 +1372,7 @@ async fn timeweb_cloud_server_errors_are_retried_then_transient() {
 #[tokio::test]
 async fn timeweb_cloud_refusals_are_rejected() {
     let (mock, client) = setup().await;
-    mock.faults().push(Fault::on("POST", RECORDS).respond(
+    mock.faults().push(Fault::on("POST", CREATE).respond(
         400,
         r#"{"status_code":400,"error_code":"bad_subdomain_name","message":["subdomain is wrong"],"response_id":"r"}"#,
     ));
@@ -1468,11 +1394,11 @@ async fn timeweb_cloud_refusals_are_rejected() {
     assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
     // An answer to a create without the record it created.
     mock.faults()
-        .push(Fault::on("POST", RECORDS).respond(201, r#"{"dns_record":{}}"#));
+        .push(Fault::on("POST", CREATE).respond(201, r#"{"dns_record":{}}"#));
     let e = add(&client, "AAA").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
     mock.faults()
-        .push(Fault::on("POST", RECORDS).respond(201, "{}"));
+        .push(Fault::on("POST", CREATE).respond(201, "{}"));
     let e = add(&client, "AAA").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
 }
@@ -1673,8 +1599,15 @@ fn random_u64() -> u64 {
     hasher.finish()
 }
 
-/// Adds and removes two values under a generated label in the zone the maintainer names, and
-/// removes exactly the values it added afterwards, also when the body failed.
+/// Adds and removes two values at a challenge name, `_acme-challenge` under a generated label,
+/// in the zone the maintainer names, and removes exactly the values it added afterwards, also
+/// when the body failed. The first add is what shows that the `v2` create accepts a name with an
+/// underscore label that is not a subdomain yet.
+///
+/// The provider may keep the subdomain the create made after its last record is gone (the
+/// `v2` create is documented to need one); this test does not delete subdomains, so look for
+/// `_acme-challenge.zw-live-…` and `zw-live-…` in the zone's subdomains afterwards and report
+/// what is there.
 #[tokio::test]
 #[ignore = "live API: run only by the maintainer"]
 async fn live_timeweb_cloud_add_and_remove() {
@@ -1692,7 +1625,11 @@ async fn live_timeweb_cloud_add_and_remove() {
         .unwrap(),
     );
     let tag = random_u64();
-    let name = zone.prepend(&format!("_zw-live-{tag:016x}")).unwrap();
+    let name = zone
+        .prepend(&format!("zw-live-{tag:016x}"))
+        .unwrap()
+        .prepend("_acme-challenge")
+        .unwrap();
     let values = [
         txt(&format!("zw-live-{tag:016x}-a")),
         txt(&format!("zw-live-{tag:016x}-b")),

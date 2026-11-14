@@ -32,10 +32,10 @@ Consequences that shape the API:
   3.5).
 - Waiting for propagation is the inspector's job (section 8), never a provider operation's.
 - The crate holds process-local state only: caches of zone identifiers and tokens, per-name locks,
-  and for three providers (acme-dns, nic.ru, Timeweb Cloud) a small memory of its own writes, owned
-  by `Context` (section 11.3). Losing that state on restart never leads to a wrong write. In one
-  case it leaves work for a person: a nic.ru zone left with this process's staged, uncommitted
-  changes has to be committed by hand.
+  and for two providers (acme-dns, nic.ru) a small memory of its own writes, owned by `Context`
+  (section 11.3). Losing that state on restart never leads to a wrong write. In one case it leaves
+  work for a person: a nic.ru zone left with this process's staged, uncommitted changes has to be
+  committed by hand.
 
 Explicitly not in the crate: ACME, certificate-authority policy checks (including CAA tree climbing,
 section 7.4), mail-specific record construction, metrics, any UI text beyond the English labels of
@@ -2645,9 +2645,9 @@ Ownership, so that fifteen providers can be written in parallel without touching
   module with a complete `meta.rs` and a stub `client.rs` whose operations all return
   `Error::Unsupported`, the empty test file and the empty mock module. A provider developer then
   never needs a shared file. A need for a new shared helper, or a change to one, goes to the lead.
-- Provider state that must outlive a client (nic.ru, acme-dns, Timeweb Cloud; section 11.3) is a
-  type defined in the provider's directory and held by `Context` in a field behind the provider's
-  feature. The field is added in the core phase.
+- Provider state that must outlive a client (nic.ru, acme-dns; section 11.3) is a type defined in
+  the provider's directory and held by `Context` in a field behind the provider's feature. The field
+  is added in the core phase.
 
 ## 11. Providers
 
@@ -2700,7 +2700,7 @@ this table is a guess about such an API.
 | `rfc2136`       | yes                    | get, set, delete possible by the protocol, planned; listing impossible                   | any type with a wire form                                                       | 60                    | —                           | wire format                                             | RFC 2136, RFC 8945, RFC 7766, RFC 1035                                                             |
 | `route53`       | yes; plain values      | TXT only until established (alias and routing-policy sets need a decision first)         | —                                                                               | 60                    | 120 s                       | Auto / Presentation                                     | Amazon Route 53 API reference, lego                                                                |
 | `selectel_v2`   | yes; plain values      | list, get, set, delete                                                                   | A, AAAA, ALIAS, CAA, CNAME, MX, NS, SOA (read only), SRV, SSHFP, TXT            | 60                    | —                           | Auto / Presentation                                     | Selectel DNS API v2 and authorization documentation. Earlier TXT-level version proven live         |
-| `timeweb_cloud` | yes; plain values      | TXT only until established (the v1 endpoints in use are marked deprecated)               | —                                                                               | provider default      | —                           | Auto / Raw                                              | a client generated from the public OpenAPI description, lego                                       |
+| `timeweb_cloud` | yes; plain values      | TXT only until implemented (the API description documents A, AAAA, CNAME, MX, SRV, TXT)  | —                                                                               | provider default      | —                           | Auto / Raw                                              | a client generated from the public OpenAPI description, lego                                       |
 | `vk_cloud`      | yes; plain values      | TXT only until implemented (the API description documents other types)                   | —                                                                               | 60                    | —                           | Auto / Raw                                              | the provider's published API description, lego                                                     |
 | `yandex_360`    | yes; plain values      | TXT only until established                                                               | —                                                                               | 300                   | —                           | Auto / Raw                                              | Yandex 360 API documentation, lego                                                                 |
 | `yandex_cloud`  | yes; plain values      | list, get, set, delete                                                                   | A, AAAA, ANAME, CAA, CNAME, HTTPS, MX, NS, PTR, SOA (read only), SRV, SVCB, TXT | 60                    | —                           | Auto / Raw for TXT values, Presentation at record level | Yandex Cloud DNS, IAM and Operation API documentation, lego. Earlier TXT-level version proven live |
@@ -2829,9 +2829,19 @@ Behavior that the design fixes because the generic sections cannot:
   Keystone domain, and the project ID the identity service states for the token tells the project's
   zones from others; of several zones with the requested name, the one of that project is used.
   `check` exchanges the credentials for a new token even when one is cached.
-- `timeweb_cloud`. A record this process created is remembered by ID so it can be removed even if
-  the listing does not show it. The memory is in `Context`, holds at most 1024 records, and drops an
-  entry when the record is removed or 24 hours after it was created.
+- `timeweb_cloud`. Records are created and deleted with the `v2` calls
+  (`POST /v2/domains/{fqdn}/dns-records`, `DELETE /v2/domains/{fqdn}/dns-records/{id}`), where
+  `fqdn` is the owner name: the domain for the apex, the full name below it. The deprecated `v1`
+  create and delete are not used (section 13.4, item 12). The API has no `v2` listing; the client
+  reads the `GET /v1/domains/{fqdn}/dns-records` call, which is not marked deprecated, for the owner
+  name itself. The API description defines that listing as all records of that domain or subdomain,
+  so every record the client can create is in what it reads, and nothing is remembered between
+  operations. A `404` on the listing of a name below the zone, or on a create, is followed by a
+  lookup of the zone: a missing zone is `ZoneNotFound`; otherwise the name has no records (read) or
+  the provider refused the name (create, `Rejected`). No subdomain is created before a create: the
+  API description says one must exist, while lego does not create one and a user's run recorded in
+  its tracker succeeded without it. A listing of a name below the zone that states a record without
+  a name is `Protocol`.
 - `yandex_cloud`. The strict write must repeat the existing set exactly, including fields this crate
   does not model, so the client keeps the JSON object it read and sends that object as the deletion.
   TTL travels as a JSON string.
@@ -3231,10 +3241,12 @@ Added after review:
     supplies them through `ContextOptions`.
 11. **Strict settings.** An application that stores its own keys next to the provider's settings
     must strip them before calling the crate. The alternative, ignoring unknown keys, hides typos.
-12. **Timeweb Cloud: decided by the maintainer on 2026-11-14 — the v2 endpoints only.** The v1
-    endpoints, which the provider's API description marks as deprecated, are not used: lego's issue
-    tracker (issue 3119, 2026-05-22) shows the v1 create refusing `_acme-challenge` names with
-    `bad_subdomain_name` while v2 accepted them.
+12. **Timeweb Cloud: decided by the maintainer on 2026-11-14 — the v2 endpoints only.** Records are
+    written with v2. The API has no v2 listing, so reads use the v1 listing calls, which are not
+    marked deprecated (section 11.3); say if that is not acceptable. The v1 writes, which the
+    provider's API description marks as deprecated, are not used: lego's issue tracker (issue 3119,
+    2026-05-22) shows the v1 create refusing `_acme-challenge` names with `bad_subdomain_name` while
+    v2 accepted them.
 13. **Typed views for more record types** (SSHFP, SOA) exist as canonical forms only. Typed structs
     are added on request.
 14. **Hard rule 2 against writers outside the process: accepted by the maintainer on 2026-11-14.**

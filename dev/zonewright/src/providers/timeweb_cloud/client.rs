@@ -23,9 +23,8 @@ use crate::record::{Ttl, Txt};
 use crate::redact::Detail;
 use crate::values;
 
-use super::api::{self, Api, Deleted};
+use super::api::{self, Api};
 use super::config::{self, TimewebCloudConfig, TimewebCloudCredentials};
-use super::txt;
 
 /// The Timeweb Cloud client.
 ///
@@ -36,25 +35,16 @@ use super::txt;
 /// (`ValueGuarantee::PerValue`); a writer outside this process can at worst cause a duplicate
 /// of our own value.
 ///
-/// The API lists the whole zone, page by page; every operation reads it in full before it
-/// writes, so a very large zone costs many requests. A listing that ends before the total it
-/// states is `Error::Protocol`.
-///
-/// A record this client created is remembered by its identifier in the `Context`, for at most
-/// 1024 records and 24 hours. When the listing shows no record with the value being removed,
-/// `remove_txt_value` deletes the remembered records by identifier, but only those whose
-/// identifier a new complete listing does not show at all, and reports `Accepted`.
-///
-/// The create and delete endpoints are the `v1` ones, which the provider's API description
-/// marks as deprecated (see the module documentation of the API calls).
+/// Records are created and deleted with the `v2` calls, addressed to the record's owner name,
+/// and read with the listing of that name (the domain's, or the subdomain's), page by page;
+/// every operation reads it in full before it writes. A listing that ends before the total it
+/// states is `Error::Protocol`. The client keeps no state between operations.
 pub struct TimewebCloud {
     config: TimewebCloudConfig,
     /// The API.
     pub(super) api: Api,
     /// The per-name locks of the context.
     pub(super) locks: NameLocks,
-    /// The context, which holds the memory of created records.
-    pub(super) ctx: Context,
     /// TTL of a new record; `None` leaves the choice to the provider.
     pub(super) ttl: Option<u32>,
 }
@@ -93,82 +83,8 @@ impl TimewebCloud {
         Ok(TimewebCloud {
             api: Api::new(http, settings.api),
             locks: ctx.locks().clone(),
-            ctx: ctx.clone(),
             ttl: settings.ttl,
             config,
-        })
-    }
-
-    /// Called after the value layer's complete listing showed no record with `value`: deletes
-    /// the records this process created for `value` at `name`, by the identifiers it
-    /// remembered, but only those that a new complete listing, read under the per-name lock,
-    /// does not show at all.
-    ///
-    /// An identifier proves nothing about what the record holds now: the API changes records
-    /// in place under the same identifier (`PATCH .../dns-records/{record_id}`), so a person or
-    /// another program may have turned our record into theirs. A listed identifier is
-    /// therefore never deleted from memory, whatever it holds now; its entry is dropped and the
-    /// listing decides. A listing with a record without an identifier cannot prove that a
-    /// remembered identifier is absent, so then nothing is deleted from memory either.
-    async fn remove_remembered(
-        &self,
-        zone: &DomainName,
-        name: &DomainName,
-        value: &Txt,
-    ) -> Result<RemoveOutcome, Error> {
-        let state = self.ctx.timeweb_cloud();
-        let endpoint = self.api.endpoint_key();
-        if state
-            .recall(endpoint, zone, name, value.as_bytes())
-            .is_empty()
-        {
-            return Ok(RemoveOutcome::NotPresent);
-        }
-        let _guard = self.locks.lock(name).await;
-        // Recall again under the lock: an operation that held it may have used or changed the
-        // entries.
-        let remembered = state.recall(endpoint, zone, name, value.as_bytes());
-        if remembered.is_empty() {
-            return Ok(RemoveOutcome::NotPresent);
-        }
-        let records = self.api.records(zone).await?;
-        let mut hidden = Vec::with_capacity(remembered.len());
-        for id in remembered {
-            if records.iter().any(|record| record.id() == Some(id)) {
-                state.forget(endpoint, zone, id);
-            } else {
-                hidden.push(id);
-            }
-        }
-        if records
-            .iter()
-            .any(|record| txt::holds(record, zone, name, value))
-        {
-            // The value is listed now, after the value layer's read found it absent: it was
-            // added, or became visible, in between. The listing decides on the next attempt.
-            return Err(Error::Conflict {
-                detail: Detail::constant(
-                    "the value appeared in the listing while it was being removed; repeat the \
-                     removal",
-                ),
-            });
-        }
-        if hidden.is_empty() || records.iter().any(|record| record.id().is_none()) {
-            return Ok(RemoveOutcome::NotPresent);
-        }
-        let mut deleted = false;
-        for id in hidden {
-            if let Deleted::Done = self.api.delete_record(zone, id).await? {
-                deleted = true;
-            }
-            state.forget(endpoint, zone, id);
-        }
-        Ok(if deleted {
-            // The listing did not show the record, so what else is at the name is unknown.
-            RemoveOutcome::Accepted
-        } else {
-            // The listing showed no record with the value, and the records are gone.
-            RemoveOutcome::NotPresent
         })
     }
 }
@@ -218,11 +134,7 @@ impl Provider for TimewebCloud {
         name: &DomainName,
         value: &Txt,
     ) -> Result<RemoveOutcome, Error> {
-        let outcome = values::remove_per_record(self, zone, name, value).await?;
-        match outcome {
-            RemoveOutcome::NotPresent => self.remove_remembered(zone, name, value).await,
-            other => Ok(other),
-        }
+        values::remove_per_record(self, zone, name, value).await
     }
 }
 

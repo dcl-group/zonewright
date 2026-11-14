@@ -53,6 +53,10 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ### Changed
 
+- Timeweb Cloud: records are created and deleted with the provider's v2 API instead of the
+  deprecated v1 calls, and the listing of the record's own name is read. The client no longer
+  remembers created record IDs, and `remove_txt_value` no longer returns `Accepted`. Settings and
+  credentials keys are unchanged.
 - `Rfc2136Config`: `algorithm` is a `String` and `ttl` a `u32` with the documented defaults; `null`
   is still read as the default.
 - `Yandex360Config` no longer implements `Default`: `org_id` is required.

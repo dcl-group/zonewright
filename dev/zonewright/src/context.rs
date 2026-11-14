@@ -36,9 +36,6 @@ struct Inner {
     /// Zone locks and staged-change marks of the nic.ru client (design section 11.3).
     #[cfg(feature = "nicru")]
     nicru: crate::providers::nicru::State,
-    /// Memory of records the Timeweb Cloud client created (design section 11.3).
-    #[cfg(feature = "timeweb_cloud")]
-    timeweb_cloud: crate::providers::timeweb_cloud::State,
 }
 
 impl fmt::Debug for Context {
@@ -72,8 +69,6 @@ impl Context {
                 acme_dns: crate::providers::acme_dns::State::default(),
                 #[cfg(feature = "nicru")]
                 nicru: crate::providers::nicru::State::default(),
-                #[cfg(feature = "timeweb_cloud")]
-                timeweb_cloud: crate::providers::timeweb_cloud::State::default(),
             }),
         })
     }
@@ -124,12 +119,6 @@ impl Context {
     #[cfg(feature = "nicru")]
     pub(crate) fn nicru(&self) -> &crate::providers::nicru::State {
         &self.inner.nicru
-    }
-
-    /// The Timeweb Cloud client's memory of created records.
-    #[cfg(feature = "timeweb_cloud")]
-    pub(crate) fn timeweb_cloud(&self) -> &crate::providers::timeweb_cloud::State {
-        &self.inner.timeweb_cloud
     }
 }
 
