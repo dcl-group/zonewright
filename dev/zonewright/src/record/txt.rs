@@ -107,6 +107,13 @@ impl Txt {
         Ok(())
     }
 
+    /// The canonical presentation text: quoted 255-octet chunks (design section 4.4).
+    pub(crate) fn to_presentation(&self) -> String {
+        let mut out = String::with_capacity(self.0.len() + 2);
+        self.write_text(&mut out);
+        out
+    }
+
     pub(crate) fn write_text(&self, out: &mut String) {
         if self.0.is_empty() {
             out.push_str("\"\"");
@@ -118,5 +125,127 @@ impl Txt {
             }
             text::quote_into(out, chunk);
         }
+    }
+}
+
+/// How a provider's API spells TXT data (design section 4.4). Each client declares one reading
+/// rule and one writing rule; `Auto` is a reading rule only.
+// TEMPORARY (core phase): no client reads or writes TXT yet; the first ported client uses it.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TxtDialect {
+    /// Zone-file text: quoted character-strings with escapes. Read with the strict parser; write
+    /// the canonical text.
+    Presentation,
+    /// The value itself, unquoted and unescaped. Read the string's bytes as the data; write the
+    /// data as a string.
+    Raw,
+    /// Reading only: text that starts with `"` is `Presentation`, anything else `Raw`.
+    Auto,
+}
+
+// TEMPORARY (core phase): no client reads or writes TXT yet; the first ported client uses it.
+#[allow(dead_code)]
+impl TxtDialect {
+    /// Decodes provider text. `None` when the text is not valid in this dialect; the caller then
+    /// keeps the text as an opaque value (design sections 3.5 and 4.9).
+    pub(crate) fn read(self, text: &str) -> Option<Txt> {
+        match self {
+            TxtDialect::Presentation => RecordData::parse(RecordType::TXT, text)
+                .ok()
+                .and_then(|data| Txt::from_data(&data).ok()),
+            TxtDialect::Raw => Txt::new(text.as_bytes()).ok(),
+            TxtDialect::Auto => {
+                if text.trim_start().starts_with('"') {
+                    TxtDialect::Presentation.read(text)
+                } else {
+                    TxtDialect::Raw.read(text)
+                }
+            }
+        }
+    }
+
+    /// Encodes a value for the provider. `None` when this dialect cannot carry the value: in
+    /// `Raw`, data that is not valid UTF-8; `Auto` is not a writing rule and always gives `None`.
+    /// A client that is not known to pass other values through unchanged accepts only
+    /// [`Txt::is_plain`] values before it gets here (design section 4.4).
+    pub(crate) fn write(self, value: &Txt) -> Option<String> {
+        match self {
+            TxtDialect::Presentation => Some(value.to_presentation()),
+            TxtDialect::Raw => value.as_str().map(str::to_owned),
+            TxtDialect::Auto => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Txt, TxtDialect};
+
+    fn txt(data: &str) -> Txt {
+        Txt::new(data.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn presentation_reads_quoted_and_escaped_text() {
+        let d = TxtDialect::Presentation;
+        assert_eq!(d.read(r#""a b" "c""#), Some(txt("a bc")));
+        assert_eq!(d.read(r#""say \"hi\"""#), Some(txt("say \"hi\"")));
+        assert_eq!(d.read("plain"), Some(txt("plain")));
+        assert_eq!(d.read("two words"), None);
+        assert_eq!(d.read(r#""open"#), None);
+    }
+
+    #[test]
+    fn raw_reads_bytes_verbatim() {
+        let d = TxtDialect::Raw;
+        assert_eq!(d.read(r#""quoted""#), Some(txt("\"quoted\"")));
+        assert_eq!(d.read("a b"), Some(txt("a b")));
+    }
+
+    #[test]
+    fn auto_picks_by_leading_quote() {
+        let d = TxtDialect::Auto;
+        assert_eq!(d.read(r#""a" "b""#), Some(txt("ab")));
+        assert_eq!(d.read("v=spf1 -all"), Some(txt("v=spf1 -all")));
+        assert_eq!(d.read(r#""broken"#), None);
+    }
+
+    #[test]
+    fn writing_rules() {
+        let value = txt("say \"hi\"");
+        assert_eq!(
+            TxtDialect::Presentation.write(&value).as_deref(),
+            Some(r#""say \"hi\"""#)
+        );
+        assert_eq!(TxtDialect::Raw.write(&value).as_deref(), Some("say \"hi\""));
+        assert_eq!(TxtDialect::Auto.write(&value), None);
+        let binary = Txt::new(vec![0xff, 0x00]).unwrap();
+        assert_eq!(TxtDialect::Raw.write(&binary), None);
+        assert_eq!(
+            TxtDialect::Presentation.write(&binary).as_deref(),
+            Some(r#""\255\000""#)
+        );
+    }
+
+    #[test]
+    fn provider_text_falls_back_to_non_canonical() {
+        use crate::name::DomainName;
+        use crate::record::{RecordData, RecordType};
+        let zone = DomainName::parse("example.org").unwrap();
+        let a = RecordData::from_provider(RecordType::A, " 192.0.2.1 ", None, TxtDialect::Auto);
+        assert!(a.is_canonical());
+        assert_eq!(a.as_str(), "192.0.2.1");
+        let cname =
+            RecordData::from_provider(RecordType::CNAME, "www", Some(&zone), TxtDialect::Auto);
+        assert_eq!(cname.as_str(), "www.example.org.");
+        let odd =
+            RecordData::from_provider(RecordType::A, " not an address ", None, TxtDialect::Auto);
+        assert!(!odd.is_canonical());
+        assert_eq!(odd.as_str(), "not an address");
+        let raw = RecordData::from_provider(RecordType::TXT, "a b", None, TxtDialect::Raw);
+        assert_eq!(raw.as_str(), "\"a b\"");
+        let bad = RecordData::from_provider(RecordType::TXT, "a b", None, TxtDialect::Presentation);
+        assert!(!bad.is_canonical());
     }
 }

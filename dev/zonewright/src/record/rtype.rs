@@ -74,6 +74,17 @@ impl RecordType {
     pub(crate) const fn is_pseudo(self) -> bool {
         matches!(self.0, Repr::Alias | Repr::Aname)
     }
+
+    /// True for types that cannot be the type of an rrset at a provider: the reserved code 0,
+    /// OPT (41), and the range 128 ..= 255 that RFC 6895 section 3.1 reserves for query and meta
+    /// types (TKEY, TSIG, IXFR, AXFR, MAILB, MAILA, ANY and future ones). Every operation
+    /// rejects them with `Error::InvalidInput` (design section 2.2).
+    pub(crate) const fn is_meta(self) -> bool {
+        match self.0 {
+            Repr::Code(code) => code == 0 || code == 41 || (code >= 128 && code <= 255),
+            Repr::Alias | Repr::Aname => false,
+        }
+    }
 }
 
 /// Mnemonics of the IANA "Resource Record (RR) TYPEs" registry, sorted by code.

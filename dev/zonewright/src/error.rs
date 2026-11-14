@@ -1,0 +1,474 @@
+//! The error type of provider operations (design section 2.9).
+
+use std::fmt;
+use std::time::Duration;
+
+use crate::id::ProviderId;
+use crate::name::DomainName;
+use crate::record::RecordType;
+use crate::redact::Detail;
+
+/// An error of a provider operation, of building a client, or of building a [`Context`].
+///
+/// `Error` is `Clone + Send + Sync + 'static` and has no `source()`: the errors of the HTTP
+/// stack are not exposed, because their text can contain a URL with a query string. Every text it
+/// carries is a [`Detail`]: at most 512 bytes, no control characters, and inside the crate built
+/// either from a constant or by a scrubber that removed the client's secrets.
+///
+/// [`ErrorKind`] is what an application switches on and maps to its own codes.
+///
+/// [`Context`]: crate::Context
+#[derive(Clone, Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    /// Settings or credentials are malformed, the context could not be built, or it cannot do
+    /// what is asked of it (no CA certificates to verify an HTTPS endpoint with).
+    #[error("invalid provider configuration: {detail}")]
+    #[non_exhaustive]
+    Config {
+        /// What is wrong. Never quotes a configured value.
+        detail: Detail,
+    },
+
+    /// The provider's cargo feature is not enabled in this build.
+    #[error("provider {provider} is not compiled into this build")]
+    #[non_exhaustive]
+    NotCompiled {
+        /// The provider.
+        provider: ProviderId,
+    },
+
+    /// The provider's client does not offer this operation (its capability flag is false).
+    #[error("provider {provider} does not support {operation}")]
+    #[non_exhaustive]
+    Unsupported {
+        /// The provider.
+        provider: ProviderId,
+        /// The operation.
+        operation: Operation,
+    },
+
+    /// The record type is outside the provider's `record_types`, or a write was asked for a
+    /// read-only type.
+    #[error("provider {provider} does not support record type {rtype}")]
+    #[non_exhaustive]
+    UnsupportedRecordType {
+        /// The provider.
+        provider: ProviderId,
+        /// The record type.
+        rtype: RecordType,
+    },
+
+    /// The request cannot be sent as given: a value the provider's encoding cannot carry, a TTL
+    /// outside the provider's range, a wildcard zone, an rrset over the provider's size limit.
+    #[error("invalid request: {detail}")]
+    #[non_exhaustive]
+    InvalidInput {
+        /// What is wrong.
+        detail: Detail,
+    },
+
+    /// The owner name is not the zone or below it.
+    #[error("name {name} is outside zone {zone}")]
+    #[non_exhaustive]
+    NameOutsideZone {
+        /// The owner name.
+        name: DomainName,
+        /// The zone.
+        zone: DomainName,
+    },
+
+    /// The zone does not exist at the provider or is not visible to these credentials.
+    #[error("zone {zone} not found at the provider")]
+    #[non_exhaustive]
+    ZoneNotFound {
+        /// The zone.
+        zone: DomainName,
+    },
+
+    /// The provider did not accept the credentials.
+    #[error("provider authentication failed: {detail}")]
+    #[non_exhaustive]
+    Auth {
+        /// The provider's reason, scrubbed.
+        detail: Detail,
+    },
+
+    /// The credentials are valid but lack a permission.
+    #[error("provider denied access: {detail}")]
+    #[non_exhaustive]
+    Forbidden {
+        /// The provider's reason, scrubbed.
+        detail: Detail,
+    },
+
+    /// The provider's rate limit was reached. `retry_after` is how long to wait, counted from
+    /// the moment the error was returned.
+    #[error("provider rate limit reached")]
+    #[non_exhaustive]
+    RateLimited {
+        /// How long to wait, when the provider said.
+        retry_after: Option<Duration>,
+    },
+
+    /// The caller's `Expect` does not hold for the rrset as it is at the provider. Repeating the
+    /// same call gives the same answer until someone changes the rrset or the expectation.
+    #[error("precondition failed: {detail}")]
+    #[non_exhaustive]
+    PreconditionFailed {
+        /// What did not hold.
+        detail: Detail,
+    },
+
+    /// The provider detected that the rrset changed between this operation's read and its
+    /// write, and nothing was written. Repeating the call reads the new state.
+    #[error("concurrent change: {detail}")]
+    #[non_exhaustive]
+    Conflict {
+        /// What changed.
+        detail: Detail,
+    },
+
+    /// Network failure, timeout, a 5xx answer, or a provider-side operation still running.
+    /// The outcome of a write may be unknown.
+    #[error("transient provider error: {detail}")]
+    #[non_exhaustive]
+    Transient {
+        /// What failed.
+        detail: Detail,
+    },
+
+    /// The provider understood the request and refused it. `status` is the HTTP status when the
+    /// refusal was an HTTP-level one.
+    #[error("provider rejected the request: {detail}")]
+    #[non_exhaustive]
+    Rejected {
+        /// The HTTP status, when there was one.
+        status: Option<u16>,
+        /// The provider's reason, scrubbed.
+        detail: Detail,
+    },
+
+    /// The provider answered with something the client cannot interpret.
+    #[error("unexpected provider response: {detail}")]
+    #[non_exhaustive]
+    Protocol {
+        /// What was unexpected.
+        detail: Detail,
+    },
+}
+
+impl Error {
+    /// The kind of this error.
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Error::Config { .. } => ErrorKind::Config,
+            Error::NotCompiled { .. } => ErrorKind::NotCompiled,
+            Error::Unsupported { .. } => ErrorKind::Unsupported,
+            Error::UnsupportedRecordType { .. } => ErrorKind::UnsupportedRecordType,
+            Error::InvalidInput { .. } => ErrorKind::InvalidInput,
+            Error::NameOutsideZone { .. } => ErrorKind::NameOutsideZone,
+            Error::ZoneNotFound { .. } => ErrorKind::ZoneNotFound,
+            Error::Auth { .. } => ErrorKind::Auth,
+            Error::Forbidden { .. } => ErrorKind::Forbidden,
+            Error::RateLimited { .. } => ErrorKind::RateLimited,
+            Error::PreconditionFailed { .. } => ErrorKind::PreconditionFailed,
+            Error::Conflict { .. } => ErrorKind::Conflict,
+            Error::Transient { .. } => ErrorKind::Transient,
+            Error::Rejected { .. } => ErrorKind::Rejected,
+            Error::Protocol { .. } => ErrorKind::Protocol,
+        }
+    }
+
+    /// True for `RateLimited`, `Conflict` and `Transient`: repeating the same operation later
+    /// can succeed without anyone changing anything.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self.kind(),
+            ErrorKind::RateLimited | ErrorKind::Conflict | ErrorKind::Transient
+        )
+    }
+
+    /// The wait the provider asked for, for `RateLimited`; `None` otherwise.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Error::RateLimited { retry_after } => *retry_after,
+            _ => None,
+        }
+    }
+
+    // Constructors for implementations of `Provider` outside the crate. Text arguments become a
+    // `Detail` through `Detail::new`, which bounds and cleans the text and knows no secret.
+    // Provider clients inside the crate never call the ones that take text (a conformance test
+    // scans for it); they build their `Detail` through a scrubber or from a constant.
+
+    /// `Error::Config`. The caller keeps secrets out of `detail`.
+    #[must_use]
+    pub fn config(detail: &str) -> Error {
+        Error::Config {
+            detail: Detail::new(detail),
+        }
+    }
+
+    /// `Error::NotCompiled`.
+    #[must_use]
+    pub fn not_compiled(provider: ProviderId) -> Error {
+        Error::NotCompiled { provider }
+    }
+
+    /// `Error::Unsupported`.
+    #[must_use]
+    pub fn unsupported(provider: ProviderId, operation: Operation) -> Error {
+        Error::Unsupported {
+            provider,
+            operation,
+        }
+    }
+
+    /// `Error::UnsupportedRecordType`.
+    #[must_use]
+    pub fn unsupported_record_type(provider: ProviderId, rtype: RecordType) -> Error {
+        Error::UnsupportedRecordType { provider, rtype }
+    }
+
+    /// `Error::InvalidInput`. The caller keeps secrets out of `detail`.
+    #[must_use]
+    pub fn invalid_input(detail: &str) -> Error {
+        Error::InvalidInput {
+            detail: Detail::new(detail),
+        }
+    }
+
+    /// `Error::NameOutsideZone`.
+    #[must_use]
+    pub fn name_outside_zone(name: DomainName, zone: DomainName) -> Error {
+        Error::NameOutsideZone { name, zone }
+    }
+
+    /// `Error::ZoneNotFound`.
+    #[must_use]
+    pub fn zone_not_found(zone: DomainName) -> Error {
+        Error::ZoneNotFound { zone }
+    }
+
+    /// `Error::Auth`. The caller keeps secrets out of `detail`.
+    #[must_use]
+    pub fn auth(detail: &str) -> Error {
+        Error::Auth {
+            detail: Detail::new(detail),
+        }
+    }
+
+    /// `Error::Forbidden`. The caller keeps secrets out of `detail`.
+    #[must_use]
+    pub fn forbidden(detail: &str) -> Error {
+        Error::Forbidden {
+            detail: Detail::new(detail),
+        }
+    }
+
+    /// `Error::RateLimited`.
+    #[must_use]
+    pub fn rate_limited(retry_after: Option<Duration>) -> Error {
+        Error::RateLimited { retry_after }
+    }
+
+    /// `Error::PreconditionFailed`. The caller keeps secrets out of `detail`.
+    #[must_use]
+    pub fn precondition_failed(detail: &str) -> Error {
+        Error::PreconditionFailed {
+            detail: Detail::new(detail),
+        }
+    }
+
+    /// `Error::Conflict`. The caller keeps secrets out of `detail`.
+    #[must_use]
+    pub fn conflict(detail: &str) -> Error {
+        Error::Conflict {
+            detail: Detail::new(detail),
+        }
+    }
+
+    /// `Error::Transient`. The caller keeps secrets out of `detail`.
+    #[must_use]
+    pub fn transient(detail: &str) -> Error {
+        Error::Transient {
+            detail: Detail::new(detail),
+        }
+    }
+
+    /// `Error::Rejected`. The caller keeps secrets out of `detail`.
+    #[must_use]
+    pub fn rejected(status: Option<u16>, detail: &str) -> Error {
+        Error::Rejected {
+            status,
+            detail: Detail::new(detail),
+        }
+    }
+
+    /// `Error::Protocol`. The caller keeps secrets out of `detail`.
+    #[must_use]
+    pub fn protocol(detail: &str) -> Error {
+        Error::Protocol {
+            detail: Detail::new(detail),
+        }
+    }
+}
+
+/// The kind of an [`Error`], with a stable identifier for each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// [`Error::Config`].
+    Config,
+    /// [`Error::NotCompiled`].
+    NotCompiled,
+    /// [`Error::Unsupported`].
+    Unsupported,
+    /// [`Error::UnsupportedRecordType`].
+    UnsupportedRecordType,
+    /// [`Error::InvalidInput`].
+    InvalidInput,
+    /// [`Error::NameOutsideZone`].
+    NameOutsideZone,
+    /// [`Error::ZoneNotFound`].
+    ZoneNotFound,
+    /// [`Error::Auth`].
+    Auth,
+    /// [`Error::Forbidden`].
+    Forbidden,
+    /// [`Error::RateLimited`].
+    RateLimited,
+    /// [`Error::PreconditionFailed`].
+    PreconditionFailed,
+    /// [`Error::Conflict`].
+    Conflict,
+    /// [`Error::Transient`].
+    Transient,
+    /// [`Error::Rejected`].
+    Rejected,
+    /// [`Error::Protocol`].
+    Protocol,
+}
+
+impl ErrorKind {
+    /// Stable snake_case identifier: `"config"`, `"not_compiled"`, ..., `"protocol"`. Part of
+    /// the public API: applications map these to their own error codes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::Config => "config",
+            ErrorKind::NotCompiled => "not_compiled",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::UnsupportedRecordType => "unsupported_record_type",
+            ErrorKind::InvalidInput => "invalid_input",
+            ErrorKind::NameOutsideZone => "name_outside_zone",
+            ErrorKind::ZoneNotFound => "zone_not_found",
+            ErrorKind::Auth => "auth",
+            ErrorKind::Forbidden => "forbidden",
+            ErrorKind::RateLimited => "rate_limited",
+            ErrorKind::PreconditionFailed => "precondition_failed",
+            ErrorKind::Conflict => "conflict",
+            ErrorKind::Transient => "transient",
+            ErrorKind::Rejected => "rejected",
+            ErrorKind::Protocol => "protocol",
+        }
+    }
+}
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A provider operation: the methods of [`Provider`](crate::Provider).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Operation {
+    /// [`Provider::check`](crate::Provider::check).
+    Check,
+    /// [`Provider::list_zones`](crate::Provider::list_zones).
+    ListZones,
+    /// [`Provider::list_rrsets`](crate::Provider::list_rrsets).
+    ListRrsets,
+    /// [`Provider::get_rrset`](crate::Provider::get_rrset).
+    GetRrset,
+    /// [`Provider::set_rrset`](crate::Provider::set_rrset).
+    SetRrset,
+    /// [`Provider::delete_rrset`](crate::Provider::delete_rrset).
+    DeleteRrset,
+    /// [`Provider::add_txt_value`](crate::Provider::add_txt_value).
+    AddTxtValue,
+    /// [`Provider::remove_txt_value`](crate::Provider::remove_txt_value).
+    RemoveTxtValue,
+}
+
+impl Operation {
+    /// Stable snake_case identifier, the same as `Display`: `"check"`, `"list_zones"`, ...
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Operation::Check => "check",
+            Operation::ListZones => "list_zones",
+            Operation::ListRrsets => "list_rrsets",
+            Operation::GetRrset => "get_rrset",
+            Operation::SetRrset => "set_rrset",
+            Operation::DeleteRrset => "delete_rrset",
+            Operation::AddTxtValue => "add_txt_value",
+            Operation::RemoveTxtValue => "remove_txt_value",
+        }
+    }
+}
+
+impl fmt::Display for Operation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, ErrorKind};
+    use std::time::Duration;
+
+    #[test]
+    fn error_is_send_sync_static_clone() {
+        fn assert_traits<T: Send + Sync + Clone + 'static + std::error::Error>() {}
+        assert_traits::<Error>();
+    }
+
+    #[test]
+    fn error_has_no_source() {
+        use std::error::Error as _;
+        assert!(Error::transient("x").source().is_none());
+    }
+
+    #[test]
+    fn retryability_follows_the_kind() {
+        assert!(Error::rate_limited(None).is_retryable());
+        assert!(Error::conflict("c").is_retryable());
+        assert!(Error::transient("t").is_retryable());
+        assert!(!Error::precondition_failed("p").is_retryable());
+        assert!(!Error::rejected(Some(400), "r").is_retryable());
+        assert_eq!(
+            Error::rate_limited(Some(Duration::from_secs(3))).retry_after(),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(Error::transient("t").retry_after(), None);
+    }
+
+    #[test]
+    fn constructors_bound_the_text() {
+        let long = "a\nb".repeat(400);
+        let Error::Protocol { detail } = Error::protocol(&long) else {
+            panic!("wrong variant");
+        };
+        assert!(detail.as_str().len() <= 512);
+        assert!(!detail.as_str().contains('\n'));
+        assert_eq!(Error::protocol("x").kind(), ErrorKind::Protocol);
+    }
+}

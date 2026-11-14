@@ -27,6 +27,9 @@ pub use svcb::{SvcParam, Svcb};
 pub use tlsa::Tlsa;
 pub use ttl::Ttl;
 pub use txt::Txt;
+// TEMPORARY (core phase): no client reads or writes TXT yet; the first ported client uses it.
+#[allow(unused_imports)]
+pub(crate) use txt::TxtDialect;
 
 use crate::name::NameError;
 
