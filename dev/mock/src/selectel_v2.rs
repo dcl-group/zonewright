@@ -6,7 +6,8 @@
 //!   OpenAPI document behind it, <https://docs.selectel.ru/api/dns-actual.json>: zones and
 //!   rrsets in `{count, next_offset, result}` pages with `limit` (minimum 1, default 1000) and
 //!   `offset`; create answers `200` with the new rrset; `PATCH` (`ttl` and `records` required,
-//!   `comment` at most 255 characters, `X-Managed-By` header) and `DELETE` answer `204`; a
+//!   `comment` at most 255 characters, `X-Managed-By` header) and `DELETE` (`X-Managed-By`
+//!   header, no request body) answer `204`; a
 //!   missing zone or rrset is `404`; validation errors are `422`; error bodies are
 //!   `{"error", "description"}`; `ttl` 60 to 604800; `records` 1 to 100; the types of
 //!   `AllowedRecordTypes`.
@@ -35,6 +36,12 @@
 //!   not with which status);
 //! - an update replaces the comment with the one it carries (none when absent) and the
 //!   managing resource with its `X-Managed-By` header (none when absent);
+//! - a delete removes an rrset whether or not it is managed, with or without an `X-Managed-By`
+//!   header, and whatever UUID the header names (the documentation does not say whether the
+//!   header must match, or what it changes);
+//! - an `X-Managed-By` header that is not a UUID (`PATCH` and `DELETE`; the documented schema
+//!   is a UUID or null) and a `DELETE` with a request body (the documented call has none) are
+//!   refused with `422`, the documented validation status;
 //! - the next offset of the last page is `0`.
 //!
 //! Content per type, as the provider's Terraform documentation for `selectel_domains_rrset_v2`
@@ -1031,10 +1038,10 @@ async fn rrset_update(
     {
         return validation("unexpected field");
     }
-    let managed_by = headers
-        .get("x-managed-by")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    let managed_by = match managed_by(&headers) {
+        Ok(managed_by) => managed_by,
+        Err(response) => return response,
+    };
     let Some((name, rtype)) = lock(&state)
         .rrsets
         .iter()
@@ -1071,10 +1078,33 @@ async fn rrset_update(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// The `X-Managed-By` header of `PATCH` and `DELETE`: absent, or a UUID.
+// Source: the OpenAPI, header parameter `X-Managed-By` (not required; `anyOf` a string of
+// format `uuid` or null).
+fn managed_by(headers: &HeaderMap) -> Result<Option<String>, Response> {
+    let Some(value) = headers.get("x-managed-by") else {
+        return Ok(None);
+    };
+    match value.to_str() {
+        Ok(text) if is_uuid(text) => Ok(Some(text.to_owned())),
+        _ => Err(validation("X-Managed-By is not a UUID")),
+    }
+}
+
+/// `text` is a UUID in its hyphenated hexadecimal form.
+fn is_uuid(text: &str) -> bool {
+    let groups: Vec<&str> = text.split('-').collect();
+    groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 async fn rrset_delete(
     State(state): State<Shared>,
     headers: HeaderMap,
     Path((zone_id, rrset_id)): Path<(String, String)>,
+    body: Bytes,
 ) -> Response {
     let project = match authorize(&state, &headers) {
         Ok(project) => project,
@@ -1084,6 +1114,12 @@ async fn rrset_delete(
         Ok(zone) => zone,
         Err(response) => return response,
     };
+    if !body.is_empty() {
+        return validation("the delete takes no request body");
+    }
+    if let Err(response) = managed_by(&headers) {
+        return response;
+    }
     let mut inner = lock(&state);
     if inner
         .rrsets
@@ -1104,7 +1140,7 @@ async fn rrset_delete(
 
 #[cfg(test)]
 mod tests {
-    use super::{content_valid, rfc3339};
+    use super::{content_valid, is_uuid, rfc3339};
 
     #[test]
     fn content_is_checked_per_type() {
@@ -1151,5 +1187,22 @@ mod tests {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000000Z");
         assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00.000000Z");
         assert_eq!(rfc3339(4_102_444_799), "2099-12-31T23:59:59.000000Z");
+    }
+
+    #[test]
+    fn managed_by_is_a_uuid() {
+        assert!(is_uuid("00000000-0000-4000-8000-0000000000aa"));
+        assert!(is_uuid("0A1B2C3D-4E5F-6789-ABCD-EF0123456789"));
+        for text in [
+            "",
+            "terraform",
+            "00000000000040008000000000000000",
+            "00000000-0000-4000-8000-0000000000a",
+            "00000000-0000-4000-8000-0000000000aaa",
+            "0000000g-0000-4000-8000-0000000000aa",
+            "00000000-0000-4000-8000-0000000000aa-",
+        ] {
+            assert!(!is_uuid(text), "{text}");
+        }
     }
 }

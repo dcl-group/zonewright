@@ -65,8 +65,9 @@
 //! of the rrset as read, a write keeps it disabled and in place, a requested value that a
 //! disabled record holds enables that record instead of adding a duplicate, and a delete of an
 //! rrset that has disabled records writes them back alone instead of deleting the rrset. The
-//! rrset's `comment` and `managed_by` travel back unchanged on every update (`rrset.rs`). A new
-//! rrset gets neither.
+//! rrset's `comment` and `managed_by` travel back unchanged on every update, and `managed_by`
+//! also on a delete, which removes a managed rrset like any other (`rrset.rs`). A new rrset gets
+//! neither.
 
 use crate::error::Error;
 use crate::id::ProviderId;

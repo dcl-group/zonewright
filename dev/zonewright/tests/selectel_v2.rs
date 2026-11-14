@@ -2218,32 +2218,86 @@ async fn selectel_v2_values_outside_the_documented_form_are_non_canonical() {
     }
 }
 
-/// An rrset a web resource manages (`managed_by`) is never deleted: the delete would drop the
-/// association that an update preserves. `delete_rrset` and the removal of the last TXT value
-/// are `InvalidInput` with nothing written; an update still works and keeps it.
+/// The web resource of the managed-rrset tests.
+const RESOURCE: &str = "00000000-0000-4000-8000-0000000000aa";
+
+/// An rrset a web resource manages (`managed_by`) is deleted like any other, by `delete_rrset`
+/// and by the removal of its last TXT value. The delete is sent once and carries the managing
+/// resource in `X-Managed-By` as read, as an update does; an rrset without one gets no header.
+/// A delete that would leave disabled records is an update, which keeps the managing resource.
 #[tokio::test]
-async fn selectel_v2_managed_rrset_is_not_deleted() {
-    const RESOURCE: &str = "00000000-0000-4000-8000-0000000000aa";
+async fn selectel_v2_managed_rrset_is_deleted() {
     let (mock, client) = setup().await;
     let control = mock.control();
     control.insert_rrset("example.org", REC, "A", 600, &["192.0.2.1"]);
     control.set_managed_by(REC, "A", Some(RESOURCE));
-    let e = client
-        .delete_rrset(&zone(), &dn(REC), RecordType::A, Expect::Any)
-        .await
-        .unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(REC), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(control.rrset(REC, "A").is_none());
+    let deletes = mock.log().matching(Some("DELETE"), RRSET);
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].header("x-managed-by"), Some(RESOURCE));
+    assert!(deletes[0].body.is_empty());
+    assert_eq!(writes(&mock), 1);
+
+    // The last TXT value of a managed rrset: the rrset is deleted.
     control.insert_rrset("example.org", NAME, "TXT", 600, &["\"ours\""]);
     control.set_managed_by(NAME, "TXT", Some(RESOURCE));
-    let e = remove(&client, "ours").await.unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
-    assert_eq!(writes(&mock), 0);
     assert_eq!(
-        control.contents(REC, "A"),
-        [("192.0.2.1".to_owned(), false)]
+        remove(&client, "ours").await.unwrap(),
+        RemoveOutcome::RrsetDeleted
     );
-    assert_eq!(control.txt_values(NAME), ["ours"]);
-    // A replacement is an update, which keeps the managing resource.
+    assert!(control.rrset(NAME, "TXT").is_none());
+    let deletes = mock.log().matching(Some("DELETE"), RRSET);
+    assert_eq!(deletes.len(), 2);
+    assert_eq!(deletes[1].header("x-managed-by"), Some(RESOURCE));
+    assert_eq!(writes(&mock), 2);
+
+    // An rrset no web resource manages: the delete carries no header.
+    control.insert_rrset("example.org", REC, "A", 600, &["192.0.2.1"]);
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(REC), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    let deletes = mock.log().matching(Some("DELETE"), RRSET);
+    assert_eq!(deletes.len(), 3);
+    assert_eq!(deletes[2].header("x-managed-by"), None);
+
+    // A managed rrset with a disabled record: the delete writes the disabled record back, and
+    // that update keeps the managing resource.
+    control.insert_rrset("example.org", REC, "A", 600, &["192.0.2.1", "192.0.2.2"]);
+    control.set_disabled(REC, "A", "192.0.2.2", true);
+    control.set_managed_by(REC, "A", Some(RESOURCE));
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(REC), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    let stored = control.rrset(REC, "A").unwrap();
+    assert_eq!(stored.managed_by.as_deref(), Some(RESOURCE));
+    assert_eq!(control.contents(REC, "A"), [("192.0.2.2".to_owned(), true)]);
+    let patch = mock.log().matching(Some("PATCH"), RRSET).pop().unwrap();
+    assert_eq!(patch.header("x-managed-by"), Some(RESOURCE));
+}
+
+/// An update of a managed rrset still keeps the managing resource, at the record level and at
+/// the TXT level, and an rrset created after a managed one was deleted carries no trace of it.
+#[tokio::test]
+async fn selectel_v2_managed_rrset_update_keeps_the_mark() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_rrset("example.org", REC, "A", 600, &["192.0.2.1"]);
+    control.set_managed_by(REC, "A", Some(RESOURCE));
     assert_eq!(
         client
             .set_rrset(
@@ -2259,8 +2313,82 @@ async fn selectel_v2_managed_rrset_is_not_deleted() {
         control.rrset(REC, "A").unwrap().managed_by.as_deref(),
         Some(RESOURCE)
     );
-    // Without a managing resource the delete goes through.
-    control.set_managed_by(REC, "A", None);
+    let patch = mock.log().matching(Some("PATCH"), RRSET).pop().unwrap();
+    assert_eq!(patch.header("x-managed-by"), Some(RESOURCE));
+
+    control.insert_rrset("example.org", NAME, "TXT", 600, &["\"foreign\""]);
+    control.set_managed_by(NAME, "TXT", Some(RESOURCE));
+    assert_eq!(add(&client, "ours").await.unwrap(), AddOutcome::Appended);
+    assert_eq!(
+        remove(&client, "ours").await.unwrap(),
+        RemoveOutcome::Removed
+    );
+    let txt = control.rrset(NAME, "TXT").unwrap();
+    assert_eq!(txt.managed_by.as_deref(), Some(RESOURCE));
+    assert_eq!(control.txt_values(NAME), ["foreign"]);
+
+    // Delete the managed TXT rrset, then create one at the same name: the create carries no
+    // header and the new rrset is not managed.
+    control.delete_rrset(NAME, "TXT");
+    control.insert_rrset("example.org", NAME, "TXT", 600, &["\"ours\""]);
+    control.set_managed_by(NAME, "TXT", Some(RESOURCE));
+    assert_eq!(
+        remove(&client, "ours").await.unwrap(),
+        RemoveOutcome::RrsetDeleted
+    );
+    assert_eq!(add(&client, "again").await.unwrap(), AddOutcome::Created);
+    let post = mock.log().matching(Some("POST"), RRSETS).pop().unwrap();
+    assert_eq!(post.header("x-managed-by"), None);
+    assert!(!post.contains(RESOURCE));
+    assert_eq!(control.rrset(NAME, "TXT").unwrap().managed_by, None);
+}
+
+/// The managing resource's identifier travels only in the `X-Managed-By` header of the rrset
+/// it belongs to: never in a `tracing` event, never in an error the client builds, never in the
+/// request of another rrset. A refused delete is the error its status maps to and is sent once,
+/// never again without the header.
+#[tokio::test(flavor = "current_thread")]
+async fn selectel_v2_managed_rrset_mark_does_not_leak() {
+    let (capture, _guard) = LogCapture::install();
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_rrset("example.org", REC, "A", 600, &["192.0.2.1"]);
+    control.set_managed_by(REC, "A", Some(RESOURCE));
+    control.insert_rrset("example.org", "other.example.org", "A", 600, &["192.0.2.7"]);
+    let mut texts = Vec::new();
+
+    // A refused delete (documented 422): `Rejected`, one request, nothing sent again.
+    mock.faults().push(Fault::on("DELETE", RRSET).status(422));
+    let e = client
+        .delete_rrset(&zone(), &dn(REC), RecordType::A, Expect::Any)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::Rejected {
+                status: Some(422),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    texts.push(format!("{e} | {e:?}"));
+    let deletes = mock.log().matching(Some("DELETE"), RRSET);
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].header("x-managed-by"), Some(RESOURCE));
+    assert!(control.rrset(REC, "A").is_some());
+
+    // A transient failure: not repeated either.
+    mock.faults().push(Fault::on("DELETE", RRSET).status(502));
+    let e = client
+        .delete_rrset(&zone(), &dn(REC), RecordType::A, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    texts.push(format!("{e} | {e:?}"));
+    assert_eq!(mock.log().count(Some("DELETE"), RRSET), 2);
+
     assert_eq!(
         client
             .delete_rrset(&zone(), &dn(REC), RecordType::A, Expect::Any)
@@ -2268,6 +2396,48 @@ async fn selectel_v2_managed_rrset_is_not_deleted() {
             .unwrap(),
         DeleteOutcome::Deleted
     );
+    // Writes to another rrset carry no header.
+    client
+        .set_rrset(
+            &zone(),
+            &rrset("other.example.org", RecordType::A, None, &["192.0.2.8"]),
+            Expect::Any,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .delete_rrset(
+                &zone(),
+                &dn("other.example.org"),
+                RecordType::A,
+                Expect::Any
+            )
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    let deletes = mock.log().matching(Some("DELETE"), RRSET);
+    assert_eq!(deletes.len(), 4);
+    assert_eq!(deletes[3].header("x-managed-by"), None);
+    let patch = mock.log().matching(Some("PATCH"), RRSET).pop().unwrap();
+    assert_eq!(patch.header("x-managed-by"), None);
+    for request in mock.log().entries() {
+        let carries = request.header("x-managed-by").is_some() || request.contains(RESOURCE);
+        let managed_delete = request.method == Method::DELETE && request.path == deletes[0].path;
+        assert!(
+            !carries || managed_delete,
+            "{} {}",
+            request.method,
+            request.path
+        );
+    }
+
+    texts.push(capture.text());
+    for text in &texts {
+        assert!(!text.contains(RESOURCE), "{text}");
+        assert!(!text.contains(&RESOURCE.to_uppercase()), "{text}");
+    }
 }
 
 #[tokio::test]

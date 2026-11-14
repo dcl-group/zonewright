@@ -346,15 +346,29 @@ impl Api {
     /// Deletes an rrset. Sent once: the rrset can hold values of other writers that arrived
     /// after the read, and a repeat would widen that window like a repeated update (design
     /// section 5.3).
-    // Source: the OpenAPI, `DELETE /zones/{zone_id}/rrset/{rrset_id}`: 204; 401, 403, 404, 422,
-    // 500.
+    ///
+    /// `managed_by` is the value read, sent in `X-Managed-By` exactly as on an update: the
+    /// header is documented for this call with the same schema, optional. Whether the API
+    /// refuses the delete of a managed rrset without it, or what it does differently with it,
+    /// is not documented; a refusal is returned as the error it maps to, and the delete is
+    /// never sent again in another form.
+    // Source: the OpenAPI, `DELETE /zones/{zone_id}/rrset/{rrset_id}`: header parameter
+    // `X-Managed-By` (not required; a UUID or null, "Identifier of the web resource that
+    // manages record set."), no request body; 204; 401, 403, 404, 422, 500. The provider's Go
+    // client (`domains-go` `pkg/v2/rrsetManager.go` `DeleteRRSet`, v1.0.2 and v1.1.0) and its
+    // Terraform provider send the delete without the header.
     pub(super) async fn delete_rrset(
         &self,
         zone_id: &str,
         rrset_id: &str,
+        managed_by: Option<&str>,
     ) -> Result<Written, Error> {
         let url = self.rrset_url(zone_id, rrset_id)?;
-        let response = self.send(&Request::new(Method::DELETE, url)).await?;
+        let mut request = Request::new(Method::DELETE, url);
+        if let Some(managed_by) = managed_by {
+            request = request.header_text(X_MANAGED_BY, managed_by)?;
+        }
+        let response = self.send(&request).await?;
         self.written(&response)
     }
 
