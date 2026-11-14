@@ -10,13 +10,28 @@
 //!   on TCP.
 //! - RFC 2136 section 2: opcode UPDATE (5); the zone section holds exactly one `zone SOA` entry
 //!   (2.3); prerequisites (2.4): "name is in use" (`ANY ANY`), "name is not in use"
-//!   (`NONE ANY`), "RRset exists" (`ANY type`), "RRset does not exist" (`NONE type`); updates
-//!   (2.5): add (`zone class`), delete an RRset (`ANY type`), delete all RRsets of a name
-//!   (`ANY ANY`), delete one RR (`NONE type` with the RDATA). A duplicate add and the delete of an
-//!   RR that does not exist are silently ignored (2.5.1, 2.5.4). RCODEs of section 2.2: NOTAUTH
-//!   for a zone the server does not serve, NOTZONE for a name outside the zone section's zone,
-//!   NXDOMAIN, YXDOMAIN, NXRRSET, YXRRSET for failed prerequisites, FORMERR for what cannot be
-//!   read. The response copies the ID and the opcode and sets QR (3.8).
+//!   (`NONE ANY`), "RRset exists (value independent)" (`ANY type`), "RRset exists (value
+//!   dependent)" (`IN type` with the RRs), "RRset does not exist" (`NONE type`); updates (2.5):
+//!   add (`zone class`), delete an RRset (`ANY type`), delete all RRsets of a name (`ANY ANY`),
+//!   delete one RR (`NONE type` with the RDATA). RCODEs of section 2.2: NOTAUTH for a zone the
+//!   server does not serve, NOTZONE for a name outside the zone section's zone, NXDOMAIN,
+//!   YXDOMAIN, NXRRSET, YXRRSET for failed prerequisites, FORMERR for what cannot be read. The
+//!   response copies the ID and the opcode and sets QR (3.8).
+//! - RFC 2136 section 3, for every update: prerequisites in order, the first that fails decides
+//!   the RCODE, value-dependent RRsets compared as sets after the loop (3.2, pseudocode 3.2.5);
+//!   the prescan of the update section (3.4.1); then the updates in order, all or nothing
+//!   (3.4.2.1): a duplicate add replaces the zone RR, a CNAME add next to other data and a
+//!   non-CNAME add next to a CNAME are ignored, an SOA add without a higher serial is ignored
+//!   (3.4.2.2, serials compared by RFC 1982); the deletion of every RRset of the apex keeps SOA
+//!   and NS, the deletion of the apex SOA or NS RRset is ignored (3.4.2.3); the deletion of an
+//!   SOA RR, and of the last NS RR of the apex, is ignored (3.4.2.4); a duplicate add and the
+//!   delete of an RR or RRset that does not exist are silently ignored (2.5.1, 2.5.2, 2.5.4).
+//! - Queries (RFC 1034 section 4.3.2): an NS RRset at a name below the apex is a zone cut; a
+//!   query at or below it is answered with a referral (step 3b: no AA, an empty answer section,
+//!   the NS RRset of the cut in the authority section). A CNAME at the name answers a query of
+//!   any type (step 3a), without following the chain. Names inside the RDATA of the RFC 1035
+//!   types NS, CNAME, PTR, MX and SOA are compressed against the question name where a suffix
+//!   matches (RFC 1035 section 4.1.4; RFC 3597 section 4 allows it for these types only).
 //! - RFC 8945: TSIG is the last record of the additional section (5.1); the request MAC covers
 //!   the message without the TSIG record (ARCOUNT less one, the original ID) and the TSIG
 //!   variables (4.3.3); the response MAC covers the request MAC with its length, the response,
@@ -37,6 +52,11 @@
 //! - an add whose RDATA is already present replaces that record's TTL, and an add to an existing
 //!   RRset gives every record of the RRset the added record's TTL (RFC 2136 section 3.4.2.2 says a
 //!   duplicate replaces the zone RR; one TTL per RRset is RFC 2181 section 5.2);
+//! - RDATA, names inside it included, is compared octet by octet (RFC 2136 sections 3.2.3 and
+//!   3.4.2.4 speak of equal RDATA without saying how names compare); the seeds hold lowercase
+//!   names, so the comparison is exact for what a client reads back;
+//! - the zone apex counts as a name in use even without records, since a real zone always has
+//!   its SOA there and the seeds usually leave it out;
 //! - an update answer copies the zone section (RFC 2136 section 3.8 also allows zero counts;
 //!   [`Fault::omit_question`] produces that form).
 //!
@@ -65,12 +85,23 @@ pub const TYPE_TXT: u16 = 16;
 pub const TYPE_A: u16 = 1;
 /// Type code of CNAME (RFC 1035 section 3.2.2).
 pub const TYPE_CNAME: u16 = 5;
-const TYPE_SOA: u16 = 6;
+/// Type code of NS (RFC 1035 section 3.2.2).
+pub const TYPE_NS: u16 = 2;
+/// Type code of SOA (RFC 1035 section 3.2.2).
+pub const TYPE_SOA: u16 = 6;
+/// Type code of MX (RFC 1035 section 3.2.2).
+pub const TYPE_MX: u16 = 15;
+/// Type code of PTR (RFC 1035 section 3.2.2).
+const TYPE_PTR: u16 = 12;
 const TYPE_TSIG: u16 = 250;
-const TYPE_ANY: u16 = 255;
-const CLASS_IN: u16 = 1;
-const CLASS_NONE: u16 = 254;
-const CLASS_ANY: u16 = 255;
+/// Type code ANY (RFC 1035 section 3.2.3).
+pub const TYPE_ANY: u16 = 255;
+/// Class IN (RFC 1035 section 3.2.4).
+pub const CLASS_IN: u16 = 1;
+/// Class NONE (RFC 2136 section 1.3).
+pub const CLASS_NONE: u16 = 254;
+/// Class ANY (RFC 1035 section 3.2.5).
+pub const CLASS_ANY: u16 = 255;
 
 /// RCODE NOERROR.
 pub const NOERROR: u8 = 0;
@@ -229,7 +260,7 @@ pub struct Call {
 /// A behavior injected into the next matching requests. Built with [`Fault::on`] and the
 /// methods below; the first fault in the queue whose operation matches takes the request.
 ///
-/// Order of effects: the delay, the foreign record, then either no answer ([`Fault::close`]), a
+/// Order of effects: the delay, the foreign deletion and record, then either no answer ([`Fault::close`]), a
 /// fixed RCODE without applying the request ([`Fault::rcode`]), or normal processing; then the
 /// changes to the answer; then how it is written ([`Fault::truncate`], [`Fault::short_length`],
 /// [`Fault::drop_reply`]).
@@ -239,6 +270,7 @@ pub struct Fault {
     times: usize,
     delay: Duration,
     foreign: Option<MockRecord>,
+    foreign_delete: Option<(String, u16)>,
     close: bool,
     rcode: Option<u8>,
     unsigned: bool,
@@ -303,6 +335,13 @@ impl Fault {
     /// Adds `record` before the request is processed: a change by another writer, of any type.
     pub fn foreign_record(mut self, record: MockRecord) -> Fault {
         self.foreign = Some(record);
+        self
+    }
+
+    /// Deletes every record of `name` and `rtype` before the request is processed: a change by
+    /// another writer.
+    pub fn foreign_delete(mut self, name: &str, rtype: u16) -> Fault {
+        self.foreign_delete = Some((name.to_ascii_lowercase(), rtype));
         self
     }
 
@@ -455,6 +494,30 @@ impl Control {
             .filter(|r| r.name == name)
             .cloned()
             .collect()
+    }
+
+    /// The records of `name` and `rtype`, in insertion order.
+    pub fn records_of(&self, name: &str, rtype: u16) -> Vec<MockRecord> {
+        self.records(name)
+            .into_iter()
+            .filter(|r| r.rtype == rtype)
+            .collect()
+    }
+
+    /// Every record held, in insertion order.
+    pub fn all_records(&self) -> Vec<MockRecord> {
+        lock(&self.state).records.clone()
+    }
+
+    /// How many update records deleted every RRset of a name (class ANY, type ANY, RFC 2136
+    /// section 2.5.3).
+    pub fn name_deletes(&self) -> usize {
+        lock(&self.state)
+            .calls
+            .iter()
+            .flat_map(|c| c.updates.iter())
+            .filter(|u| u.class == CLASS_ANY && u.rtype == TYPE_ANY)
+            .count()
     }
 
     /// Adds a TXT record with `value` as one character-string.
@@ -886,6 +949,11 @@ async fn handle(b: &[u8], control: &Control) -> Reply {
     if !fault.delay.is_zero() {
         tokio::time::sleep(fault.delay).await;
     }
+    if let Some((name, rtype)) = &fault.foreign_delete {
+        lock(&control.state)
+            .records
+            .retain(|r| !(&r.name == name && r.rtype == *rtype));
+    }
     if let Some(record) = &fault.foreign {
         control.add_record(record.clone());
     }
@@ -915,7 +983,10 @@ async fn handle(b: &[u8], control: &Control) -> Reply {
         let rcode = if tsig_count == 0 { REFUSED } else { FORMERR };
         call.rcode = Some(rcode);
         lock(&control.state).calls.push(call);
-        return Reply::Send(answer(&req, rcode, &[], None, &fault), Write::Full);
+        return Reply::Send(
+            answer(&req, &Outcome::rcode(rcode), None, &fault),
+            Write::Full,
+        );
     };
     call.request_mac = tsig.mac.clone();
     if fault.close {
@@ -944,7 +1015,12 @@ async fn handle(b: &[u8], control: &Control) -> Reply {
             error,
             other,
         };
-        answer(&req, NOTAUTH, &[], Some(signing), &Fault::default())
+        answer(
+            &req,
+            &Outcome::rcode(NOTAUTH),
+            Some(signing),
+            &Fault::default(),
+        )
     };
     let Some(key) = key else {
         let reply = tsig_failure(&mut call, BADKEY, None);
@@ -978,11 +1054,11 @@ async fn handle(b: &[u8], control: &Control) -> Reply {
         lock(&control.state).calls.push(call);
         return Reply::Send(reply, Write::Full);
     }
-    let (rcode, answers) = match fault.rcode {
-        Some(rcode) => (rcode, Vec::new()),
+    let outcome = match fault.rcode {
+        Some(rcode) => Outcome::rcode(rcode),
         None => process(&req, control, refuse_queries),
     };
-    call.rcode = Some(rcode);
+    call.rcode = Some(outcome.rcode);
     lock(&control.state).calls.push(call);
     if fault.drop_reply {
         return Reply::Close;
@@ -1000,7 +1076,7 @@ async fn handle(b: &[u8], control: &Control) -> Reply {
         error: fault.tsig_error,
         other: Vec::new(),
     });
-    let reply = answer(&req, rcode, &answers, signing, &fault);
+    let reply = answer(&req, &outcome, signing, &fault);
     let how = if fault.truncate {
         Write::Truncated
     } else if fault.short_length {
@@ -1025,38 +1101,117 @@ fn in_zone(name: &str, zone: &str) -> bool {
     name == zone || name.ends_with(&format!(".{zone}"))
 }
 
-/// Answer records as (type, TTL, RDATA).
-type Answers = Vec<(u16, u32, Vec<u8>)>;
+/// Query and meta types: the reserved 0, OPT and 128 ..= 255 (RFC 6895 section 3.1), which RFC
+/// 2136 section 3.4.1.2 calls "ANY, AXFR, MAILA, MAILB, or any other QUERY metatype".
+fn is_meta(rtype: u16) -> bool {
+    rtype == 0 || rtype == 41 || (128..=255).contains(&rtype)
+}
 
-fn process(req: &Request, control: &Control, refuse_queries: bool) -> (u8, Answers) {
+/// One record of an answer.
+#[derive(Clone, Debug)]
+struct AnswerRr {
+    owner: String,
+    rtype: u16,
+    ttl: u32,
+    rdata: Vec<u8>,
+}
+
+/// What processing a request produced.
+#[derive(Debug)]
+struct Outcome {
+    rcode: u8,
+    /// AA: the answer comes from an authority for the name (false for a referral).
+    authoritative: bool,
+    answers: Vec<AnswerRr>,
+    authority: Vec<AnswerRr>,
+}
+
+impl Outcome {
+    fn rcode(rcode: u8) -> Outcome {
+        Outcome {
+            rcode,
+            authoritative: true,
+            answers: Vec::new(),
+            authority: Vec::new(),
+        }
+    }
+}
+
+fn process(req: &Request, control: &Control, refuse_queries: bool) -> Outcome {
     let zones = &control.seed.zones;
     let mut state = lock(&control.state);
     match req.opcode {
         0 => {
-            if refuse_queries || !zones.iter().any(|z| in_zone(&req.qname, z)) {
-                return (REFUSED, Vec::new());
+            let Some(zone) = zones.iter().find(|z| in_zone(&req.qname, z)) else {
+                return Outcome::rcode(REFUSED);
+            };
+            if refuse_queries {
+                return Outcome::rcode(REFUSED);
+            }
+            let to_answer = |r: &MockRecord| AnswerRr {
+                owner: r.name.clone(),
+                rtype: r.rtype,
+                ttl: r.ttl,
+                rdata: r.rdata.clone(),
+            };
+            // A zone cut: NS records at a name below the apex (RFC 1034 section 4.3.2, step 3b).
+            let cut = state
+                .records
+                .iter()
+                .filter(|r| r.rtype == TYPE_NS && &r.name != zone && in_zone(&req.qname, &r.name))
+                .map(|r| r.name.clone())
+                .next();
+            if let Some(cut) = cut {
+                return Outcome {
+                    rcode: NOERROR,
+                    authoritative: false,
+                    answers: Vec::new(),
+                    authority: state
+                        .records
+                        .iter()
+                        .filter(|r| r.name == cut && r.rtype == TYPE_NS)
+                        .map(to_answer)
+                        .collect(),
+                };
             }
             // A CNAME at the name answers a query of any type (RFC 1034 section 4.3.2, step
             // 3a). The mock does not follow the chain to the target.
-            let answers: Answers = state
+            let answers = state
                 .records
                 .iter()
                 .filter(|r| {
                     r.name == req.qname
                         && (req.qtype == r.rtype || req.qtype == TYPE_ANY || r.rtype == TYPE_CNAME)
                 })
-                .map(|r| (r.rtype, r.ttl, r.rdata.clone()))
+                .map(to_answer)
                 .collect();
             let exists =
                 state.records.iter().any(|r| r.name == req.qname) || zones.contains(&req.qname);
-            (if exists { NOERROR } else { NXDOMAIN }, answers)
+            Outcome {
+                rcode: if exists { NOERROR } else { NXDOMAIN },
+                authoritative: true,
+                answers,
+                authority: Vec::new(),
+            }
         }
-        5 => (update(req, zones, &mut state.records), Vec::new()),
-        _ => (NOTIMP, Vec::new()),
+        5 => Outcome::rcode(update(req, zones, &mut state.records)),
+        _ => Outcome::rcode(NOTIMP),
     }
 }
 
-/// RFC 2136 section 3: zone section, prerequisites, then updates, all or nothing.
+/// The serial of SOA RDATA: the third 32-bit field after the two names.
+fn soa_serial(rdata: &[u8]) -> Option<u32> {
+    let (_, i) = read_name(rdata, 0)?;
+    let (_, j) = read_name(rdata, i)?;
+    be32(rdata, j)
+}
+
+/// `a` is lower than or equal to `b` in serial number arithmetic (RFC 1982 section 3.2).
+fn serial_not_greater(a: u32, b: u32) -> bool {
+    a == b || (a < b && b - a < (1 << 31)) || (a > b && a - b > (1 << 31))
+}
+
+/// RFC 2136 section 3: zone section, prerequisites, prescan, then the updates, all or nothing.
 fn update(req: &Request, zones: &[String], records: &mut Vec<MockRecord>) -> u8 {
     if req.qtype != TYPE_SOA {
         return FORMERR;
@@ -1065,7 +1220,12 @@ fn update(req: &Request, zones: &[String], records: &mut Vec<MockRecord>) -> u8 
     if !zones.contains(zone) {
         return NOTAUTH;
     }
+    // Section 3.2 (pseudocode 3.2.5): in order, the first failure decides.
+    let mut temp: Vec<(String, u16, Vec<Vec<u8>>)> = Vec::new();
     for p in &req.prereqs {
+        if p.ttl != 0 {
+            return FORMERR;
+        }
         if !in_zone(&p.name, zone) {
             return NOTZONE;
         }
@@ -1073,78 +1233,233 @@ fn update(req: &Request, zones: &[String], records: &mut Vec<MockRecord>) -> u8 
         let rrset_exists = records
             .iter()
             .any(|r| r.name == p.name && r.rtype == p.rtype);
-        match (p.class, p.rtype) {
-            (CLASS_ANY, TYPE_ANY) if !name_in_use => return NXDOMAIN,
-            (CLASS_NONE, TYPE_ANY) if name_in_use => return YXDOMAIN,
-            (CLASS_ANY, TYPE_ANY) | (CLASS_NONE, TYPE_ANY) => {}
-            (CLASS_ANY, _) if !rrset_exists => return NXRRSET,
-            (CLASS_NONE, _) if rrset_exists => return YXRRSET,
-            (CLASS_ANY, _) | (CLASS_NONE, _) => {}
+        match p.class {
+            CLASS_ANY | CLASS_NONE if !p.rdata.is_empty() => return FORMERR,
+            CLASS_ANY if p.rtype == TYPE_ANY && !name_in_use => return NXDOMAIN,
+            CLASS_ANY if p.rtype != TYPE_ANY && !rrset_exists => return NXRRSET,
+            CLASS_NONE if p.rtype == TYPE_ANY && name_in_use => return YXDOMAIN,
+            CLASS_NONE if p.rtype != TYPE_ANY && rrset_exists => return YXRRSET,
+            CLASS_ANY | CLASS_NONE => {}
+            CLASS_IN => match temp
+                .iter_mut()
+                .find(|(n, t, _)| n == &p.name && *t == p.rtype)
+            {
+                Some((_, _, set)) => set.push(p.rdata.clone()),
+                None => temp.push((p.name.clone(), p.rtype, vec![p.rdata.clone()])),
+            },
             _ => return FORMERR,
         }
     }
+    // Section 3.2.3: each value-dependent RRset must equal the zone RRset, as a set.
+    for (name, rtype, set) in &temp {
+        let zone_set: Vec<&Vec<u8>> = records
+            .iter()
+            .filter(|r| &r.name == name && r.rtype == *rtype)
+            .map(|r| &r.rdata)
+            .collect();
+        let equal =
+            zone_set.iter().all(|z| set.contains(z)) && set.iter().all(|s| zone_set.contains(&s));
+        if !equal {
+            return NXRRSET;
+        }
+    }
+    // Section 3.4.1: the prescan.
     for u in &req.updates {
         if !in_zone(&u.name, zone) {
             return NOTZONE;
         }
-        if !matches!(u.class, CLASS_IN | CLASS_NONE | CLASS_ANY) || u.rtype == TYPE_TSIG {
+        let valid = match u.class {
+            CLASS_IN => !is_meta(u.rtype),
+            CLASS_ANY => {
+                u.ttl == 0 && u.rdata.is_empty() && (u.rtype == TYPE_ANY || !is_meta(u.rtype))
+            }
+            CLASS_NONE => u.ttl == 0 && !is_meta(u.rtype),
+            _ => false,
+        };
+        if !valid {
             return FORMERR;
         }
     }
+    // Section 3.4.2 (pseudocode 3.4.2.7), on a copy committed at the end (3.4.2.1).
+    let mut work = records.clone();
     for u in &req.updates {
         match u.class {
-            // RFC 2136 section 3.4.2.2: "In the case of a CNAME Update RR and a non-CNAME Zone
-            // RRset or vice versa, ignore the CNAME Update RR, otherwise replace the CNAME Zone
-            // RR with the CNAME Update RR." The add is ignored silently: NOERROR all the same.
-            CLASS_IN
-                if records.iter().any(|r| {
-                    r.name == u.name && ((r.rtype == TYPE_CNAME) != (u.rtype == TYPE_CNAME))
-                }) => {}
-            CLASS_IN if u.rtype == TYPE_CNAME => {
-                records.retain(|r| !(r.name == u.name && r.rtype == TYPE_CNAME));
-                records.push(MockRecord {
-                    name: u.name.clone(),
-                    rtype: u.rtype,
-                    ttl: u.ttl,
-                    rdata: u.rdata.clone(),
-                });
-            }
             CLASS_IN => {
-                for r in records
-                    .iter_mut()
-                    .filter(|r| r.name == u.name && r.rtype == u.rtype)
-                {
-                    r.ttl = u.ttl;
+                // "In the case of a CNAME Update RR and a non-CNAME Zone RRset or vice versa,
+                // ignore the CNAME Update RR." The add is ignored silently: NOERROR all the
+                // same.
+                let conflicting = work.iter().any(|r| {
+                    r.name == u.name && ((r.rtype == TYPE_CNAME) != (u.rtype == TYPE_CNAME))
+                });
+                if conflicting {
+                    continue;
                 }
-                let present = records
-                    .iter()
-                    .any(|r| r.name == u.name && r.rtype == u.rtype && r.rdata == u.rdata);
-                if !present {
-                    records.push(MockRecord {
+                if u.rtype == TYPE_SOA {
+                    let current = work
+                        .iter()
+                        .find(|r| r.name == u.name && r.rtype == TYPE_SOA)
+                        .and_then(|r| soa_serial(&r.rdata));
+                    let ignored = match (current, soa_serial(&u.rdata)) {
+                        (Some(current), Some(new)) => serial_not_greater(new, current),
+                        _ => true,
+                    };
+                    if ignored {
+                        continue;
+                    }
+                }
+                let replaces = |r: &MockRecord| {
+                    r.name == u.name
+                        && r.rtype == u.rtype
+                        && (u.rtype == TYPE_CNAME || u.rtype == TYPE_SOA || r.rdata == u.rdata)
+                };
+                if let Some(existing) = work.iter_mut().find(|r| replaces(r)) {
+                    existing.rdata = u.rdata.clone();
+                    existing.ttl = u.ttl;
+                } else {
+                    work.push(MockRecord {
                         name: u.name.clone(),
                         rtype: u.rtype,
                         ttl: u.ttl,
                         rdata: u.rdata.clone(),
                     });
                 }
+                // Invented (see the module documentation): one TTL per RRset, the added one.
+                for r in work
+                    .iter_mut()
+                    .filter(|r| r.name == u.name && r.rtype == u.rtype)
+                {
+                    r.ttl = u.ttl;
+                }
             }
-            CLASS_NONE => {
-                records.retain(|r| !(r.name == u.name && r.rtype == u.rtype && r.rdata == u.rdata));
+            CLASS_ANY => {
+                let apex = &u.name == zone;
+                if u.rtype == TYPE_ANY {
+                    work.retain(|r| {
+                        !(r.name == u.name && !(apex && matches!(r.rtype, TYPE_SOA | TYPE_NS)))
+                    });
+                } else if !(apex && matches!(u.rtype, TYPE_SOA | TYPE_NS)) {
+                    work.retain(|r| !(r.name == u.name && r.rtype == u.rtype));
+                }
             }
             _ => {
-                records
-                    .retain(|r| !(r.name == u.name && (u.rtype == TYPE_ANY || r.rtype == u.rtype)));
+                if u.rtype == TYPE_SOA {
+                    continue;
+                }
+                let ns: Vec<&MockRecord> = work
+                    .iter()
+                    .filter(|r| r.name == u.name && r.rtype == TYPE_NS)
+                    .collect();
+                let last_apex_ns = u.rtype == TYPE_NS
+                    && &u.name == zone
+                    && matches!(ns.as_slice(), [only] if only.rdata == u.rdata);
+                if last_apex_ns {
+                    continue;
+                }
+                work.retain(|r| !(r.name == u.name && r.rtype == u.rtype && r.rdata == u.rdata));
             }
         }
     }
+    *records = work;
     NOERROR
 }
 
-/// Builds the answer: header, question or zone section, answers, then the TSIG record.
+/// The labels of an uncompressed wire name, `None` when malformed.
+fn labels(wire: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        let len = usize::from(*wire.get(i)?);
+        if len == 0 {
+            return Some(out);
+        }
+        out.push(wire.get(i + 1..i + 1 + len)?);
+        i += 1 + len;
+    }
+}
+
+/// The suffixes of the question name with their offsets in the message (the question starts at
+/// offset 12).
+fn question_suffixes(question: &[u8]) -> Vec<(Vec<&[u8]>, usize)> {
+    let Some(all) = labels(question) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut offset = 12;
+    for i in 0..all.len() {
+        out.push((all[i..].to_vec(), offset));
+        offset += 1 + all[i].len();
+    }
+    out
+}
+
+/// Appends the uncompressed wire name `name`, compressed against the question where a suffix of
+/// labels matches octet for octet (RFC 1035 section 4.1.4).
+fn put_compressed(m: &mut Vec<u8>, name: &[u8], suffixes: &[(Vec<&[u8]>, usize)]) {
+    let Some(name_labels) = labels(name) else {
+        m.extend_from_slice(name);
+        return;
+    };
+    for start in 0..name_labels.len() {
+        let rest = &name_labels[start..];
+        if let Some((_, offset)) = suffixes.iter().find(|(s, _)| s.as_slice() == rest) {
+            for label in &name_labels[..start] {
+                m.push(u8::try_from(label.len()).unwrap_or(63));
+                m.extend_from_slice(label);
+            }
+            let pointer = 0xc000 | u16::try_from(*offset).unwrap_or(0);
+            m.extend_from_slice(&pointer.to_be_bytes());
+            return;
+        }
+    }
+    m.extend_from_slice(name);
+}
+
+/// The RDATA of an answer record, with the names of NS, CNAME, PTR, MX and SOA compressed.
+fn answer_rdata(rtype: u16, rdata: &[u8], suffixes: &[(Vec<&[u8]>, usize)]) -> Vec<u8> {
+    let name_end = |at: usize| -> Option<usize> {
+        let mut i = at;
+        loop {
+            let len = usize::from(*rdata.get(i)?);
+            i += 1 + len;
+            if len == 0 {
+                return Some(i);
+            }
+        }
+    };
+    let compressed = (|| -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        match rtype {
+            TYPE_NS | TYPE_CNAME | TYPE_PTR => {
+                let end = name_end(0).filter(|&e| e == rdata.len())?;
+                put_compressed(&mut out, rdata.get(..end)?, suffixes);
+            }
+            TYPE_MX => {
+                let end = name_end(2).filter(|&e| e == rdata.len())?;
+                out.extend_from_slice(rdata.get(..2)?);
+                put_compressed(&mut out, rdata.get(2..end)?, suffixes);
+            }
+            TYPE_SOA => {
+                let first = name_end(0)?;
+                let second = name_end(first)?;
+                if second + 20 != rdata.len() {
+                    return None;
+                }
+                put_compressed(&mut out, rdata.get(..first)?, suffixes);
+                put_compressed(&mut out, rdata.get(first..second)?, suffixes);
+                out.extend_from_slice(rdata.get(second..)?);
+            }
+            _ => return None,
+        }
+        Some(out)
+    })();
+    compressed.unwrap_or_else(|| rdata.to_vec())
+}
+
+/// Builds the answer: header, question or zone section, answers, authority, then the TSIG
+/// record.
 fn answer(
     req: &Request,
-    rcode: u8,
-    answers: &[(u16, u32, Vec<u8>)],
+    outcome: &Outcome,
     signing: Option<Signing<'_>>,
     fault: &Fault,
 ) -> Vec<u8> {
@@ -1153,12 +1468,13 @@ fn answer(
     } else {
         req.id
     };
-    let mut flags: u16 = 0x8000 | (u16::from(req.opcode) << 11) | 0x0400 | u16::from(rcode & 0x0f);
+    let rcode = outcome.rcode;
+    let mut flags: u16 = 0x8000 | (u16::from(req.opcode) << 11) | u16::from(rcode & 0x0f);
+    if outcome.authoritative && !fault.clear_aa {
+        flags |= 0x0400;
+    }
     if fault.clear_qr {
         flags &= !0x8000;
-    }
-    if fault.clear_aa {
-        flags &= !0x0400;
     }
     if fault.set_tc {
         flags |= 0x0200;
@@ -1168,10 +1484,16 @@ fn answer(
     m.extend_from_slice(&flags.to_be_bytes());
     let qdcount: u16 = if fault.omit_question { 0 } else { 1 };
     let extra = usize::from(fault.extra_answer.is_some());
-    let ancount = u16::try_from(answers.len() + extra).unwrap_or(0);
-    for n in [qdcount, ancount, 0, 0] {
+    let ancount = u16::try_from(outcome.answers.len() + extra).unwrap_or(0);
+    let nscount = u16::try_from(outcome.authority.len()).unwrap_or(0);
+    for n in [qdcount, ancount, nscount, 0] {
         m.extend_from_slice(&n.to_be_bytes());
     }
+    let suffixes = if fault.omit_question {
+        Vec::new()
+    } else {
+        question_suffixes(&req.question)
+    };
     if !fault.omit_question {
         let mut question = req.question.clone();
         if fault.wrong_question {
@@ -1180,14 +1502,14 @@ fn answer(
         }
         m.extend_from_slice(&question);
     }
-    for (rtype, ttl, rdata) in answers {
-        // The owner is a compression pointer to the question name at offset 12.
-        m.extend_from_slice(&[0xc0, 12]);
-        m.extend_from_slice(&rtype.to_be_bytes());
+    for rr in outcome.answers.iter().chain(&outcome.authority) {
+        put_compressed(&mut m, &wire_name(&rr.owner), &suffixes);
+        m.extend_from_slice(&rr.rtype.to_be_bytes());
         m.extend_from_slice(&CLASS_IN.to_be_bytes());
-        m.extend_from_slice(&ttl.to_be_bytes());
+        m.extend_from_slice(&rr.ttl.to_be_bytes());
+        let rdata = answer_rdata(rr.rtype, &rr.rdata, &suffixes);
         m.extend_from_slice(&u16::try_from(rdata.len()).unwrap_or(0).to_be_bytes());
-        m.extend_from_slice(rdata);
+        m.extend_from_slice(&rdata);
     }
     if let Some((name, rtype, class, rdata)) = &fault.extra_answer {
         m.extend_from_slice(&wire_name(name));
@@ -1335,6 +1657,305 @@ mod tests {
         assert!(mock.control().txt("a.example.org.").is_empty());
         let call = &mock.control().calls()[0];
         assert_eq!(call.tsig_error, BADSIG);
+    }
+
+    fn rr(name: &str, rtype: u16, class: u16, ttl: u32, rdata: &[u8]) -> Rr {
+        Rr {
+            name: name.to_owned(),
+            rtype,
+            class,
+            ttl,
+            rdata: rdata.to_vec(),
+            start: 0,
+        }
+    }
+
+    fn update_request(prereqs: Vec<Rr>, updates: Vec<Rr>) -> Request {
+        Request {
+            id: 1,
+            opcode: 5,
+            question: Vec::new(),
+            qname: ZONE.to_owned(),
+            qtype: TYPE_SOA,
+            prereqs,
+            updates,
+            additional: Vec::new(),
+        }
+    }
+
+    fn record(name: &str, rtype: u16, rdata: &[u8]) -> MockRecord {
+        MockRecord {
+            name: name.to_owned(),
+            rtype,
+            ttl: 300,
+            rdata: rdata.to_vec(),
+        }
+    }
+
+    fn soa(serial: u32) -> Vec<u8> {
+        let mut rd = wire_name("ns1.example.org.");
+        rd.extend_from_slice(&wire_name("admin.example.org."));
+        rd.extend_from_slice(&serial.to_be_bytes());
+        rd.extend_from_slice(&[0; 16]);
+        rd
+    }
+
+    const A: &str = "a.example.org.";
+
+    /// The five prerequisite forms of RFC 2136 section 2.4 and their RCODEs (section 3.2).
+    #[test]
+    fn prerequisites_follow_section_3_2() {
+        let zones = vec![ZONE.to_owned()];
+        let base = vec![
+            record(A, TYPE_TXT, &txt_rdata(b"x")),
+            record(A, TYPE_TXT, &txt_rdata(b"y")),
+        ];
+        let run = |prereqs: Vec<Rr>| {
+            let mut records = base.clone();
+            let add = rr(A, TYPE_A, CLASS_IN, 60, &[192, 0, 2, 1]);
+            let rcode = update(&update_request(prereqs, vec![add]), &zones, &mut records);
+            (rcode, records.len())
+        };
+        let x = txt_rdata(b"x");
+        let y = txt_rdata(b"y");
+        let cases: Vec<(Vec<Rr>, u8)> = vec![
+            (vec![rr(A, TYPE_ANY, CLASS_ANY, 0, &[])], NOERROR),
+            (
+                vec![rr("b.example.org.", TYPE_ANY, CLASS_ANY, 0, &[])],
+                NXDOMAIN,
+            ),
+            (vec![rr(A, TYPE_ANY, CLASS_NONE, 0, &[])], YXDOMAIN),
+            (
+                vec![rr("b.example.org.", TYPE_ANY, CLASS_NONE, 0, &[])],
+                NOERROR,
+            ),
+            (vec![rr(A, TYPE_TXT, CLASS_ANY, 0, &[])], NOERROR),
+            (vec![rr(A, TYPE_MX, CLASS_ANY, 0, &[])], NXRRSET),
+            (vec![rr(A, TYPE_TXT, CLASS_NONE, 0, &[])], YXRRSET),
+            (vec![rr(A, TYPE_MX, CLASS_NONE, 0, &[])], NOERROR),
+            // Value dependent: the same set in any order, nothing more, nothing less.
+            (
+                vec![
+                    rr(A, TYPE_TXT, CLASS_IN, 0, &y),
+                    rr(A, TYPE_TXT, CLASS_IN, 0, &x),
+                ],
+                NOERROR,
+            ),
+            (vec![rr(A, TYPE_TXT, CLASS_IN, 0, &x)], NXRRSET),
+            (
+                vec![
+                    rr(A, TYPE_TXT, CLASS_IN, 0, &x),
+                    rr(A, TYPE_TXT, CLASS_IN, 0, &y),
+                    rr(A, TYPE_TXT, CLASS_IN, 0, &txt_rdata(b"z")),
+                ],
+                NXRRSET,
+            ),
+            (vec![rr(A, TYPE_MX, CLASS_IN, 0, &[0, 10, 0])], NXRRSET),
+            // Malformed prerequisites.
+            (vec![rr(A, TYPE_TXT, CLASS_IN, 60, &x)], FORMERR),
+            (vec![rr(A, TYPE_TXT, CLASS_ANY, 0, &x)], FORMERR),
+            (vec![rr(A, TYPE_TXT, CLASS_NONE, 0, &x)], FORMERR),
+            (vec![rr(A, TYPE_TXT, 3, 0, &[])], FORMERR),
+            (
+                vec![rr("a.example.net.", TYPE_TXT, CLASS_ANY, 0, &[])],
+                NOTZONE,
+            ),
+            // In order: the first failing prerequisite decides.
+            (
+                vec![
+                    rr(A, TYPE_TXT, CLASS_NONE, 0, &[]),
+                    rr(A, TYPE_ANY, CLASS_NONE, 0, &[]),
+                ],
+                YXRRSET,
+            ),
+            (
+                vec![
+                    rr(A, TYPE_MX, CLASS_NONE, 0, &[]),
+                    rr(A, TYPE_ANY, CLASS_NONE, 0, &[]),
+                ],
+                YXDOMAIN,
+            ),
+        ];
+        for (prereqs, expected) in cases {
+            let (rcode, len) = run(prereqs);
+            assert_eq!(rcode, expected);
+            // Applied only when every prerequisite holds.
+            assert_eq!(len, if expected == NOERROR { 3 } else { 2 });
+        }
+    }
+
+    /// Deletion of an RRset and of every RRset of a name; replacement in one message is atomic.
+    #[test]
+    fn updates_follow_section_3_4() {
+        let zones = vec![ZONE.to_owned()];
+        let mut records = vec![
+            record(A, TYPE_TXT, &txt_rdata(b"x")),
+            record(A, TYPE_A, &[192, 0, 2, 1]),
+            record("b.example.org.", TYPE_TXT, &txt_rdata(b"b")),
+        ];
+        // Delete an RRset, then add its new member, in one message.
+        let req = update_request(
+            vec![rr(A, TYPE_TXT, CLASS_IN, 0, &txt_rdata(b"x"))],
+            vec![
+                rr(A, TYPE_TXT, CLASS_ANY, 0, &[]),
+                rr(A, TYPE_TXT, CLASS_IN, 120, &txt_rdata(b"new")),
+            ],
+        );
+        assert_eq!(update(&req, &zones, &mut records), NOERROR);
+        let txt: Vec<_> = records
+            .iter()
+            .filter(|r| r.name == A && r.rtype == TYPE_TXT)
+            .collect();
+        assert_eq!(txt.len(), 1);
+        assert_eq!((txt[0].rdata.clone(), txt[0].ttl), (txt_rdata(b"new"), 120));
+        // A failing update later in the message leaves nothing applied (prescan).
+        let before = records.clone();
+        let req = update_request(
+            Vec::new(),
+            vec![
+                rr(A, TYPE_TXT, CLASS_ANY, 0, &[]),
+                rr(A, TYPE_TXT, CLASS_ANY, 60, &[]),
+            ],
+        );
+        assert_eq!(update(&req, &zones, &mut records), FORMERR);
+        assert_eq!(records, before);
+        for bad in [
+            rr(A, TYPE_ANY, CLASS_IN, 60, &[]),
+            rr(A, 252, CLASS_ANY, 0, &[]),
+            rr(A, TYPE_TXT, CLASS_ANY, 0, &[1]),
+            rr(A, TYPE_TXT, CLASS_NONE, 60, &txt_rdata(b"x")),
+            rr(A, TYPE_ANY, CLASS_NONE, 0, &[]),
+            rr(A, TYPE_TXT, 3, 0, &[]),
+        ] {
+            assert_eq!(
+                update(&update_request(Vec::new(), vec![bad]), &zones, &mut records),
+                FORMERR
+            );
+        }
+        // Delete all RRsets from a name.
+        let req = update_request(Vec::new(), vec![rr(A, TYPE_ANY, CLASS_ANY, 0, &[])]);
+        assert_eq!(update(&req, &zones, &mut records), NOERROR);
+        assert!(records.iter().all(|r| r.name != A));
+        assert_eq!(records.len(), 1);
+    }
+
+    /// The special rules for SOA and NS at the apex (sections 3.4.2.2 to 3.4.2.4) and for CNAME.
+    #[test]
+    fn apex_soa_ns_and_cname_rules() {
+        let zones = vec![ZONE.to_owned()];
+        let ns1 = wire_name("ns1.example.org.");
+        let ns2 = wire_name("ns2.example.org.");
+        let mut records = vec![
+            record(ZONE, TYPE_SOA, &soa(10)),
+            record(ZONE, TYPE_NS, &ns1),
+            record(ZONE, TYPE_NS, &ns2),
+            record(ZONE, TYPE_TXT, &txt_rdata(b"apex")),
+        ];
+        let apply = |records: &mut Vec<MockRecord>, updates: Vec<Rr>| {
+            assert_eq!(
+                update(&update_request(Vec::new(), updates), &zones, records),
+                NOERROR
+            );
+        };
+        // An SOA without a higher serial is ignored; a higher one replaces it.
+        apply(
+            &mut records,
+            vec![rr(ZONE, TYPE_SOA, CLASS_IN, 60, &soa(10))],
+        );
+        apply(
+            &mut records,
+            vec![rr(ZONE, TYPE_SOA, CLASS_IN, 60, &soa(9))],
+        );
+        assert_eq!(soa_serial(&records[0].rdata), Some(10));
+        apply(
+            &mut records,
+            vec![rr(ZONE, TYPE_SOA, CLASS_IN, 60, &soa(11))],
+        );
+        let soas: Vec<_> = records.iter().filter(|r| r.rtype == TYPE_SOA).collect();
+        assert_eq!((soas.len(), soa_serial(&soas[0].rdata)), (1, Some(11)));
+        // The apex SOA and NS RRsets survive their deletion and the deletion of the apex.
+        apply(
+            &mut records,
+            vec![
+                rr(ZONE, TYPE_SOA, CLASS_ANY, 0, &[]),
+                rr(ZONE, TYPE_NS, CLASS_ANY, 0, &[]),
+                rr(ZONE, TYPE_SOA, CLASS_NONE, 0, &soa(11)),
+                rr(ZONE, TYPE_ANY, CLASS_ANY, 0, &[]),
+            ],
+        );
+        let types: Vec<u16> = records.iter().map(|r| r.rtype).collect();
+        assert_eq!(types, [TYPE_SOA, TYPE_NS, TYPE_NS]);
+        // One NS RR can go; the last one stays.
+        apply(
+            &mut records,
+            vec![
+                rr(ZONE, TYPE_NS, CLASS_NONE, 0, &ns1),
+                rr(ZONE, TYPE_NS, CLASS_NONE, 0, &ns2),
+            ],
+        );
+        let ns: Vec<_> = records.iter().filter(|r| r.rtype == TYPE_NS).collect();
+        assert_eq!(ns.len(), 1);
+        assert_eq!(ns[0].rdata, ns2);
+        // CNAME: ignored next to other data, replaces a CNAME, blocks other data.
+        let c = "c.example.org.";
+        records.push(record(c, TYPE_TXT, &txt_rdata(b"t")));
+        apply(&mut records, vec![rr(c, TYPE_CNAME, CLASS_IN, 60, &ns1)]);
+        assert!(records.iter().all(|r| r.rtype != TYPE_CNAME));
+        apply(
+            &mut records,
+            vec![
+                rr(c, TYPE_TXT, CLASS_ANY, 0, &[]),
+                rr(c, TYPE_CNAME, CLASS_IN, 60, &ns1),
+                rr(c, TYPE_CNAME, CLASS_IN, 60, &ns2),
+                rr(c, TYPE_TXT, CLASS_IN, 60, &txt_rdata(b"t")),
+            ],
+        );
+        let at_c: Vec<_> = records.iter().filter(|r| r.name == c).collect();
+        assert_eq!(at_c.len(), 1);
+        assert_eq!((at_c[0].rtype, at_c[0].rdata.clone()), (TYPE_CNAME, ns2));
+    }
+
+    /// Queries below a zone cut get a referral; RDATA names of RFC 1035 types are compressed.
+    #[tokio::test]
+    async fn referrals_and_compressed_rdata() {
+        let mock = Rfc2136Mock::start(Seed::standard()).await;
+        let control = mock.control();
+        control.add_record(record(
+            "child.example.org.",
+            TYPE_NS,
+            &wire_name("ns.child.example.org."),
+        ));
+        control.add_record(record(
+            "www.example.org.",
+            TYPE_CNAME,
+            &wire_name("host.example.org."),
+        ));
+        let query = |name: &str| Request {
+            id: 1,
+            opcode: 0,
+            question: {
+                let mut q = wire_name(name);
+                q.extend_from_slice(&[0, 1, 0, 1]);
+                q
+            },
+            qname: name.to_owned(),
+            qtype: TYPE_A,
+            prereqs: Vec::new(),
+            updates: Vec::new(),
+            additional: Vec::new(),
+        };
+        let req = query("x.child.example.org.");
+        let outcome = process(&req, control, false);
+        assert!(!outcome.authoritative && outcome.answers.is_empty());
+        assert_eq!(outcome.authority.len(), 1);
+        let req = query("www.example.org.");
+        let outcome = process(&req, control, false);
+        let reply = answer(&req, &outcome, None, &Fault::default());
+        // The answer's owner points to the question, its target's suffix too.
+        let at = 12 + req.question.len();
+        assert_eq!(&reply[at..at + 2], &[0xc0, 12]);
+        assert_eq!(&reply[at + 10..at + 12], &[0, 7]);
+        assert_eq!(&reply[at + 12..at + 19], b"\x04host\xc0\x10");
     }
 
     #[test]

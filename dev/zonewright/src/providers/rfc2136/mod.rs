@@ -5,10 +5,13 @@
 //! `Rfc2136Config` and credentials `Rfc2136Credentials`, is compiled with the cargo feature
 //! `rfc2136`. It does not use HTTP: it speaks DNS over TCP with its own wire format and TSIG.
 //!
-//! This version offers `check` and the TXT value operations. They add and remove one RR at a
-//! time, so a foreign value is never part of a write
-//! ([`ValueGuarantee::PerValue`](crate::ValueGuarantee::PerValue)). The protocol has no listing
-//! of zones or records.
+//! This version offers `check`, the TXT value operations and the record-level operations `get`,
+//! `set` and `delete` for every type with a type code. The TXT value operations add and remove
+//! one RR at a time, so a foreign value is never part of a write
+//! ([`ValueGuarantee::PerValue`](crate::ValueGuarantee::PerValue)). The record-level operations
+//! read by query and write one UPDATE per operation whose prerequisites name the RRset as read
+//! ([`Preconditions::Atomic`](crate::Preconditions::Atomic)); they need a key that may query the
+//! zone. The protocol has no listing of zones or records.
 
 pub(crate) mod meta;
 
@@ -16,6 +19,8 @@ pub(crate) mod meta;
 mod client;
 #[cfg(feature = "rfc2136")]
 mod config;
+#[cfg(feature = "rfc2136")]
+mod records;
 #[cfg(feature = "rfc2136")]
 mod transport;
 #[cfg(feature = "rfc2136")]

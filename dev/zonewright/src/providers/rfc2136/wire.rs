@@ -3,7 +3,8 @@
 //!
 //! Sources: RFC 1035 section 4.1 (header, question and resource record layout; name compression
 //! in 4.1.4), RFC 2136 section 2 (the UPDATE message: opcode 5, the zone, prerequisite, update and
-//! additional sections, the class values that select an operation).
+//! additional sections, the class values that select an operation), RFC 3597 section 4 (which
+//! types may carry compressed names inside their RDATA).
 //!
 //! Every read checks its bounds; a message that does not parse is an error value, never a panic.
 
@@ -13,6 +14,8 @@ use crate::error::Error;
 use crate::name::{DomainName, TargetName};
 use crate::redact::Detail;
 
+/// Type code of NS (RFC 1035 section 3.2.2).
+pub(super) const TYPE_NS: u16 = 2;
 /// Type code of CNAME (RFC 1035 section 3.2.2).
 pub(super) const TYPE_CNAME: u16 = 5;
 /// Type code of SOA (RFC 1035 section 3.2.2).
@@ -193,6 +196,34 @@ impl Builder {
         self.rr(0, name, rtype, CLASS_NONE, 0, &[])
     }
 
+    /// Prerequisite "name is not in use" (RFC 2136 section 2.4.5): class NONE, type ANY, TTL 0,
+    /// no RDATA. A server answers YXDOMAIN when the name owns any RR (section 3.2.2).
+    pub(super) fn prereq_name_unused(&mut self, name: &DomainName) -> Result<(), Error> {
+        self.rr(0, name, TYPE_ANY, CLASS_NONE, 0, &[])
+    }
+
+    /// One RR of the prerequisite "RRset exists (value dependent)" (RFC 2136 section 2.4.2): the
+    /// zone's class, TTL 0, the RDATA. The RRs given for one name and type form the RRset the
+    /// zone must hold exactly; a server answers NXRRSET otherwise (section 3.2.3).
+    pub(super) fn prereq_rr(
+        &mut self,
+        name: &DomainName,
+        rtype: u16,
+        rdata: &[u8],
+    ) -> Result<(), Error> {
+        self.rr(0, name, rtype, CLASS_IN, 0, rdata)
+    }
+
+    /// "Delete an RRset" (RFC 2136 section 2.5.2): class ANY, the type, TTL 0, no RDATA. Type
+    /// ANY would be "delete all RRsets from a name" (section 2.5.3), which this client never
+    /// sends; it is refused here.
+    pub(super) fn delete_rrset(&mut self, name: &DomainName, rtype: u16) -> Result<(), Error> {
+        if rtype == TYPE_ANY {
+            return Err(invalid("the client never deletes every RRset of a name"));
+        }
+        self.rr(1, name, rtype, CLASS_ANY, 0, &[])
+    }
+
     /// "Add to an RRset" (RFC 2136 section 2.5.1): the zone's class, the RR's TTL and RDATA. A
     /// duplicate is silently ignored by the server.
     pub(super) fn add(
@@ -207,8 +238,9 @@ impl Builder {
 
     /// "Delete an RR from an RRset" (RFC 2136 section 2.5.4): class NONE, TTL 0, the RDATA of the
     /// one RR to delete. The server matches it by name, type and RDATA (section 3.4.2.4) and
-    /// silently ignores an RR that does not exist. The deletion of a whole RRset (class ANY,
-    /// section 2.5.2) has no builder: this client never sends it.
+    /// silently ignores an RR that does not exist. The TXT value operations use only this
+    /// deletion; the deletion of a whole RRset ([`Builder::delete_rrset`]) is sent only by the
+    /// record-level operations, under a prerequisite that names the RRset as read.
     pub(super) fn delete_rr(
         &mut self,
         name: &DomainName,
@@ -259,6 +291,11 @@ pub(super) struct Request {
 }
 
 impl Request {
+    /// The length of the message without TSIG.
+    pub(super) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
     /// A copy of the message with message ID `id`.
     pub(super) fn with_id(&self, id: u16) -> Vec<u8> {
         let mut out = self.bytes.clone();
@@ -324,8 +361,10 @@ impl<'a> Reader<'a> {
     }
 
     /// A name, following compression pointers (RFC 1035 section 4.1.4). The text is lowercase
-    /// with the trailing dot (`.` for the root); a label octet outside letters, digits, `-`, `_`
-    /// and `*` is written `\DDD`, so a dot inside a label cannot pass for a label boundary.
+    /// with the trailing dot (`.` for the root) and escaped as `DomainName` spells names (design
+    /// section 4.2: a dot inside a label as `\.`, a backslash as `\\`, `"`, `$`, `(`, `)`,
+    /// `;`, `@`, space and octets outside 0x21-0x7E as `\DDD`), so a dot inside a label cannot
+    /// pass for a label boundary and the text compares directly with `DomainName::as_str`.
     pub(super) fn name(&mut self) -> Result<String, ParseError> {
         let mut out = String::new();
         let mut pos = self.pos;
@@ -353,11 +392,14 @@ impl<'a> Reader<'a> {
                         .get(pos..end)
                         .ok_or(ParseError("the message ends inside a name"))?;
                     for &b in label {
-                        let c = b.to_ascii_lowercase();
-                        if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'*') {
-                            out.push(char::from(c));
-                        } else {
-                            out.push_str(&format!("\\{b:03}"));
+                        match b.to_ascii_lowercase() {
+                            b'.' => out.push_str("\\."),
+                            b'\\' => out.push_str("\\\\"),
+                            b'"' | b'$' | b'(' | b')' | b';' | b'@' => {
+                                out.push_str(&format!("\\{b:03}"));
+                            }
+                            c @ 0x21..=0x7e => out.push(char::from(c)),
+                            _ => out.push_str(&format!("\\{b:03}")),
                         }
                     }
                     out.push('.');
@@ -411,6 +453,8 @@ pub(super) struct Response {
     flags: u16,
     pub(super) questions: Vec<Question>,
     pub(super) answers: Vec<Record>,
+    /// The authority section: the NS records of a referral (RFC 1034 section 4.3.2, step 3b).
+    pub(super) authority: Vec<Record>,
     pub(super) additional: Vec<Record>,
 }
 
@@ -482,12 +526,13 @@ pub(super) fn parse(buf: &[u8]) -> Result<Response, ParseError> {
     if r.pos() != buf.len() {
         return Err(ParseError("the message has octets after its last record"));
     }
-    let [answers, _authority, additional] = sections;
+    let [answers, authority, additional] = sections;
     Ok(Response {
         id,
         flags,
         questions,
         answers,
+        authority,
         additional,
     })
 }
@@ -506,6 +551,125 @@ pub(super) fn txt_data(rdata: &[u8]) -> Option<Vec<u8>> {
         pos += 1 + len;
     }
     Some(out)
+}
+
+/// One field of RDATA that may hold a compressed name.
+#[derive(Clone, Copy)]
+enum Field {
+    /// A fixed number of octets.
+    Fixed(usize),
+    /// A domain name, possibly compressed.
+    Name,
+    /// A character-string: a length octet and that many octets.
+    CharString,
+    /// Everything up to the end of the RDATA.
+    Rest,
+}
+
+/// The RDATA layout of the types whose names a server may compress: the types of RFC 1035, which
+/// a receiver MUST decompress, and RP, AFSDB, RT, SIG, PX, NXT, NAPTR and SRV, which it SHOULD
+/// decompress (RFC 3597 section 4). Layouts: RFC 1035 section 3.3 (NS, MD, MF, CNAME, MB, MG,
+/// MR, PTR: one name; SOA: two names and five 32-bit fields; MINFO: two names; MX: a 16-bit
+/// preference and a name), RFC 1183 (RP: two names; AFSDB and RT: a 16-bit field and a name),
+/// RFC 2535 sections 4.1 and 5.2 (SIG: 18 octets, the signer's name, the signature; NXT: a name
+/// and a bit map), RFC 2163 section 4 (PX: a 16-bit preference and two names), RFC 2782 (SRV:
+/// three 16-bit fields and a name), RFC 3403 section 4.1 (NAPTR: two 16-bit fields, three
+/// character-strings and a name). Every other type is copied as it is: its names are never
+/// compressed (RFC 3597 section 4).
+fn layout(rtype: u16) -> Option<&'static [Field]> {
+    use Field::{CharString, Fixed, Name, Rest};
+    Some(match rtype {
+        2 | 3 | 4 | 5 | 7 | 8 | 9 | 12 => &[Name],
+        6 => &[Name, Name, Fixed(20)],
+        14 | 17 => &[Name, Name],
+        15 | 18 | 21 => &[Fixed(2), Name],
+        24 => &[Fixed(18), Name, Rest],
+        26 => &[Fixed(2), Name, Name],
+        30 => &[Name, Rest],
+        33 => &[Fixed(6), Name],
+        35 => &[Fixed(4), CharString, CharString, CharString, Name],
+        _ => return None,
+    })
+}
+
+/// The RDATA of an answer record without name compression: the octets as the server sent them,
+/// with every compressed name of the types in [`layout`] expanded, label octets unchanged. RDATA
+/// that does not fit its type's layout is returned as it is; the record model then carries it
+/// as non-canonical data.
+pub(super) fn rdata_uncompressed(buf: &[u8], record: &Record) -> Result<Vec<u8>, ParseError> {
+    let raw = buf
+        .get(record.rdata.clone())
+        .ok_or(ParseError("an answer record points outside the message"))?;
+    let Some(fields) = layout(record.rtype) else {
+        return Ok(raw.to_vec());
+    };
+    Ok(expand(buf, record.rdata.clone(), fields).unwrap_or_else(|| raw.to_vec()))
+}
+
+fn expand(buf: &[u8], rdata: Range<usize>, fields: &[Field]) -> Option<Vec<u8>> {
+    let end = rdata.end;
+    let mut pos = rdata.start;
+    let mut out = Vec::with_capacity(end.saturating_sub(pos) + MAX_NAME);
+    for field in fields {
+        match *field {
+            Field::Fixed(n) => {
+                let next = pos.checked_add(n).filter(|&next| next <= end)?;
+                out.extend_from_slice(buf.get(pos..next)?);
+                pos = next;
+            }
+            Field::CharString => {
+                let len = usize::from(*buf.get(pos).filter(|_| pos < end)?);
+                let next = pos.checked_add(1 + len).filter(|&next| next <= end)?;
+                out.extend_from_slice(buf.get(pos..next)?);
+                pos = next;
+            }
+            Field::Name => pos = expand_name(buf, pos, end, &mut out)?,
+            Field::Rest => {
+                out.extend_from_slice(buf.get(pos..end)?);
+                pos = end;
+            }
+        }
+    }
+    (pos == end).then_some(out)
+}
+
+/// Appends the name at `pos` uncompressed and returns the position after it within the RDATA
+/// (which ends at `end`). A pointer must point backwards (RFC 1035 section 4.1.4: "a prior
+/// occurance of the same name"), which also rules out loops.
+fn expand_name(buf: &[u8], mut pos: usize, end: usize, out: &mut Vec<u8>) -> Option<usize> {
+    let mut after: Option<usize> = None;
+    let mut limit = end;
+    let mut wire_len = 0usize;
+    loop {
+        let len = *buf.get(pos).filter(|_| pos < limit)?;
+        match len & 0xc0 {
+            0x00 => {
+                wire_len += 1 + usize::from(len);
+                if wire_len > MAX_NAME {
+                    return None;
+                }
+                let next = pos
+                    .checked_add(1 + usize::from(len))
+                    .filter(|&n| n <= limit)?;
+                out.extend_from_slice(buf.get(pos..next)?);
+                if len == 0 {
+                    return Some(after.unwrap_or(next));
+                }
+                pos = next;
+            }
+            0xc0 => {
+                let low = *buf.get(pos + 1).filter(|_| pos + 1 < limit)?;
+                let target = (usize::from(len & 0x3f) << 8) | usize::from(low);
+                if target >= pos {
+                    return None;
+                }
+                after.get_or_insert(pos + 2);
+                limit = pos;
+                pos = target;
+            }
+            _ => return None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -592,7 +756,12 @@ mod tests {
         assert!(Reader::new(&[0xc0], 0).name().is_err());
         assert_eq!(
             Reader::new(b"\x03a.b\x03org\x00", 0).name().unwrap(),
-            "a\\046b.org."
+            "a\\.b.org."
+        );
+        // The spelling of `DomainName`, so the two compare directly.
+        assert_eq!(
+            Reader::new(b"\x03a b\x03A/c\x00", 0).name().unwrap(),
+            "a\\032b.a/c."
         );
         assert_eq!(Reader::new(&[0], 0).name().unwrap(), ".");
         // 128 labels of one octet: 257 octets in wire form.
@@ -621,6 +790,100 @@ mod tests {
         huge[6] = 0xff;
         huge[7] = 0xff;
         assert!(parse(&huge).is_err());
+    }
+
+    #[test]
+    fn rdata_names_are_decompressed() {
+        // Header, question `www.example.org. A IN`, then an answer `CNAME` whose target
+        // `host.example.org.` points to `example.org.` in the question.
+        let mut buf = vec![0u8; 12];
+        buf.extend_from_slice(b"\x03www\x07Example\x03org\x00\x00\x01\x00\x01");
+        let rdata_at = buf.len();
+        buf.extend_from_slice(&[0x04, b'H', b'o', b's', b't', 0xc0, 16]);
+        let record = Record {
+            name: "www.example.org.".to_owned(),
+            rtype: TYPE_CNAME,
+            class: CLASS_IN,
+            ttl: 60,
+            rdata: rdata_at..buf.len(),
+            start: rdata_at,
+        };
+        assert_eq!(
+            rdata_uncompressed(&buf, &record).unwrap(),
+            b"\x04Host\x07Example\x03org\x00"
+        );
+        // MX: the preference stays, the exchange is expanded.
+        let mx_at = buf.len();
+        buf.extend_from_slice(&[0, 10, 0xc0, 12]);
+        let mx = Record {
+            rtype: 15,
+            rdata: mx_at..buf.len(),
+            ..record.clone()
+        };
+        assert_eq!(
+            rdata_uncompressed(&buf, &mx).unwrap(),
+            b"\x00\x0a\x03www\x07Example\x03org\x00"
+        );
+        // A forward pointer, a pointer to itself and RDATA longer than its fields are kept as
+        // they are, never followed into a loop.
+        for bad in [&[0xc0u8, 0xff][..], &[0x01, b'a', 0x00, 0x00][..]] {
+            let at = buf.len();
+            buf.extend_from_slice(bad);
+            let record = Record {
+                rdata: at..buf.len(),
+                ..record.clone()
+            };
+            assert_eq!(rdata_uncompressed(&buf, &record).unwrap(), bad);
+        }
+        let at = buf.len();
+        buf.extend_from_slice(&[0xc0, u8::try_from(at).unwrap()]);
+        let looped = Record {
+            rdata: at..buf.len(),
+            ..record.clone()
+        };
+        assert_eq!(rdata_uncompressed(&buf, &looped).unwrap(), &buf[at..]);
+        // A type without names inside its RDATA is copied, pointer-like octets included.
+        let a = Record {
+            rtype: 1,
+            rdata: rdata_at..rdata_at + 4,
+            ..record
+        };
+        assert_eq!(
+            rdata_uncompressed(&buf, &a).unwrap(),
+            &buf[rdata_at..rdata_at + 4]
+        );
+    }
+
+    #[test]
+    fn rrset_deletion_never_names_every_type() {
+        let mut b = Builder::update(&dn("example.org"));
+        assert!(b.delete_rrset(&dn("a.example.org"), TYPE_ANY).is_err());
+        b.delete_rrset(&dn("a.example.org"), TYPE_TXT).unwrap();
+        b.prereq_rr(&dn("a.example.org"), TYPE_TXT, b"\x01x")
+            .unwrap();
+        b.prereq_name_unused(&dn("a.example.org")).unwrap();
+        let m = b.finish().unwrap().with_id(1);
+        let p = parse(&m).unwrap();
+        // PRCOUNT 2, UPCOUNT 1.
+        assert_eq!(&m[4..12], &[0, 1, 0, 2, 0, 1, 0, 0]);
+        let mut r = Reader::new(&m, 29);
+        r.name().unwrap();
+        assert_eq!(
+            (r.u16().unwrap(), r.u16().unwrap(), r.u32().unwrap()),
+            (TYPE_TXT, CLASS_IN, 0)
+        );
+        assert_eq!(p.answers.len(), 2);
+        assert_eq!(
+            (p.answers[1].rtype, p.answers[1].class),
+            (TYPE_ANY, CLASS_NONE)
+        );
+        assert_eq!(p.authority.len(), 1);
+        let rrset = &p.authority[0];
+        assert_eq!(
+            (rrset.rtype, rrset.class, rrset.ttl),
+            (TYPE_TXT, CLASS_ANY, 0)
+        );
+        assert!(rrset.rdata.is_empty());
     }
 
     #[test]

@@ -4,16 +4,19 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements: `check` and the TXT value
-//! operations, for any TXT value (they travel as wire-format RDATA), one RR per message. The
-//! record-level operations are not written yet, so their flags are false and `record_types` is
-//! empty; the protocol has no zone listing.
+//! Capabilities describe what this version of the crate implements: `check`, the TXT value
+//! operations for any TXT value (they travel as wire-format RDATA, one RR per message), and the
+//! record-level `get`, `set` and `delete` for every type with a type code and a wire form
+//! (design sections 2.5 and 11.2), SOA read-only. The protocol has no listing of zones or of the
+//! records of a zone (dynamic update has no such operation, RFC 2136 section 2.5), so
+//! `list_zones` and `list_rrsets` are false.
 
 use crate::id::ProviderId;
 use crate::meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
     ValueGuarantee,
 };
+use crate::record::RecordType;
 
 /// The metadata of RFC 2136.
 pub(crate) static META: ProviderMeta = ProviderMeta {
@@ -83,15 +86,21 @@ const FIELDS: &[ConfigField] = &[
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: false,
     list_rrsets: false,
-    get_rrset: false,
-    set_rrset: false,
-    delete_rrset: false,
+    get_rrset: true,
+    set_rrset: true,
+    delete_rrset: true,
     add_txt_value: true,
     remove_txt_value: true,
-    record_types: TypeSet::Listed(&[]),
-    read_only_types: &[],
+    // Every type with a code and a wire form; query and meta types are refused by every
+    // operation (design section 2.2).
+    record_types: TypeSet::AnyWithCode,
+    // SOA is never writable (design section 3.4); the apex NS RRset is refused by the record
+    // layer.
+    read_only_types: &[RecordType::SOA],
     txt_plain_only: false,
     txt_values: ValueGuarantee::PerValue,
+    // Prerequisites are evaluated by the server with the update, in one transaction (RFC 2136
+    // sections 3.2 and 3.4.2.1).
     preconditions: Preconditions::Atomic,
     // One UPDATE can delete the RRset and add its new RRs, applied as one transaction (RFC 2136
     // sections 2.5.2, 3.3.2 and 3.4.2.1; design section 11.1).

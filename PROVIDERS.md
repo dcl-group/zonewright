@@ -31,7 +31,7 @@ None yet.
 | Route 53      | `route53`       | TXT values, records   |                                                                                                  |
 | DigitalOcean  | `digitalocean`  | TXT values, records   |                                                                                                  |
 | VK Cloud      | `vk_cloud`      | TXT values            |                                                                                                  |
-| RFC 2136      | `rfc2136`       | TXT values            | Dynamic update has no operation that lists the records of a zone.                                |
+| RFC 2136      | `rfc2136`       | TXT values, records   | Dynamic update has no operation that lists the records of a zone.                                |
 | Yandex 360    | `yandex_360`    | TXT values            |                                                                                                  |
 | Timeweb Cloud | `timeweb_cloud` | TXT values            |                                                                                                  |
 | Cloud.ru      | `cloud_ru`      | TXT values            |                                                                                                  |

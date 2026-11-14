@@ -69,7 +69,8 @@ mod values;
     feature = "digitalocean",
     feature = "cloudflare",
     feature = "yandex_cloud",
-    feature = "route53"
+    feature = "route53",
+    feature = "rfc2136"
 ))]
 mod rrsets;
 

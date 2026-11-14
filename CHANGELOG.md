@@ -53,6 +53,9 @@ All notable changes to this crate are recorded in this file. The format follows
 - Record-level operations for Route 53: A, AAAA, CAA, CNAME, DS, HTTPS, MX, NAPTR, NS, PTR, SPF,
   SRV, SSHFP, SVCB, TLSA and TXT through conditional change batches; SOA is read only. Alias and
   routing-policy record sets are reported as skipped and never written.
+- Record-level operations for RFC 2136: get, set and delete of an rrset of any type with a wire
+  form, with prerequisites checked by the server in the same update; listing is impossible in the
+  protocol.
 
 ### Changed
 

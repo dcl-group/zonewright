@@ -12,13 +12,16 @@
 //!   `Error::Protocol` whatever its RCODE, so a forged answer can neither report success nor turn
 //!   a removal into "not present". TSIG errors reported by the server (NOTAUTH with BADKEY,
 //!   BADSIG, BADTIME, BADTRUNC; RFC 8945 section 5.2) are `Error::Auth`.
-//! - Repeats (design sections 5.3 and 11.3): every message this client sends is idempotent at
-//!   the server — a query, an empty update with a prerequisite, the addition of one RR (a
-//!   duplicate "will be silently ignored", RFC 2136 section 2.5.1) and the deletion of one RR
-//!   ("If no such RRs exist, then this Update RR will be silently ignored", section 2.5.4). So
-//!   a connection failure, a timeout, an answer cut short and SERVFAIL are repeated, up to 3
-//!   attempts with the back-off of section 5.3 and a new message ID and signature each time
-//!   (RFC 8945 section 5.4.2 suggests a new ID for a repeat). Everything else is not repeated.
+//! - Repeats (design sections 5.3 and 11.3): [`Transport::exchange`] is for the messages that
+//!   are idempotent at the server — a query, an empty update with a prerequisite, the addition
+//!   of one RR (a duplicate "will be silently ignored", RFC 2136 section 2.5.1) and the deletion
+//!   of one RR ("If no such RRs exist, then this Update RR will be silently ignored", section
+//!   2.5.4). For them a connection failure, a timeout, an answer cut short and SERVFAIL are
+//!   repeated, up to 3 attempts with the back-off of section 5.3 and a new message ID and
+//!   signature each time (RFC 8945 section 5.4.2 suggests a new ID for a repeat). Everything
+//!   else is not repeated. [`Transport::send_once`] is for the conditional updates of the
+//!   record-level operations: a repeat of one that was applied but whose answer was lost would
+//!   fail its own prerequisite and misreport the outcome, so they are sent exactly once.
 //! - Tracing: one `DEBUG` event per attempt, target `zonewright::rfc2136`, with the operation,
 //!   the RCODE when an answer was read, and the duration. No message content, no key, no MAC.
 
@@ -106,6 +109,25 @@ impl Transport {
         request: &Request,
         op: &'static str,
     ) -> Result<Answer, Error> {
+        self.exchange_with(request, op, MAX_ATTEMPTS).await
+    }
+
+    /// Sends `request` once and returns the verified answer; nothing is repeated. A SERVFAIL is
+    /// returned as an answer; the caller maps it.
+    pub(super) async fn send_once(
+        &self,
+        request: &Request,
+        op: &'static str,
+    ) -> Result<Answer, Error> {
+        self.exchange_with(request, op, 1).await
+    }
+
+    async fn exchange_with(
+        &self,
+        request: &Request,
+        op: &'static str,
+        max_attempts: u32,
+    ) -> Result<Answer, Error> {
         let mut attempt = 1;
         loop {
             let started = Instant::now();
@@ -126,7 +148,7 @@ impl Transport {
                 Ok(answer) => answer.rcode() == rcode::SERVFAIL,
                 Err(_) => false,
             };
-            if !repeat || attempt >= MAX_ATTEMPTS {
+            if !repeat || attempt >= max_attempts {
                 return result;
             }
             tokio::time::sleep(backoff(attempt)).await;

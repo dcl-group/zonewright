@@ -17,9 +17,12 @@ use crate::error::Error;
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
+use crate::rrsets;
 use crate::values;
 
 use super::config::{self, Rfc2136Config, Rfc2136Credentials};
@@ -37,6 +40,13 @@ use super::wire::{Builder, TYPE_SOA, rcode};
 /// When the server lets the key update but refuses its queries, the TXT value operations send
 /// their change without reading first and report `AddOutcome::Accepted` or
 /// `RemoveOutcome::Accepted`.
+///
+/// The record-level operations `get_rrset`, `set_rrset` and `delete_rrset` accept every type
+/// with a type code (SOA read-only, the apex NS RRset not writable). They read by query and
+/// write one UPDATE whose prerequisites name the RRset as read, so the server refuses a write
+/// to an RRset that changed in between (`Preconditions::Atomic`). They need a key that may
+/// query the zone: a refused query is `Error::Forbidden`, since the record model has no outcome
+/// for a write whose prior state was not seen.
 pub struct Rfc2136 {
     config: Rfc2136Config,
     pub(super) transport: Transport,
@@ -123,6 +133,37 @@ impl Provider for Rfc2136 {
             checks.push(self.check_zone(zone).await?);
         }
         Ok(CheckReport::new(true, checks))
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_whole_set(self, zone, name, rtype).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        if self.set_target_valid(zone, rrset) {
+            self.check_size(zone, rrset, expect)?;
+        }
+        rrsets::set_whole_set(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_whole_set(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(
