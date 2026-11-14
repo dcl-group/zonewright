@@ -32,6 +32,7 @@ None yet.
 | DigitalOcean | `digitalocean` | TXT values |                                                                                                  |
 | VK Cloud     | `vk_cloud`     | TXT values |                                                                                                  |
 | RFC 2136     | `rfc2136`      | TXT values | Dynamic update has no operation that lists the records of a zone.                                |
+| Yandex 360   | `yandex_360`   | TXT values |                                                                                                  |
 
 ## Planned
 
@@ -44,7 +45,6 @@ None yet.
 | nic.ru        | `nicru`         |                                                                    |
 | reg.ru        | `regru`         | An earlier version of this client was proven against the live API. |
 | Timeweb Cloud | `timeweb_cloud` |                                                                    |
-| Yandex 360    | `yandex_360`    |                                                                    |
 
 "An earlier version was proven" does not make the client verified here: it is verified again once it
 is implemented in this crate.
