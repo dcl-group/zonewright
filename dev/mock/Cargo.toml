@@ -1,0 +1,15 @@
+[package]
+name = "zonewright-mock"
+version = "0.0.0"
+description = "Stateful mock provider APIs for the zonewright test suite. Not published."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"

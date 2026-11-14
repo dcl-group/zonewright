@@ -1,0 +1,38 @@
+# cargo-deny configuration. Run from this directory: `cargo deny check`.
+
+[graph]
+# Check the tree with every provider and the inspector enabled.
+all-features = true
+
+[advisories]
+version = 2
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The mock crate is a path dependency without a version.
+allow-wildcard-paths = true
+# Crypto is rustls + aws-lc-rs only.
+deny = [
+    { crate = "ring" },
+    { crate = "openssl" },
+    { crate = "openssl-sys" },
+    { crate = "native-tls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

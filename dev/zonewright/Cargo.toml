@@ -1,0 +1,86 @@
+[package]
+name = "zonewright"
+version = "0.1.0"
+description = "Manage DNS zones at DNS hosting providers: provider clients, record operations, DNS-01 helpers and a propagation inspector."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["dns", "acme", "dns-01", "zone"]
+categories = ["network-programming", "api-bindings"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+all-providers = [
+    "acme_dns", "beget", "cloud_ru", "cloudflare", "digitalocean", "hetzner", "nicru", "regru",
+    "rfc2136", "route53", "selectel_v2", "timeweb_cloud", "vk_cloud", "yandex_360", "yandex_cloud",
+]
+inspector = ["dep:hickory-proto", "dep:futures-util", "dep:fastrand", "tokio/net", "tokio/io-util"]
+
+acme_dns = ["__http"]
+beget = ["__http"]
+cloud_ru = ["__http"]
+cloudflare = ["__http"]
+digitalocean = ["__http"]
+hetzner = ["__http"]
+nicru = ["__http", "__xml"]
+regru = ["__http"]
+rfc2136 = ["__crypto", "dep:fastrand", "tokio/net", "tokio/io-util"]
+route53 = ["__http", "__crypto", "__xml"]
+selectel_v2 = ["__http"]
+timeweb_cloud = ["__http"]
+vk_cloud = ["__http"]
+yandex_360 = ["__http"]
+yandex_cloud = ["__http", "__crypto"]
+
+# Internal: groups of optional dependencies. Not part of the public feature set.
+__http = [
+    "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:rustls-pki-types",
+    "dep:bytes", "dep:jiff", "dep:fastrand",
+]
+__crypto = ["dep:aws-lc-rs"]
+__xml = ["dep:roxmltree"]
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+secrecy = { version = "0.10.3", features = ["serde"] }
+zeroize = { version = "1.9.1", features = ["derive"] }
+thiserror = "2.0.21"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+idna = "1.1.0"
+base64 = "0.23.1"
+tokio = { version = "1.54.1", features = ["sync", "time"] }
+
+# __http
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"], optional = true }
+# Must stay on the same 0.23 line as the rustls inside reqwest.
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
+rustls-platform-verifier = { version = "0.7.1", optional = true }
+rustls-pki-types = { version = "1.16.0", optional = true }
+bytes = { version = "1.12.1", optional = true }
+jiff = { version = "0.2.43", default-features = false, features = ["std"], optional = true }
+fastrand = { version = "2.5.0", optional = true }
+
+# __crypto
+aws-lc-rs = { version = "1.19.0", optional = true }
+
+# __xml
+roxmltree = { version = "0.21.2", optional = true }
+
+# inspector
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"], optional = true }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+zonewright-mock = { path = "../mock" }
+tokio = { version = "1.54.1", features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+
+[lints]
+workspace = true
