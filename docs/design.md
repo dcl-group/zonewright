@@ -35,8 +35,9 @@ Consequences that shape the API:
 - The crate holds process-local state only: caches of zone identifiers and tokens, per-name locks,
   and for two providers (acme-dns, nic.ru) a small memory of its own writes, owned by `Context`
   (section 11.3). Losing that state on restart never leads to a wrong write. In one case it leaves
-  work for a person: a nic.ru zone left with this process's staged, uncommitted changes has to be
-  committed by hand.
+  work for a person: a nic.ru zone left with staged, uncommitted changes that the client cannot show
+  to be its own (after a restart, or after an operation that was dropped mid-request or whose
+  outcome stayed unknown) is refused until it is committed or rolled back by hand.
 
 Explicitly not in the crate: ACME, certificate-authority policy checks (including CAA tree climbing,
 section 7.4), mail-specific record construction, metrics, any UI text beyond the English labels of
@@ -1275,7 +1276,10 @@ write whose outcome the caller does not know, which is the same situation as `Er
 Per-name locks are released on drop. Clients that keep process-local memory of unfinished writes
 record their intent before the request that creates the unfinished state, not after it fails
 (section 11.3, nic.ru), so a dropped future cannot make the client mistake its own leftovers for
-someone else's.
+someone else's. At nic.ru that record stays unconfirmed when the future is dropped while a request
+is in flight, and the client does not act on staged changes it cannot show to be its own: if the
+zone has staged changes, it is refused until a person commits or rolls them back, so there a repeat
+after such a drop can end in `Error::Rejected` rather than in the converged state.
 
 ### 3.3 Per-name serialization
 
@@ -1294,7 +1298,8 @@ All mutating operations on one owner name are serialized inside a process (hard 
   the zone lock second.
 - Read operations (`list_rrsets`, `get_rrset`, `list_zones`, `check`) take no name lock. The nic.ru
   client's `list_rrsets` and `get_rrset` take its zone lock, so that they never see this process's
-  edits between staging and commit (section 11.3).
+  edits between staging and commit, and refuse a zone with staged changes that are not under a
+  confirmed mark of this process (section 11.3).
 - Waiting for the lock has no timeout of its own. Its length is bounded by the bounded duration of
   the operations ahead (section 3.7). An application that wants a deadline wraps the call in its own
   timeout; dropping the future is safe (section 3.2).
@@ -1689,6 +1694,10 @@ rule from this private set, and the provider table records which:
   known to accept unchanged, cannot be written and is `InvalidInput`.
 - `Auto` (read only): text that starts with `"` is read as `Presentation`, anything else as `Raw`.
   For APIs observed or documented to return both spellings.
+
+Two clients read by a rule of their own, shared by their record level and their TXT value operations
+so that both agree on what a record holds: Selectel v2 reads only quoted content, as `Presentation`,
+and Yandex Cloud reads the master-file strings its documentation names (section 11.2).
 
 Until a source establishes how a provider treats quotes, backslashes, spaces and non-ASCII bytes in
 TXT, its client sets `txt_plain_only` and accepts only `Txt::is_plain` values in the TXT value
@@ -3111,23 +3120,23 @@ until its record-level API (endpoints, the shape of each record type, TTL rules)
 the provider's documentation or observed against the live API, as hard rule 3 requires. Nothing in
 this table is a guess about such an API.
 
-| ID              | TXT values             | Record level                                                                            | Record types (record level)                                                                           | Default `ttl` setting | Default propagation timeout | TXT dialect, read / write                               | Source of API knowledge                                                                   |
-| --------------- | ---------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | --------------------- | --------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `acme_dns`      | add only; plain values | impossible: the API has no read, no delete and nothing but TXT                          | —                                                                                                     | not settable          | 60 s                        | none / Raw                                              | acme-dns README and server source                                                         |
-| `beget`         | yes; plain values      | TXT only until established (the write form of the A and MX records a write must repeat) | —                                                                                                     | 300                   | —                           | Auto / Raw                                              | Beget.API documentation, lego. Whether the API accepts POST is unconfirmed (section 13.4) |
-| `cloud_ru`      | yes; plain values      | list, get, set, delete; GSLB records are skipped and refused                            | A, AAAA, CAA, CNAME, MX, NS, SPF, SRV, TXT                                                            | 60                    | —                           | Auto / Raw                                              | Evolution DNS OpenAPI specification and documentation                                     |
-| `cloudflare`    | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CAA, CNAME, MX, NS, PTR, SRV, TLSA, TXT                                                      | 120                   | 120 s                       | Auto / Presentation                                     | Cloudflare API v4 documentation, lego                                                     |
-| `digitalocean`  | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CAA, CNAME, MX, NS, SOA (read only), SRV, TXT                                                | 30                    | 120 s                       | Auto / Raw                                              | DigitalOcean API v2 reference, lego                                                       |
-| `hetzner`       | yes; plain values      | list, get, set, delete (a TTL change of an existing set is a second request)            | A, AAAA, CNAME, MX, NS, PTR, SOA (read only), SRV, TLSA, TXT                                          | 60                    | 120 s                       | Auto / Presentation                                     | Hetzner Cloud API reference, lego, hcloud-go schema                                       |
-| `nicru`         | yes; plain values      | list, get, set, delete; one commit per operation                                        | A, AAAA, CNAME, DNAME, MX, NS, PTR, SOA (read only), SRV, TXT                                         | 30                    | 1200 s                      | Raw / Raw                                               | the provider's request description (2013, read in the Internet Archive copy), lego        |
-| `regru`         | yes; plain values      | list, get, set, delete for A, AAAA, TXT (several requests per set)                      | A, AAAA, TXT                                                                                          | not settable          | —                           | Auto / Raw                                              | reg.ru API 2 documentation, lego. Earlier version proven live                             |
-| `rfc2136`       | yes                    | get, set, delete with server-checked prerequisites; listing impossible                  | any type with a wire form; SOA read only                                                              | 60                    | —                           | wire format                                             | RFC 2136, RFC 8945, RFC 7766, RFC 1035                                                    |
-| `route53`       | yes; plain values      | list, get, set, delete; alias and routing-policy sets are skipped and refused           | A, AAAA, CAA, CNAME, DS, HTTPS, MX, NAPTR, NS, PTR, SOA (read only), SPF, SRV, SSHFP, SVCB, TLSA, TXT | 60                    | 120 s                       | Auto / Presentation                                     | Amazon Route 53 API reference, lego                                                       |
-| `selectel_v2`   | yes; plain values      | list, get, set, delete                                                                  | A, AAAA, ALIAS, CAA, CNAME, MX, NS, SOA (read only), SRV, SSHFP, TXT                                  | 60                    | —                           | Auto / Presentation                                     | Selectel DNS API v2 and authorization documentation. Earlier version proven live          |
-| `timeweb_cloud` | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CNAME, MX, TXT                                                                               | `provider_default`    | —                           | Auto / Raw                                              | the public API description (OpenAPI document), lego                                       |
-| `vk_cloud`      | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CNAME, MX, NS, SRV, TXT                                                                      | 60                    | —                           | Auto / Raw                                              | the provider's published API description, lego                                            |
-| `yandex_360`    | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CAA, CNAME, MX, SRV, TXT                                                                     | 300                   | —                           | Auto / Raw                                              | Yandex 360 API documentation, lego                                                        |
-| `yandex_cloud`  | yes; plain values      | list, get, set, delete                                                                  | A, AAAA, ANAME, CAA, CNAME, HTTPS, MX, NS, PTR, SOA (read only), SRV, SVCB, TXT                       | 60                    | —                           | Auto / Raw for TXT values, Presentation at record level | Yandex Cloud DNS, IAM and Operation API documentation, lego. Earlier version proven live  |
+| ID              | TXT values             | Record level                                                                            | Record types (record level)                                                                           | Default `ttl` setting | Default propagation timeout | TXT dialect, read / write                                                                                    | Source of API knowledge                                                                   |
+| --------------- | ---------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | --------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `acme_dns`      | add only; plain values | impossible: the API has no read, no delete and nothing but TXT                          | —                                                                                                     | not settable          | 60 s                        | none / Raw                                                                                                   | acme-dns README and server source                                                         |
+| `beget`         | yes; plain values      | TXT only until established (the write form of the A and MX records a write must repeat) | —                                                                                                     | 300                   | —                           | Auto / Raw                                                                                                   | Beget.API documentation, lego. Whether the API accepts POST is unconfirmed (section 13.4) |
+| `cloud_ru`      | yes; plain values      | list, get, set, delete; GSLB records are skipped and refused                            | A, AAAA, CAA, CNAME, MX, NS, SPF, SRV, TXT                                                            | 60                    | —                           | Auto / Raw                                                                                                   | Evolution DNS OpenAPI specification and documentation                                     |
+| `cloudflare`    | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CAA, CNAME, MX, NS, PTR, SRV, TLSA, TXT                                                      | 120                   | 120 s                       | Auto / Presentation                                                                                          | Cloudflare API v4 documentation, lego                                                     |
+| `digitalocean`  | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CAA, CNAME, MX, NS, SOA (read only), SRV, TXT                                                | 30                    | 120 s                       | Auto / Raw                                                                                                   | DigitalOcean API v2 reference, lego                                                       |
+| `hetzner`       | yes; plain values      | list, get, set, delete (a TTL change of an existing set is a second request)            | A, AAAA, CNAME, MX, NS, PTR, SOA (read only), SRV, TLSA, TXT                                          | 60                    | 120 s                       | Auto / Presentation                                                                                          | Hetzner Cloud API reference, lego, hcloud-go schema                                       |
+| `nicru`         | yes; plain values      | list, get, set, delete; one commit per operation                                        | A, AAAA, CNAME, DNAME, MX, NS, PTR, SOA (read only), SRV, TXT                                         | 30                    | 1200 s                      | Raw / Raw                                                                                                    | the provider's request description (2013, read in the Internet Archive copy), lego        |
+| `regru`         | yes; plain values      | list, get, set, delete for A, AAAA, TXT (several requests per set)                      | A, AAAA, TXT                                                                                          | not settable          | —                           | Auto / Raw                                                                                                   | reg.ru API 2 documentation, lego. Earlier version proven live                             |
+| `rfc2136`       | yes                    | get, set, delete with server-checked prerequisites; listing impossible                  | any type with a wire form; SOA read only                                                              | 60                    | —                           | wire format                                                                                                  | RFC 2136, RFC 8945, RFC 7766, RFC 1035                                                    |
+| `route53`       | yes; plain values      | list, get, set, delete; alias and routing-policy sets are skipped and refused           | A, AAAA, CAA, CNAME, DS, HTTPS, MX, NAPTR, NS, PTR, SOA (read only), SPF, SRV, SSHFP, SVCB, TLSA, TXT | 60                    | 120 s                       | Auto / Presentation                                                                                          | Amazon Route 53 API reference, lego                                                       |
+| `selectel_v2`   | yes; plain values      | list, get, set, delete                                                                  | A, AAAA, ALIAS, CAA, CNAME, MX, NS, SOA (read only), SRV, SSHFP, TXT                                  | 60                    | —                           | Presentation, quoted content only / Presentation                                                             | Selectel DNS API v2 and authorization documentation. Earlier version proven live          |
+| `timeweb_cloud` | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CNAME, MX, TXT                                                                               | `provider_default`    | —                           | Auto / Raw                                                                                                   | the public API description (OpenAPI document), lego                                       |
+| `vk_cloud`      | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CNAME, MX, NS, SRV, TXT                                                                      | 60                    | —                           | Auto / Raw                                                                                                   | the provider's published API description, lego                                            |
+| `yandex_360`    | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CAA, CNAME, MX, SRV, TXT                                                                     | 300                   | —                           | Auto / Raw                                                                                                   | Yandex 360 API documentation, lego                                                        |
+| `yandex_cloud`  | yes; plain values      | list, get, set, delete                                                                  | A, AAAA, ANAME, CAA, CNAME, HTTPS, MX, NS, PTR, SOA (read only), SRV, SVCB, TXT                       | 60                    | —                           | master-file strings / Raw (in double quotes with `;`, `(`, `)`) for TXT values, Presentation at record level | Yandex Cloud DNS, IAM and Operation API documentation, lego. Earlier version proven live  |
 
 Notes on the table:
 
@@ -3145,11 +3154,21 @@ Notes on the table:
   it. SOA is read only wherever a provider lists it, and the apex NS set is not writable (section
   3.4).
 - Yandex Cloud writes plain TXT values unquoted in the value operations, as the version proven live
-  did, and quoted canonical text at record level, as its documentation describes for values with
-  spaces. The value operations read with `Auto`. The record level reads values in the master-file
-  format the documentation names: a name without the trailing dot inside a value is relative to the
-  zone, and unquoted TXT text with whitespace is several strings; other unquoted text is read as
-  with `Auto`.
+  did, except a value with `;`, `(` or `)`, which is written in double quotes (the documentation's
+  TXT section: to use `;`, "enclose the string containing it in double quotes"); at record level it
+  writes quoted canonical text, as its documentation describes for values with spaces. Both levels
+  read TXT by one rule, the master-file format the TXT section names: strings separated by
+  whitespace, each quoted (with the escapes of RFC 1035) or unquoted, joined into one value, so
+  `"ab" "c"`, `ab c` and `abc` all hold `abc`. Data the rule leaves undecided (an unquoted string
+  with `;`, `(` or `)`, strings not separated by whitespace, an unterminated quote, text outside
+  ASCII) is non-canonical data at record level and never a value of the client's in the value
+  operations. What each level writes reads back as the same value at both levels. The same page's
+  ANAME section shows unquoted TXT with spaces and `;`, which the TXT section's rule reads as
+  several strings and a comment; the client follows the TXT section (section 13.4, item 26).
+- Selectel v2 reads TXT by one rule at both levels: content that starts with `"` is read by the
+  strict presentation parser (one quoted string or several), anything else (unquoted, mixed or
+  unterminated content) is non-canonical data at record level and never a value of the client's in
+  the value operations, since its sources show TXT content only "wrapped in `\"`".
 - Every provider whose API allows it has record-level operations. Beget waits until the write form
   of the A and MX records is established: a write at a name must repeat them or deletes them
   (section 11.3, section 13.4 item 20).
@@ -3218,21 +3237,35 @@ Behavior that the design fixes because the generic sections cannot:
   key and allows `null` with that description; no live run has confirmed it yet (section 13.4, item
   25).
 - `nicru`. Changes are staged and published by a commit that covers the whole zone, including edits
-  staged by anyone else. The client therefore (a) takes a per-zone lock in `Context` for the whole
-  read, edit and commit; (b) refuses to work in a zone that has staged changes it did not make
-  (`Error::Rejected`, nothing committed); (c) marks the zone in `Context` before it stages an edit,
-  as pending commit, or, for an operation that failed before its commit, as pending rollback
-  (`POST …/rollback`), so that the next operation in the zone commits or rolls back accordingly
-  instead of mistaking the staged edits for a foreign edit; (d) tries the commit, or the rollback,
-  up to three times and returns `Error::Transient` if all fail. The mark is process memory; after a
-  restart a zone left with staged changes needs a commit or a rollback by hand. After an edit or a
-  record-level operation fails, the zone is listed again under the zone lock: without staged changes
-  the mark is cleared, with them the client commits (a single edit) or rolls back (a record-level
-  operation, which is never published half-applied); if the listing fails the mark stays for the
-  next operation. Reads (`get_rrset`, `list_rrsets`) take the zone lock too, first settle the
-  client's own leftovers as a write does, and refuse a zone with staged changes of others
-  (`Error::Rejected`), since the documentation does not say whether the listing shows staged or
-  published records. A record without `<ttl>` takes the zone's default (Docs 4.6) and reads as the
+  staged by anyone else; a rollback (`POST …/rollback`) discards every staged change. The client
+  therefore (a) takes a per-zone lock in `Context` for the whole read, edit and commit; (b) refuses
+  to work in a zone that has staged changes it did not make (`Error::Rejected`, nothing committed);
+  (c) marks the zone in `Context` before every request that can change its staged state: before a
+  TXT edit as pending commit, before each edit of a record-level operation as pending rollback
+  (pending commit once every edit is staged), and before a commit or a rollback as what it attempts;
+  (d) tries the commit, or the rollback, up to three times and returns `Error::Transient` if all
+  fail. A mark starts unconfirmed. After an edit fails with an unknown outcome, or a record-level
+  operation fails, the zone is listed again under the zone lock: without staged changes the mark is
+  cleared, with them the client commits (a single edit) or rolls back (a record-level operation,
+  which is never published half-applied); an edit that was certainly refused only clears the mark.
+  After the last failed commit or rollback attempt the zone is listed once more: a clean zone (an
+  attempt applied with its answer lost) loses the mark, and staged changes confirm it. Only a
+  confirmed mark is acted on by a later operation, read or write, which commits or rolls back as the
+  mark says before it goes on. A zone with staged changes and an unconfirmed mark (an operation
+  dropped while a request was in flight, or a settling listing that failed) is refused by every
+  operation (`Error::Rejected`; `check` reports it with its own detail) until the staged changes are
+  committed or rolled back by hand; a zone found without staged changes loses its mark, confirmed or
+  not. A confirmation establishes that the staged changes include this process's; it does not
+  exclude a writer outside the process that staged changes in the meantime or after the zone lock is
+  released, and the next operation then commits or rolls back that writer's changes too. The
+  documentation does not say whether the record listing shows staged or published records (Docs
+  4.5.2 speaks only of "resource records which are already created in the zone file"; its example in
+  a zone with staged changes lists records just created, which suggests a staged view but is no
+  rule), so the client cannot compare the staged state with what it staged and keeps no fingerprint
+  of it (section 13.4, item 22). The mark is process memory; after a restart a zone left with staged
+  changes needs a commit or a rollback by hand. Reads (`get_rrset`, `list_rrsets`) take the zone
+  lock too and refuse a zone with staged changes that are not under a confirmed mark of this process
+  (`Error::Rejected`). A record without `<ttl>` takes the zone's default (Docs 4.6) and reads as the
   provider's default (`Requestable`): a record staged without `<ttl>` gets it, and a switch to it
   from a number, like any TTL change, stages the value again (without `<ttl>`) and deletes the old
   record. A zone under a Secondary service, or listed under more than one DNS-master service, is not
@@ -3297,12 +3330,15 @@ Behavior that the design fixes because the generic sections cannot:
   and is not sent again in another form. A listing follows a positive `next_offset` until the items
   received reach the stated `count`, and past it while pages still bring items and name a next
   offset, since an earlier page's `count` may be stale; a listing that ends short of its `count` is
-  `Error::Protocol`. Inside a value, a name without the trailing dot, `@` and unquoted TXT text are
-  read as non-canonical data (section 4.9), since the sources do not say whether they are relative
-  to the zone. A project given by name is scoped within the account's Keystone domain, and the
-  project ID the identity service states for the token tells the project's zones from others; of
-  several zones with the requested name, the one of that project is used. `check` exchanges the
-  credentials for a new token even when one is cached.
+  `Error::Protocol`. Inside a value, a name without the trailing dot and `@` are read as
+  non-canonical data (section 4.9), since the sources do not say whether they are relative to the
+  zone. TXT content is read by one rule at both levels (section 11.2): unquoted or mixed content is
+  non-canonical at record level, and the TXT value operations never take it for a value of theirs,
+  so an add puts the value next to it and a removal answers `NotPresent`. A project given by name is
+  scoped within the account's Keystone domain, and the project ID the identity service states for
+  the token tells the project's zones from others; of several zones with the requested name, the one
+  of that project is used. `check` exchanges the credentials for a new token even when one is
+  cached.
 - `timeweb_cloud`. Records are created, updated and deleted with the `v2` calls
   (`POST /v2/domains/{name}/dns-records`, `PATCH` and `DELETE /v2/domains/{name}/dns-records/{id}`),
   where `name` is the owner name: the domain for the apex, the full name below it. The deprecated
@@ -3312,18 +3348,27 @@ Behavior that the design fixes because the generic sections cannot:
   of those subdomains. Each listed record is placed at its owner name by deciding, per listing,
   whether it states names relative to the zone or in full (`names.rs`); a name that reads both ways
   and that no listing settles is `Error::Protocol` on a read of it and is reported in `skipped` by a
-  zone listing. An empty or `@` name in the listing of a subdomain is `Protocol`. A `404` on the
-  domain's answer or on the zone's listing is `ZoneNotFound`; a `404` on a create is told apart by a
-  lookup of the zone (`ZoneNotFound`, or `Rejected` for a name the provider refused); a `404` on an
-  update is `Conflict`; a `404` on a delete counts as done once a new read no longer shows the
-  value. Nothing is remembered between operations. No subdomain is created before a create: the API
-  description says one must exist, while lego does not create one and a user's run recorded in its
-  tracker succeeded without it. A record without `ttl` (optional in the create; absent or `null` in
-  the listing) has the provider's choice and reads as the provider's default. It can be requested
-  for records a write creates (`ForNewRecords`): whether a `PATCH` without `ttl` clears an explicit
-  TTL is not documented, so a write that would need it is refused after the read, with nothing
-  written. The `ttl` setting's default is `"provider_default"`; `null` and a missing key mean the
-  same.
+  zone listing. An empty or `@` name in the listing of a subdomain is `Protocol`. A relative name is
+  read relative to the zone in every listing, also in the listing of a subdomain. This is an
+  assumption from the wording of the `v2` record schema, "Имя поддомена (только поддомен без
+  основного домена, например `sub` для `sub.example.com`)" ("only the subdomain without the main
+  domain"): the part left out is the main domain, not the listed subdomain (section 13.4, item 28).
+  Where a listing shows evidence of the other reading, the client refuses rather than misplaces: a
+  record at the listed subdomain itself would be stated without a name, a record below it would name
+  something not at or below the subdomain, and a record the zone's listing also shows would be at
+  two names, each `Protocol`. A record shown by several listings is taken once by its identifier
+  only when every listing shows it at the same name with the same type, value, priority and TTL; one
+  identifier at two names or with different contents is `Protocol`. A `404` on the domain's answer
+  or on the zone's listing is `ZoneNotFound`; a `404` on a create is told apart by a lookup of the
+  zone (`ZoneNotFound`, or `Rejected` for a name the provider refused); a `404` on an update is
+  `Conflict`; a `404` on a delete counts as done once a new read no longer shows the value. Nothing
+  is remembered between operations. No subdomain is created before a create: the API description
+  says one must exist, while lego does not create one and a user's run recorded in its tracker
+  succeeded without it. A record without `ttl` (optional in the create; absent or `null` in the
+  listing) has the provider's choice and reads as the provider's default. It can be requested for
+  records a write creates (`ForNewRecords`): whether a `PATCH` without `ttl` clears an explicit TTL
+  is not documented, so a write that would need it is refused after the read, with nothing written.
+  The `ttl` setting's default is `"provider_default"`; `null` and a missing key mean the same.
 - `cloudflare`. Record attributes the model does not carry (`comment`, `tags`, `proxied`,
   `private_routing`, `settings`) survive: a record that keeps its value is not touched, and a TTL
   change or the in-place change of a CNAME is a `PATCH` naming only that field. A new record in an
@@ -3341,15 +3386,32 @@ Behavior that the design fixes because the generic sections cannot:
   replacement deletes and creates records, except a CNAME, which is replaced by one in-place `PUT`
   of its target. A TTL change of a record that stays (a CNAME changed in place included) is refused
   with `InvalidInput` in `check_plan`, before any write.
-- `yandex_360`. The listing has no filter by name or type and states names relative or in full; the
-  form is decided once per listing from what it states. A record whose dotless name reads as two
-  different names in a listing that does not decide the form is `Error::Protocol` for `get_rrset`,
-  `set_rrset`, `delete_rrset` and the TXT value operations, and is reported in `skipped` by
-  `list_rrsets`. Names are written relative to the domain, `@` for the apex. A CNAME is replaced in
-  place by the edit call.
+- `yandex_360`. The listing has no filter by name or type, and its documentation leaves the name
+  form open: the list page describes the record field `name` as "Полное доменное имя" ("full domain
+  name", word for word the description of the `domain` path parameter, with the example `example`),
+  the create page as "Имя записи." ("record name"), and lego sends names relative to the domain. The
+  form is decided once per listing from what it states, and only the relative form can be proven (by
+  `@`, or by a dotless name that is not within the zone). The full form cannot: every set of dotless
+  names a full-form listing can state is also a possible relative-form listing, since the documented
+  create form writes `name: "www.example.org"` as a record at `www.example.org.example.org`. A name
+  whose relative reading would be longer than a domain name can be is placed at its full reading. A
+  record whose dotless name reads as two different names in a listing that does not decide the form
+  is `Error::Protocol` for `get_rrset`, `set_rrset`, `delete_rrset` and the TXT value operations of
+  its type at either name (a record of another type counts there as data of an unknown type), and is
+  reported in `skipped` by `list_rrsets`. If the live listing states full names, every operation on
+  a name and type that has records is refused this way until the form is confirmed (section 13.4,
+  item 27). Names are written relative to the domain, `@` for the apex. A CNAME is replaced in place
+  by the edit call.
 - `yandex_cloud`. The strict write must repeat the existing set exactly, including fields this crate
   does not model, so the client keeps the JSON object it read and sends that object as the deletion.
-  TTL travels as a JSON string.
+  TTL travels as a JSON string. Inside a value of a type other than TXT, a name without the trailing
+  dot (one that reads differently relative to the zone than absolute) and `@` are non-canonical data
+  (section 4.9), never read as relative or as absolute: the documentation's examples spell names
+  with the trailing dot and describe the fields as an "FQDN", say nothing of dotless names or `@`
+  inside values, and show dotless names that are plainly absolute in the ANAME section; its
+  statement of the master-file format stands in the TXT section. Names are written absolute with the
+  trailing dot. TXT is read by one rule at both levels, and the value operations write a value with
+  `;`, `(` or `)` in double quotes (section 11.2).
 
 ## 12. Testing
 
@@ -3809,10 +3871,14 @@ documentation. The remaining items stay open until a live check or a concrete ne
 17. **Value forms that only a live run shows.** Where the provider's sources are silent, the clients
     assume a form and refuse what they cannot send safely: names in listings (trailing dot, relative
     names, `@` for the apex) at DigitalOcean, Timeweb Cloud, VK Cloud, Yandex 360 and Yandex Cloud;
-    the spelling of TXT content in listings at reg.ru (a removal must repeat it exactly), Cloud.ru
-    and Selectel v2; how escapes inside TXT values are stored at Cloudflare, Hetzner, Route 53 and
-    Selectel v2. The `live_<id>_record_round_trip` tests exercise the common forms. Which providers
-    should be run first?
+    names inside values without the trailing dot, read as non-canonical data at Selectel v2 and
+    Yandex Cloud (section 11.3); the spelling of TXT content in listings at reg.ru (a removal must
+    repeat it exactly), Cloud.ru, Selectel v2 (unquoted content is non-canonical at both levels) and
+    Yandex Cloud (how unquoted text with spaces is stored, and whether a value the client writes in
+    double quotes comes back as written); how escapes inside TXT values are stored at Cloudflare,
+    Hetzner, Route 53 and Selectel v2. Items 26 to 28 are the cases where the assumed form can make
+    a client refuse or misread a whole listing. The `live_<id>_record_round_trip` tests exercise the
+    common forms. Which providers should be run first?
 18. **Timeweb Cloud subdomains.** Does a create at a name that is not yet a subdomain make one, and
     does the zone's listing show records of subdomains? If neither, `list_rrsets` can miss such a
     record. The client's `PATCH` assumes omitted fields are kept. A live run settles both.
@@ -3829,7 +3895,11 @@ documentation. The remaining items stay open until a live check or a concrete ne
     at Selectel v2. Which of them does a consumer need?
 22. **nic.ru staging.** Whether the record listing shows staged or published records, and what
     commit and rollback answer on a zone without staged changes, are not documented. A live run
-    settles both before the client is relied on.
+    settles both before the client is relied on. Until the listing's view is known, the client
+    cannot tell its own staged changes from a foreign writer's by comparing listings, so it acts
+    only on a mark confirmed by a listing and otherwise refuses the zone until a person commits or
+    rolls back (section 11.3). Knowing the view could allow a check of the staged state against what
+    the client staged.
 23. **RFC 2136 servers.** The messages and the TSIG computation are verified only against the
     independent mock; BIND, Knot and PowerDNS have not been tried. A synthesized wildcard answer at
     a name that does not exist looks like a value there, so an add can report `AlreadyPresent`
@@ -3842,3 +3912,18 @@ documentation. The remaining items stay open until a live check or a concrete ne
     resets the TTL and no live run has shown it. If it does not, the provider becomes
     `ForNewRecords`. Timeweb Cloud stays `ForNewRecords` until a live run shows whether a `PATCH`
     without `ttl` clears an explicit TTL, which would make it `Requestable`.
+26. **Yandex Cloud TXT without quotes.** The provider's page on record types contradicts itself: its
+    TXT section says the service uses the master-file format, that `;` outside double quotes starts
+    a comment and that spaces separate strings, while its ANAME section shows unquoted TXT values
+    with spaces and `;`. The client follows the TXT section at both levels (section 11.2): an
+    unquoted string with `;`, `(` or `)` is non-canonical data and never a value of the client's,
+    and the value operations write a value with these characters in double quotes. A live run shows
+    how the API stores and returns unquoted TXT with spaces or `;` and a quoted `"a;b"`.
+27. **Yandex 360 name form.** If the live listing states full names without a trailing dot, the
+    client cannot tell them from relative names, and every operation on a name and type that has
+    records is `Error::Protocol` (section 11.3). A live listing that holds a record created with a
+    known relative name settles the form; if it is the full form, the client needs a decision on how
+    to read it.
+28. **Timeweb Cloud names in a subdomain's listing.** The client reads a relative `subdomain` in the
+    listing of a subdomain as relative to the zone, by the wording of the `v2` schema (section
+    11.3). A live run settles whether it is relative to the zone or to that subdomain.
