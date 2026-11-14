@@ -147,17 +147,25 @@ Ok(())
 }
 ```
 
+A name server that cannot be asked (no address in the configured address families, or an address the
+policy refuses) is reported with its reason and, by default, keeps the wait from succeeding. Set
+`WaitOptions::ignore_unaskable_name_servers` to wait only for the name servers that can be asked;
+`Report::unaskable_ignored` then says how many were left out.
+
 ## TLS and crypto
 
 HTTP clients use `reqwest` with `rustls` and `aws-lc-rs`. The crate builds its own TLS configuration
 for its requests and never installs a process-wide crypto provider; if the application needs one for
 its own TLS, the application installs it. Server certificates are verified against the platform's
 trust store plus any DER-encoded certificates the application passes in
-`ContextOptions::extra_root_certificates`. Proxy environment variables are ignored; an HTTP or HTTPS
-proxy is used only when set in `ContextOptions::proxy`, and requests to HTTPS endpoints go through
-it in a `CONNECT` tunnel with the provider's certificate verified as without it. `ring`, OpenSSL and
-`native-tls` are not in the dependency tree. Building needs a C compiler (for `aws-lc-rs`) when an
-HTTP provider or `rfc2136` is enabled.
+`ContextOptions::extra_root_certificates`. Proxy environment variables are ignored; a proxy is used
+only when set in `ContextOptions::proxy`. It may be an HTTP or HTTPS proxy (requests to HTTPS
+endpoints go through it in a `CONNECT` tunnel) or a SOCKS5 proxy (`socks5://`, `socks5h://`); the
+provider's certificate is verified as without it, and the hosts listed in `HttpProxy::exclusions`
+are reached directly. With an `http://` or SOCKS5 proxy the proxy credentials travel to the proxy
+unencrypted; the provider traffic stays inside TLS. A proxy that refuses its credentials gives
+`Error::ProxyAuth`. `ring`, OpenSSL and `native-tls` are not in the dependency tree. Building needs
+a C compiler (for `aws-lc-rs`) when an HTTP provider or `rfc2136` is enabled.
 
 ## Secrets and logging
 

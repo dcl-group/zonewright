@@ -47,11 +47,13 @@ The first version, 0.1.0. Not tagged yet.
 - `Context` and `ContextOptions`: the state shared by the clients of a process (HTTP client,
   per-name locks, timeouts, user agent suffix, extra root certificates, `loopback_only` for tests,
   proxy).
-- `HttpProxy`, the explicit proxy of `ContextOptions::proxy`: an `http://` or `https://` proxy that
-  every HTTP provider request goes through (`CONNECT` tunnels for HTTPS endpoints), with optional
-  Basic proxy authentication whose password is a `SecretString`. Proxy environment variables are
-  ignored with and without it; SOCKS and URLs with user info are refused. A `407` from the proxy is
-  `Error::Config`. RFC 2136 and the inspector do not use it.
+- `HttpProxy`, the explicit proxy of `ContextOptions::proxy`: an `http://` or `https://` proxy
+  (`CONNECT` tunnels for HTTPS endpoints, optional Basic proxy authentication) or a SOCKS5 proxy
+  (`socks5://`, `socks5h://`, optional username/password authentication) that every HTTP provider
+  request goes through, except requests to the hosts in `HttpProxy::exclusions`. The password is a
+  `SecretString`. Proxy environment variables are ignored with and without it; SOCKS4 and URLs with
+  user info are refused. Proxy credentials the proxy refuses are `Error::ProxyAuth`
+  (`ErrorKind::ProxyAuth`, `proxy_auth`). RFC 2136 and the inspector do not use the proxy.
 - `Error` with `ErrorKind` (stable snake_case identifiers), `Operation`, `Error::is_retryable`,
   `Error::retry_after`, a constructor per kind for implementations of `Provider` outside the crate,
   and `Detail`, the redacted text an error carries.
@@ -68,8 +70,9 @@ The first version, 0.1.0. Not tagged yet.
   a `Report` and a `ServerReport` per name server. Discovery never shortens the server list: a name
   server without an address in the configured families, or at an address the policy refuses, is
   returned with `NameServer::not_asked` (`NotAsked`, `AddressRefusal`) and reported as a row that
-  never satisfies (`Answer::NotAsked`). Errors are `InspectorError`. It also implements
-  `CnameLookup`.
+  never satisfies (`Answer::NotAsked`); with `WaitOptions::ignore_unaskable_name_servers` such
+  servers are left out of the condition and counted in `Report::unaskable_ignored`. Errors are
+  `InspectorError`. It also implements `CnameLookup`.
 - Features: one per provider, named like its ID; `all-providers`, which enables every provider;
   `inspector`. No feature is enabled by default.
 - Configuration types per provider, in `providers::<id>`: a settings type and a credentials type,

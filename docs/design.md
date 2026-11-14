@@ -947,17 +947,20 @@ impl Default for ContextOptions {}
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct HttpProxy {
-    /// "http://host:port" or "https://host:port" (without a port, 80 or 443); no user info,
-    /// path, query or fragment.
+    /// "http://", "https://", "socks5://" or "socks5h://", then host:port (without a port, 80,
+    /// 443 or 1080); no user info, path, query or fragment.
     pub url: String,
-    /// Basic proxy authentication: not empty, no ':' and no control characters.
+    /// Proxy authentication: not empty, no ':' and no control characters.
     pub username: Option<String>,
-    /// No control characters; requires `username`.
+    /// No control characters; requires `username`, and is required with it for SOCKS5.
     pub password: Option<secrecy::SecretString>,
+    /// Hosts reached directly, bypassing the proxy. Default empty. Section 5.1.
+    pub exclusions: Vec<String>,
 }
 impl HttpProxy {
     pub fn new(url: String) -> HttpProxy;
     pub fn with_credentials(self, username: String, password: secrecy::SecretString) -> HttpProxy;
+    pub fn with_exclusions(self, exclusions: Vec<String>) -> HttpProxy;
 }
 impl std::fmt::Debug for HttpProxy {}  // the URL (withheld if it contains '@'), whether credentials are set
 ```
@@ -1118,6 +1121,12 @@ pub enum Error {
     #[error("provider denied access: {detail}")]
     #[non_exhaustive]
     Forbidden { detail: Detail },
+
+    /// The context's proxy refused the proxy credentials or demanded credentials that are not
+    /// configured. Never retried. Section 5.3.
+    #[error("the proxy refused the proxy credentials; check proxy.username and proxy.password")]
+    #[non_exhaustive]
+    ProxyAuth {},
 
     /// `retry_after` is how long to wait, counted from the moment the error was returned.
     #[error("provider rate limit reached")]
@@ -1827,31 +1836,51 @@ helper used by three clients and nine hand-written variants of it.)
   says.
 - An explicit proxy, `ContextOptions::proxy` (decided by the maintainer on 2026-11-14, item 15 of
   section 13.4), is the only way to configure one. It is added with `ClientBuilder::proxy` after
-  `no_proxy()` as one `Proxy::all`, which in `reqwest` 0.13.5 also turns off reading the environment
-  (`auto_sys_proxy = false`) and has an empty exclusion list: the environment, `NO_PROXY` included,
-  stays ignored with the setting as without it, and every HTTP request of the context goes through
-  the proxy. Without the setting the client is exactly the one described above.
-  - Schemes: `http://` and `https://` proxies. SOCKS needs `reqwest`'s `socks` feature, which is not
-    enabled (section 9.3); `socks*` and every other scheme are refused with `Error::Config`, also
-    because `hyper-util`'s matcher silently ignores a scheme it does not know and the request would
-    go out directly.
-  - An `https://` target goes through a `CONNECT` tunnel. The proxy sees the target's host and port
-    and nothing else; the TLS session with the provider runs inside the tunnel with the crate's
-    `ClientConfig`, so the provider's certificate is verified exactly as without a proxy, and ALPN
-    is the crate's `http/1.1`. For an `https://` proxy, `reqwest` uses a clone of the same
-    `ClientConfig` with ALPN cleared for the TLS connection to the proxy (`connect.rs`,
-    `new_rustls_tls`): the proxy's certificate is verified with the context's trust anchors and the
-    explicit `aws-lc-rs` provider. A client with a TLS client certificate (reg.ru) presents it to an
-    `https://` proxy that asks for one, since the clone carries it.
-  - A plain-HTTP loopback target (tests) is forwarded in absolute form. It is refused before any
-    connection when the proxy is not itself a loopback IP literal: plain HTTP is accepted only
-    because it never leaves the host, and a proxy elsewhere would carry it over the network (and
-    reach its own loopback, not this host's).
+  `no_proxy()` as one `Proxy::custom`, which in `reqwest` 0.13.5 also turns off reading the
+  environment (`auto_sys_proxy = false`): the environment, `NO_PROXY` included, stays ignored with
+  the setting as without it, and every HTTP request of the context goes through the proxy except
+  requests to the hosts in `HttpProxy::exclusions`. Without the setting the client is exactly the
+  one described above.
+  - Schemes: `http://` and `https://` proxies, and SOCKS5 as `socks5://` (the client resolves the
+    provider's host name and gives the proxy an address) or `socks5h://` (the proxy resolves it),
+    through `reqwest`'s `socks` feature (section 9.3). `socks4`, `socks4a` and every other scheme
+    are refused with `Error::Config`, also because `hyper-util`'s matcher silently ignores a scheme
+    it does not know and the request would go out directly. Through SOCKS5 every request is a SOCKS5
+    `CONNECT` (RFC 1928) with the TLS session to the provider inside it; the connection to the
+    SOCKS5 proxy itself is not encrypted.
+  - An `http://` proxy on another host is allowed (decided by the maintainer on 2026-11-15): the
+    proxy credentials then travel to the proxy unencrypted, as they do to any SOCKS5 proxy, while
+    the provider traffic stays inside TLS. The rustdoc of `HttpProxy` says so; whether that is
+    acceptable on a given network is the application's decision.
+  - Exclusions (decided by the maintainer on 2026-11-15). Each entry is a host name
+    (`api.example.com`: exactly that host), `*.` and a host name (`*.example.com`: every name below
+    it, not the name itself), an IP address (IPv6 without brackets) or a CIDR block with zero host
+    bits and a prefix of at least 1. Nothing else is accepted: no `*` alone, no leading dot, no
+    port, no scheme. An entry is compared with the host of the request URL as written, for every
+    port; nothing is resolved, so `127.0.0.0/8` does not cover `localhost`. A bad entry is
+    `Error::Config` naming its position only. `reqwest::NoProxy` is not used: each of its host-name
+    entries also matches every name below it, so it cannot express an exact host, and its `*`
+    matches everything. The crate's own matcher, called from `Proxy::custom`, is the only routing
+    decision, and the transport uses the same matcher to know whether a request went through the
+    proxy.
+  - An `https://` target behind an HTTP proxy goes through a `CONNECT` tunnel. The proxy sees the
+    target's host and port and nothing else; the TLS session with the provider runs inside the
+    tunnel with the crate's `ClientConfig`, so the provider's certificate is verified exactly as
+    without a proxy, and ALPN is the crate's `http/1.1`. For an `https://` proxy, `reqwest` uses a
+    clone of the same `ClientConfig` with ALPN cleared for the TLS connection to the proxy
+    (`connect.rs`, `new_rustls_tls`): the proxy's certificate is verified with the context's trust
+    anchors and the explicit `aws-lc-rs` provider. A client with a TLS client certificate (reg.ru)
+    presents it to an `https://` proxy that asks for one, since the clone carries it.
+  - A plain-HTTP loopback target (tests) is forwarded in absolute form by an HTTP proxy and relayed
+    by a SOCKS5 one. It is refused before any connection when the proxy is not itself a loopback IP
+    literal: plain HTTP is accepted only because it never leaves the host, and a proxy elsewhere
+    would carry it over the network (and reach its own loopback, not this host's).
   - Checks at `Context::new`, each `Error::Config` with a fixed text that names the setting and
-    quotes nothing: the URL parses and has a host; no user info; scheme `http` or `https`; no path,
-    query or fragment; with `loopback_only`, a loopback IP literal; a password requires a user name;
-    the user name is not empty and has no `:` or control character, the password no control
-    character (RFC 7617).
+    quotes nothing: the URL parses and has a host that is an IP literal or a name of letters,
+    digits, `.`, `-` and `_`; no user info; one of the four schemes; no path, query or fragment;
+    with `loopback_only`, a loopback IP literal; a password requires a user name; the user name is
+    not empty and has no `:` or control character, the password no control character (RFC 7617);
+    every exclusion is valid.
   - Credentials: `Proxy-Authorization: Basic` (RFC 7617), built in a zeroizing buffer and marked
     sensitive, set with `Proxy::custom_http_auth`. `Proxy::basic_auth` is not used: it writes the
     password into the proxy URL, which `reqwest` keeps as an ordinary string and prints in its
@@ -1859,6 +1888,17 @@ helper used by three clients and nine hand-written variants of it.)
     of a forwarded request. With an `http://` proxy it travels unencrypted to the proxy; provider
     traffic is still TLS inside the tunnel. Limit: `hyper-util` writes the `CONNECT` request into an
     ordinary buffer that is not wiped.
+  - SOCKS5 credentials: the username/password method (RFC 1929), which needs both, each not empty,
+    together at most 128 bytes (`hyper-util` writes the whole handshake into one 262-byte buffer).
+    The only route `reqwest` offers for them is the user info of the proxy URL, so the crate builds
+    that URL percent-encoded in a wiped buffer and hands `reqwest` a fresh copy per connection.
+    Limit: `reqwest` and `hyper-util` keep plain, unwiped copies of the password for the lifetime of
+    a connection attempt; `hyper-util`'s SOCKS5 connector derives a `Debug` that would show them,
+    and `reqwest` 0.13.5 never formats it. A test checks that the password is in no error, `Debug`
+    output or `tracing` event of the crate; check again when `reqwest` changes.
+  - Limits of `reqwest` 0.13.5: through any proxy an `https://` endpoint written as an IPv6 literal
+    cannot be reached, and through `socks5://` neither can a plain-HTTP one. Providers' endpoints
+    are host names, so this affects tests only.
   - The URL policy, `loopback_only`, the endpoint binding of section 5.2 and the certificate checks
     apply to the request URL as before; the proxy changes none of them. `connect_timeout` covers the
     whole connector: TCP to the proxy, the `CONNECT` exchange and both TLS handshakes.
@@ -1949,18 +1989,22 @@ a whole rrset, which can hold values another writer added after the read: it is 
   headers it returns are inserted last. Route 53 signs with it, so every attempt carries its own
   `x-amz-date` and a signature over what is sent. A finisher that fails is the request's error and
   nothing is sent.
-- With the context's proxy: a `407` from the proxy is `Error::Config` ("the proxy refused the proxy
-  credentials") and is never retried, idempotent or not. The kind is not `Auth`, which means the
-  provider's credentials; the proxy credentials are part of the context's configuration, and the
-  next attempt would be refused the same way, as with a refused certificate. For `CONNECT`,
-  `hyper-util` reports it as `TunnelError::ProxyAuthRequired`, a type in a private module that
-  cannot be named, so the transport compares the error's text with that library's constant; the
-  proxy cannot choose the text, and the `407` body is never read. A `407` answer to a forwarded
-  request is recognized by its status before the client's kept statuses. Any other failure to get
-  through the proxy (refused or closed `CONNECT`, unreachable or stalled proxy) is a connection
-  failure: `Error::Transient` ("could not connect to the provider through the proxy"), retried only
-  for an idempotent request. A refused certificate, the provider's or an `https://` proxy's, is
-  `Error::Config` as above.
+- With the context's proxy, for a request that goes through it (its host is not excluded): a refusal
+  of the proxy credentials is `Error::ProxyAuth` and is never retried, idempotent or not (its own
+  kind by the maintainer's decision of 2026-11-15; before that it was `Config`). The kind is not
+  `Auth`, which means the provider's credentials; the next attempt would be refused the same way.
+  Three cases map to it. A `407` to `CONNECT`: `hyper-util` reports it as
+  `TunnelError::ProxyAuthRequired`, a type in a private module that cannot be named, so the
+  transport compares the error's text with that library's constant; the proxy cannot choose the
+  text, and the `407` body is never read. A `407` answer to a plain-HTTP request forwarded by an
+  HTTP proxy, recognized by its status before the client's kept statuses. A SOCKS5 proxy's refusal
+  of the username and password or of every offered authentication method, recognized the same way by
+  `hyper-util`'s constant texts; the proxy sends only a status byte. A `407` that arrives through a
+  tunnel or a SOCKS5 relay, or from an excluded host, comes from the provider and is handled like
+  any other status. Any other failure to get through the proxy (refused or closed `CONNECT`,
+  unreachable or stalled proxy) is a connection failure: `Error::Transient` ("could not connect to
+  the provider through the proxy"), retried only for an idempotent request. A refused certificate,
+  the provider's or an `https://` proxy's, is `Error::Config` as above.
 - `Http::try_send` returns, with the error, whether the request certainly never reached the
   provider: refused before any connection (the URL policy, a header value, a failed token fetch or
   finisher), or every attempt failed while its connection was being established (TCP connect or TLS
@@ -1999,16 +2043,17 @@ a whole rrset, which can hold values another writer added after the read: it is 
 Each client owns a `Scrubber` (private), created in its constructor from every secret the client
 holds. It is the only way to make a `Detail` from dynamic text.
 
-- Registered at construction: every field of the credentials, and the context's proxy password and
-  base64 Basic credentials (a forwarding proxy's error answer can echo them), each also in its
-  form-encoded and percent-encoded forms, so that a value the client sent encoded and the API echoes
-  encoded once more is replaced in place. Private key material (a TLS client key, a signing key) is
-  not registered: it is never sent, so no API can echo it, and a multi-line PEM document makes
-  needles that match nothing. Registered at run time: every token the client obtains (Keystone, IAM,
-  OAuth) and every signed assertion it sends (JWT), each under the slot of its source (a token
-  cache, a signer). A slot keeps its current and its previous secret, so a client with several token
-  sources never loses the coverage of a live token. The transport registers each token it sends;
-  registering the slot's current token again costs a comparison.
+- Registered at construction: every field of the credentials, and the context's proxy password, its
+  base64 Basic credentials and, for a SOCKS5 proxy, its percent-encoded form (a forwarding proxy's
+  error answer can echo them), each also in its form-encoded and percent-encoded forms, so that a
+  value the client sent encoded and the API echoes encoded once more is replaced in place. Private
+  key material (a TLS client key, a signing key) is not registered: it is never sent, so no API can
+  echo it, and a multi-line PEM document makes needles that match nothing. Registered at run time:
+  every token the client obtains (Keystone, IAM, OAuth) and every signed assertion it sends (JWT),
+  each under the slot of its source (a token cache, a signer). A slot keeps its current and its
+  previous secret, so a client with several token sources never loses the coverage of a live token.
+  The transport registers each token it sends; registering the slot's current token again costs a
+  comparison.
 - Encoded needles, replaced in place: for each secret, the spellings in which an API most often
   echoes it — verbatim; form-urlencoded with `+` and with `%20` for a space; RFC 3986
   percent-encoding (the crate's own URL encoding); as the inside of a JSON string; JSON with `\/`
@@ -2457,6 +2502,8 @@ pub struct WaitOptions {
     pub interval: std::time::Duration,
     /// The pause varies by up to this percentage either way. Default 20; at most 50.
     pub jitter_percent: u8,
+    /// Leave the servers that are not asked out of "every server agrees". Default false.
+    pub ignore_unaskable_name_servers: bool,
 }
 impl WaitOptions {
     /// 1 s.
@@ -2482,6 +2529,8 @@ pub struct Report {
     pub servers: Vec<ServerReport>,
     pub rounds: u32,
     pub elapsed: std::time::Duration,
+    /// Servers left out of the condition; 0 unless `ignore_unaskable_name_servers` is set.
+    pub unaskable_ignored: usize,
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -2538,11 +2587,13 @@ A server that is not asked is a row, not an omission. `observe` gives it an `Ans
 question and sends nothing to it; `wait` gives it a `ServerReport` whose answers are
 `Answer::NotAsked`, whose `satisfied` is false and whose `first_satisfied_after` is `None`, so
 "every server agrees" cannot hold while it exists: the wait runs to its timeout and the report in
-`InspectorError::Timeout` says why. There is no switch to ignore such servers: success would then
-need a further rule for a zone none of whose servers can be asked, and the timeout report already
-gives the caller everything it needs to decide on its own. `query_server` takes a socket address,
-not a `NameServer`; a server that is not asked has no `query_addr` to pass, and an address given to
-`query_server` is the caller's choice, like a static list.
+`InspectorError::Timeout` says why. That is the default. With
+`WaitOptions::ignore_unaskable_name_servers` set, the servers that are not asked are left out of the
+condition (section 8.6); their rows stay in the report unchanged, and `Report::unaskable_ignored`
+counts them (it is 0 when the option is off). `observe` gives no verdict, so the option does not
+apply to it. `query_server` takes a socket address, not a `NameServer`; a server that is not asked
+has no `query_addr` to pass, and an address given to `query_server` is the caller's choice, like a
+static list.
 
 ### 8.3 Name-server discovery
 
@@ -2688,7 +2739,14 @@ non-canonical value is `InvalidInput`. `Present` and `Absent` need at least one 
 2. A round asks every server that is asked every question, at most 128 questions at a time (each
    bounded by `query_timeout`, each holding one socket), evaluates the expectations and builds the
    report, with a row for every server that is not asked (section 8.2).
-3. If every server satisfies every expectation in this round: `Ok(report)`.
+3. If every server satisfies every expectation in this round: `Ok(report)`. With
+   `ignore_unaskable_name_servers`, "every server" is every server that is asked, and at least one
+   server must be asked: a zone none of whose servers can be asked never succeeds and runs to the
+   timeout. Only a server that is not asked for a reason known before any query (`NotAsked`) is left
+   out; a server that was asked and timed out, refused, failed or disagreed always counts. A success
+   with servers left out is logged at `WARN` with their number. The option exists for zones such as
+   one with an IPv6-only name server observed over IPv4; it is off by default because a resolver
+   elsewhere may ask exactly the server that was left out.
 4. If the time since the start is at least `timeout`: `Err(Timeout { report })`.
 5. Sleep `interval`, varied uniformly by ±`jitter_percent`, but not past the deadline; go to 2. If
    less time is left than the shortest pause the jitter allows (`interval` less `jitter_percent`),
@@ -2910,7 +2968,8 @@ Why each is there, and what is deliberately absent:
 - `reqwest` with `default-features = false` and `rustls-no-provider` only, as `AGENTS.md` requires.
   Not enabled: `json` (bodies are built and parsed by the transport so that secret-bearing bodies
   stay in zeroizing buffers and every response goes through the size cap), `http2`, `charset`,
-  `gzip`, `cookies`, `system-proxy`, `socks` (SOCKS proxies, section 5.1), `form`, `query`.
+  `gzip`, `cookies`, `system-proxy`, `form`, `query`. `socks` is enabled for SOCKS5 proxies (section
+  5.1); in `reqwest` 0.13.5 it is an empty feature that adds no crate.
 - `rustls` is a direct dependency only to build the `ClientConfig` of section 5.1; its `aws_lc_rs`
   feature provides the provider the crate passes explicitly. It must stay on the same `0.23` line as
   the `rustls` inside `reqwest`: `tls_backend_preconfigured` recognizes the configuration by type,
@@ -3859,12 +3918,14 @@ documentation. The remaining items stay open until a live check or a concrete ne
     where the API gives no means.
 15. **Proxy: decided by the maintainer on 2026-11-14 — an explicit setting; implemented.**
     `ContextOptions::proxy` takes an `HttpProxy` (URL, optional user name, password as
-    `SecretString`). Supported: `http://` and `https://` proxies, `CONNECT` tunnels for HTTPS
-    providers, Basic proxy authentication. Not supported: SOCKS (needs `reqwest`'s `socks` feature),
-    other authentication schemes, an exclusion list. Environment variables stay ignored (section
-    5.1). A `407` from the proxy is `Error::Config`, as is a refused certificate of an `https://`
-    proxy; a proxy that cannot be reached, stalls or refuses the tunnel gives `Error::Transient`
-    (section 5.3). Open: whether SOCKS or a per-host exclusion list is wanted.
+    `SecretString`, exclusions). Supported: `http://` and `https://` proxies with `CONNECT` tunnels
+    for HTTPS providers and Basic proxy authentication; SOCKS5 (`socks5://`, `socks5h://`) with
+    username/password authentication; a list of hosts reached directly. Environment variables stay
+    ignored (section 5.1). Decided by the maintainer on 2026-11-15: refused proxy credentials are
+    `Error::ProxyAuth`, a kind of their own; an `http://` proxy on another host stays allowed, with
+    the unencrypted proxy credentials described in the documentation; SOCKS5 and the exclusion list
+    are added. A refused certificate of an `https://` proxy is `Error::Config`; a proxy that cannot
+    be reached, stalls or refuses the tunnel gives `Error::Transient` (section 5.3).
 16. **Private name-server addresses are refused by default** in the inspector. Deployments whose
     authoritative servers are internal must set `allow_private_addresses` or use
     `NsDiscovery::Static`. The earlier implementation accepted them by default.
