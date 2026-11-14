@@ -5,10 +5,11 @@
 //! `TimewebCloudConfig` and credentials `TimewebCloudCredentials`, is compiled with the cargo
 //! feature `timeweb_cloud`.
 //!
-//! This version offers `check`, `list_zones` and the TXT value operations. The TXT value
-//! operations accept plain values only. The API's unit is the individual record with an
-//! identifier, so they create and delete single records and never write a foreign value (see
-//! `ValueGuarantee::PerValue`).
+//! This version offers `check`, `list_zones`, the TXT value operations and the record-level
+//! operations for A, AAAA, CNAME, MX and TXT. The TXT value operations accept plain values only.
+//! The API's unit is the individual record with an identifier, so they create and delete single
+//! records and never write a foreign value (see `ValueGuarantee::PerValue`); a record-level
+//! replacement is several requests, creates before deletes.
 //!
 //! Records are created and deleted with the provider's `v2` calls and read with the listing of
 //! the owner name; the client keeps no state between operations.
@@ -21,6 +22,8 @@ mod api;
 mod client;
 #[cfg(feature = "timeweb_cloud")]
 mod config;
+#[cfg(feature = "timeweb_cloud")]
+mod records;
 #[cfg(feature = "timeweb_cloud")]
 mod txt;
 

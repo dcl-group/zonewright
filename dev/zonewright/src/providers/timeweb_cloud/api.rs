@@ -30,6 +30,18 @@
 //!   - `DELETE /api/v2/domains/{fqdn}/dns-records/{record_id}` (`deleteDomainDNSRecordV2`):
 //!     `fqdn` as for the create, `record_id` an integer; `204`; `400`, `401`, `404`, `429`,
 //!     `500`.
+//!   - `PATCH /api/v2/domains/{fqdn}/dns-records/{record_id}` (`updateDomainDNSRecordV2`):
+//!     "updates the DNS record" with the given attributes; `fqdn` and `record_id` as for the
+//!     delete; the body is the create's per-type object (`create-dns-v2`, `type` and `value`
+//!     required, `priority` required for MX); `200` with `dns_record`; documented answers `200`,
+//!     `400`, `401`, `404`, `409`, `429`, `500`.
+//!   - `GET /api/v1/domains/{fqdn}` (`getDomain`, not marked deprecated): the answer holds
+//!     `domain` with `fqdn` and `subdomains` (both required), each subdomain with `fqdn`, "the
+//!     full name of the subdomain" (required); documented answers `200`, `400`, `401`, `403`,
+//!     `404`, `429`, `500`.
+//!   - The listing's record (`dns-record`) has `data.priority` ("the record's priority", a
+//!     number) beside `data.subdomain` and `data.value`; the record schema's `type` enumerates
+//!     `TXT`, `SRV`, `CNAME`, `AAAA`, `MX` and `A`.
 //!   - The error body of every non-success answer: `status_code`, `error_code`, `message` (a
 //!     string or an array of strings) and `response_id`.
 //! - lego `providers/dns/timewebcloud` at commit `012a2c1e01` ("update API client to new API
@@ -53,8 +65,10 @@
 //! | probe         | `GET /v1/domains?limit=1&offset=0`                     | 200       |
 //! | list domains  | `GET /v1/domains?limit&offset`                         | 200, page |
 //! | zone exists   | `GET /v1/domains/{zone}/dns-records?limit=1&offset=0`  | 200       |
+//! | subdomains    | `GET /v1/domains/{zone}`                               | 200       |
 //! | list records  | `GET /v1/domains/{name}/dns-records?limit&offset`      | 200, page |
 //! | create record | `POST /v2/domains/{name}/dns-records`                  | 201       |
+//! | update record | `PATCH /v2/domains/{name}/dns-records/{id}`            | 200       |
 //! | delete record | `DELETE /v2/domains/{name}/dns-records/{id}`           | 204       |
 //!
 //! `{name}` is the record's owner name: the zone itself, or the full name below it.
@@ -112,9 +126,29 @@ struct RecordData {
     /// The value.
     #[serde(default)]
     value: Option<String>,
+    /// The priority (an MX preference); the schema types it as a number.
+    #[serde(default)]
+    priority: Option<Value>,
 }
 
 impl Record {
+    /// The priority, when the answer states one as a non-negative whole number.
+    pub(super) fn priority(&self) -> Option<u64> {
+        self.data
+            .as_ref()
+            .and_then(|data| data.priority.as_ref())
+            .and_then(whole)
+    }
+
+    /// The priority as the answer states it, for text that keeps an unusual spelling.
+    pub(super) fn priority_text(&self) -> Option<String> {
+        self.data
+            .as_ref()
+            .and_then(|data| data.priority.as_ref())
+            .filter(|value| !value.is_null())
+            .map(Value::to_string)
+    }
+
     /// The record's identifier, when the answer states one.
     pub(super) fn id(&self) -> Option<u64> {
         self.id.as_ref().and_then(whole)
@@ -149,10 +183,13 @@ pub(super) struct Domain {
     pub(super) fqdn: String,
 }
 
-/// The body of `POST /v2/domains/{fqdn}/dns-records`.
-// Source: the create's TXT request object (`type` and `value` required, `ttl` optional, no
-// other field); lego types.go lines 5 to 8 sends `type` and `value`. The owner name is the
-// path, not a body field.
+/// The body of `POST /v2/domains/{fqdn}/dns-records` and of `PATCH
+/// /v2/domains/{fqdn}/dns-records/{record_id}`.
+// Source: the per-type request objects of `create-dns-v2`, the body of both calls: `type` and
+// `value` required for A, AAAA, TXT and CNAME, `type`, `value` and `priority` for MX, `ttl`
+// optional for every type (A also has an optional `app_id`, which this client never sends;
+// SRV has other fields and is not written). lego types.go lines 5 to 8 sends `type` and
+// `value`. The owner name is the path, not a body field.
 #[derive(Serialize)]
 pub(super) struct NewRecord<'a> {
     /// The record type.
@@ -160,6 +197,9 @@ pub(super) struct NewRecord<'a> {
     pub(super) rtype: &'a str,
     /// The value.
     pub(super) value: &'a str,
+    /// The MX preference; left out for every other type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) priority: Option<u64>,
     /// TTL in seconds; left out when the caller has none to give.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ttl: Option<u32>,
@@ -173,6 +213,16 @@ pub(super) enum Created {
     /// `404`: the domain, or the name as a subdomain of it, is unknown to the provider; nothing
     /// was written. Carries the provider's refusal, for when the domain exists.
     NotFound(Error),
+}
+
+/// The answer to an update.
+#[derive(Debug)]
+pub(super) enum Updated {
+    /// The provider changed the record.
+    Done,
+    /// `404`: the record, or the domain with it, does not exist (any more); nothing was
+    /// written.
+    NotFound,
 }
 
 /// The answer to a delete.
@@ -222,7 +272,7 @@ impl Api {
     // no such domain (the status is documented, its meaning is not). Being wrong reports a zone
     // as missing, or a write as refused; nothing is written either way.
     pub(super) async fn zone_exists(&self, zone: &DomainName) -> Result<bool, Error> {
-        let url = paging(self.records_path(zone), 1, 0).build()?;
+        let url = paging(self.records_path(zone.without_dot()), 1, 0).build()?;
         let response = self.http.send(&Request::get(url)).await?;
         if response.status() == 404 {
             return Ok(false);
@@ -264,17 +314,64 @@ impl Api {
         zone: &DomainName,
         name: &DomainName,
     ) -> Result<Vec<Record>, Error> {
-        let listed = self
-            .list(
-                |offset| paging(self.records_path(name), PAGE_SIZE, offset).build(),
-                "dns_records",
-            )
-            .await?;
-        match listed {
+        match self.records_of(name.without_dot()).await? {
             Some(records) => Ok(records),
             None if name != zone && self.zone_exists(zone).await? => Ok(Vec::new()),
             None => Err(Error::zone_not_found(zone.clone())),
         }
+    }
+
+    /// Every record the API lists for the domain or subdomain spelled `fqdn` (without a
+    /// trailing dot), all pages; `None` when the first page is answered `404`.
+    pub(super) async fn records_of(&self, fqdn: &str) -> Result<Option<Vec<Record>>, Error> {
+        self.list(
+            |offset| paging(self.records_path(fqdn), PAGE_SIZE, offset).build(),
+            "dns_records",
+        )
+        .await
+    }
+
+    /// The full names of the zone's subdomains as `GET /v1/domains/{zone}` states them. A `404`
+    /// is `Error::ZoneNotFound` (the same reading as for the zone's listing, see
+    /// [`Api::zone_exists`]); an answer without the required `domain.subdomains` list, or a
+    /// subdomain without its `fqdn`, is `Error::Protocol`.
+    // Source: `getDomain`; the `domain` schema requires `subdomains`, the `subdomain` schema
+    // requires `fqdn`, "the full name of the subdomain".
+    pub(super) async fn subdomains(&self, zone: &DomainName) -> Result<Vec<String>, Error> {
+        #[derive(Deserialize)]
+        struct Answer {
+            domain: DomainInfo,
+        }
+        #[derive(Deserialize)]
+        struct DomainInfo {
+            subdomains: Vec<Subdomain>,
+        }
+        #[derive(Deserialize)]
+        struct Subdomain {
+            fqdn: String,
+        }
+        let url = self
+            .base
+            .url()
+            .path("/v1/domains")
+            .segment(zone.without_dot())
+            .build()?;
+        let response = self.http.send(&Request::get(url)).await?;
+        if response.status() == 404 {
+            return Err(Error::zone_not_found(zone.clone()));
+        }
+        if !response.is_success() {
+            return Err(self.refusal(&response));
+        }
+        let answer: Answer = response.json(
+            "the provider's answer about the domain lacks its list of subdomains or their names",
+        )?;
+        Ok(answer
+            .domain
+            .subdomains
+            .into_iter()
+            .map(|subdomain| subdomain.fqdn)
+            .collect())
     }
 
     /// Creates a record at `name`. Sent once: a create is not idempotent, and a repeat after an
@@ -313,6 +410,42 @@ impl Api {
         Ok(Created::Done)
     }
 
+    /// Changes the record `id` at `name` to `record`. Sent once (design section 5.3). A `404`
+    /// is [`Updated::NotFound`]; another refusal is an error.
+    pub(super) async fn update_record(
+        &self,
+        name: &DomainName,
+        id: u64,
+        record: &NewRecord<'_>,
+    ) -> Result<Updated, Error> {
+        #[derive(Deserialize)]
+        struct Answer {
+            // Only the presence of the record is checked: the schema requires it.
+            #[serde(rename = "dns_record")]
+            _record: Written,
+        }
+        #[derive(Deserialize)]
+        struct Written {
+            // Only the presence of the type is checked: the schema requires it.
+            #[serde(rename = "type")]
+            _rtype: String,
+        }
+        let url = self.v2_records_path(name).id(&id.to_string()).build()?;
+        let response = self
+            .http
+            .send(&Request::new(Method::PATCH, url).json(record)?)
+            .await?;
+        if response.status() == 404 {
+            return Ok(Updated::NotFound);
+        }
+        if !response.is_success() {
+            return Err(self.refusal(&response));
+        }
+        let _: Answer =
+            response.json("the provider's answer to an update is not in the expected form")?;
+        Ok(Updated::Done)
+    }
+
     /// Deletes the record `id` at `name`. Idempotent: repeating it leaves the same state, so
     /// the transport may retry it.
     pub(super) async fn delete_record(&self, name: &DomainName, id: u64) -> Result<Deleted, Error> {
@@ -335,12 +468,12 @@ impl Api {
         paging(self.base.url().path("/v1/domains"), limit, offset)
     }
 
-    /// `/v1/domains/{name}/dns-records`, the name without its trailing dot.
-    fn records_path(&self, name: &DomainName) -> UrlBuilder {
+    /// `/v1/domains/{fqdn}/dns-records`, `fqdn` a name without its trailing dot.
+    fn records_path(&self, fqdn: &str) -> UrlBuilder {
         self.base
             .url()
             .path("/v1/domains")
-            .segment(name.without_dot())
+            .segment(fqdn)
             .path("/dns-records")
     }
 
@@ -506,6 +639,43 @@ pub(super) fn stated_names(stated: Option<&str>, zone: &DomainName) -> Vec<Domai
     names
 }
 
+/// Refuses the listing of a name below the zone (`of_zone` false) when it states a record
+/// without a name (absent, empty or `@`): in the listing of the zone that is the zone itself,
+/// but in the listing of a subdomain such a record could be at the subdomain or at the zone.
+pub(super) fn check_named(records: &[Record], of_zone: bool) -> Result<(), Error> {
+    let unnamed = |record: &Record| {
+        record
+            .subdomain()
+            .map(str::trim)
+            .is_none_or(|stated| stated.is_empty() || stated == "@")
+    };
+    if !of_zone && records.iter().any(unnamed) {
+        return Err(protocol(
+            "the provider's listing of a subdomain states a record without its name",
+        ));
+    }
+    Ok(())
+}
+
+/// The owner name of a record found in the listing of `listed` (`None`: a name the client could
+/// not parse), for a zone listing: `listed` itself when the record's stated name can denote it,
+/// which is how [`stated_names`] selects the records of one name for a read, so a listing and a
+/// read agree; otherwise the first reading of the stated name that lies within the zone, the
+/// full name before the relative one. `None` when no reading lies within the zone.
+pub(super) fn owner(
+    listed: Option<&DomainName>,
+    stated: Option<&str>,
+    zone: &DomainName,
+) -> Option<DomainName> {
+    let names = stated_names(stated, zone);
+    if let Some(listed) = listed
+        && names.contains(listed)
+    {
+        return Some(listed.clone());
+    }
+    names.into_iter().find(|name| name.is_within(zone))
+}
+
 /// The provider's error message: `error_code` and `message` of the documented error body.
 // Source: the error schema; `message` is a string or an array of strings.
 pub(super) fn error_message(body: &str) -> Option<String> {
@@ -540,8 +710,45 @@ pub(super) fn error_message(body: &str) -> Option<String> {
 mod tests {
     use serde_json::json;
 
-    use super::{error_message, stated_names, whole};
+    use super::{error_message, owner, stated_names, whole};
     use crate::name::DomainName;
+
+    #[test]
+    fn owners_prefer_the_listed_name() {
+        let zone = DomainName::parse("example.org").unwrap();
+        let sub = DomainName::parse("sub.example.org").unwrap();
+        let odd = DomainName::parse("sub.example.org.example.org").unwrap();
+        let of = |listed: Option<&DomainName>, s: Option<&str>| {
+            owner(listed, s, &zone).map(|n| n.as_str().to_owned())
+        };
+        assert_eq!(of(Some(&zone), None).as_deref(), Some("example.org."));
+        assert_eq!(
+            of(Some(&zone), Some("sub")).as_deref(),
+            Some("sub.example.org.")
+        );
+        assert_eq!(
+            of(Some(&zone), Some("sub.example.org")).as_deref(),
+            Some("sub.example.org.")
+        );
+        assert_eq!(
+            of(Some(&sub), Some("sub")).as_deref(),
+            Some("sub.example.org.")
+        );
+        assert_eq!(
+            of(Some(&sub), Some("x.sub.example.org")).as_deref(),
+            Some("x.sub.example.org.")
+        );
+        // The relative reading wins only where the listing is of that name.
+        assert_eq!(
+            of(Some(&odd), Some("sub.example.org")).as_deref(),
+            Some("sub.example.org.example.org.")
+        );
+        assert_eq!(
+            of(None, Some("other.net")).as_deref(),
+            Some("other.net.example.org.")
+        );
+        assert_eq!(of(None, Some("bad name")), None);
+    }
 
     #[test]
     fn error_messages_join_code_and_message() {

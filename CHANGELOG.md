@@ -64,6 +64,8 @@ All notable changes to this crate are recorded in this file. The format follows
   wildcard names. Records with GSLB links are reported as skipped and never written.
 - Record-level operations for Yandex 360: A, AAAA, CAA, CNAME, MX, SRV and TXT. NS records are
   listed as skipped: the API documentation names no value field for them.
+- Record-level operations for Timeweb Cloud: A, AAAA, CNAME, MX and TXT; a zone listing reads the
+  zone and each of its subdomains.
 
 ### Changed
 

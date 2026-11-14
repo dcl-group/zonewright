@@ -4,15 +4,16 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and
-//! the TXT value operations. Record-level operations stay unsupported until the record-level API
-//! is established (design section 11.2).
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones`, the
+//! TXT value operations and the record-level operations for the types whose write fields and
+//! listing fields the API description establishes (see `records.rs`).
 
 use crate::id::ProviderId;
 use crate::meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
     ValueGuarantee,
 };
+use crate::record::RecordType;
 
 /// The metadata of Timeweb Cloud.
 pub(crate) static META: ProviderMeta = ProviderMeta {
@@ -64,13 +65,22 @@ const FIELDS: &[ConfigField] = &[
 /// What this version of the crate implements for Timeweb Cloud.
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: true,
-    list_rrsets: false,
-    get_rrset: false,
-    set_rrset: false,
-    delete_rrset: false,
+    list_rrsets: true,
+    get_rrset: true,
+    set_rrset: true,
+    delete_rrset: true,
     add_txt_value: true,
     remove_txt_value: true,
-    record_types: TypeSet::Listed(&[]),
+    // The types whose create object (`create-dns-v2`) and listing fields (`dns-record`) the API
+    // description gives. SRV is left out: the listing documents no fields for its priority,
+    // weight, port and target, and the create has no weight. The API documents no other type.
+    record_types: TypeSet::Listed(&[
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::CNAME,
+        RecordType::MX,
+        RecordType::TXT,
+    ]),
     read_only_types: &[],
     // The encoding of values with spaces, quotes, backslashes or non-ASCII bytes is not
     // established for this API (design section 4.4).
@@ -78,9 +88,12 @@ const CAPABILITIES: Capabilities = Capabilities {
     // Every value is a record of its own, created and deleted by identifier (design section
     // 3.5).
     txt_values: ValueGuarantee::PerValue,
+    // No request carries a condition on the rrset as read.
     preconditions: Preconditions::ReadThenWrite,
-    // Individual records with IDs: a replacement is several requests.
+    // Individual records with IDs: a replacement is several requests (creates, then deletes).
     atomic_rrset_write: false,
+    // Every record has its own `ttl` (a number of seconds); no range is documented, so the
+    // range is the settings form's (an assumption, see the client).
     ttl: TtlSupport::PerRecord {
         min: 60,
         max: 86_400,

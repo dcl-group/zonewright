@@ -35,7 +35,7 @@ use crate::record::{Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
-use super::api::{Created, Deleted, NewRecord, Record, TXT, stated_names};
+use super::api::{Created, Deleted, NewRecord, Record, TXT, check_named, stated_names};
 use super::client::TimewebCloud;
 
 /// How TXT data is read.
@@ -69,13 +69,7 @@ impl PerRecord for TimewebCloud {
         name: &DomainName,
     ) -> Result<PerRecordRead<Option<u64>>, Error> {
         let listed = self.api.records(zone, name).await?;
-        if name != zone && listed.iter().any(states_no_name) {
-            return Err(Error::Protocol {
-                detail: Detail::constant(
-                    "the provider's listing of a subdomain states a record without its name",
-                ),
-            });
-        }
+        check_named(&listed, name == zone)?;
         let records = listed
             .into_iter()
             .filter(|record| is_txt_at(record, zone, name))
@@ -107,6 +101,7 @@ impl PerRecord for TimewebCloud {
         let record = NewRecord {
             rtype: TXT,
             value: &data,
+            priority: None,
             ttl,
         };
         match self.api.create_record(name, &record).await? {
@@ -157,13 +152,4 @@ impl PerRecord for TimewebCloud {
 /// Whether a listed record is a TXT record at exactly `name`.
 fn is_txt_at(record: &Record, zone: &DomainName, name: &DomainName) -> bool {
     record.rtype == TXT && stated_names(record.subdomain(), zone).contains(name)
-}
-
-/// Whether a listed record states no owner name (absent, empty or `@`), which in the listing of
-/// the zone is the zone itself.
-fn states_no_name(record: &Record) -> bool {
-    record
-        .subdomain()
-        .map(str::trim)
-        .is_none_or(|stated| stated.is_empty() || stated == "@")
 }

@@ -2,7 +2,8 @@
 //!
 //! The module follows the layout of every provider module: `meta.rs` (static metadata),
 //! `config.rs` (settings and credentials), `api.rs` (the HTTP API), `txt.rs` (the TXT value
-//! operations over one shape of the value layer) and this file.
+//! operations over one shape of the value layer), `records.rs` (the record-level operations
+//! over the per-record shape of the record layer) and this file.
 //!
 //! The domain's name is the key of every path, so there are no zone identifiers to cache and
 //! none to go stale.
@@ -18,10 +19,13 @@ use crate::http::Http;
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
-use crate::values;
+use crate::{rrsets, values};
 
 use super::api::{self, Api};
 use super::config::{self, TimewebCloudConfig, TimewebCloudCredentials};
@@ -39,6 +43,13 @@ use super::config::{self, TimewebCloudConfig, TimewebCloudCredentials};
 /// and read with the listing of that name (the domain's, or the subdomain's), page by page;
 /// every operation reads it in full before it writes. A listing that ends before the total it
 /// states is `Error::Protocol`. The client keeps no state between operations.
+///
+/// Record-level operations work on the same individual records: a replacement creates the
+/// missing records, changes TTLs in place and deletes the surplus records last, in several
+/// requests (`atomic_rrset_write` is false), and a writer outside this process that changes the
+/// rrset between the read and the writes is not detected (`Preconditions::ReadThenWrite`). A
+/// zone's listing reads the zone's records and those of every subdomain the provider states for
+/// it.
 pub struct TimewebCloud {
     config: TimewebCloudConfig,
     /// The API.
@@ -116,6 +127,40 @@ impl Provider for TimewebCloud {
             .filter_map(|domain| DomainName::parse(&domain.fqdn).ok())
             .collect();
         Ok(names.into_iter().map(ZoneInfo::new).collect())
+    }
+
+    /// The records of the zone and of every subdomain the provider states for it, grouped into
+    /// rrsets. Records of types outside the record-level type list are listed too.
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_per_record(self, zone, name, rtype).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        rrsets::set_per_record(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_per_record(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(
