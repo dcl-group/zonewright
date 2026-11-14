@@ -15,17 +15,22 @@ use crate::http::Http;
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
-use crate::values;
+use crate::{rrsets, values};
 
-use super::State;
 use super::api::{self, Api, Zone};
 use super::config::{self, NicruConfig, NicruCredentials};
+use super::records::RecordOp;
 use super::txt::{FOREIGN_CHANGES, Op};
+use super::{Pending, State};
 
-/// How many times a commit is tried before the operation gives up (design section 11.3).
+/// How many times a commit is tried before the operation gives up (design section 11.3). A
+/// rollback is tried as often.
 const COMMIT_ATTEMPTS: u32 = 3;
 
 /// Pause before commit attempt `n + 1`: `n` times this. The design fixes the number of
@@ -44,7 +49,8 @@ const ZONE_AMBIGUOUS: &str = "the zone is listed under more than one DNS-master 
 
 /// A warning about a usable zone with staged changes of this process.
 const OWN_CHANGES: &str = "the zone has staged changes of this process that are not committed \
-     yet; the next operation in the zone commits them";
+     yet; the next operation in the zone commits them or, if they belong to a record-level \
+     operation that did not finish, rolls them back";
 
 /// The nic.ru (RU-CENTER) DNS hosting client.
 ///
@@ -60,8 +66,14 @@ const OWN_CHANGES: &str = "the zone has staged changes of this process that are 
 /// the whole read, edit and commit, and remembers in the context which zones hold its own
 /// staged changes, so that an operation interrupted before its commit is finished by the next
 /// one. That memory lives in the process: after a restart, a zone left with this process's
-/// staged changes has to be committed by hand, in the provider's control panel or with its
-/// API.
+/// staged changes has to be committed or rolled back by hand, in the provider's control panel
+/// or with its API.
+///
+/// The record-level operations stage every edit of one operation (records to create, the
+/// deletions of records to remove) and publish them with one commit, so the published rrset
+/// changes in one step; an operation that fails before its commit has its staged edits rolled
+/// back, and a zone with staged changes is not read, since its record listing could show them
+/// as published. The API has no edit call: a TTL change stages each record again.
 ///
 /// The zone listing and the record listing each arrive in one answer, bounded by the
 /// transport's 4 MiB limit. Zones are looked up afresh on every operation.
@@ -129,22 +141,35 @@ impl Nicru {
         self.ctx.nicru()
     }
 
-    /// True when this process has marked `zone` as holding its staged changes.
-    pub(super) fn is_marked(&self, zone: &DomainName) -> bool {
+    /// What this process has marked `zone` for: `None` when it holds no staged changes of
+    /// this process.
+    pub(super) fn pending(&self, zone: &DomainName) -> Option<Pending> {
         self.state()
             .staged
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains(zone)
+            .get(zone)
+            .copied()
     }
 
-    /// Marks `zone` as holding staged changes of this process.
+    /// True when this process has marked `zone` as holding its staged changes.
+    pub(super) fn is_marked(&self, zone: &DomainName) -> bool {
+        self.pending(zone).is_some()
+    }
+
+    /// Marks `zone` as holding staged changes of this process that make up a complete change,
+    /// to be committed by the next operation if this one does not.
     pub(super) fn mark(&self, zone: &DomainName) {
+        self.mark_for(zone, Pending::Commit);
+    }
+
+    /// Marks `zone` as holding staged changes of this process, to be treated as `pending`.
+    pub(super) fn mark_for(&self, zone: &DomainName, pending: Pending) {
         self.state()
             .staged
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(zone.clone());
+            .insert(zone.clone(), pending);
     }
 
     /// Clears the mark of `zone`.
@@ -154,6 +179,27 @@ impl Nicru {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(zone);
+    }
+
+    /// Before an operation edits `zone`, under the zone lock: a zone without staged changes has
+    /// its mark cleared (nothing of ours can be pending there, and a stale mark must not later
+    /// make a foreign edit look like ours); staged changes this process did not make are
+    /// `Error::Rejected`; staged changes of this process left by an earlier operation are
+    /// committed or rolled back, as their mark says (design section 11.3, points b and c).
+    pub(super) async fn settle_leftovers(
+        &self,
+        zone: &DomainName,
+        target: &Zone,
+    ) -> Result<(), Error> {
+        if !target.has_changes {
+            self.unmark(zone);
+            return Ok(());
+        }
+        match self.pending(zone) {
+            None => Err(rejected(FOREIGN_CHANGES)),
+            Some(Pending::Commit) => self.commit_own(zone, &target.service).await,
+            Some(Pending::Rollback) => self.rollback_own(zone, &target.service).await,
+        }
     }
 
     /// Commits `zone`, up to [`COMMIT_ATTEMPTS`] times, and clears its mark after a successful
@@ -180,6 +226,56 @@ impl Nicru {
                  in the zone commits them ({cause})"
             )),
         })
+    }
+
+    /// Rolls `zone` back, up to [`COMMIT_ATTEMPTS`] times, and clears its mark after a
+    /// successful rollback. When every attempt fails, the zone is marked for a rollback and the
+    /// result is `Error::Transient`: the next operation in the zone rolls the staged changes
+    /// back before it does anything else.
+    pub(super) async fn rollback_own(&self, zone: &DomainName, service: &str) -> Result<(), Error> {
+        let mut last = None;
+        for attempt in 0..COMMIT_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(COMMIT_BACKOFF * attempt).await;
+            }
+            match self.api.rollback(service, zone).await {
+                Ok(()) => {
+                    self.unmark(zone);
+                    return Ok(());
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        self.mark_for(zone, Pending::Rollback);
+        let cause = last.map(|e| e.to_string()).unwrap_or_default();
+        Err(Error::Transient {
+            detail: self.api.detail(&format!(
+                "the staged changes of an unfinished operation are not rolled back after three \
+                 attempts; the next operation in the zone rolls them back ({cause})"
+            )),
+        })
+    }
+
+    /// After a record-level operation failed with some of its edits possibly staged, still
+    /// under the zone lock: its edits are discarded, never published (a commit would publish
+    /// a half-applied replacement). The zone is listed again; without staged changes nothing
+    /// was staged and the mark is cleared, with staged changes the zone is rolled back. A
+    /// rollback discards every staged change of the zone: when this operation read the zone it
+    /// had none but ours, which it settled first, and every edit of this process in the zone
+    /// happens under the zone lock; a writer outside the process that stages an edit between
+    /// this operation's read and the rollback loses that edit, the same window as the one
+    /// before a commit. If the zone cannot be listed again the mark stays, and the next
+    /// operation rolls back.
+    pub(super) async fn discard_own(&self, zone: &DomainName, service: &str) -> Result<(), Error> {
+        let zones = self.api.zones().await?;
+        let Lookup::Found(found) = lookup(zones, zone) else {
+            return Ok(());
+        };
+        if !found.has_changes {
+            self.unmark(zone);
+            return Ok(());
+        }
+        self.rollback_own(zone, service).await
     }
 
     /// After an edit failed, still under the zone lock: makes sure the mark of `zone` stays only
@@ -280,7 +376,7 @@ fn lookup(zones: Vec<Zone>, zone: &DomainName) -> Lookup {
     }
 }
 
-fn rejected(text: &'static str) -> Error {
+pub(super) fn rejected(text: &'static str) -> Error {
     Error::Rejected {
         status: None,
         detail: Detail::constant(text),
@@ -335,6 +431,49 @@ impl Provider for Nicru {
         value: &Txt,
     ) -> Result<RemoveOutcome, Error> {
         values::remove_per_record(&Op::new(self), zone, name, value).await
+    }
+
+    /// Every record of the zone. Refused (`Error::Rejected`) while the zone has staged changes:
+    /// the listing would show them as if they were published.
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    /// Refused (`Error::Rejected`) while the zone has staged changes, as `list_rrsets`.
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_per_record(&RecordOp::reading(self), zone, name, rtype).await
+    }
+
+    /// Stages every edit of the replacement, then publishes them with one commit; an operation
+    /// that fails before its commit has its staged edits rolled back.
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        let op = RecordOp::writing(self);
+        let result = rrsets::set_per_record(&op, zone, rrset, expect).await;
+        op.finish(zone, result).await
+    }
+
+    /// Stages the deletion of every record of the rrset, then publishes them with one commit; an
+    /// operation that fails before its commit has its staged edits rolled back.
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        let op = RecordOp::writing(self);
+        let result = rrsets::delete_per_record(&op, zone, name, rtype, expect).await;
+        op.finish(zone, result).await
     }
 }
 

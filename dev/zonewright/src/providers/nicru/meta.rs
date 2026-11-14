@@ -4,8 +4,9 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and the
-//! TXT value operations for plain values; no record-level operation yet.
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones`, the
+//! TXT value operations for plain values, and the record-level operations for the types whose
+//! record element the provider's documentation shows and the record model can hold.
 
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use crate::meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
     ValueGuarantee,
 };
+use crate::record::RecordType;
 
 /// The metadata of nic.ru.
 pub(crate) static META: ProviderMeta = ProviderMeta {
@@ -122,17 +124,40 @@ const FIELDS: &[ConfigField] = &[
     },
 ];
 
+/// The types of the record-level operations: those whose record element the provider's
+/// documentation shows (section 4.6) and that have a canonical text form (design section 4.3).
+/// HINFO, NAPTR and RP are shown too but have no canonical form; listings carry them as
+/// non-canonical data.
+const RECORD_TYPES: &[RecordType] = &[
+    RecordType::A,
+    RecordType::AAAA,
+    RecordType::CNAME,
+    RecordType::DNAME,
+    RecordType::MX,
+    RecordType::NS,
+    RecordType::PTR,
+    RecordType::SOA,
+    RecordType::SRV,
+    RecordType::TXT,
+];
+
 /// What this version of the crate implements for nic.ru.
+///
+/// `atomic_rrset_write` is false: a replacement is several requests (staged edits and a
+/// commit). The publication is one step all the same: no edit is published before the one
+/// commit that publishes all of them, and an operation that fails before its commit has its
+/// edits rolled back. `preconditions` is `ReadThenWrite`: neither the edits nor the commit carry
+/// a condition on the rrset as read.
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: true,
-    list_rrsets: false,
-    get_rrset: false,
-    set_rrset: false,
-    delete_rrset: false,
+    list_rrsets: true,
+    get_rrset: true,
+    set_rrset: true,
+    delete_rrset: true,
     add_txt_value: true,
     remove_txt_value: true,
-    record_types: TypeSet::Listed(&[]),
-    read_only_types: &[],
+    record_types: TypeSet::Listed(RECORD_TYPES),
+    read_only_types: &[RecordType::SOA],
     txt_plain_only: true,
     txt_values: ValueGuarantee::PerValue,
     preconditions: Preconditions::ReadThenWrite,

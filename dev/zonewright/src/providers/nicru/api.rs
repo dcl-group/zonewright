@@ -1,7 +1,7 @@
 //! The nic.ru DNS hosting API as this client uses it: the token exchange, one function per
 //! endpoint, the XML of requests and answers, and the classification of answers. Nothing here
-//! knows the value layer, the zone lock or the staged-change marks; `client.rs` and `txt.rs`
-//! build on these calls.
+//! knows the value or record layer, the zone lock or the staged-change marks; `client.rs`,
+//! `txt.rs` and `records.rs` build on these calls.
 //!
 //! Sources (hard rule 3):
 //!
@@ -25,6 +25,12 @@
 //! | add record    | `PUT /services/{service}/zones/{zone}/records` (XML) | 4.5.1 |
 //! | delete record | `DELETE /services/{service}/zones/{zone}/records/{id}` | 4.5.3 |
 //! | commit        | `POST /services/{service}/zones/{zone}/commit`       | 4.3.1 |
+//! | rollback      | `POST /services/{service}/zones/{zone}/rollback`     | 4.2   |
+//!
+//! A record is `<rr>` with `name`, an optional `ttl`, `type` and one element per type (Docs 4.6,
+//! the form of a request body; the listing of 4.5.2 shows the same form for SOA and NS, with an
+//! `idn-name` next to every `name`). [`SHAPES`] holds the elements of the types the document
+//! shows.
 //!
 //! Every answer of the DNS API is `<response><status>success</status>…</response>`, or
 //! `<status>fail</status>` with `<errors><error code="…">text</error></errors>`. The
@@ -55,8 +61,130 @@ const TOKEN_REJECTED: &str = "4097";
 // with a body); Docs section 1 (XML in requests and responses).
 const TEXT_XML: &str = "text/xml";
 
-/// The record type this client writes.
+/// The TXT record type, whose element holds one or more `string` elements.
 pub(super) const TXT: &str = "TXT";
+
+/// Where the fields of one record type sit in its element.
+#[derive(Debug)]
+pub(super) struct Shape {
+    /// The type as the API spells it in `type`.
+    pub(super) rtype: &'static str,
+    /// The type's element inside `rr`.
+    element: &'static str,
+    /// The path of each field below the element, in the order of the type's presentation
+    /// format; an empty path is the element's own text.
+    fields: &'static [&'static [&'static str]],
+}
+
+impl Shape {
+    /// The number of fields.
+    pub(super) fn len(&self) -> usize {
+        self.fields.len()
+    }
+}
+
+/// The record elements the documentation shows, other than TXT.
+// Source: Docs 4.6.1 (SOA: `soa` with `mname/name`, `rname/name`, `serial`, `refresh`, `retry`,
+// `expire`, `minimum`), 4.6.2 (A: `<a>IP</a>`), 4.6.3 (AAAA: `<aaaa>ipv6</aaaa>`), 4.6.4 (CNAME:
+// `cname/name`), 4.6.5 (NS: `ns/name`), 4.6.6 (MX: `mx` with `preference` and `exchange/name`),
+// 4.6.7 (SRV: `srv` with `priority`, `weight`, `port` and `target/name`), 4.6.8 (PTR: `ptr/name`),
+// 4.6.10 (DNAME: `dname/name`), 4.6.11 (HINFO: `hinfo` with `hardware` and `os`), 4.6.12
+// (NAPTR: `naptr` with `order`, `preference`, `flags`, `service`, `regexp` and
+// `replacement/name`), 4.6.13 (RP: `rp` with `mbox-dname/name` and `txt-dname/name`). The
+// listing examples of 4.5.1 and 4.5.2 show SOA and NS in the same form.
+pub(super) const SHAPES: &[Shape] = &[
+    Shape {
+        rtype: "A",
+        element: "a",
+        fields: &[&[]],
+    },
+    Shape {
+        rtype: "AAAA",
+        element: "aaaa",
+        fields: &[&[]],
+    },
+    Shape {
+        rtype: "CNAME",
+        element: "cname",
+        fields: &[&["name"]],
+    },
+    Shape {
+        rtype: "NS",
+        element: "ns",
+        fields: &[&["name"]],
+    },
+    Shape {
+        rtype: "PTR",
+        element: "ptr",
+        fields: &[&["name"]],
+    },
+    Shape {
+        rtype: "DNAME",
+        element: "dname",
+        fields: &[&["name"]],
+    },
+    Shape {
+        rtype: "MX",
+        element: "mx",
+        fields: &[&["preference"], &["exchange", "name"]],
+    },
+    Shape {
+        rtype: "SRV",
+        element: "srv",
+        fields: &[&["priority"], &["weight"], &["port"], &["target", "name"]],
+    },
+    Shape {
+        rtype: "SOA",
+        element: "soa",
+        fields: &[
+            &["mname", "name"],
+            &["rname", "name"],
+            &["serial"],
+            &["refresh"],
+            &["retry"],
+            &["expire"],
+            &["minimum"],
+        ],
+    },
+    Shape {
+        rtype: "HINFO",
+        element: "hinfo",
+        fields: &[&["hardware"], &["os"]],
+    },
+    Shape {
+        rtype: "NAPTR",
+        element: "naptr",
+        fields: &[
+            &["order"],
+            &["preference"],
+            &["flags"],
+            &["service"],
+            &["regexp"],
+            &["replacement", "name"],
+        ],
+    },
+    Shape {
+        rtype: "RP",
+        element: "rp",
+        fields: &[&["mbox-dname", "name"], &["txt-dname", "name"]],
+    },
+];
+
+/// The shape of `rtype` (any case), if the documentation shows one.
+pub(super) fn shape(rtype: &str) -> Option<&'static Shape> {
+    SHAPES
+        .iter()
+        .find(|shape| shape.rtype.eq_ignore_ascii_case(rtype))
+}
+
+/// The type-specific content of a record to stage.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Content<'a> {
+    /// The fields of a type in [`SHAPES`], in its order.
+    Fields(&'a Shape, &'a [String]),
+    /// The character strings of a TXT record, each at most 255 bytes.
+    Strings(&'a [String]),
+}
 
 /// A zone as `GET /zones` lists it.
 // Source: Docs 3.2.1 and 3.2.2: `name` ("zone name in Punycode"), `service` ("service
@@ -87,10 +215,23 @@ pub(super) struct Rr {
     pub(super) owner: Option<DomainName>,
     /// The record type.
     pub(super) rtype: String,
-    /// The TTL in seconds, if the record states one in numeric form.
+    /// The TTL in seconds, if the record states one in numeric or BIND form.
     pub(super) ttl: Option<u32>,
     /// For TXT, the value: the strings joined; `None` when it cannot be read.
     pub(super) txt: Option<String>,
+    /// For a type in [`SHAPES`], the text of each field in the shape's order; `None` for a
+    /// field the record lacks. Empty for TXT and for a type the documentation does not show.
+    pub(super) fields: Vec<Option<String>>,
+}
+
+/// The answer of `GET …/records`.
+#[derive(Clone, Debug)]
+pub(super) struct RecordListing {
+    /// The `has-changes` attribute of the listed zone: whether it has staged changes. `None`
+    /// when the answer does not state it.
+    pub(super) has_changes: Option<bool>,
+    /// Every record of the zone.
+    pub(super) records: Vec<Rr>,
 }
 
 /// The JSON answer of the token endpoint; other fields are ignored.
@@ -406,12 +547,18 @@ impl Api {
             .path(tail)
     }
 
-    /// Every record of the zone. The answer holds the whole zone in one document, bounded by
-    /// the transport's 4 MiB limit (design section 5.4). An answer without the zone element, or
-    /// with a record without an identifier, a name or a type, is an unexpected answer.
-    // Source: Docs 4.5.2; lego internal/client.go:112-135 (`GetRecords` joins the `rr` of every
-    // `zone` of `data`).
-    pub(super) async fn records(&self, service: &str, zone: &DomainName) -> Result<Vec<Rr>, Error> {
+    /// Every record of the zone, and whether the answer says the zone has staged changes. The
+    /// answer holds the whole zone in one document, bounded by the transport's 4 MiB limit
+    /// (design section 5.4). An answer without the zone element, with a record without an
+    /// identifier, a name or a type, or with a `has-changes` other than `true` or `false`, is an
+    /// unexpected answer.
+    // Source: Docs 4.5.2 (the listed `zone` carries `has-changes`); lego
+    // internal/client.go:112-135 (`GetRecords` joins the `rr` of every `zone` of `data`).
+    pub(super) async fn records(
+        &self,
+        service: &str,
+        zone: &DomainName,
+    ) -> Result<RecordListing, Error> {
         let url = self.zone_url(service, zone, "/records").build()?;
         let text = self
             .call(
@@ -427,7 +574,21 @@ impl Api {
         if zones.is_empty() {
             return Err(protocol("the record listing has no zone element"));
         }
-        let mut out = Vec::new();
+        let mut has_changes = None;
+        for node in &zones {
+            match node.attribute("has-changes") {
+                None => {}
+                Some("true") => has_changes = Some(true),
+                Some("false") => has_changes = has_changes.or(Some(false)),
+                Some(_) => {
+                    return Err(protocol(
+                        "the record listing does not say clearly whether the zone has staged \
+                         changes",
+                    ));
+                }
+            }
+        }
+        let mut records = Vec::new();
         for node in zones.iter().flat_map(|z| children(*z, "rr")) {
             let (Some(id), Some(name), Some(rtype)) = (
                 node.attribute("id"),
@@ -443,15 +604,20 @@ impl Api {
             } else {
                 None
             };
-            out.push(Rr {
+            let fields = shape(&rtype).map_or_else(Vec::new, |shape| read_fields(node, shape));
+            records.push(Rr {
                 id: id.trim().to_owned(),
                 owner: owner(&name, zone),
                 rtype,
-                ttl: child_text(node, "ttl").and_then(|t| t.parse().ok()),
+                ttl: child_text(node, "ttl").and_then(|t| parse_ttl(&t)),
                 txt,
+                fields,
             });
         }
-        Ok(out)
+        Ok(RecordListing {
+            has_changes,
+            records,
+        })
     }
 
     /// Stages one TXT record. `ttl` `None` sends none, so the zone's default applies. Sent once.
@@ -467,11 +633,29 @@ impl Api {
         value: &str,
         ttl: Option<u32>,
     ) -> Result<(), EditError> {
+        let strings = [value.to_owned()];
+        self.add_record(service, zone, owner, ttl, TXT, Content::Strings(&strings))
+            .await
+    }
+
+    /// Stages one record of type `rtype` with `content`. `ttl` `None` sends none, so the zone's
+    /// default applies. Sent once.
+    // Source: Docs 4.5.1 and 4.6 (the request body, `ttl` optional), 4.6.2 to 4.6.9 (the type's
+    // element).
+    pub(super) async fn add_record(
+        &self,
+        service: &str,
+        zone: &DomainName,
+        owner: &str,
+        ttl: Option<u32>,
+        rtype: &str,
+        content: Content<'_>,
+    ) -> Result<(), EditError> {
         let url = self
             .zone_url(service, zone, "/records")
             .build()
             .map_err(|e| EditError::new(e, true))?;
-        let body = Bytes::from(add_request(owner, value, ttl));
+        let body = Bytes::from(add_request(owner, ttl, rtype, content));
         self.call_edit(
             || {
                 Ok(Request::new(Method::PUT, url.clone())
@@ -528,6 +712,21 @@ impl Api {
         .await?;
         Ok(())
     }
+
+    /// Rolls the zone back: discards every staged change of it. Sent once; the caller decides
+    /// about further attempts.
+    // Source: Docs 4.2 ("Cancellation of introduced changes in zone", `POST …/rollback`, no body,
+    // a `success` answer).
+    pub(super) async fn rollback(&self, service: &str, zone: &DomainName) -> Result<(), Error> {
+        let url = self.zone_url(service, zone, "/rollback").build()?;
+        self.call(
+            || Ok(Request::new(Method::POST, url.clone()).accept(TEXT_XML)),
+            false,
+            false,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 /// The form body of the token request, in a zeroizing buffer: the user name, the password, the
@@ -553,22 +752,109 @@ pub(super) fn grant(
     ]))
 }
 
-/// The body of `PUT …/records` with one TXT record. Every value goes through the one XML
-/// escaping function; element names are constants.
-// Source: Docs 4.5.1 and 4.6.9; lego internal/types.go (`Request`, `RRList`, `RR` with `name`,
-// `ttl`, `type`, `txt` / `string`, in that order) and internal/client.go:220-235 (`xml.Header`).
-pub(super) fn add_request(owner: &str, value: &str, ttl: Option<u32>) -> String {
+/// The body of `PUT …/records` with one record. Every value goes through the one XML escaping
+/// function; element names are constants.
+// Source: Docs 4.5.1, 4.6 and the type's section of 4.6; lego internal/types.go (`Request`,
+// `RRList`, `RR` with `name`, `ttl`, `type`, `txt` / `string`, in that order) and
+// internal/client.go:220-235 (`xml.Header`).
+pub(super) fn add_request(
+    owner: &str,
+    ttl: Option<u32>,
+    rtype: &str,
+    content: Content<'_>,
+) -> String {
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     xml.push_str("<request><rr-list><rr>");
     element(&mut xml, "name", owner);
     if let Some(ttl) = ttl {
         element(&mut xml, "ttl", &ttl.to_string());
     }
-    element(&mut xml, "type", TXT);
-    xml.push_str("<txt>");
-    element(&mut xml, "string", value);
-    xml.push_str("</txt></rr></rr-list></request>");
+    match content {
+        Content::Strings(strings) => {
+            element(&mut xml, "type", TXT);
+            xml.push_str("<txt>");
+            for string in strings {
+                element(&mut xml, "string", string);
+            }
+            xml.push_str("</txt>");
+        }
+        Content::Fields(shape, values) => {
+            element(&mut xml, "type", rtype);
+            open(&mut xml, shape.element);
+            for (path, value) in shape.fields.iter().zip(values) {
+                for tag in *path {
+                    open(&mut xml, tag);
+                }
+                xml.push_str(&xml_escape(value));
+                for tag in path.iter().rev() {
+                    close(&mut xml, tag);
+                }
+            }
+            close(&mut xml, shape.element);
+        }
+    }
+    xml.push_str("</rr></rr-list></request>");
     xml
+}
+
+fn open(out: &mut String, tag: &str) {
+    out.push('<');
+    out.push_str(tag);
+    out.push('>');
+}
+
+fn close(out: &mut String, tag: &str) {
+    out.push_str("</");
+    out.push_str(tag);
+    out.push('>');
+}
+
+/// The fields of `shape` in record `node`: the trimmed text at each path below the type's
+/// element; `None` where an element is missing.
+fn read_fields(node: roxmltree::Node<'_, '_>, shape: &Shape) -> Vec<Option<String>> {
+    let element = child(node, shape.element);
+    shape
+        .fields
+        .iter()
+        .map(|path| {
+            let mut at = element?;
+            for tag in *path {
+                at = child(at, tag)?;
+            }
+            Some(at.text().unwrap_or("").trim().to_owned())
+        })
+        .collect()
+}
+
+/// A TTL in numeric form or in the BIND form of numbers with the units `w`, `d`, `h`, `m` and
+/// `s` (`1h30m`); `None` for anything else or a value beyond `u32`.
+// Source: Docs 4.6 ("ttl setting … may be set both in numeric form and in wdhs form maintained
+// by BIND").
+pub(super) fn parse_ttl(text: &str) -> Option<u32> {
+    if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+        return text.parse().ok();
+    }
+    let mut total: u32 = 0;
+    let mut number: Option<u32> = None;
+    for c in text.chars() {
+        if let Some(digit) = c.to_digit(10) {
+            number = Some(number.unwrap_or(0).checked_mul(10)?.checked_add(digit)?);
+            continue;
+        }
+        let unit: u32 = match c.to_ascii_lowercase() {
+            'w' => 604_800,
+            'd' => 86_400,
+            'h' => 3_600,
+            'm' => 60,
+            's' => 1,
+            _ => return None,
+        };
+        total = total.checked_add(number.take()?.checked_mul(unit)?)?;
+    }
+    if number.is_some() || text.is_empty() {
+        return None;
+    }
+    Some(total)
 }
 
 /// Appends `<tag>text</tag>` with `text` escaped.
@@ -671,7 +957,8 @@ mod tests {
 
     #[test]
     fn add_requests_escape_every_value() {
-        let xml = add_request("_acme-challenge", "a<b&c\"d", Some(30));
+        let strings = ["a<b&c\"d".to_owned()];
+        let xml = add_request("_acme-challenge", Some(30), TXT, Content::Strings(&strings));
         let doc = roxmltree::Document::parse(&xml).unwrap();
         let rr = doc.descendants().find(|n| n.has_tag_name("rr")).unwrap();
         assert_eq!(child_text(rr, "name").unwrap(), "_acme-challenge");
@@ -679,7 +966,45 @@ mod tests {
         assert_eq!(child_text(rr, "type").unwrap(), "TXT");
         let txt = child(rr, "txt").unwrap();
         assert_eq!(txt_value(txt).unwrap(), "a<b&c\"d");
-        assert!(!add_request("x", "v", None).contains("<ttl>"));
+        let strings = ["v".to_owned()];
+        assert!(!add_request("x", None, TXT, Content::Strings(&strings)).contains("<ttl>"));
+    }
+
+    #[test]
+    fn add_requests_nest_the_documented_elements() {
+        let mx = shape("mx").unwrap();
+        let values = ["10".to_owned(), "mail.example.org.".to_owned()];
+        let xml = add_request("@", None, "MX", Content::Fields(mx, &values));
+        assert!(
+            xml.contains(
+                "<rr><name>@</name><type>MX</type><mx><preference>10</preference><exchange>\
+                 <name>mail.example.org.</name></exchange></mx></rr>"
+            ),
+            "{xml}"
+        );
+        let a = shape("A").unwrap();
+        let values = ["192.0.2.1".to_owned()];
+        let xml = add_request("www", Some(60), "A", Content::Fields(a, &values));
+        assert!(
+            xml.contains("<name>www</name><ttl>60</ttl><type>A</type><a>192.0.2.1</a>"),
+            "{xml}"
+        );
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let rr = doc.descendants().find(|n| n.has_tag_name("rr")).unwrap();
+        assert_eq!(read_fields(rr, a), [Some("192.0.2.1".to_owned())]);
+        let srv = shape("SRV").unwrap();
+        assert_eq!(read_fields(rr, srv), [None, None, None, None]);
+    }
+
+    #[test]
+    fn ttls_are_numeric_or_bind_units() {
+        assert_eq!(parse_ttl("3600"), Some(3600));
+        assert_eq!(parse_ttl("1h30m"), Some(5400));
+        assert_eq!(parse_ttl("1W2d"), Some(777_600));
+        assert_eq!(parse_ttl("30s"), Some(30));
+        for bad in ["", "1h30", "h", "-1", "1.5h", "99999999999", "1x"] {
+            assert_eq!(parse_ttl(bad), None, "{bad}");
+        }
     }
 
     #[test]

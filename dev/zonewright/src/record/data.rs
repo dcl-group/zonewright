@@ -95,7 +95,8 @@ impl RecordData {
         feature = "vk_cloud",
         feature = "yandex_360",
         feature = "timeweb_cloud",
-        feature = "regru"
+        feature = "regru",
+        feature = "nicru"
     ))]
     pub(crate) fn from_provider(
         rtype: RecordType,
@@ -526,7 +527,8 @@ fn parse_generic(tokens: &[Token<'_>]) -> Result<Vec<u8>, RecordError> {
     feature = "vk_cloud",
     feature = "yandex_360",
     feature = "timeweb_cloud",
-    feature = "regru"
+    feature = "regru",
+    feature = "nicru"
 ))]
 mod tests {
     use super::RecordData;

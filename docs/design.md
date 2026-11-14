@@ -509,8 +509,9 @@ pub struct Capabilities {
     /// individual records and a replacement is several requests.
     pub atomic_rrset_write: bool,
         pub ttl: TtlSupport,
-    /// The provider can choose a TTL itself (an "automatic" TTL, or a default it applies when
-    /// none is sent). Such an rrset reads as `ttl() == None`.
+    /// The provider can choose a TTL itself: an rrset or a record can have no explicit TTL at the
+    /// provider (an "automatic" TTL, or a zone default that applies while none is stored). Such
+    /// an rrset reads as `ttl() == None`. True for every `TtlSupport::NotSettable` provider.
     pub provider_default_ttl: bool,
     /// Writes complete through a provider-side operation that the client polls.
     pub asynchronous: bool,
@@ -547,7 +548,8 @@ pub enum TtlSupport {
     /// One TTL per rrset, within the given bounds (seconds).
     PerRrset { min: u32, max: u32 },
     /// The API stores a TTL on every record. The crate writes the same TTL to all records of an
-    /// rrset and reports the smallest one it reads.
+    /// rrset and reports the smallest one it reads; a requested TTL counts as already set only
+    /// when every record has it.
     PerRecord { min: u32, max: u32 },
     /// The provider chooses the TTL; a requested TTL is refused.
     NotSettable,
@@ -1209,12 +1211,18 @@ of `rrset`. How it is carried out depends on the provider's native unit:
   with a fresh read.
 - Per-record APIs (`atomic_rrset_write == false`): the client computes the difference between the
   records read and the records wanted, creates the missing ones and deletes the extra ones by their
-  identifiers. Records present in both are not touched. For types that allow only one record (CNAME,
-  SOA, DNAME, ALIAS, ANAME), the client updates the record in place if the API can, otherwise
-  deletes and then creates. For all other types it creates before it deletes, so the name never
-  loses all its values. A TTL change is applied to every record. The sequence is not atomic: if it
-  fails part-way the rrset holds a mixture, the error is returned, and repeating the call completes
-  the change because step 1 reads the mixture and step 4 computes the remaining difference.
+  identifiers. Records present in both are not touched. All requests are computed from the one read
+  and handed to the client as a whole before the first is sent, so a request the client knows the
+  API refuses ends the operation with nothing written. They are sent in a fixed order: records in
+  the order of the read, new values in the order of the requested set. For types that allow only one
+  record (CNAME, SOA, DNAME, ALIAS, ANAME), two published records never exist, not even for one
+  request: surplus records are deleted first, and the last of them is updated in place to the new
+  value if the API can; otherwise the new value is created after the deletes. For all other types
+  the order is: enabling of disabled records with a requested value, TTL changes, creates, deletes;
+  so the name never loses all its values. A TTL change is applied to every record. The sequence is
+  not atomic: if it fails part-way the rrset holds a mixture, the error is returned, and repeating
+  the call completes the change because step 1 reads the mixture and step 4 computes the remaining
+  difference.
 
 Attributes of existing records that the model does not carry (a per-record disabled flag, a comment,
 a description) are preserved by a write wherever the API returns them. A requested value that exists
@@ -1223,16 +1231,26 @@ requested values stay disabled and stay in place.
 
 `delete_rrset(zone, name, rtype, expect)` removes all published values of that name and type.
 `Expect::Absent` is `Error::InvalidInput`. A missing rrset is `NotPresent`. `Matches` is evaluated
-as for `set_rrset`. On per-record APIs every record of the set is deleted by identifier.
+as for `set_rrset`. On per-record APIs every record of the set is deleted by identifier. A delete
+answered "not found", of one record or of a whole rrset, is done only when a new read, under a zone
+identifier looked up afresh, no longer finds the record's value or the rrset; otherwise the zone
+changed after the read and the result is `Error::Conflict` (sections 3.5 and 3.8).
 
 Guard rails in this version, as `read_only_types` or explicit refusals:
 
 - SOA is never writable.
 - The NS rrset at the zone apex is not writable (`Error::InvalidInput`): at the providers covered so
   far it belongs to the provider. NS rrsets below the apex (delegations) are ordinary data.
-- Rrsets a provider cannot express as plain records (Route 53 alias and routing-policy sets) are
-  never modified. A TXT value operation that meets one fails with `Error::Rejected`. A listing
-  reports them in `ZoneListing::skipped` with `SkipReason::NotPlainRecords`.
+- Rrsets a provider cannot express as plain records (Route 53 alias and routing-policy sets,
+  Cloud.ru records with GSLB links) are never modified. A TXT value operation that meets one fails
+  with `Error::Rejected`. A listing reports them in `ZoneListing::skipped` with
+  `SkipReason::NotPlainRecords`.
+- A CNAME owner has no other data (RFC 1034 section 3.6.2; RRSIG and NSEC excepted, RFC 4035 section
+  2.5). The operations read one name and type, so whether the name holds other data is known only
+  where the client's read already shows it (a read that returns every record of the name). There, a
+  `set_rrset` of a CNAME at a name with other data, or of another type at a name with a CNAME, is
+  `Error::InvalidInput` after the read and before any write. Elsewhere the write is sent and the
+  provider's refusal is returned as any other refusal; no request is made only to find out.
 
 ### 3.5 TXT value operations
 
@@ -1324,12 +1342,21 @@ one.**
 - Where the provider cannot set a TTL (`TtlSupport::NotSettable`), `Some(t)` is `InvalidInput` and
   `None` is the only accepted value.
 - Where the API stores a TTL per record (`TtlSupport::PerRecord`), `RrSet::ttl()` of a set that was
-  read is the smallest TTL among its records, a write with `Some(t)` sets `t` on every record, and a
-  record added to an existing set gets the set's TTL as read.
+  read is the smallest TTL among its records, a write with `Some(t)` sets `t` on every record (and
+  is `Unchanged` only when every record already has `t`), and a record added to an existing set gets
+  the set's TTL as read.
 - Where the provider can choose the TTL (`provider_default_ttl`): a set whose TTL the provider
-  manages reads as `None`. The client's `ttl` setting has a spelling for "let the provider choose"
-  (Cloudflare: the value `1`, which the API defines as automatic; Timeweb Cloud: the setting left
-  unset), and a new set created with `None` then gets no explicit TTL.
+  manages reads as `None`, and a write with `None` leaves it so. Where the client's `ttl` setting
+  has a spelling for "let the provider choose" (Cloudflare: the value `1`, which the API defines as
+  automatic; Timeweb Cloud: the setting left unset), a new set created with `None` gets no explicit
+  TTL. Hetzner's setting has no such spelling: a new set always gets the configured TTL, while an
+  existing set whose TTL is the zone default keeps it.
+- Where it cannot (`provider_default_ttl == false`), every set the client reads should carry a TTL.
+  If a read cannot state one (a value the model cannot hold, an answer without the field), a write
+  with `None` sends the provider's value back where the client has it, and the client's `ttl`
+  setting otherwise; it never sends "no TTL". The flag is true exactly for the providers at which an
+  rrset or a record can have no explicit TTL, and for every `TtlSupport::NotSettable` provider; a
+  conformance test lists the value per provider with its reason.
 - One exception, RFC 2136 without read access: when the server refuses the client's queries, the TTL
   of the existing rrset is unknown, the add is sent with the client's `ttl`, and common servers then
   apply that TTL to the whole rrset (RFC 2136 section 3.4.2.2 leaves the rrset with one TTL). The
@@ -2695,7 +2722,7 @@ this table is a guess about such an API.
 | `cloudflare`    | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CAA, CNAME, MX, NS, PTR, SRV, TLSA, TXT                                                      | 120                   | 120 s                       | Auto / Presentation                                     | Cloudflare API v4 documentation, lego                                                              |
 | `digitalocean`  | yes; plain values      | list, get, set, delete (several requests per set)                                        | A, AAAA, CAA, CNAME, MX, NS, SOA (read only), SRV, TXT                                                | 30                    | 120 s                       | Auto / Raw                                              | DigitalOcean API v2 reference, lego                                                                |
 | `hetzner`       | yes; plain values      | list, get, set, delete                                                                   | A, AAAA, CNAME, MX, NS, PTR, SOA (read only), SRV, TLSA, TXT                                          | 60                    | 120 s                       | Auto / Presentation                                     | Hetzner Cloud API reference, lego, hcloud-go schema                                                |
-| `nicru`         | yes; plain values      | TXT only until established                                                               | —                                                                                                     | 30                    | 1200 s                      | Raw / Raw                                               | lego and third-party clients; the official documentation was not readable                          |
+| `nicru`         | yes; plain values      | list, get, set, delete; one commit per operation                                         | A, AAAA, CNAME, DNAME, MX, NS, PTR, SOA (read only), SRV, TXT                                         | 30                    | 1200 s                      | Raw / Raw                                               | lego and third-party clients; the official documentation was not readable                          |
 | `regru`         | yes; plain values      | list, get, set, delete for A, AAAA, TXT (several requests per set)                       | A, AAAA, TXT                                                                                          | not settable          | —                           | Auto / Raw                                              | lego and a third-party client library. Earlier version proven live                                 |
 | `rfc2136`       | yes                    | get, set, delete with server-checked prerequisites; listing impossible                   | any type with a wire form; SOA read only                                                              | 60                    | —                           | wire format                                             | RFC 2136, RFC 8945, RFC 7766, RFC 1035                                                             |
 | `route53`       | yes; plain values      | list, get, set, delete; alias and routing-policy sets are skipped and refused            | A, AAAA, CAA, CNAME, DS, HTTPS, MX, NAPTR, NS, PTR, SOA (read only), SPF, SRV, SSHFP, SVCB, TLSA, TXT | 60                    | 120 s                       | Auto / Presentation                                     | Amazon Route 53 API reference, lego                                                                |
@@ -2770,7 +2797,11 @@ Behavior that the design fixes because the generic sections cannot:
   without a trailing dot that can be read both as relative to the zone and as a full name inside it
   is `Error::Protocol` when either reading is the requested name: the form the API uses is not
   documented, and the client does not guess. Two zones with one name, and a listed record of another
-  zone, are `Error::Protocol`.
+  zone, are `Error::Protocol`. A record with GSLB links answers from its links, not from its values:
+  it is not an rrset (section 3.4), a listing skips it, and every record-level operation and TXT
+  value operation at its name and type is `Error::Rejected` after the read. The read again before
+  every write (section 3.5) is the layers' `reread_before_write`; refusals that need the read (a
+  read-only record, a wildcard NS record) are made before that second read.
 - `hetzner`. Only zones in primary mode are usable; a secondary zone is reported by `check` as not
   found with a detail, and operations on it are `Error::Rejected`. Values are removed using exactly
   the text the API returned.
@@ -2814,10 +2845,13 @@ Behavior that the design fixes because the generic sections cannot:
     `Error::Rejected`.
   - TTL: with read access an add carries the TTL of the existing rrset. Without it the exception of
     section 3.6 applies: the add carries the client's `ttl`, and the server may apply it to the
-    whole rrset.
+    whole rrset. A requested TTL may be anything the protocol carries, 0 to 2^31 − 1 (RFC 2181
+    section 8), a delegation's 172800 included; the `ttl` setting keeps 1 to 86400.
 - `route53`. The zone is found by exact name among public hosted zones; several with the same name
   are `Error::Config` unless `hosted_zone_id` selects one. Region `us-east-1` and service `route53`
-  are constants. A signature rejected for clock skew is `Error::Auth` with that hint.
+  are constants. A signature rejected for clock skew is `Error::Auth` with that hint. A requested
+  TTL may be 0 to 2147483647, as the API accepts (`ResourceRecordSet.TTL`); the `ttl` setting keeps
+  1 to 86400.
 - `selectel_v2`. Names are sent in Unicode form. Records with the `disabled` flag follow section
   3.4. An rrset holds at most 100 records; a larger request is `InvalidInput`. An rrset is addressed
   by reading it by name and type on every operation, not by a remembered ID. The answer to a create

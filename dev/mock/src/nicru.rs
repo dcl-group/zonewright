@@ -17,12 +17,15 @@
 //!   an unknown or expired token is code `4097`, "Access token expired or not found";
 //! - `GET /dns-master/zones` lists every zone with the attributes `admin`, `enable`,
 //!   `has-changes`, `has-primary`, `id`, `idn-name`, `name` (Punycode), `payer`, `service`;
-//! - `GET /dns-master/services/{service}/zones/{zone}/records` answers one `zone` element with
-//!   its `rr` elements (`id` attribute; `name`, `idn-name`, `ttl`, `type` and the type's element,
-//!   for TXT `<txt><string>…</string>+</txt>`);
+//! - `GET /dns-master/services/{service}/zones/{zone}/records` answers one `zone` element (with
+//!   `has-changes`) and its `rr` elements (`id` attribute; `name`, `idn-name`, `ttl`, `type` and
+//!   the type's element of documentation section 4.6, for TXT `<txt><string>…</string>+</txt>`,
+//!   with an `idn-name` next to every `name` inside it, as the listing example of 4.5.2 shows);
 //! - `PUT …/records` takes `<request><rr-list><rr>…</rr>+</rr-list></request>` and answers the
-//!   zone with the created records; `ttl` is optional; a TXT `string` holds at most 255 bytes;
-//!   the zone then has changes;
+//!   zone with the created records; `ttl` is optional, numeric or in BIND form (4.6); the type's
+//!   element must be complete: an IPv4 address for A, an IPv6 address for AAAA, a name for
+//!   CNAME, NS, PTR and DNAME, a 16-bit preference and a name for MX, three 16-bit numbers and a
+//!   name for SRV, one to many strings of at most 255 bytes for TXT; the zone then has changes;
 //! - `DELETE …/records/{id}` deletes one record (lego's fixture answers `success`);
 //! - `POST …/commit` publishes every staged change of the zone; `POST …/rollback` discards them.
 //!
@@ -39,7 +42,11 @@
 //!   `{"error":"invalid_scope"}` (the form of RFC 6749 section 5.2);
 //! - a record name is stored relative to the zone, lowercase; an absolute name in a request is
 //!   converted;
-//! - the mock accepts only TXT records in a `PUT`; other types exist only through the control.
+//! - the mock accepts A, AAAA, CNAME, NS, PTR, DNAME, MX, SRV and TXT records in a `PUT`
+//!   (section 4.6 also shows SOA, HINFO, NAPTR and RP; the client does not send them); any other
+//!   type is refused with `4004`; other types exist only through the control;
+//! - the text of each field is stored as sent, trimmed, and listed as stored (a name keeps or
+//!   lacks its trailing dot as sent).
 //!
 //! Error texts are invented.
 
@@ -128,8 +135,12 @@ pub struct Record {
     pub ttl: Option<String>,
     /// The record type.
     pub rtype: String,
-    /// For TXT, the character strings; for other types, one string with the type's data.
+    /// For TXT, the character strings; for a type of section 4.6, the fields of its element in
+    /// the order of the documentation; for another type, one string with its data.
     pub strings: Vec<String>,
+    /// Content of the type's element as given to [`Control::insert_raw`], listed verbatim in
+    /// place of `strings`.
+    pub raw: Option<String>,
 }
 
 impl Record {
@@ -326,8 +337,8 @@ impl Control {
     }
 
     /// Adds a record directly, published and staged alike, as another writer's committed
-    /// change would. `name` is relative to the zone; `data` is the TXT value or the data of
-    /// another type. Returns the record's identifier.
+    /// change would. `name` is relative to the zone; `data` is the TXT value, or the fields of
+    /// another type separated by whitespace. Returns the record's identifier.
     ///
     /// # Panics
     ///
@@ -372,18 +383,82 @@ impl Control {
             .map(|z| z.id)
             .unwrap_or_else(|| panic!("no zone {zone}"));
         let id = inner.new_id();
+        let strings = if rtype == "TXT" || shape(rtype).is_none() {
+            vec![data.to_owned()]
+        } else {
+            data.split_whitespace().map(str::to_owned).collect()
+        };
         inner.staged.push(Record {
             id,
             zone_id,
             name: name.to_lowercase(),
             ttl: ttl.map(str::to_owned),
             rtype: rtype.to_owned(),
-            strings: vec![data.to_owned()],
+            strings,
+            raw: None,
         });
         for z in inner.zones.iter_mut().filter(|z| z.id == zone_id) {
             z.has_changes = true;
         }
         id
+    }
+
+    /// Adds a published record of `rtype` at `name` (relative, as listed) whose type element is
+    /// `element`, listed verbatim: content the documentation does not describe. Returns the
+    /// record's identifier.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such zone.
+    pub fn insert_raw(
+        &self,
+        zone: &str,
+        name: &str,
+        rtype: &str,
+        element: &str,
+        ttl: Option<&str>,
+    ) -> u64 {
+        let id = self.insert_record(zone, name, rtype, "", ttl);
+        let mut inner = lock(&self.state);
+        let inner = &mut *inner;
+        for record in inner
+            .staged
+            .iter_mut()
+            .chain(inner.published.iter_mut())
+            .filter(|r| r.id == id)
+        {
+            record.name = name.to_owned();
+            record.raw = Some(element.to_owned());
+        }
+        id
+    }
+
+    /// Every published record of zone `zone`.
+    pub fn published_all(&self, zone: &str) -> Vec<Record> {
+        let inner = lock(&self.state);
+        let Some(zone_id) = inner.zone_by_name(zone).map(|z| z.id) else {
+            return Vec::new();
+        };
+        inner
+            .published
+            .iter()
+            .filter(|r| r.zone_id == zone_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Every staged record of zone `zone`, the records a commit would publish.
+    pub fn staged_all(&self, zone: &str) -> Vec<Record> {
+        let inner = lock(&self.state);
+        let Some(zone_id) = inner.zone_by_name(zone).map(|z| z.id) else {
+            return Vec::new();
+        };
+        inner
+            .staged
+            .iter()
+            .filter(|r| r.zone_id == zone_id)
+            .cloned()
+            .collect()
     }
 
     /// Stages the deletion of the TXT records of `name` (relative) holding `value`, as an edit
@@ -641,6 +716,67 @@ fn find_zone(inner: &Inner, service: &str, zone: &str) -> Result<Zone, Response>
         .ok_or_else(|| fail("4026", "zone not found"))
 }
 
+/// The element of each record type of documentation section 4.6 other than TXT, and the path
+/// of each of its fields; an empty path is the element's own text.
+const SHAPES: &[(&str, &str, &[&[&str]])] = &[
+    ("A", "a", &[&[]]),
+    ("AAAA", "aaaa", &[&[]]),
+    ("CNAME", "cname", &[&["name"]]),
+    ("NS", "ns", &[&["name"]]),
+    ("PTR", "ptr", &[&["name"]]),
+    ("DNAME", "dname", &[&["name"]]),
+    ("MX", "mx", &[&["preference"], &["exchange", "name"]]),
+    (
+        "SRV",
+        "srv",
+        &[&["priority"], &["weight"], &["port"], &["target", "name"]],
+    ),
+    (
+        "SOA",
+        "soa",
+        &[
+            &["mname", "name"],
+            &["rname", "name"],
+            &["serial"],
+            &["refresh"],
+            &["retry"],
+            &["expire"],
+            &["minimum"],
+        ],
+    ),
+    ("HINFO", "hinfo", &[&["hardware"], &["os"]]),
+    (
+        "NAPTR",
+        "naptr",
+        &[
+            &["order"],
+            &["preference"],
+            &["flags"],
+            &["service"],
+            &["regexp"],
+            &["replacement", "name"],
+        ],
+    ),
+    (
+        "RP",
+        "rp",
+        &[&["mbox-dname", "name"], &["txt-dname", "name"]],
+    ),
+];
+
+/// The element and field paths of `rtype`.
+fn shape(rtype: &str) -> Option<(&'static str, &'static [&'static [&'static str]])> {
+    SHAPES
+        .iter()
+        .find(|(t, _, _)| *t == rtype)
+        .map(|(_, element, fields)| (*element, *fields))
+}
+
+/// The types a `PUT` accepts.
+const WRITABLE: &[&str] = &[
+    "A", "AAAA", "CNAME", "NS", "PTR", "DNAME", "MX", "SRV", "TXT",
+];
+
 fn rr_element(record: &Record) -> String {
     let mut out = format!(
         "\n      <rr id=\"{}\">\n        <name>{}</name>\n        <idn-name>{}</idn-name>\n",
@@ -652,18 +788,33 @@ fn rr_element(record: &Record) -> String {
         let _ = writeln!(out, "        <ttl>{}</ttl>", esc(ttl));
     }
     let _ = writeln!(out, "        <type>{}</type>", esc(&record.rtype));
-    if record.rtype == "TXT" {
+    if let Some(raw) = &record.raw {
+        let _ = writeln!(out, "        {raw}");
+    } else if record.rtype == "TXT" {
         out.push_str("        <txt>\n");
         for s in &record.strings {
             let _ = writeln!(out, "          <string>{}</string>", esc(s));
         }
         out.push_str("        </txt>\n");
-    } else if record.rtype == "A" {
-        let _ = writeln!(out, "        <a>{}</a>", esc(&record.value()));
+    } else if let Some((element, fields)) = shape(&record.rtype) {
+        let _ = write!(out, "        <{element}>");
+        for (path, value) in fields.iter().zip(&record.strings) {
+            for tag in *path {
+                let _ = write!(out, "<{tag}>");
+            }
+            out.push_str(&esc(value));
+            for tag in path.iter().rev() {
+                let _ = write!(out, "</{tag}>");
+                if *tag == "name" {
+                    let _ = write!(out, "<idn-name>{}</idn-name>", esc(value));
+                }
+            }
+        }
+        let _ = writeln!(out, "</{element}>");
     } else {
         let _ = writeln!(
             out,
-            "        <{0}><name>{1}</name></{0}>",
+            "        <{0}>{1}</{0}>",
             record.rtype.to_lowercase(),
             esc(&record.value())
         );
@@ -744,26 +895,16 @@ async fn add_records(
         let (Some(name), Some(rtype)) = (child_text(rr, "name"), child_text(rr, "type")) else {
             return fail("4004", "an rr lacks name or type");
         };
-        if rtype != "TXT" {
+        let rtype = rtype.to_uppercase();
+        if !WRITABLE.contains(&rtype.as_str()) {
             return fail("4004", "unsupported record type");
         }
-        let Some(txt) = rr
-            .children()
-            .find(|c| c.is_element() && c.tag_name().name() == "txt")
-        else {
-            return fail("4004", "a TXT rr lacks txt");
+        let strings = match record_fields(rr, &rtype) {
+            Ok(strings) => strings,
+            Err(text) => return fail("4004", text),
         };
-        // The raw text of each string, as sent.
-        let strings: Vec<String> = txt
-            .children()
-            .filter(|c| c.is_element() && c.tag_name().name() == "string")
-            .map(|c| c.text().unwrap_or("").to_owned())
-            .collect();
-        if strings.is_empty() || strings.iter().any(|s| s.len() > 255) {
-            return fail("4004", "a TXT string is missing or longer than 255 bytes");
-        }
         let ttl = child_text(rr, "ttl").filter(|t| !t.is_empty());
-        if ttl.as_deref().is_some_and(|t| t.parse::<u32>().is_err()) {
+        if ttl.as_deref().is_some_and(|t| !valid_ttl(t)) {
             return fail("4004", "the ttl is not a number");
         }
         let name = relative(&name, &zone.name);
@@ -775,6 +916,7 @@ async fn add_records(
             ttl,
             rtype,
             strings,
+            raw: None,
         });
     }
     inner.staged.extend(created.iter().cloned());
@@ -789,6 +931,78 @@ async fn add_records(
         zone_element(&zone, &inner.seed.username, &format!("{rrs}\n    "))
     );
     success(Some(&data))
+}
+
+/// The fields of record `rr` of type `rtype` (one of [`WRITABLE`]), validated as the
+/// documentation describes them; the text of an error otherwise.
+fn record_fields(rr: roxmltree::Node<'_, '_>, rtype: &str) -> Result<Vec<String>, &'static str> {
+    fn child<'a, 'i>(node: roxmltree::Node<'a, 'i>, tag: &str) -> Option<roxmltree::Node<'a, 'i>> {
+        node.children()
+            .find(|c| c.is_element() && c.tag_name().name() == tag)
+    }
+    if rtype == "TXT" {
+        let txt = child(rr, "txt").ok_or("a TXT rr lacks txt")?;
+        // The raw text of each string, as sent.
+        let strings: Vec<String> = txt
+            .children()
+            .filter(|c| c.is_element() && c.tag_name().name() == "string")
+            .map(|c| c.text().unwrap_or("").to_owned())
+            .collect();
+        if strings.is_empty() || strings.iter().any(|s| s.len() > 255) {
+            return Err("a TXT string is missing or longer than 255 bytes");
+        }
+        return Ok(strings);
+    }
+    let (element, paths) = shape(rtype).ok_or("unsupported record type")?;
+    let node = child(rr, element).ok_or("the rr lacks the element of its type")?;
+    let mut fields = Vec::new();
+    for path in paths {
+        let mut at = node;
+        for tag in *path {
+            at = child(at, tag).ok_or("a field of the record is missing")?;
+        }
+        fields.push(at.text().unwrap_or("").trim().to_owned());
+    }
+    let number = |i: usize| fields.get(i).is_some_and(|f| f.parse::<u16>().is_ok());
+    let name = |i: usize| {
+        fields
+            .get(i)
+            .is_some_and(|f| !f.is_empty() && !f.contains(' '))
+    };
+    let valid = match rtype {
+        "A" => fields
+            .first()
+            .is_some_and(|f| f.parse::<std::net::Ipv4Addr>().is_ok()),
+        "AAAA" => fields
+            .first()
+            .is_some_and(|f| f.parse::<std::net::Ipv6Addr>().is_ok()),
+        "MX" => number(0) && name(1),
+        "SRV" => number(0) && number(1) && number(2) && name(3),
+        _ => name(0),
+    };
+    if !valid {
+        return Err("a field of the record is not valid for its type");
+    }
+    Ok(fields)
+}
+
+/// A TTL in numeric form or in BIND's form of numbers with `w`, `d`, `h`, `m` or `s`
+/// (documentation section 4.6).
+fn valid_ttl(ttl: &str) -> bool {
+    if ttl.parse::<u32>().is_ok() {
+        return true;
+    }
+    let mut digits = false;
+    for c in ttl.chars() {
+        if c.is_ascii_digit() {
+            digits = true;
+        } else if "wdhmsWDHMS".contains(c) && digits {
+            digits = false;
+        } else {
+            return false;
+        }
+    }
+    !ttl.is_empty() && !digits
 }
 
 /// A record name relative to `zone`: `@` for the apex; an absolute name (with a trailing dot)
@@ -898,6 +1112,16 @@ mod tests {
         assert_eq!(pairs["b"], "/:");
         assert_eq!(pairs["c"], "");
         assert_eq!(pairs["d"], "");
+    }
+
+    #[test]
+    fn ttls_are_numeric_or_bind_units() {
+        for good in ["30", "1h", "1h30m", "2W"] {
+            assert!(valid_ttl(good), "{good}");
+        }
+        for bad in ["", "h", "1h3", "-1", "1x"] {
+            assert!(!valid_ttl(bad), "{bad}");
+        }
     }
 
     #[test]

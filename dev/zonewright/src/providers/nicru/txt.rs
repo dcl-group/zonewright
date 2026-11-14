@@ -14,7 +14,8 @@
 //! - (c) the zone is marked "has our staged changes" in the context before an edit is sent, and
 //!   the mark is cleared after a successful commit; a zone with staged changes and the mark is
 //!   committed before the operation goes on, which finishes an earlier operation that failed or
-//!   was dropped between its edit and its commit. A zone found without staged changes has its
+//!   was dropped between its edit and its commit (or rolled back, when the mark was left by a
+//!   record-level operation that did not finish, see `records.rs`). A zone found without staged changes has its
 //!   mark cleared too: nothing of ours can be pending there, and a stale mark must not later
 //!   make a foreign edit look like ours;
 //! - (d) the commit is tried up to three times; if all fail, `Error::Transient`.
@@ -24,8 +25,8 @@
 //! its read and holds it until the operation ends, so the read, the edits and the commits of the
 //! operation are one critical section in the zone.
 //!
-//! - read: `GET /zones` (staged changes of the zone, its service), then `GET …/records`, exact
-//!   name match;
+//! - read: `GET /zones` (staged changes of the zone, its service; leftovers of this process
+//!   settled by `Nicru::settle_leftovers`), then `GET …/records`, exact name match;
 //! - create: mark, `PUT …/records` (sent once), commit;
 //! - delete: mark, `DELETE …/records/{id}` (sent once), commit;
 //! - a failed edit clears the mark at once when it was certainly refused, and otherwise lists
@@ -137,25 +138,17 @@ impl PerRecord for Op<'_> {
     ) -> Result<PerRecordRead<String>, Error> {
         self.lock_zone(zone).await;
         let target = self.client.resolve_zone(zone).await?;
-        if target.has_changes {
-            if !self.client.is_marked(zone) {
-                return Err(Error::Rejected {
-                    status: None,
-                    detail: Detail::constant(FOREIGN_CHANGES),
-                });
-            }
-            // Our own edit from an earlier operation that failed or was dropped before its
-            // commit: finish it (design section 11.3, point c).
-            self.client.commit_own(zone, &target.service).await?;
-        } else {
-            self.client.unmark(zone);
-        }
+        // Refuses foreign staged changes, and finishes (commits) or discards (rolls back) our
+        // own from an earlier operation that failed or was dropped before its end (design
+        // section 11.3, points b and c).
+        self.client.settle_leftovers(zone, &target).await?;
         *self.service.lock().unwrap_or_else(PoisonError::into_inner) = Some(target.service.clone());
         let records = self
             .client
             .api
             .records(&target.service, zone)
             .await?
+            .records
             .into_iter()
             .filter(|rr| rr.rtype.eq_ignore_ascii_case(TXT) && rr.owner.as_ref() == Some(name))
             .map(|rr| TxtRecord {

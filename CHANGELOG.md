@@ -68,9 +68,17 @@ All notable changes to this crate are recorded in this file. The format follows
   zone and each of its subdomains.
 - Record-level operations for reg.ru: A, AAAA and TXT. Other types are listed but not written: the
   documentation does not state how a listing spells their content, which a removal must repeat.
+- Record-level operations for nic.ru: A, AAAA, CNAME, DNAME, MX, NS, PTR, SRV and TXT; SOA is read
+  only. All edits of one operation are staged and published by one commit, or rolled back.
 
 ### Changed
 
+- Route 53 and RFC 2136 accept a requested TTL from 0 to 2147483647; the `ttl` setting keeps its
+  narrower range.
+- A record-level `set_rrset` at a per-record API never publishes two records of a singleton type
+  (such as CNAME), and sends its requests in a fixed, documented order.
+- DigitalOcean record-level writes use the configured `ttl` when the records read state none.
+- Cloud.ru: adding or removing a TXT value at a record with GSLB links is refused.
 - Timeweb Cloud: records are created and deleted with the provider's v2 API instead of the
   deprecated v1 calls, and the listing of the record's own name is read. The client no longer
   remembers created record IDs, and `remove_txt_value` no longer returns `Accepted`. Settings and
