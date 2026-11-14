@@ -24,3 +24,5 @@ All notable changes to this crate are recorded in this file. The format follows
   change batches.
 - DigitalOcean client (`digitalocean`): connection check, zone listing, TXT value operations.
 - VK Cloud client (`vk_cloud`): connection check, zone listing, TXT value operations.
+- RFC 2136 client (`rfc2136`): connection check and TXT value operations by dynamic update over TCP,
+  authenticated with TSIG.

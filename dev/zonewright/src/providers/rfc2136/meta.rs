@@ -4,9 +4,10 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements. Until the client is ported,
-//! every operation flag is false, `record_types` is empty and `txt_values` is `NotOffered`; the
-//! provider's developer switches them on together with the client code that implements them.
+//! Capabilities describe what this version of the crate implements: `check` and the TXT value
+//! operations, for any TXT value (they travel as wire-format RDATA), one RR per message. The
+//! record-level operations are not written yet, so their flags are false and `record_types` is
+//! empty; the protocol has no zone listing.
 
 use crate::id::ProviderId;
 use crate::meta::{
@@ -85,12 +86,12 @@ const CAPABILITIES: Capabilities = Capabilities {
     get_rrset: false,
     set_rrset: false,
     delete_rrset: false,
-    add_txt_value: false,
-    remove_txt_value: false,
+    add_txt_value: true,
+    remove_txt_value: true,
     record_types: TypeSet::Listed(&[]),
     read_only_types: &[],
-    txt_plain_only: true,
-    txt_values: ValueGuarantee::NotOffered,
+    txt_plain_only: false,
+    txt_values: ValueGuarantee::PerValue,
     preconditions: Preconditions::Atomic,
     atomic_rrset_write: false,
     ttl: TtlSupport::PerRrset {

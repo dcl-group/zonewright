@@ -31,6 +31,7 @@ None yet.
 | Route 53     | `route53`      | TXT values |                                                                                                  |
 | DigitalOcean | `digitalocean` | TXT values |                                                                                                  |
 | VK Cloud     | `vk_cloud`     | TXT values |                                                                                                  |
+| RFC 2136     | `rfc2136`      | TXT values | Dynamic update has no operation that lists the records of a zone.                                |
 
 ## Planned
 
@@ -42,7 +43,6 @@ None yet.
 | Hetzner       | `hetzner`       |                                                                    |
 | nic.ru        | `nicru`         |                                                                    |
 | reg.ru        | `regru`         | An earlier version of this client was proven against the live API. |
-| RFC 2136      | `rfc2136`       | Dynamic update has no operation that lists the records of a zone.  |
 | Timeweb Cloud | `timeweb_cloud` |                                                                    |
 | Yandex 360    | `yandex_360`    |                                                                    |
 
