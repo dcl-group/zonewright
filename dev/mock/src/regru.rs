@@ -19,6 +19,8 @@
 //!   and an error code otherwise (section 9.1); `DOMAIN_NOT_FOUND` for a domain that is not
 //!   found or not owned by the user and `DOMAIN_IS_NOT_USE_REGRU_NSS` for a domain whose zone is
 //!   not served by the provider's name servers (section 2.3.3);
+//! - `zone/add_alias` and `zone/add_aaaa` take `subdomain` and `ipaddr`, an IPv4 or an IPv6
+//!   address (sections 9.2 and 9.3); neither has a TTL parameter;
 //! - `zone/add_txt` takes `subdomain` and `text` ("only alphanumeric ASCII characters") and the
 //!   errors `TEXT_NOT_FOUND`, `TEXT_TOOLONG` and `TEXT_CONTAINS_INVALID_CHARACTERS` (section 9.9);
 //!   it has no TTL parameter;
@@ -36,7 +38,11 @@
 //! - HTTP status: every answer, errors included, is `200`, as the documentation's examples show no
 //!   other; only injected faults change it;
 //! - `add_txt` of a value the name already holds appends a second record with the same content
-//!   (the documentation does not say whether it does that or refuses);
+//!   (the documentation does not say whether it does that or refuses); the same for
+//!   `add_alias` and `add_aaaa`;
+//! - `add_alias` and `add_aaaa` refuse an `ipaddr` that is not an address of their family, and a
+//!   missing one, with the code `IP_INVALID` (no code is documented for them); the address is
+//!   stored as sent, and [`Control::add_record`] can store another spelling;
 //! - `remove_record` of a content nothing holds is `success` with no effect (not documented);
 //! - the order of `rrs` is the order of creation; `rrs` of a zone holds every record the mock
 //!   holds, of every type, and no SOA or NS record (the documentation's example shows `soa` as a
@@ -217,6 +223,16 @@ impl Control {
             .collect()
     }
 
+    /// The contents of the records of type `rtype` at `sub` in `zone`, in the order of creation.
+    pub fn contents(&self, zone: &str, sub: &str, rtype: &str) -> Vec<String> {
+        lock(&self.state)
+            .records
+            .iter()
+            .filter(|r| r.zone == zone && r.sub == sub && r.rtype == rtype)
+            .map(|r| r.content.clone())
+            .collect()
+    }
+
     /// Adds a record directly, as another writer would.
     pub fn add_record(&self, zone: &str, sub: &str, rtype: &str, content: &str) {
         lock(&self.state).records.push(Record {
@@ -383,7 +399,12 @@ async fn handle(State(state): State<Shared>, method: Method, uri: Uri, body: Byt
 fn zone_function(s: &mut Inner, function: &str, input: &Value) -> Value {
     if !matches!(
         function,
-        "zone/nop" | "zone/add_txt" | "zone/remove_record" | "zone/get_resource_records"
+        "zone/nop"
+            | "zone/add_alias"
+            | "zone/add_aaaa"
+            | "zone/add_txt"
+            | "zone/remove_record"
+            | "zone/get_resource_records"
     ) {
         return error("NO_SUCH_COMMAND", "Command not found");
     }
@@ -391,7 +412,20 @@ fn zone_function(s: &mut Inner, function: &str, input: &Value) -> Value {
     let subdomain = input.get("subdomain").and_then(Value::as_str);
     let content = input.get("content").and_then(Value::as_str);
     let record_type = input.get("record_type").and_then(Value::as_str);
+    let ipaddr = input.get("ipaddr").and_then(Value::as_str);
     match function {
+        "zone/add_alias" | "zone/add_aaaa" => {
+            if subdomain.is_none_or(str::is_empty) {
+                return error("PARAMETER_MISSING", "subdomain required");
+            }
+            let valid = match function {
+                "zone/add_alias" => ipaddr.is_some_and(|a| a.parse::<std::net::Ipv4Addr>().is_ok()),
+                _ => ipaddr.is_some_and(|a| a.parse::<std::net::Ipv6Addr>().is_ok()),
+            };
+            if !valid {
+                return error("IP_INVALID", "IP address is invalid");
+            }
+        }
         "zone/add_txt" => {
             if subdomain.is_none_or(str::is_empty) {
                 return error("PARAMETER_MISSING", "subdomain required");
@@ -450,6 +484,16 @@ fn zone_function(s: &mut Inner, function: &str, input: &Value) -> Value {
         let mut done = json!({"dname": dname, "result": "success", "service_id": "12345"});
         match function {
             "zone/nop" => {}
+            "zone/add_alias" | "zone/add_aaaa" => s.records.push(Record {
+                zone: dname.to_owned(),
+                sub: subdomain.unwrap_or_default().to_owned(),
+                rtype: if function == "zone/add_alias" {
+                    "A".into()
+                } else {
+                    "AAAA".into()
+                },
+                content: ipaddr.unwrap_or_default().to_owned(),
+            }),
             "zone/add_txt" => s.records.push(Record {
                 zone: dname.to_owned(),
                 sub: subdomain.unwrap_or_default().to_owned(),

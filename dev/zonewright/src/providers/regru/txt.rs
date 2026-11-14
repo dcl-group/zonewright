@@ -50,7 +50,7 @@ const WRITE: TxtDialect = TxtDialect::Raw;
 /// The name relative to the zone as the API spells it: `@` for the zone itself.
 // Source: the documentation, 9.11 (`subname`: "@ for the domain itself") and 9.18 (`subdomain`
 // `@` in the request example).
-fn subdomain<'a>(zone: &DomainName, name: &'a DomainName) -> Result<&'a str, Error> {
+pub(super) fn subdomain<'a>(zone: &DomainName, name: &'a DomainName) -> Result<&'a str, Error> {
     match name.relative_to(zone) {
         Some("") => Ok("@"),
         Some(relative) => Ok(relative),
@@ -131,7 +131,9 @@ impl PerRecord for Regru {
         record: &TxtRecord<String>,
     ) -> Result<(), Error> {
         let sub = subdomain(zone, name)?;
-        self.api.remove_txt(zone, sub, &record.handle).await?;
+        self.api
+            .remove_record(zone, sub, TXT, &record.handle)
+            .await?;
         // The documentation does not say what the function answers for a content nothing
         // holds, so a `success` does not prove that the record is gone. Reading the zone again
         // does: a record with the content just named that is still there, with the API having

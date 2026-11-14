@@ -73,6 +73,7 @@ mod values;
     feature = "vk_cloud",
     feature = "yandex_360",
     feature = "timeweb_cloud",
+    feature = "regru",
     feature = "route53",
     feature = "rfc2136",
     feature = "cloud_ru"

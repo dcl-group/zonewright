@@ -37,7 +37,7 @@ None yet.
 | Cloud.ru      | `cloud_ru`      | TXT values, records   |                                                                                                  |
 | Hetzner       | `hetzner`       | TXT values, records   |                                                                                                  |
 | nic.ru        | `nicru`         | TXT values            |                                                                                                  |
-| reg.ru        | `regru`         | TXT values            | An earlier version of this client was proven against the live API.                               |
+| reg.ru        | `regru`         | TXT values, records   | An earlier version of this client was proven against the live API.                               |
 | acme-dns      | `acme_dns`      | TXT values (add only) | TXT values only: the acme-dns API offers nothing else.                                           |
 | Beget         | `beget`         | TXT values            |                                                                                                  |
 

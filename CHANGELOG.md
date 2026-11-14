@@ -66,6 +66,8 @@ All notable changes to this crate are recorded in this file. The format follows
   listed as skipped: the API documentation names no value field for them.
 - Record-level operations for Timeweb Cloud: A, AAAA, CNAME, MX and TXT; a zone listing reads the
   zone and each of its subdomains.
+- Record-level operations for reg.ru: A, AAAA and TXT. Other types are listed but not written: the
+  documentation does not state how a listing spells their content, which a removal must repeat.
 
 ### Changed
 

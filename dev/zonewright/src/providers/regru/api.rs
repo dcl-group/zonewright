@@ -1,6 +1,6 @@
 //! The reg.ru API 2 as this client uses it: one function per API function, the wire types and the
-//! classification of answers. Nothing here knows the value layer; `client.rs` and `txt.rs` build
-//! on these calls.
+//! classification of answers. Nothing here knows the value layer or the record layer; `client.rs`,
+//! `txt.rs` and `records.rs` build on these calls.
 //!
 //! Sources (hard rule 3):
 //!
@@ -24,6 +24,9 @@
 //!   - 4.1: the function `nop` ("nothing, plus the login and ID of the authenticated user") at
 //!     `{base}/nop`, with the answer `{"login", "user_id"}` and `PASSWORD_AUTH_FAILED` for wrong
 //!     credentials;
+//!   - 9.2 `zone/add_alias`: `subdomain` (`@` for the domain itself, `*` for every subdomain not
+//!     named in other records) and `ipaddr`, the IPv4 address; 9.3 `zone/add_aaaa`: the same
+//!     fields with an IPv6 address; neither has a TTL parameter;
 //!   - 9.1 `zone/nop`: whether the zone of a domain can be managed; the answer is `domains`
 //!     with `result` per domain; "managing the zone is possible only if the domain uses the name
 //!     servers ns1.reg.ru and ns2.reg.ru";
@@ -31,9 +34,13 @@
 //!     set"), the errors `TEXT_NOT_FOUND`, `TEXT_TOOLONG`, `TEXT_CONTAINS_INVALID_CHARACTERS`;
 //!     there is no TTL parameter;
 //!   - 9.11 `zone/get_resource_records`: `domains[].rrs[]` with `subname` (`@` for the domain
-//!     itself, `*` for all other subdomains, or the name of the subdomain), `rectype`, `content`;
-//!   - 9.18 `zone/remove_record`: `subdomain` and `record_type` required, `content` optional,
-//!     "when it is absent, all records that satisfy the other parameters are marked for
+//!     itself, `*` for all other subdomains, or the name of the subdomain), `rectype`, `content`
+//!     ("IP address for A, IPv6 address for AAAA, and others"), `prio` and `state` ("A: active;
+//!     obsolete, present only for compatibility"); the zone's `soa` is an object of its own, not
+//!     a record;
+//!   - 9.18 `zone/remove_record`: `subdomain` and `record_type` required, `priority` optional
+//!     ("default 0; not applicable to the removal of an A record and similar records"), `content`
+//!     optional, "when it is absent, all records that satisfy the other parameters are marked for
 //!     deletion";
 //!   - 9.19 `zone/clear` deletes every record of a zone and is never called.
 //! - lego `providers/dns/regru/internal/client.go` and `types.go`: the request bodies of
@@ -50,8 +57,10 @@
 //! | credentials           | `/nop`                       | yes        |
 //! | zone check            | `/zone/nop`                  | yes        |
 //! | read records          | `/zone/get_resource_records` | yes        |
+//! | add an A record       | `/zone/add_alias`            | no         |
+//! | add an AAAA record    | `/zone/add_aaaa`             | no         |
 //! | add a TXT record      | `/zone/add_txt`              | no         |
-//! | remove TXT by content | `/zone/remove_record`        | no         |
+//! | remove by content     | `/zone/remove_record`        | no         |
 //!
 //! HTTP status. The documentation shows every answer, errors included, as a JSON object and
 //! states no status for any of them; lego treats any non-2xx status as an error and reads both
@@ -74,8 +83,12 @@ use crate::http::{Endpoint, Http, Request, Response};
 use crate::name::DomainName;
 use crate::redact::Detail;
 
-/// The record type name as the API spells it.
+/// The record type names as the API spells them.
+// Source: the documentation, 9.11 (`rectype`: "A, AAAA, CNAME, MX, NS and others") and 9.18
+// (`record_type` "A" in the request example); lego types.go (`record_type: "TXT"`).
 pub(super) const TXT: &str = "TXT";
+pub(super) const A: &str = "A";
+pub(super) const AAAA: &str = "AAAA";
 
 /// `output_content_type` of every call: the form lego sends, which makes the answer plain
 /// `text/plain` JSON.
@@ -92,6 +105,10 @@ enum Function {
     ZoneNop,
     /// `zone/get_resource_records`.
     GetResourceRecords,
+    /// `zone/add_alias`.
+    AddAlias,
+    /// `zone/add_aaaa`.
+    AddAaaa,
     /// `zone/add_txt`.
     AddTxt,
     /// `zone/remove_record`.
@@ -105,6 +122,8 @@ impl Function {
             Function::Nop => "/nop",
             Function::ZoneNop => "/zone/nop",
             Function::GetResourceRecords => "/zone/get_resource_records",
+            Function::AddAlias => "/zone/add_alias",
+            Function::AddAaaa => "/zone/add_aaaa",
             Function::AddTxt => "/zone/add_txt",
             Function::RemoveRecord => "/zone/remove_record",
         }
@@ -126,13 +145,15 @@ struct DomainRef<'a> {
 }
 
 /// The `input_data` of a zone call: the one domain and the parameters of the function.
-// Source: the documentation, 9.1, 9.9, 9.11 and 9.18 (request examples); lego types.go lines 57
-// to 77.
+// Source: the documentation, 9.1, 9.2, 9.3, 9.9, 9.11 and 9.18 (request examples); lego types.go
+// lines 57 to 77.
 #[derive(Serialize)]
 struct Input<'a> {
     domains: [DomainRef<'a>; 1],
     #[serde(skip_serializing_if = "Option::is_none")]
     subdomain: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipaddr: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,6 +170,7 @@ impl<'a> Input<'a> {
                 dname: zone.without_dot(),
             }],
             subdomain: None,
+            ipaddr: None,
             text: None,
             content: None,
             record_type: None,
@@ -336,18 +358,45 @@ impl Api {
             .map(drop)
     }
 
-    /// Removes the TXT records at `sub` whose content is `content`. Sent once.
+    /// Adds an A record (`zone/add_alias`) or an AAAA record (`zone/add_aaaa`) with the address
+    /// `ipaddr` at `sub` ("@" for the zone itself). Sent once: the documentation does not say what
+    /// a repeated add does.
+    pub(super) async fn add_address(
+        &self,
+        zone: &DomainName,
+        sub: &str,
+        record_type: &str,
+        ipaddr: &str,
+    ) -> Result<(), Error> {
+        let function = match record_type {
+            A => Function::AddAlias,
+            AAAA => Function::AddAaaa,
+            _ => {
+                return Err(Error::InvalidInput {
+                    detail: Detail::constant("the record type has no address function"),
+                });
+            }
+        };
+        let mut input = Input::new(zone);
+        input.subdomain = Some(sub);
+        input.ipaddr = Some(ipaddr);
+        self.zone_call(function, zone, &input).await.map(drop)
+    }
+
+    /// Removes the records of type `record_type` at `sub` whose content is `content`. Sent once.
+    /// No `priority` is sent: the client removes only types to which it does not apply
+    /// (documentation 9.18).
     ///
     /// A `content` that is empty or only white space is refused before any request: with no
     /// content the function removes every record of the type at the name (documentation 9.18),
     /// which is never what this client means, and whether the API trims white space before it
-    /// looks at the field is not documented. The value layer only ever passes the content of a
-    /// record that holds a plain value, which is never blank; the check guards the request
-    /// itself.
-    pub(super) async fn remove_txt(
+    /// looks at the field is not documented. The layers above only ever pass the content of a
+    /// record as the listing returned it; the check guards the request itself.
+    pub(super) async fn remove_record(
         &self,
         zone: &DomainName,
         sub: &str,
+        record_type: &str,
         content: &str,
     ) -> Result<(), Error> {
         if content.trim().is_empty() {
@@ -358,7 +407,7 @@ impl Api {
         let mut input = Input::new(zone);
         input.subdomain = Some(sub);
         input.content = Some(content);
-        input.record_type = Some(TXT);
+        input.record_type = Some(record_type);
         self.zone_call(Function::RemoveRecord, zone, &input)
             .await
             .map(drop)
@@ -583,8 +632,13 @@ mod tests {
         );
         let zone = DomainName::parse("example.org").unwrap();
         for content in ["", " ", "\t", "\n", " \r\n "] {
-            let e = api.remove_txt(&zone, "x", content).await.unwrap_err();
-            assert_eq!(e.kind(), ErrorKind::InvalidInput, "{content:?}: {e:?}");
+            for rtype in [super::TXT, super::A, super::AAAA] {
+                let e = api
+                    .remove_record(&zone, "x", rtype, content)
+                    .await
+                    .unwrap_err();
+                assert_eq!(e.kind(), ErrorKind::InvalidInput, "{content:?}: {e:?}");
+            }
         }
     }
 

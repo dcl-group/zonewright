@@ -4,15 +4,16 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements: `check` and the TXT value
-//! operations on plain values. The API has no zone listing, and the record-level operations are
-//! not written yet, so their flags are false and `record_types` is empty.
+//! Capabilities describe what this version of the crate implements: `check`, the TXT value
+//! operations on plain values, and the record-level operations for A, AAAA and TXT. The API has no
+//! zone listing.
 
 use crate::id::ProviderId;
 use crate::meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
     ValueGuarantee,
 };
+use crate::record::RecordType;
 
 /// The metadata of reg.ru.
 pub(crate) static META: ProviderMeta = ProviderMeta {
@@ -91,13 +92,16 @@ const FIELDS: &[ConfigField] = &[
 /// What this version of the crate implements for reg.ru.
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: false,
-    list_rrsets: false,
-    get_rrset: false,
-    set_rrset: false,
-    delete_rrset: false,
+    list_rrsets: true,
+    get_rrset: true,
+    set_rrset: true,
+    delete_rrset: true,
     add_txt_value: true,
     remove_txt_value: true,
-    record_types: TypeSet::Listed(&[]),
+    // The types whose add function, listing form and removal the documentation gives (9.2, 9.3,
+    // 9.9, 9.11, 9.18). CAA, CNAME, HTTPS, MX, NS and SRV have add functions, but the listing's
+    // content form for them is not documented (see `records.rs`).
+    record_types: TypeSet::Listed(&[RecordType::A, RecordType::AAAA, RecordType::TXT]),
     read_only_types: &[],
     // The documentation allows only alphanumeric ASCII characters in the text of a TXT record
     // (9.9); the encoding of anything else is not established (design section 4.4).
@@ -105,10 +109,12 @@ const CAPABILITIES: Capabilities = Capabilities {
     // Every value is a record of its own, identified by its content and removed by it (design
     // section 3.5).
     txt_values: ValueGuarantee::PerValue,
+    // The client reads, compares and writes; no request carries a condition on the rrset.
     preconditions: Preconditions::ReadThenWrite,
     // Individual records without IDs: a replacement is several requests.
     atomic_rrset_write: false,
-    // `zone/add_txt` has no TTL parameter (documentation 9.9).
+    // No add function has a TTL parameter (documentation 9.2, 9.3, 9.9), and the listing states
+    // none per record (9.11).
     ttl: TtlSupport::NotSettable,
     provider_default_ttl: true,
     asynchronous: false,

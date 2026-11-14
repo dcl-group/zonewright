@@ -2,7 +2,8 @@
 //!
 //! The module follows the layout of every provider module: `meta.rs` (static metadata),
 //! `config.rs` (settings and credentials), `api.rs` (the HTTP API), `txt.rs` (the TXT value
-//! operations over one shape of the value layer) and this file.
+//! operations over one shape of the value layer), `records.rs` (the record-level operations over
+//! one shape of the record layer) and this file.
 //!
 //! The domain's name is the key of every call, so there are no zone identifiers to cache and
 //! none to go stale.
@@ -17,10 +18,13 @@ use crate::http::Http;
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
-use crate::values;
+use crate::{rrsets, values};
 
 use super::api::{self, Api};
 use super::config::{self, RegruConfig, RegruCredentials};
@@ -35,9 +39,15 @@ use super::config::{self, RegruConfig, RegruCredentials};
 /// a request (`ValueGuarantee::PerValue`); a writer outside this process can at worst cause a
 /// duplicate of our own value.
 ///
-/// The API has no zone listing, so `list_zones` is unsupported. It has no TTL parameter for TXT
-/// records: the zone's settings decide. Every call is a `POST`, reads included; only the reads
-/// are repeated automatically.
+/// The record-level operations cover A, AAAA and TXT, the types whose add function and listing
+/// form the documentation gives. Replacing an rrset is several requests (creates, then removals by
+/// content) and not atomic (`atomic_rrset_write` is false), and a writer outside this process that
+/// changes the rrset between the read and the writes is not detected
+/// (`Preconditions::ReadThenWrite`).
+///
+/// The API has no zone listing, so `list_zones` is unsupported. No add function has a TTL
+/// parameter: the zone's settings decide, and a requested TTL is refused. Every call is a `POST`,
+/// reads included; only the reads are repeated automatically.
 ///
 /// A zone is read whole, in one answer, before anything is written; a zone whose records do not
 /// fit the transport's 4 MiB limit cannot be used and fails with `Error::Protocol`.
@@ -130,6 +140,39 @@ impl Provider for Regru {
             checks.push(self.check_zone(zone).await?);
         }
         Ok(CheckReport::new(true, checks))
+    }
+
+    /// Every record of the zone, in one answer, grouped into rrsets.
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_per_record(self, zone, name, rtype).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        rrsets::set_per_record(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_per_record(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(
