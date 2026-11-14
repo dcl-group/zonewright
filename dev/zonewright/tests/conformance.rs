@@ -1014,7 +1014,10 @@ async fn ttl_requests_the_provider_refuses_send_nothing() {
             }
         }
     }
-    if ProviderId::ALL.iter().any(|id| id.available()) {
+    // A single provider may accept every TTL request (Hetzner takes the whole range and the
+    // provider's default), so the loop can be empty for one feature alone. With all providers
+    // compiled in it must not be: several of them refuse the provider's default.
+    if cfg!(feature = "all-providers") {
         assert!(refused > 0);
     }
 }
