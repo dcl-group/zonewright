@@ -91,7 +91,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::{DomainName, TargetName};
 use crate::provider::{SkipReason, ZoneListing};
-use crate::record::{Caa, Mx, RecordData, RecordType, Srv, Ttl, Txt, TxtDialect};
+use crate::record::{Caa, Mx, RecordData, RecordType, RrsetTtl, Srv, Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
     self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
@@ -382,8 +382,9 @@ fn not_sendable() -> Error {
 impl Yandex360 {
     /// The TTL a write sends: the API requires one, so the configured TTL stands in when the
     /// layer has none.
-    fn write_ttl(&self, ttl: Option<Ttl>) -> u32 {
-        ttl.map_or(self.ttl, Ttl::as_secs)
+    fn write_ttl(&self, ttl: Option<RrsetTtl>) -> u32 {
+        ttl.and_then(RrsetTtl::explicit)
+            .map_or(self.ttl, Ttl::as_secs)
     }
 }
 
@@ -427,7 +428,7 @@ impl PerRecord for Yandex360 {
                 data: read_record(rtype, &record),
                 // The API has no disabled records.
                 enabled: true,
-                ttl: record.ttl.and_then(|secs| Ttl::from_secs(secs).ok()),
+                ttl: record.ttl.and_then(|secs| RrsetTtl::from_secs(secs).ok()),
                 handle: record,
             })
             .collect();
@@ -448,10 +449,13 @@ impl PerRecord for Yandex360 {
     ) -> Result<(), Error> {
         let fields = encode(rtype, data).ok_or_else(not_sendable)?;
         let ttl = match ttl {
-            SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => ttl.as_secs(),
+            SetTtl::Requested(RrsetTtl::Explicit(ttl))
+            | SetTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
             // The API requires a TTL: the configured one for a new set, and for a set whose TTL
             // was not reported.
-            SetTtl::Default | SetTtl::Existing(None) => self.ttl,
+            SetTtl::Default
+            | SetTtl::Requested(RrsetTtl::ProviderDefault)
+            | SetTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => self.ttl,
         };
         let owner = write_name(name, zone)
             .ok_or_else(|| Error::name_outside_zone(name.clone(), zone.clone()))?;
@@ -572,7 +576,7 @@ struct Group {
     name: Option<DomainName>,
     type_name: String,
     rtype: Option<RecordType>,
-    ttl: Option<Ttl>,
+    ttl: Option<RrsetTtl>,
     records: Vec<RecordData>,
 }
 
@@ -594,7 +598,7 @@ impl Yandex360 {
                     .map_or_else(|| format!("raw:{}", record.name), |n| n.as_str().to_owned()),
                 rtype.map_or_else(|| format!("raw:{}", record.rtype), |t| t.to_string()),
             );
-            let ttl = record.ttl.and_then(|secs| Ttl::from_secs(secs).ok());
+            let ttl = record.ttl.and_then(|secs| RrsetTtl::from_secs(secs).ok());
             let group = groups.entry(key).or_insert_with(|| Group {
                 name,
                 type_name: record.rtype.clone(),

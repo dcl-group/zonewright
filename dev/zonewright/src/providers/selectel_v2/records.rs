@@ -75,7 +75,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
 use crate::provider::ZoneListing;
-use crate::record::{RecordData, RecordType, Ttl, TxtDialect};
+use crate::record::{RecordData, RecordType, RrsetTtl, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{self, Current, Found, Listing, Member, RrsetBase, SetTtl, Stored, WholeSet};
 
@@ -159,7 +159,7 @@ fn found(zone: &DomainName, rtype: RecordType, rrset: Rrset) -> Found<Record, Rr
         .collect();
     Found {
         records,
-        ttl: Ttl::from_secs(rrset.ttl).ok(),
+        ttl: RrsetTtl::from_secs(rrset.ttl).ok(),
         snapshot: rrset,
     }
 }
@@ -212,8 +212,12 @@ impl WholeSet for SelectelV2 {
             })
             .collect::<Result<Vec<Record>, Error>>()?;
         let ttl = match ttl {
-            SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => ttl.as_secs(),
-            SetTtl::Existing(None) | SetTtl::Default => self.ttl,
+            SetTtl::Requested(RrsetTtl::Explicit(ttl))
+            | SetTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
+            // No default TTL of its own: the layer never passes it, and the setting stands in.
+            SetTtl::Existing(None | Some(RrsetTtl::ProviderDefault))
+            | SetTtl::Default
+            | SetTtl::Requested(RrsetTtl::ProviderDefault) => self.ttl,
         };
         match prior {
             None => {
@@ -258,7 +262,7 @@ impl SelectelV2 {
         let mut listing = Listing::new(zone);
         for rrset in all {
             let name = DomainName::parse(&rrset.name).ok();
-            let ttl = Ttl::from_secs(rrset.ttl).ok();
+            let ttl = RrsetTtl::from_secs(rrset.ttl).ok();
             let enabled: Vec<&str> = rrset
                 .records
                 .iter()

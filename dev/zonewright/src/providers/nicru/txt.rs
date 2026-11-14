@@ -36,8 +36,10 @@
 //! TXT dialect (design sections 4.4 and 11.2): read `Raw`, write `Raw`. The API carries each
 //! character string as the text of a `string` element; only plain values are written.
 //!
-//! TTL: the API stores a TTL on every record. A record added to an existing set gets the
-//! smallest TTL read; when the set states none, none is sent and the zone's default applies.
+//! TTL: the API stores a TTL on every record; one without `<ttl>` has the zone's default and
+//! reads as the provider's default. A record added to an existing set gets the smallest
+//! explicit TTL read; when the set has none, none is sent and the zone's default applies. A new
+//! set asked to have the provider's default is staged without `<ttl>` as well.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -46,12 +48,13 @@ use crate::id::ProviderId;
 use crate::locks::{NameGuard, NameLocks};
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, Txt, TxtDialect};
+use crate::record::{Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
 use super::api::TXT;
 use super::client::Nicru;
+use super::records::{api_ttl, read_ttl};
 
 /// How TXT text is read.
 const READ: TxtDialect = TxtDialect::Raw;
@@ -153,7 +156,7 @@ impl PerRecord for Op<'_> {
             .filter(|rr| rr.rtype.eq_ignore_ascii_case(TXT) && rr.owner.as_ref() == Some(name))
             .map(|rr| TxtRecord {
                 value: rr.txt.as_deref().and_then(|text| READ.read(text)),
-                ttl: rr.ttl.and_then(|ttl| Ttl::from_secs(ttl).ok()),
+                ttl: read_ttl(rr.ttl),
                 handle: rr.id,
             })
             .collect();
@@ -175,11 +178,7 @@ impl PerRecord for Op<'_> {
             Some(relative) => relative,
             None => return Err(Error::name_outside_zone(name.clone(), zone.clone())),
         };
-        let ttl = match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => Some(ttl.as_secs()),
-            WriteTtl::New(None) => Some(self.client.ttl),
-            WriteTtl::Existing(None) => None,
-        };
+        let ttl = api_ttl(ttl.resolve(self.client.ttl));
         let service = self.service()?;
         // Recorded before the edit is sent (design section 3.2), so that an edit whose answer
         // is lost is recognized as ours.

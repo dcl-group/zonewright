@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 use crate::context::Context;
 use crate::error::Error;
 use crate::name::DomainName;
+use crate::record::{RrsetTtl, Ttl};
 use crate::redact::Detail;
 
 use super::tsig::{Algorithm, Key};
@@ -56,9 +57,10 @@ pub struct Rfc2136Config {
     )]
     pub algorithm: String,
     /// TTL of new records, in seconds: 1 to 86400; default 60. An absent key and `null` mean
-    /// the default.
+    /// the default (60), as they always have; `"provider_default"` is refused, since every RR
+    /// carries a TTL on the wire.
     #[serde(default = "default_ttl", deserialize_with = "ttl_or_default")]
-    pub ttl: u32,
+    pub ttl: RrsetTtl,
 }
 
 /// The default of `algorithm`.
@@ -67,8 +69,8 @@ fn default_algorithm() -> String {
 }
 
 /// The default of `ttl`.
-fn default_ttl() -> u32 {
-    DEFAULT_TTL
+fn default_ttl() -> RrsetTtl {
+    RrsetTtl::Explicit(Ttl::clamped(DEFAULT_TTL))
 }
 
 /// `algorithm`, with `null` read as the default.
@@ -77,8 +79,8 @@ fn algorithm_or_default<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String
 }
 
 /// `ttl`, with `null` read as the default.
-fn ttl_or_default<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
-    Ok(Option::<u32>::deserialize(d)?.unwrap_or(DEFAULT_TTL))
+fn ttl_or_default<'de, D: serde::Deserializer<'de>>(d: D) -> Result<RrsetTtl, D::Error> {
+    Ok(Option::<RrsetTtl>::deserialize(d)?.unwrap_or_else(default_ttl))
 }
 
 impl Rfc2136Config {
@@ -89,7 +91,7 @@ impl Rfc2136Config {
             server,
             key_name,
             algorithm: default_algorithm(),
-            ttl: DEFAULT_TTL,
+            ttl: default_ttl(),
         }
     }
 
@@ -119,10 +121,17 @@ impl Rfc2136Config {
             text => Algorithm::parse(text)
                 .ok_or_else(|| config("algorithm must be hmac-sha256 or hmac-sha512"))?,
         };
-        let ttl = self.ttl;
-        if !(TTL_MIN..=TTL_MAX).contains(&ttl) {
-            return Err(config("ttl must be between 1 and 86400"));
-        }
+        let ttl = match self.ttl {
+            RrsetTtl::Explicit(ttl) if (TTL_MIN..=TTL_MAX).contains(&ttl.as_secs()) => {
+                ttl.as_secs()
+            }
+            RrsetTtl::Explicit(_) => return Err(config("ttl must be between 1 and 86400")),
+            RrsetTtl::ProviderDefault => {
+                return Err(config(
+                    "ttl cannot be provider_default: the provider has no default TTL of its own",
+                ));
+            }
+        };
         let secret = decode_secret(&credentials.secret)?;
         Ok(Settings {
             server,

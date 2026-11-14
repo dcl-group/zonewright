@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::Context;
 use crate::error::Error;
 use crate::http::Endpoint;
+use crate::record::{RrsetTtl, Ttl};
 use crate::redact::Detail;
 
 /// Default API endpoint.
@@ -50,15 +51,15 @@ pub struct Yandex360Config {
     pub org_id: String,
     /// TTL of a new record, in seconds: 60 to 86400, default 300.
     #[serde(default = "default_ttl")]
-    pub ttl: u32,
+    pub ttl: RrsetTtl,
 }
 
 fn default_base_url() -> String {
     DEFAULT_BASE_URL.to_owned()
 }
 
-fn default_ttl() -> u32 {
-    DEFAULT_TTL
+fn default_ttl() -> RrsetTtl {
+    RrsetTtl::Explicit(Ttl::clamped(DEFAULT_TTL))
 }
 
 impl Yandex360Config {
@@ -82,13 +83,21 @@ impl Yandex360Config {
         {
             return Err(config("org_id must be a decimal number"));
         }
-        if !(TTL_MIN..=TTL_MAX).contains(&self.ttl) {
-            return Err(config("ttl must be between 60 and 86400"));
-        }
+        let ttl = match self.ttl {
+            RrsetTtl::Explicit(ttl) if (TTL_MIN..=TTL_MAX).contains(&ttl.as_secs()) => {
+                ttl.as_secs()
+            }
+            RrsetTtl::Explicit(_) => return Err(config("ttl must be between 60 and 86400")),
+            RrsetTtl::ProviderDefault => {
+                return Err(config(
+                    "ttl cannot be provider_default: the provider has no default TTL of its own",
+                ));
+            }
+        };
         Ok(Settings {
             api: Endpoint::parse("base_url", &self.base_url, ctx)?,
             org_id: self.org_id.clone(),
-            ttl: self.ttl,
+            ttl,
         })
     }
 }

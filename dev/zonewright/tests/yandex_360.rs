@@ -17,8 +17,8 @@ use secrecy::SecretString;
 use zonewright::providers::yandex_360::{Yandex360, Yandex360Config, Yandex360Credentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, SkipReason,
-    Ttl, Txt,
+    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl, SetOutcome,
+    SkipReason, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -394,7 +394,7 @@ async fn yandex_360_invalid_input_sends_nothing() {
                 &zone(),
                 &name(),
                 &txt("v1"),
-                Some(Ttl::from_secs(ttl).unwrap()),
+                Some(RrsetTtl::from_secs(ttl).unwrap()),
             )
             .await
             .unwrap_err();
@@ -907,7 +907,7 @@ async fn yandex_360_exact_name_match() {
 async fn yandex_360_ttl_policy() {
     let mock = Yandex360Mock::start(Seed::standard()).await;
     let mut config = settings(mock.base_url());
-    config.ttl = 90;
+    config.ttl = RrsetTtl::from_secs(90).unwrap();
     let client = Yandex360::new(config, credentials(TOKEN), &context()).unwrap();
     let ttl = |name: &str| mock.control().txt_records(name)[0].ttl;
     let other = dn("a.example.org");
@@ -922,7 +922,7 @@ async fn yandex_360_ttl_policy() {
             &zone(),
             &third,
             &txt("v"),
-            Some(Ttl::from_secs(120).unwrap()),
+            Some(RrsetTtl::from_secs(120).unwrap()),
         )
         .await
         .unwrap();
@@ -936,7 +936,7 @@ async fn yandex_360_ttl_policy() {
             &zone(),
             &name(),
             &txt("ours"),
-            Some(Ttl::from_secs(3000).unwrap()),
+            Some(RrsetTtl::from_secs(3000).unwrap()),
         )
         .await
         .unwrap();
@@ -1466,7 +1466,7 @@ fn rr(owner: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrSet
     RrSet::new(
         dn(owner),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         texts.iter().map(|t| rdata(rtype, t)),
     )
     .unwrap()
@@ -1474,8 +1474,10 @@ fn rr(owner: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrSet
 
 /// `set` with the configured default TTL when it has none.
 fn with_default_ttl(set: &RrSet) -> RrSet {
-    set.clone()
-        .with_ttl(set.ttl().or(Some(Ttl::from_secs(DEFAULT_TTL).unwrap())))
+    set.clone().with_ttl(
+        set.ttl()
+            .or(Some(RrsetTtl::from_secs(DEFAULT_TTL).unwrap())),
+    )
 }
 
 /// Number of record write requests: creates, edits and deletes.
@@ -1672,7 +1674,11 @@ async fn yandex_360_record_round_trips() {
             .get_rrset(&zone(), &dn("other.example.org"), RecordType::MX)
             .await
             .unwrap(),
-        Some(other.clone().with_ttl(Some(Ttl::from_secs(600).unwrap())))
+        Some(
+            other
+                .clone()
+                .with_ttl(Some(RrsetTtl::from_secs(600).unwrap()))
+        )
     );
     let before = record_writes(&mock);
     assert_eq!(
@@ -1810,7 +1816,7 @@ async fn yandex_360_set_any_replaces_and_delete_converges() {
 
     let retuned = replaced
         .clone()
-        .with_ttl(Some(Ttl::from_secs(900).unwrap()));
+        .with_ttl(Some(RrsetTtl::from_secs(900).unwrap()));
     assert_eq!(
         client
             .set_rrset(&zone(), &retuned, Expect::Any)
@@ -2029,7 +2035,9 @@ async fn yandex_360_caa_is_replaced_never_edited() {
         .unwrap();
     let original = mock.control().records();
     let before = record_writes(&mock);
-    let retuned = caa.clone().with_ttl(Some(Ttl::from_secs(900).unwrap()));
+    let retuned = caa
+        .clone()
+        .with_ttl(Some(RrsetTtl::from_secs(900).unwrap()));
     let e = client
         .set_rrset(&zone(), &retuned, Expect::Any)
         .await
@@ -2262,7 +2270,7 @@ async fn yandex_360_record_operations_touch_only_their_rrset() {
         );
         let set = rr(www, RecordType::A, None, &["192.0.2.5", "192.0.2.6"]);
         client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
-        let set = set.with_ttl(Some(Ttl::from_secs(60).unwrap()));
+        let set = set.with_ttl(Some(RrsetTtl::from_secs(60).unwrap()));
         client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
         assert_eq!(
             client
@@ -2443,7 +2451,7 @@ async fn yandex_360_record_ttls() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(read.ttl(), Some(Ttl::from_secs(300).unwrap()));
+    assert_eq!(read.ttl(), Some(RrsetTtl::from_secs(300).unwrap()));
 
     let three = rr(
         www,
@@ -2484,7 +2492,9 @@ async fn yandex_360_record_ttls() {
     assert_eq!(record_writes(&mock), before);
 
     // A requested TTL: one edit, for the record that lacks it, with its own value.
-    let uniform = three.clone().with_ttl(Some(Ttl::from_secs(300).unwrap()));
+    let uniform = three
+        .clone()
+        .with_ttl(Some(RrsetTtl::from_secs(300).unwrap()));
     mock.log().clear();
     assert_eq!(
         client
@@ -2682,7 +2692,9 @@ async fn yandex_360_record_writes_are_sent_once() {
         assert!(control.records().is_empty());
     }
     client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
-    let retuned = set.clone().with_ttl(Some(Ttl::from_secs(600).unwrap()));
+    let retuned = set
+        .clone()
+        .with_ttl(Some(RrsetTtl::from_secs(600).unwrap()));
     for (fault, kind) in [
         (Fault::on("POST", RECORD).status(502), ErrorKind::Transient),
         (
@@ -3027,7 +3039,7 @@ async fn live_yandex_360_record_round_trip() {
         RrSet::new(
             name.clone(),
             rtype,
-            ttl.map(|t| Ttl::from_secs(t).unwrap()),
+            ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
             texts.iter().map(|t| rdata(rtype, t)),
         )
         .unwrap()

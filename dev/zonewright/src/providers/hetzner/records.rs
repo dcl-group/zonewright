@@ -35,9 +35,11 @@
 //!   API refuses (`423` `protected`, reference, Errors). A set that is already as requested is
 //!   `Unchanged` without a write, protected or not.
 //! - A TTL of `null` ("If not set, the Zone's Default TTL is used"). Such an rrset reads with
-//!   `ttl() == None`; a write without a requested TTL leaves it so (no `change_ttl` is sent),
-//!   and a write with one sets it. The client never sets a TTL back to `null`: a new rrset
-//!   gets the requested or the configured TTL.
+//!   `RrsetTtl::ProviderDefault`; a write without a requested TTL leaves it so (no `change_ttl`
+//!   is sent), and a write with a number sets it. A write that asks for the provider's default
+//!   creates a new rrset without `ttl`, and turns an explicit TTL of an existing rrset back into
+//!   the zone's default with `change_ttl` and `ttl: null` (see `api::ChangeTtl`). A new rrset
+//!   without a requested TTL gets the `ttl` setting, which can be the zone's default too.
 //!
 //! # Values per type
 //!
@@ -100,7 +102,7 @@ use crate::rrsets::{self, Current, Found, Listing, Member, RrsetBase, SetTtl, St
 
 use super::api::{MAX_RECORDS_PER_CALL, NewRrset, Record, Rrset};
 use super::client::Hetzner;
-use super::rrset::{rr_name, rrset_ttl};
+use super::rrset::{api_ttl, rr_name, rrset_ttl};
 
 /// How TXT values are read: quoted text as presentation format, anything else as the value.
 const TXT_READ: TxtDialect = TxtDialect::Auto;
@@ -238,10 +240,8 @@ impl WholeSet for Hetzner {
             .collect::<Result<Vec<Record>, Error>>()?;
         let rtype = rtype.to_string();
         let Some(prior) = prior else {
-            let ttl = match ttl {
-                SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => ttl.as_secs(),
-                SetTtl::Existing(None) | SetTtl::Default => self.ttl,
-            };
+            // A create is `Requested` or `Default`; the setting stands in for anything else.
+            let ttl = api_ttl(ttl.resolve(self.ttl).unwrap_or(self.ttl));
             let rrset = NewRrset {
                 name: &target.rr,
                 rtype: &rtype,
@@ -261,11 +261,12 @@ impl WholeSet for Hetzner {
                 .await?;
         }
         // The TTL changes only when one is requested and the rrset has another one; without a
-        // request the rrset keeps its TTL, a `null` one included (design section 3.6).
+        // request the rrset keeps its TTL, a `null` one included (design section 3.6). The
+        // provider's default is requested with `null`.
         if let SetTtl::Requested(ttl) = ttl
-            && prior.ttl != Some(ttl.as_secs())
+            && prior.ttl != api_ttl(ttl)
         {
-            self.change_ttl(zone, &target.zone_id, &target.rr, &rtype, ttl.as_secs())
+            self.change_ttl(zone, &target.zone_id, &target.rr, &rtype, api_ttl(ttl))
                 .await?;
         }
         Ok(())

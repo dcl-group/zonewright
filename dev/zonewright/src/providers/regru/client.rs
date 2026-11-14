@@ -22,7 +22,7 @@ use crate::provider::{
     AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
     ZoneListing,
 };
-use crate::record::{RecordType, RrSet, Ttl, Txt};
+use crate::record::{RecordType, RrSet, RrsetTtl, Txt};
 use crate::redact::Detail;
 use crate::{rrsets, values};
 
@@ -180,7 +180,7 @@ impl Provider for Regru {
         zone: &DomainName,
         name: &DomainName,
         value: &Txt,
-        ttl: Option<Ttl>,
+        ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
         values::add_per_record(self, zone, name, value, ttl).await
     }

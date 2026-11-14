@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::id::ProviderId;
 use crate::meta::{
-    Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
-    ValueGuarantee,
+    Capabilities, ConfigField, FieldKind, Preconditions, ProviderDefaultTtl, ProviderMeta,
+    TtlSupport, TypeSet, ValueGuarantee,
 };
 
 /// The metadata of acme-dns.
@@ -73,6 +73,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     atomic_rrset_write: false,
     // The server serves every value with a TTL of its own choosing.
     ttl: TtlSupport::NotSettable,
-    provider_default_ttl: true,
+    // The server's TTL is the only one: an add may ask for it.
+    provider_default_ttl: ProviderDefaultTtl::Requestable,
     asynchronous: false,
 };

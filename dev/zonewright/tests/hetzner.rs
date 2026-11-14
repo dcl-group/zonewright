@@ -17,8 +17,8 @@ use secrecy::SecretString;
 use zonewright::providers::hetzner::{Hetzner, HetznerConfig, HetznerCredentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Preconditions, Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome,
-    SkipReason, Ttl, TtlSupport, Txt, TypeSet,
+    Preconditions, Provider, ProviderDefaultTtl, ProviderId, RecordData, RecordType, RemoveOutcome,
+    RrSet, RrsetTtl, SetOutcome, SkipReason, TtlSupport, Txt, TypeSet,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -133,7 +133,7 @@ fn rrset(name: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrS
     RrSet::new(
         dn(name),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         texts.iter().map(|t| rd(rtype, t)),
     )
     .unwrap()
@@ -642,7 +642,7 @@ async fn hetzner_invalid_input_sends_nothing() {
                 &zone(),
                 &name(),
                 &txt("v1"),
-                Some(Ttl::from_secs(ttl).unwrap()),
+                Some(RrsetTtl::from_secs(ttl).unwrap()),
             )
             .await
             .unwrap_err();
@@ -1403,7 +1403,7 @@ async fn hetzner_idn_and_wildcard_names() {
 async fn hetzner_ttl_policy() {
     let mock = HetznerMock::start(Seed::standard()).await;
     let mut config = settings(mock.base_url());
-    config.ttl = 77;
+    config.ttl = RrsetTtl::from_secs(77).unwrap();
     let client = Hetzner::new(config, credentials(TOKEN), &context()).unwrap();
     let control = mock.control();
     client
@@ -1416,7 +1416,7 @@ async fn hetzner_ttl_policy() {
             &zone(),
             &dn("b.example.org"),
             &txt("v"),
-            Some(Ttl::from_secs(120).unwrap()),
+            Some(RrsetTtl::from_secs(120).unwrap()),
         )
         .await
         .unwrap();
@@ -1428,7 +1428,7 @@ async fn hetzner_ttl_policy() {
             &zone(),
             &name(),
             &txt("ours"),
-            Some(Ttl::from_secs(3000).unwrap()),
+            Some(RrsetTtl::from_secs(3000).unwrap()),
         )
         .await
         .unwrap();
@@ -1884,10 +1884,12 @@ fn hetzner_config_errors_name_no_value() {
     let cases = [
         (with("ttl", serde_json::json!(59)), token.clone(), "ttl"),
         (with("ttl", serde_json::json!(0)), token.clone(), "ttl"),
+        // Above the largest TTL the value no longer fits the setting's type: refused while the
+        // settings are read, by position (the deserializer cannot name the key).
         (
             with("ttl", serde_json::json!(2_147_483_648_u64)),
             token.clone(),
-            "ttl",
+            "line 1",
         ),
         (
             with("action_poll_ms", serde_json::json!(249)),
@@ -2005,8 +2007,10 @@ fn hetzner_config_keys_match_metadata() {
     let ctx = context();
     for key in ["ttl", "action_poll_ms"] {
         let field = meta.field(key).unwrap();
-        let zonewright::FieldKind::Integer { min, max } = field.kind else {
-            panic!("{key} is not an integer field");
+        let (min, max) = match field.kind {
+            zonewright::FieldKind::Integer { min, max } => (min, max),
+            zonewright::FieldKind::Ttl { min, max, .. } => (i64::from(min), i64::from(max)),
+            _ => panic!("{key} is not an integer field"),
         };
         for (value, valid) in [(min, true), (max, true), (min - 1, false), (max + 1, false)] {
             let mut settings = serde_json::json!({ "base_url": "http://127.0.0.1:1/v1" });
@@ -2041,7 +2045,8 @@ fn hetzner_config_keys_match_metadata() {
     assert_eq!(caps.read_only_types, [RecordType::SOA]);
     assert_eq!(caps.preconditions, Preconditions::ReadThenWrite);
     assert!(!caps.atomic_rrset_write);
-    assert!(caps.asynchronous && caps.provider_default_ttl && caps.txt_plain_only);
+    assert!(caps.asynchronous && caps.txt_plain_only);
+    assert_eq!(caps.provider_default_ttl, ProviderDefaultTtl::Requestable);
     assert_eq!(
         caps.ttl,
         TtlSupport::PerRrset {
@@ -2449,9 +2454,11 @@ async fn hetzner_set_replaces_and_keeps_what_the_model_does_not_carry() {
             .unwrap()
             .unwrap()
             .ttl(),
-        None
+        Some(RrsetTtl::ProviderDefault)
     );
-    let fixed = grown.clone().with_ttl(Some(Ttl::from_secs(600).unwrap()));
+    let fixed = grown
+        .clone()
+        .with_ttl(Some(RrsetTtl::from_secs(600).unwrap()));
     client
         .set_rrset(&zone(), &fixed, Expect::Any)
         .await
@@ -2843,6 +2850,7 @@ async fn hetzner_listing_reports_skipped_sets() {
     assert_eq!(
         rec_a,
         &rrset(REC, RecordType::A, None, &["192.0.2.1", "192.0.2.2"])
+            .with_ttl(Some(RrsetTtl::ProviderDefault))
     );
     let caa = listing
         .rrsets
@@ -3515,7 +3523,7 @@ async fn live_hetzner_record_round_trip() {
             let first = RrSet::new(
                 rec_name.clone(),
                 RecordType::A,
-                Some(Ttl::from_secs(300).unwrap()),
+                Some(RrsetTtl::from_secs(300).unwrap()),
                 [rd(RecordType::A, "192.0.2.10")],
             )
             .unwrap();
@@ -3534,7 +3542,7 @@ async fn live_hetzner_record_round_trip() {
             let second = RrSet::new(
                 rec_name.clone(),
                 RecordType::A,
-                Some(Ttl::from_secs(600).unwrap()),
+                Some(RrsetTtl::from_secs(600).unwrap()),
                 [
                     rd(RecordType::A, "192.0.2.10"),
                     rd(RecordType::A, "192.0.2.11"),
@@ -3584,5 +3592,145 @@ async fn live_hetzner_record_round_trip() {
     }
     if let Err(e) = cleanup {
         panic!("cleanup failed: {e}");
+    }
+}
+
+/// The zone's default TTL (design section 3.6): a `null` TTL. A set created with it (no `ttl`
+/// in the create), a switch from a number to it by `change_ttl` with `ttl: null` and back,
+/// unchanged round trips in both states, expectations of each kind, the `ttl` setting's
+/// spellings, and a TXT value added with it (no `ttl` in `add_records`).
+#[tokio::test]
+async fn hetzner_provider_default_ttl() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let default = Some(RrsetTtl::ProviderDefault);
+    let set = |ttl: Option<RrsetTtl>| {
+        rrset(REC, RecordType::A, None, &["192.0.2.1", "192.0.2.2"]).with_ttl(ttl)
+    };
+
+    // Created without a TTL.
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &set(default), Expect::Absent)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    let create = mock.log().matching(Some("POST"), RRSETS).pop().unwrap();
+    assert!(create.body_json().unwrap().get("ttl").is_none());
+    assert_eq!(control.rrset(REC, "A").unwrap().ttl, None);
+    let read = client
+        .get_rrset(&zone(), &dn(REC), RecordType::A)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, set(default));
+    let before = writes(&mock);
+    for wanted in [read.clone(), set(None)] {
+        assert_eq!(
+            client
+                .set_rrset(&zone(), &wanted, Expect::Matches(&read))
+                .await
+                .unwrap(),
+            SetOutcome::Unchanged
+        );
+    }
+    let e = client
+        .set_rrset(
+            &zone(),
+            &set(None),
+            Expect::Matches(&set(Some(RrsetTtl::from_secs(60).unwrap()))),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(writes(&mock), before);
+
+    // Default to explicit, and back: `change_ttl` with the number, then with `null`.
+    let explicit = set(Some(RrsetTtl::from_secs(600).unwrap()));
+    mock.log().clear();
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &explicit, Expect::Matches(&set(default)))
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    let change = mock.log().matching(Some("POST"), CHANGE_TTL);
+    assert_eq!(change.len(), 1);
+    assert_eq!(
+        change[0].body_json().unwrap(),
+        serde_json::json!({"ttl": 600})
+    );
+    assert_eq!(mock.log().count(Some("POST"), SET_RECORDS), 0);
+    assert_eq!(control.rrset(REC, "A").unwrap().ttl, Some(600));
+    let before = writes(&mock);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &explicit, Expect::Matches(&explicit))
+            .await
+            .unwrap(),
+        SetOutcome::Unchanged
+    );
+    let e = client
+        .set_rrset(&zone(), &explicit, Expect::Matches(&set(default)))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(writes(&mock), before);
+    mock.log().clear();
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &set(default), Expect::Matches(&explicit))
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    let change = mock.log().matching(Some("POST"), CHANGE_TTL);
+    assert_eq!(change.len(), 1);
+    assert_eq!(
+        change[0].body_json().unwrap(),
+        serde_json::json!({"ttl": null})
+    );
+    assert_eq!(control.rrset(REC, "A").unwrap().ttl, None);
+
+    // A TXT value added with the default creates the set without a TTL; later values keep it.
+    client
+        .add_txt_value(&zone(), &name(), &txt("AAA"), default)
+        .await
+        .unwrap();
+    let add = mock.log().matching(Some("POST"), ADD).pop().unwrap();
+    assert!(add.body_json().unwrap().get("ttl").is_none());
+    client
+        .add_txt_value(&zone(), &name(), &txt("BBB"), None)
+        .await
+        .unwrap();
+    assert_eq!(control.rrset(NAME, "TXT").unwrap().ttl, None);
+
+    // The setting: "provider_default" creates new sets without a TTL; a number keeps its
+    // meaning.
+    for (ttl, stored) in [
+        (serde_json::json!("provider_default"), None),
+        (serde_json::json!(300), Some(300)),
+    ] {
+        let mut settings: serde_json::Value = serde_json::from_str(&settings_json(&mock)).unwrap();
+        settings["ttl"] = ttl.clone();
+        let configured = AnyProvider::from_json(
+            ProviderId::Hetzner,
+            &settings.to_string(),
+            &format!(r#"{{"api_token":"{TOKEN}"}}"#).into(),
+            &context(),
+        )
+        .unwrap();
+        let owner = format!("s{}.example.org", stored.unwrap_or(0));
+        configured
+            .set_rrset(
+                &zone(),
+                &rrset(&owner, RecordType::A, None, &["192.0.2.9"]),
+                Expect::Absent,
+            )
+            .await
+            .unwrap();
+        assert_eq!(control.rrset(&owner, "A").unwrap().ttl, stored, "{ttl}");
     }
 }

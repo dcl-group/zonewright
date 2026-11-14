@@ -17,8 +17,8 @@ use secrecy::SecretString;
 use zonewright::providers::vk_cloud::{VkCloud, VkCloudConfig, VkCloudCredentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, SkipReason,
-    Ttl, Txt,
+    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl, SetOutcome,
+    SkipReason, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -749,7 +749,7 @@ async fn vk_cloud_ttl_policy() {
             &zone(),
             &name(),
             &txt("AAA"),
-            Some(Ttl::from_secs(300).unwrap()),
+            Some(RrsetTtl::from_secs(300).unwrap()),
         )
         .await
         .unwrap();
@@ -759,7 +759,7 @@ async fn vk_cloud_ttl_policy() {
             &zone(),
             &name(),
             &txt("BBB"),
-            Some(Ttl::from_secs(900).unwrap()),
+            Some(RrsetTtl::from_secs(900).unwrap()),
         )
         .await
         .unwrap();
@@ -771,7 +771,7 @@ async fn vk_cloud_ttl_policy() {
 
     // The configured TTL for a new rrset.
     let mut config = settings(&mock);
-    config.ttl = 3600;
+    config.ttl = RrsetTtl::from_secs(3600).unwrap();
     let other = VkCloud::new(config, credentials(PASSWORD), &context()).unwrap();
     other
         .add_txt_value(
@@ -791,7 +791,7 @@ async fn vk_cloud_ttl_policy() {
                 &zone(),
                 &name(),
                 &txt("DDD"),
-                Some(Ttl::from_secs(secs).unwrap()),
+                Some(RrsetTtl::from_secs(secs).unwrap()),
             )
             .await
             .unwrap_err();
@@ -1709,14 +1709,14 @@ fn rr(owner: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrSet
     RrSet::new(
         dn(owner),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         texts.iter().map(|t| rdata(rtype, t)),
     )
     .unwrap()
 }
 
-fn ttl(secs: u32) -> Option<Ttl> {
-    Some(Ttl::from_secs(secs).unwrap())
+fn ttl(secs: u32) -> Option<RrsetTtl> {
+    Some(RrsetTtl::from_secs(secs).unwrap())
 }
 
 /// Number of record write requests of any type: creates and deletes.
@@ -3453,7 +3453,7 @@ async fn live_vk_cloud_record_round_trip() {
                 RrSet::new(
                     name.clone(),
                     rtype,
-                    ttl.map(|t| Ttl::from_secs(t).unwrap()),
+                    ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
                     texts.iter().map(|t| RecordData::parse(rtype, t).unwrap()),
                 )
                 .unwrap()

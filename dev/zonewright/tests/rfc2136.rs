@@ -18,8 +18,8 @@ use secrecy::SecretString;
 use zonewright::providers::rfc2136::{Rfc2136, Rfc2136Config, Rfc2136Credentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, ContextOptions, DeleteOutcome, DomainName, Error, ErrorKind,
-    Expect, Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, Ttl,
-    Txt,
+    Expect, Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl,
+    SetOutcome, Ttl, Txt,
 };
 use zonewright_mock::rfc2136::{
     BADKEY, BADSIG, BADTIME, CLASS_ANY, CLASS_IN, CLASS_NONE, Call, FORMERR, Fault, KEY_NAME_512,
@@ -961,7 +961,7 @@ async fn rfc2136_ttl_policy() {
             &zone(),
             &name(),
             &txt("v2"),
-            Some(Ttl::from_secs(120).unwrap()),
+            Some(RrsetTtl::from_secs(120).unwrap()),
         )
         .await
         .unwrap();
@@ -972,7 +972,7 @@ async fn rfc2136_ttl_policy() {
             &zone(),
             &name(),
             &txt("v3"),
-            Some(Ttl::from_secs(3600).unwrap()),
+            Some(RrsetTtl::from_secs(3600).unwrap()),
         )
         .await
         .unwrap();
@@ -988,7 +988,7 @@ async fn rfc2136_ttl_policy() {
                 &zone(),
                 &dn(owner),
                 &txt("v4"),
-                Some(Ttl::from_secs(secs).unwrap()),
+                Some(RrsetTtl::from_secs(secs).unwrap()),
             )
             .await
             .unwrap();
@@ -996,7 +996,7 @@ async fn rfc2136_ttl_policy() {
     }
     // The configured TTL.
     let mut config = settings(&mock, KEY);
-    config.ttl = 300;
+    config.ttl = RrsetTtl::from_secs(300).unwrap();
     let custom = Rfc2136::new(config, credentials(STANDARD_SECRET), &context()).unwrap();
     custom
         .add_txt_value(&zone(), &dn("x.example.org"), &txt("v5"), None)
@@ -1576,7 +1576,7 @@ fn rrset(name: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrS
     RrSet::new(
         dn(name),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         texts.iter().map(|t| rd(rtype, t)),
     )
     .unwrap()
@@ -1781,7 +1781,9 @@ async fn rfc2136_record_round_trips() {
         let ttl = ttl.unwrap_or(DEFAULT_TTL);
         assert_eq!(
             read,
-            wanted.clone().with_ttl(Some(Ttl::from_secs(ttl).unwrap())),
+            wanted
+                .clone()
+                .with_ttl(Some(RrsetTtl::from_secs(ttl).unwrap())),
             "{name}"
         );
         assert!(read.records().iter().all(RecordData::is_canonical));
@@ -1817,7 +1819,7 @@ async fn rfc2136_record_round_trips() {
             );
             let again = get(&client, name, *rtype).await.unwrap().unwrap();
             assert!(again.same_records(&bigger));
-            assert_eq!(again.ttl(), Some(Ttl::from_secs(ttl).unwrap()));
+            assert_eq!(again.ttl(), Some(RrsetTtl::from_secs(ttl).unwrap()));
         }
     }
     // Everything at once is still there: no operation touched another name or type.
@@ -2250,7 +2252,7 @@ async fn rfc2136_record_soa_and_apex_ns_are_not_writable() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(read, soa.with_ttl(Some(Ttl::from_secs(3600).unwrap())));
+    assert_eq!(read, soa.with_ttl(Some(RrsetTtl::from_secs(3600).unwrap())));
     let read = get(&client, "example.org", RecordType::NS)
         .await
         .unwrap()
@@ -2274,7 +2276,7 @@ async fn rfc2136_record_ttl_bounds() {
         );
     }
     let mut config = settings(&mock, KEY);
-    config.ttl = 300;
+    config.ttl = RrsetTtl::from_secs(300).unwrap();
     let custom = Rfc2136::new(config, credentials(STANDARD_SECRET), &context()).unwrap();
     let wanted = rrset("u.example.org", RecordType::A, None, &["192.0.2.1"]);
     set(&custom, &wanted, Expect::Absent).await.unwrap();
@@ -2761,7 +2763,7 @@ async fn live_rfc2136_record_round_trip() {
             let first = RrSet::new(
                 name.clone(),
                 RecordType::TXT,
-                Some(Ttl::from_secs(120).unwrap()),
+                Some(RrsetTtl::from_secs(120).unwrap()),
                 [data(&values[0]), data(&values[1])],
             )
             .unwrap();
@@ -2802,7 +2804,7 @@ async fn live_rfc2136_record_round_trip() {
                 .unwrap()
                 .unwrap();
             assert!(read.same_records(&second));
-            assert_eq!(read.ttl(), Some(Ttl::from_secs(120).unwrap()));
+            assert_eq!(read.ttl(), Some(RrsetTtl::from_secs(120).unwrap()));
             assert_eq!(
                 client
                     .delete_rrset(&zone, &name, RecordType::TXT, Expect::Matches(&read))

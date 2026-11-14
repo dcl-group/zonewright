@@ -23,7 +23,7 @@ use crate::provider::{
     AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
     ZoneInfo, ZoneListing,
 };
-use crate::record::{RecordType, RrSet, Ttl, Txt};
+use crate::record::{RecordType, RrSet, RrsetTtl, Txt};
 use crate::redact::Detail;
 use crate::{rrsets, values};
 
@@ -59,8 +59,8 @@ pub struct TimewebCloud {
     pub(super) api: Api,
     /// The per-name locks of the context.
     pub(super) locks: NameLocks,
-    /// TTL of a new record; `None` leaves the choice to the provider.
-    pub(super) ttl: Option<u32>,
+    /// TTL of a new record: a number, or the provider's choice.
+    pub(super) ttl: RrsetTtl,
 }
 
 impl fmt::Debug for TimewebCloud {
@@ -171,7 +171,7 @@ impl Provider for TimewebCloud {
         zone: &DomainName,
         name: &DomainName,
         value: &Txt,
-        ttl: Option<Ttl>,
+        ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
         values::add_per_record(self, zone, name, value, ttl).await
     }

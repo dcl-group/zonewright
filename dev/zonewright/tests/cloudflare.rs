@@ -17,8 +17,8 @@ use secrecy::SecretString;
 use zonewright::providers::cloudflare::{Cloudflare, CloudflareConfig, CloudflareCredentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, SkipReason,
-    Ttl, Txt,
+    Provider, ProviderDefaultTtl, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet,
+    RrsetTtl, SetOutcome, SkipReason, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -133,7 +133,7 @@ fn rrset(name: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrS
     RrSet::new(
         dn(name),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         texts.iter().map(|t| rd(rtype, t)),
     )
     .unwrap()
@@ -788,7 +788,7 @@ async fn cloudflare_ttl_policy() {
             &zone(),
             &name(),
             &txt("AAA"),
-            Some(Ttl::from_secs(300).unwrap()),
+            Some(RrsetTtl::from_secs(300).unwrap()),
         )
         .await
         .unwrap();
@@ -799,7 +799,7 @@ async fn cloudflare_ttl_policy() {
             &zone(),
             &name(),
             &txt("BBB"),
-            Some(Ttl::from_secs(900).unwrap()),
+            Some(RrsetTtl::from_secs(900).unwrap()),
         )
         .await
         .unwrap();
@@ -815,7 +815,7 @@ async fn cloudflare_ttl_policy() {
             &zone(),
             &name(),
             &txt("DDD"),
-            Some(Ttl::from_secs(30).unwrap()),
+            Some(RrsetTtl::from_secs(30).unwrap()),
         )
         .await
         .unwrap_err();
@@ -840,7 +840,7 @@ async fn cloudflare_ttl_policy() {
         1
     );
     let mut config = settings(&mock);
-    config.ttl = 1;
+    config.ttl = RrsetTtl::from_secs(1).unwrap();
     let auto = Cloudflare::new(config, credentials(TOKEN), &context()).unwrap();
     let fresh = dn("_acme-challenge.fresh.example.org");
     auto.add_txt_value(&zone(), &fresh, &txt("AAA"), None)
@@ -1572,7 +1572,7 @@ fn cloudflare_capabilities_match_the_client() {
             max: 86_400
         }
     );
-    assert!(caps.provider_default_ttl);
+    assert_eq!(caps.provider_default_ttl, ProviderDefaultTtl::Requestable);
     assert_eq!(caps.txt_values, ValueGuarantee::PerValue);
     assert!(caps.txt_plain_only);
 }
@@ -2108,7 +2108,7 @@ async fn cloudflare_record_ttl_policy() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(read.ttl(), None);
+    assert_eq!(read.ttl(), Some(RrsetTtl::ProviderDefault));
     client
         .set_rrset(
             &zone(),
@@ -2160,7 +2160,7 @@ async fn cloudflare_record_ttl_policy() {
         .unwrap();
     assert_eq!(control.records_of("new.example.org", "A")[0].ttl, 120);
     let mut config = settings(&mock);
-    config.ttl = 1;
+    config.ttl = RrsetTtl::from_secs(1).unwrap();
     let automatic = Cloudflare::new(config, credentials(TOKEN), &context()).unwrap();
     automatic
         .set_rrset(
@@ -2178,7 +2178,7 @@ async fn cloudflare_record_ttl_policy() {
             .unwrap()
             .unwrap()
             .ttl(),
-        None
+        Some(RrsetTtl::ProviderDefault)
     );
 
     // The bounds, before any request; the bounds themselves are accepted.
@@ -2258,7 +2258,10 @@ async fn cloudflare_set_keeps_or_refuses_what_the_model_does_not_carry() {
             .get_rrset(&zone(), &dn(REC), RecordType::A)
             .await
             .unwrap(),
-        Some(rrset(REC, RecordType::A, None, &["192.0.2.1", "192.0.2.2"]))
+        Some(
+            rrset(REC, RecordType::A, None, &["192.0.2.1", "192.0.2.2"])
+                .with_ttl(Some(RrsetTtl::ProviderDefault))
+        )
     );
 
     // A requested TTL is refused: nothing is written.
@@ -2598,7 +2601,10 @@ async fn cloudflare_listing_reports_skipped_sets() {
         by(REC, RecordType::A),
         &rrset(REC, RecordType::A, Some(300), &["192.0.2.1", "192.0.2.2"])
     );
-    assert_eq!(by(REC, RecordType::TXT).ttl(), None);
+    assert_eq!(
+        by(REC, RecordType::TXT).ttl(),
+        Some(RrsetTtl::ProviderDefault)
+    );
     assert!(by(REC, RecordType::SSHFP).records()[0].is_canonical());
     assert!(by("example.org", RecordType::HTTPS).records()[0].is_canonical());
     assert!(!by("loc.example.org", "LOC".parse().unwrap()).records()[0].is_canonical());
@@ -3090,7 +3096,7 @@ async fn live_cloudflare_record_round_trip() {
         RrSet::new(
             name.clone(),
             rtype,
-            ttl.map(|t| Ttl::from_secs(t).unwrap()),
+            ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
             texts.iter().map(|t| rd(rtype, t)),
         )
         .unwrap()
@@ -3159,4 +3165,161 @@ async fn live_cloudflare_record_round_trip() {
         std::panic::resume_unwind(e.into_panic());
     }
     assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
+}
+
+/// The provider's default TTL (design section 3.6): `1`, "automatic". A set created with it,
+/// a switch from a number to it and back by `PATCH`, unchanged round trips in both states,
+/// expectations of each kind, the `ttl` setting's spellings, and a TXT value added with it.
+#[tokio::test]
+async fn cloudflare_provider_default_ttl() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let default = Some(RrsetTtl::ProviderDefault);
+    let two = |ttl: Option<RrsetTtl>| {
+        rrset(REC, RecordType::A, None, &["192.0.2.1", "192.0.2.2"]).with_ttl(ttl)
+    };
+    let ttls = || -> Vec<u32> { control.records_of(REC, "A").iter().map(|r| r.ttl).collect() };
+
+    // Created with the provider's default: every record is sent with `ttl: 1`.
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &two(default), Expect::Absent)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    let posts = mock.log().matching(Some("POST"), RECORDS);
+    assert_eq!(posts.len(), 2);
+    assert!(
+        posts
+            .iter()
+            .all(|p| p.body_json().unwrap()["ttl"] == serde_json::json!(1))
+    );
+    assert_eq!(ttls(), [1, 1]);
+    let read = client
+        .get_rrset(&zone(), &dn(REC), RecordType::A)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, two(default));
+    // Written back as read, or with no TTL stated: nothing is sent.
+    let before = record_writes(&mock);
+    for wanted in [read.clone(), two(None)] {
+        assert_eq!(
+            client
+                .set_rrset(&zone(), &wanted, Expect::Matches(&read))
+                .await
+                .unwrap(),
+            SetOutcome::Unchanged
+        );
+    }
+    assert_eq!(record_writes(&mock), before);
+
+    // Expectations: the default holds, a number does not, no TTL is any TTL.
+    let e = client
+        .set_rrset(
+            &zone(),
+            &two(None),
+            Expect::Matches(&two(Some(RrsetTtl::from_secs(300).unwrap()))),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(record_writes(&mock), before);
+
+    // Default to explicit: one `PATCH` per record, with the number.
+    let explicit = two(Some(RrsetTtl::from_secs(600).unwrap()));
+    mock.log().clear();
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &explicit, Expect::Matches(&two(default)))
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    let patches = mock.log().matching(Some("PATCH"), RECORD);
+    assert_eq!(patches.len(), 2);
+    assert!(
+        patches
+            .iter()
+            .all(|p| p.body_json().unwrap() == serde_json::json!({"type": "A", "ttl": 600}))
+    );
+    assert_eq!(ttls(), [600, 600]);
+    let before = record_writes(&mock);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &explicit, Expect::Matches(&explicit))
+            .await
+            .unwrap(),
+        SetOutcome::Unchanged
+    );
+    let e = client
+        .set_rrset(&zone(), &explicit, Expect::Matches(&two(default)))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(record_writes(&mock), before);
+
+    // Explicit back to the default: `PATCH` with `ttl: 1`.
+    mock.log().clear();
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &two(default), Expect::Matches(&explicit))
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    let patches = mock.log().matching(Some("PATCH"), RECORD);
+    assert_eq!(patches.len(), 2);
+    assert!(
+        patches
+            .iter()
+            .all(|p| p.body_json().unwrap() == serde_json::json!({"type": "A", "ttl": 1}))
+    );
+    assert_eq!(ttls(), [1, 1]);
+
+    // A TXT value added with the provider's default creates the set with `ttl: 1`; a value
+    // added to it later keeps it, whatever is asked for.
+    client
+        .add_txt_value(&zone(), &name(), &txt("AAA"), default)
+        .await
+        .unwrap();
+    client
+        .add_txt_value(
+            &zone(),
+            &name(),
+            &txt("BBB"),
+            Some(RrsetTtl::from_secs(300).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert!(control.records_of(NAME, "TXT").iter().all(|r| r.ttl == 1));
+
+    // The setting: "provider_default" and the API's own `1` mean the same; numbers keep
+    // their meaning; a new set gets what the setting says.
+    for (ttl, sent) in [
+        (serde_json::json!("provider_default"), 1),
+        (serde_json::json!(1), 1),
+        (serde_json::json!(300), 300),
+    ] {
+        let mut settings: serde_json::Value = serde_json::from_str(&settings_json(&mock)).unwrap();
+        settings["ttl"] = ttl.clone();
+        let configured = AnyProvider::from_json(
+            ProviderId::Cloudflare,
+            &settings.to_string(),
+            &format!(r#"{{"api_token":"{TOKEN}"}}"#).into(),
+            &context(),
+        )
+        .unwrap();
+        let owner = format!("s{sent}-{}.example.org", ttl.is_string());
+        configured
+            .set_rrset(
+                &zone(),
+                &rrset(&owner, RecordType::A, None, &["192.0.2.9"]),
+                Expect::Absent,
+            )
+            .await
+            .unwrap();
+        assert_eq!(control.records_of(&owner, "A")[0].ttl, sent, "{ttl}");
+    }
 }

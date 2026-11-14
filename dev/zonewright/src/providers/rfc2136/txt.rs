@@ -43,7 +43,7 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, Txt};
+use crate::record::{RrsetTtl, Txt};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
@@ -126,7 +126,7 @@ impl PerRecord for Rfc2136 {
                 .to_vec();
             records.push(TxtRecord {
                 value: wire::txt_data(&rdata).and_then(|data| Txt::new(data).ok()),
-                ttl: Ttl::from_secs(record.ttl).ok(),
+                ttl: RrsetTtl::from_secs(record.ttl).ok(),
                 handle: rdata,
             });
         }
@@ -141,8 +141,10 @@ impl PerRecord for Rfc2136 {
         ttl: WriteTtl,
     ) -> Result<(), Error> {
         let ttl = match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => ttl.as_secs(),
-            WriteTtl::New(None) | WriteTtl::Existing(None) => self.ttl,
+            WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))
+            | WriteTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
+            WriteTtl::New(None | Some(RrsetTtl::ProviderDefault))
+            | WriteTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => self.ttl,
         };
         let mut update = Builder::update(zone);
         update.prereq_rrset_absent(name, TYPE_CNAME)?;

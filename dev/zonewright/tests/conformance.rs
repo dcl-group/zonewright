@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use zonewright::{
     AnyProvider, CheckReport, Detail, DomainName, Error, ErrorKind, Expect, FieldKind, Operation,
-    Preconditions, Provider, ProviderId, RecordData, RecordType, RrSet, TtlSupport, Txt, TypeSet,
-    ValueGuarantee, ZoneCheck,
+    Preconditions, Provider, ProviderDefaultTtl, ProviderId, RecordData, RecordType, RrSet,
+    RrsetTtl, Ttl, TtlSupport, Txt, TypeSet, ValueGuarantee, ZoneCheck,
 };
 
 use common::{context, dn, sample_client};
@@ -239,7 +239,10 @@ fn metadata_is_sane() {
             if key.ends_with("_url") {
                 assert_eq!(field.kind, FieldKind::Url, "{id}.{key}");
             }
-            if key == "ttl" || key.ends_with("_ms") {
+            if key == "ttl" {
+                assert!(matches!(field.kind, FieldKind::Ttl { .. }), "{id}.{key}");
+            }
+            if key.ends_with("_ms") {
                 assert!(
                     matches!(field.kind, FieldKind::Integer { .. }),
                     "{id}.{key}"
@@ -262,6 +265,21 @@ fn metadata_is_sane() {
                     if let Some(default) = field.default {
                         let value: i64 = default.parse().unwrap();
                         assert!((min..=max).contains(&value), "{id}.{key}");
+                    }
+                }
+                FieldKind::Ttl {
+                    min,
+                    max,
+                    provider_default,
+                } => {
+                    assert!(min <= max, "{id}.{key}");
+                    match field.default {
+                        Some("provider_default") => assert!(provider_default, "{id}.{key}"),
+                        Some(default) => {
+                            let value: u32 = default.parse().unwrap();
+                            assert!((min..=max).contains(&value), "{id}.{key}");
+                        }
+                        None => {}
                     }
                 }
                 FieldKind::Text | FieldKind::Multiline => {}
@@ -353,36 +371,40 @@ fn atomic_rrset_write_follows_the_native_unit() {
     }
 }
 
-/// `Capabilities::provider_default_ttl` per provider: true exactly where an rrset or a record
-/// can have no explicit TTL at the provider, so that it reads as `ttl() == None` (design
-/// sections 2.5 and 3.6). Written out, with the reason, so that a change is deliberate.
-const PROVIDER_DEFAULT_TTL: &[(ProviderId, bool)] = &[
-    // The server serves every value with a TTL of its own choosing.
-    (ProviderId::AcmeDns, true),
-    // Every record carries a TTL; no read, so nothing reads as `None`.
-    (ProviderId::Beget, false),
+/// `Capabilities::provider_default_ttl` per provider: whether an rrset or a record can have no
+/// explicit TTL at the provider, so that it reads as `RrsetTtl::ProviderDefault`, and whether a
+/// write can ask for it (design sections 2.5 and 3.6). Written out, with the reason, so that a
+/// change is deliberate.
+const PROVIDER_DEFAULT_TTL: &[(ProviderId, ProviderDefaultTtl)] = &[
+    // The server serves every value with a TTL of its own choosing: it is the only TTL there is.
+    (ProviderId::AcmeDns, ProviderDefaultTtl::Requestable),
+    // Every record carries a TTL; no read, so nothing reads as the default.
+    (ProviderId::Beget, ProviderDefaultTtl::Absent),
     // A record's `ttl` is a number of seconds.
-    (ProviderId::CloudRu, false),
-    // `1` means automatic and reads as no TTL.
-    (ProviderId::Cloudflare, true),
+    (ProviderId::CloudRu, ProviderDefaultTtl::Absent),
+    // `1` means automatic, on a create and on a PATCH alike.
+    (ProviderId::Cloudflare, ProviderDefaultTtl::Requestable),
     // Every record carries a TTL in the documented answers.
-    (ProviderId::DigitalOcean, false),
-    // An rrset's `ttl` may be `null`: the zone's default TTL applies.
-    (ProviderId::Hetzner, true),
-    // A record's `ttl` is optional; without one the zone's default applies (Docs 4.6).
-    (ProviderId::Nicru, true),
-    // No TTL can be set, and the listing states none.
-    (ProviderId::Regru, true),
+    (ProviderId::DigitalOcean, ProviderDefaultTtl::Absent),
+    // An rrset's `ttl` may be `null`: the zone's default applies; a create without `ttl` and a
+    // `change_ttl` with `null` ask for it.
+    (ProviderId::Hetzner, ProviderDefaultTtl::Requestable),
+    // A record's `ttl` is optional; without one the zone's default applies (Docs 4.6). A TTL
+    // change stages the record again, with or without `<ttl>`.
+    (ProviderId::Nicru, ProviderDefaultTtl::Requestable),
+    // No TTL can be set, and the listing states none: the provider's is the only one.
+    (ProviderId::Regru, ProviderDefaultTtl::Requestable),
     // Every RR carries a TTL on the wire.
-    (ProviderId::Rfc2136, false),
+    (ProviderId::Rfc2136, ProviderDefaultTtl::Absent),
     // A plain rrset carries a TTL.
-    (ProviderId::Route53, false),
-    (ProviderId::SelectelV2, false),
-    // A record may have no `ttl`; the setting left unset sends none.
-    (ProviderId::TimewebCloud, true),
-    (ProviderId::VkCloud, false),
-    (ProviderId::Yandex360, false),
-    (ProviderId::YandexCloud, false),
+    (ProviderId::Route53, ProviderDefaultTtl::Absent),
+    (ProviderId::SelectelV2, ProviderDefaultTtl::Absent),
+    // A record may have no `ttl` and a create may leave it out, but whether an update without
+    // one clears an explicit TTL is not documented.
+    (ProviderId::TimewebCloud, ProviderDefaultTtl::ForNewRecords),
+    (ProviderId::VkCloud, ProviderDefaultTtl::Absent),
+    (ProviderId::Yandex360, ProviderDefaultTtl::Absent),
+    (ProviderId::YandexCloud, ProviderDefaultTtl::Absent),
 ];
 
 #[test]
@@ -392,36 +414,101 @@ fn provider_default_ttl_is_consistent() {
         let meta = id.meta();
         let caps = &meta.capabilities;
         assert_eq!(caps.provider_default_ttl, expected, "{id}");
-        // A provider that chooses every TTL itself has nothing but its own TTL.
+        assert_eq!(
+            caps.accepts_ttl(RrsetTtl::ProviderDefault),
+            expected.can_request(),
+            "{id}"
+        );
+        // A provider that chooses every TTL itself has nothing but its own TTL, and a request
+        // for it is always satisfied.
         if caps.ttl == TtlSupport::NotSettable {
-            assert!(
+            assert_eq!(
                 caps.provider_default_ttl,
-                "{id}: NotSettable without a provider TTL"
+                ProviderDefaultTtl::Requestable,
+                "{id}: NotSettable without a requestable provider TTL"
             );
             continue;
         }
         // Where a TTL can be set, a write without one falls back on the `ttl` setting (design
         // section 3.6): for a new rrset always, and for an existing one that reads with no TTL
-        // where the provider has no TTL of its own.
+        // where the provider has no TTL of its own. The setting offers the provider's default
+        // exactly where a write can ask for it, and no number the capabilities refuse.
         if caps.set_rrset || caps.add_txt_value {
             let field = meta.field("ttl");
             assert!(field.is_some(), "{id}: no ttl setting to fall back on");
-            if let Some(FieldKind::Integer { min, max }) = field.map(|f| f.kind) {
-                let (cap_min, cap_max) = match caps.ttl {
-                    TtlSupport::PerRrset { min, max } | TtlSupport::PerRecord { min, max } => {
-                        (min, max)
-                    }
-                    _ => panic!("{id}: unknown TTL support"),
-                };
-                // Below the range only where the setting can spell "let the provider choose"
-                // (Cloudflare's `1`).
-                assert!(
-                    (caps.provider_default_ttl || i64::from(cap_min) <= min)
-                        && max <= i64::from(cap_max),
-                    "{id}: the ttl setting allows a TTL the capabilities refuse"
-                );
+            let Some(FieldKind::Ttl {
+                min,
+                max,
+                provider_default,
+            }) = field.map(|f| f.kind)
+            else {
+                panic!("{id}: the ttl setting is not of kind Ttl");
+            };
+            assert_eq!(provider_default, expected.can_request(), "{id}");
+            let (cap_min, cap_max) = match caps.ttl {
+                TtlSupport::PerRrset { min, max } | TtlSupport::PerRecord { min, max } => {
+                    (min, max)
+                }
+                _ => panic!("{id}: unknown TTL support"),
+            };
+            assert!(
+                cap_min <= min && max <= cap_max,
+                "{id}: the ttl setting allows a TTL the capabilities refuse"
+            );
+        }
+    }
+}
+
+/// The `ttl` setting: `"provider_default"` builds a client exactly where the provider has a
+/// default a write can ask for, and is a `Config` error naming the key elsewhere; the default,
+/// the smallest and the largest number of the metadata build a client everywhere, and a
+/// configuration without the key serializes the metadata's default.
+#[test]
+fn ttl_setting_spells_the_provider_default() {
+    let ctx = context();
+    for &id in ProviderId::ALL.iter().filter(|id| id.available()) {
+        let meta = id.meta();
+        let Some(FieldKind::Ttl {
+            min,
+            max,
+            provider_default,
+        }) = meta.field("ttl").map(|f| f.kind)
+        else {
+            continue;
+        };
+        let (settings, credentials) = common::sample_config(id);
+        let build = |ttl: serde_json::Value| {
+            let settings = edit_object(settings, "ttl", Some(ttl));
+            AnyProvider::from_json(id, &settings, &credentials.to_owned().into(), &ctx)
+        };
+        match build(serde_json::json!("provider_default")) {
+            Ok(_) => assert!(provider_default, "{id}: accepted without the capability"),
+            Err(e) => {
+                assert!(!provider_default, "{id}: refused with the capability: {e}");
+                assert_eq!(e.kind(), ErrorKind::Config, "{id}");
+                assert!(e.to_string().contains("ttl"), "{id}: {e}");
             }
         }
+        for secs in [min, max] {
+            assert!(build(serde_json::json!(secs)).is_ok(), "{id}: {secs}");
+        }
+        for bad in [
+            serde_json::json!("Provider_Default"),
+            serde_json::json!("300"),
+            serde_json::json!(-1),
+        ] {
+            let e = build(bad.clone()).map(drop).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Config, "{id}: {bad}");
+        }
+        let without = edit_object(settings, "ttl", None);
+        let object = config_type_object(id, &without).unwrap();
+        let default = meta.field("ttl").and_then(|f| f.default);
+        let text = match &object["ttl"] {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        };
+        assert_eq!(text.as_deref(), default, "{id}");
     }
 }
 
@@ -607,6 +694,11 @@ fn metadata_fields_equal_the_configuration_types() {
                     FieldKind::Integer { .. } => {
                         serde_json::Value::from(default.parse::<i64>().unwrap())
                     }
+                    // A TTL is a number, or the string "provider_default".
+                    FieldKind::Ttl { .. } => default.parse::<i64>().map_or_else(
+                        |_| serde_json::Value::from(default),
+                        serde_json::Value::from,
+                    ),
                     _ => serde_json::Value::from(default),
                 };
                 if let Err(e) = with(&edit_object(object, key, Some(value))) {
@@ -847,6 +939,83 @@ async fn unsupported_operations_return_unsupported() {
             }
             assert_untouched(&format!("{id} {op}"));
         }
+    }
+}
+
+/// A request for the provider's default TTL, at a provider that has none a write can ask for,
+/// is `InvalidInput` before any request, for `set_rrset` and `add_txt_value` alike; an explicit
+/// TTL outside the capabilities is refused the same way. Endpoints as in
+/// `unsupported_operations_return_unsupported`: a loopback port that must see nothing.
+#[tokio::test]
+async fn ttl_requests_the_provider_refuses_send_nothing() {
+    let ctx = context();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    tcp.set_nonblocking(true).unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let udp = std::net::UdpSocket::bind(addr).unwrap();
+    udp.set_nonblocking(true).unwrap();
+    let assert_untouched = |what: &str| {
+        let would_block =
+            |e: std::io::Error| assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{what}: {e}");
+        match tcp.accept() {
+            Ok(_) => panic!("{what}: a TCP connection was made"),
+            Err(e) => would_block(e),
+        }
+        let mut buf = [0u8; 512];
+        match udp.recv_from(&mut buf) {
+            Ok(_) => panic!("{what}: a UDP datagram was sent"),
+            Err(e) => would_block(e),
+        }
+    };
+    let zone = dn("example.org");
+    let name = dn("_acme-challenge.example.org");
+    let value = Txt::new("conformance-value").unwrap();
+    let mut refused = 0;
+    for &id in ProviderId::ALL.iter().filter(|id| id.available()) {
+        let (settings, credentials) = common::sample_config(id);
+        let settings = settings.replace("127.0.0.1:9", &addr.to_string());
+        let client =
+            AnyProvider::from_json(id, &settings, &credentials.to_owned().into(), &ctx).unwrap();
+        let caps = client.capabilities();
+        // Decided from the capability fields themselves, not from `accepts_ttl`, so that a
+        // wrong answer of that method cannot hide a request that goes out.
+        let mut requests = Vec::new();
+        if !caps.ttl.accepts(Ttl::MAX.as_secs()) {
+            requests.push(Some(RrsetTtl::Explicit(Ttl::MAX)));
+        }
+        if !caps.provider_default_ttl.can_request() {
+            requests.push(Some(RrsetTtl::ProviderDefault));
+        }
+        for ttl in requests {
+            let rrset = RrSet::new(
+                name.clone(),
+                RecordType::TXT,
+                ttl,
+                [value.to_data().unwrap()],
+            )
+            .unwrap();
+            if caps.set_rrset && caps.can_write(RecordType::TXT) {
+                let e = client
+                    .set_rrset(&zone, &rrset, Expect::Any)
+                    .await
+                    .unwrap_err();
+                assert_eq!(e.kind(), ErrorKind::InvalidInput, "{id} set {ttl:?}: {e}");
+                assert_untouched(&format!("{id} set_rrset {ttl:?}"));
+                refused += 1;
+            }
+            if caps.add_txt_value {
+                let e = client
+                    .add_txt_value(&zone, &name, &value, ttl)
+                    .await
+                    .unwrap_err();
+                assert_eq!(e.kind(), ErrorKind::InvalidInput, "{id} add {ttl:?}: {e}");
+                assert_untouched(&format!("{id} add_txt_value {ttl:?}"));
+                refused += 1;
+            }
+        }
+    }
+    if ProviderId::ALL.iter().any(|id| id.available()) {
+        assert!(refused > 0);
     }
 }
 

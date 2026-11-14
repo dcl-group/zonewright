@@ -1,6 +1,6 @@
 //! Rrsets: all records of one owner name and type.
 
-use super::{RecordData, RecordError, RecordType, Ttl};
+use super::{RecordData, RecordError, RecordType, RrsetTtl};
 use crate::name::DomainName;
 
 /// All records of one owner name and type.
@@ -8,14 +8,15 @@ use crate::name::DomainName;
 /// Members are kept sorted by their text without duplicates, so two sets with the same members
 /// are equal. `==` compares name, type, members and TTL; [`RrSet::same_records`] ignores the TTL.
 ///
-/// Serialized as `{ "name", "type", "ttl", "records": [...] }`. A canonical record is a string,
-/// parsed with [`RecordData::parse`] for the set's type; a non-canonical one is
-/// `{ "raw": text }`.
+/// Serialized as `{ "name", "type", "ttl", "records": [...] }`. `ttl` is a number of seconds,
+/// the string `"provider_default"`, or `null` (also when the key is missing) for a set that
+/// states no TTL. A canonical record is a string, parsed with [`RecordData::parse`] for the
+/// set's type; a non-canonical one is `{ "raw": text }`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RrSet {
     name: DomainName,
     rtype: RecordType,
-    ttl: Option<Ttl>,
+    ttl: Option<RrsetTtl>,
     records: Vec<RecordData>,
 }
 
@@ -27,7 +28,7 @@ impl RrSet {
     pub fn new(
         name: DomainName,
         rtype: RecordType,
-        ttl: Option<Ttl>,
+        ttl: Option<RrsetTtl>,
         records: impl IntoIterator<Item = RecordData>,
     ) -> Result<RrSet, RecordError> {
         let mut records: Vec<RecordData> = records.into_iter().collect();
@@ -71,10 +72,16 @@ impl RrSet {
         self.rtype
     }
 
-    /// In a set read from a provider, `None` means the provider does not report a TTL. In a set
-    /// passed to a write, `None` means "keep the TTL of the existing rrset; for a new rrset use
-    /// the client's configured default".
-    pub fn ttl(&self) -> Option<Ttl> {
+    /// The TTL the set states.
+    ///
+    /// In a set read from a provider: `Some(Explicit(n))` for a TTL of `n` seconds,
+    /// `Some(ProviderDefault)` for a set with no TTL of its own (the provider's default
+    /// applies), and `None` when the read cannot tell (design section 3.6). In a set passed to a
+    /// write: `Some(Explicit(n))` requests `n`, `Some(ProviderDefault)` requests the provider's
+    /// default, and `None` requests nothing: an existing rrset keeps its TTL and a new one gets
+    /// the client's `ttl` setting. A set read and written back unchanged therefore keeps its
+    /// TTL in every case.
+    pub fn ttl(&self) -> Option<RrsetTtl> {
         self.ttl
     }
 
@@ -94,7 +101,7 @@ impl RrSet {
     }
 
     /// The same set with another TTL.
-    pub fn with_ttl(self, ttl: Option<Ttl>) -> RrSet {
+    pub fn with_ttl(self, ttl: Option<RrsetTtl>) -> RrSet {
         RrSet { ttl, ..self }
     }
 }
@@ -117,7 +124,7 @@ struct RrSetOut<'a> {
     name: &'a DomainName,
     #[serde(rename = "type")]
     rtype: RecordType,
-    ttl: Option<Ttl>,
+    ttl: Option<RrsetTtl>,
     records: &'a [RecordData],
 }
 
@@ -129,7 +136,7 @@ struct RrSetIn {
     #[serde(rename = "type")]
     rtype: RecordType,
     #[serde(default)]
-    ttl: Option<Ttl>,
+    ttl: Option<RrsetTtl>,
     records: Vec<RecordIn>,
 }
 

@@ -31,14 +31,14 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, Txt, TxtDialect};
+use crate::record::{Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
 use super::api::{Created, Deleted, NewRecord, TXT};
 use super::client::TimewebCloud;
 use super::names::{self, Owner};
-use super::records::ambiguous;
+use super::records::{ambiguous, api_ttl, read_ttl};
 
 /// How TXT data is read.
 const READ: TxtDialect = TxtDialect::Auto;
@@ -83,7 +83,7 @@ impl PerRecord for TimewebCloud {
                 let record = placed.record;
                 records.push(TxtRecord {
                     value: record.value().and_then(|text| READ.read(text)),
-                    ttl: record.ttl().and_then(|secs| Ttl::from_secs(secs).ok()),
+                    ttl: read_ttl(record.ttl()),
                     handle: record.id(),
                 });
             }
@@ -101,12 +101,8 @@ impl PerRecord for TimewebCloud {
         let data = WRITE.write(value).ok_or(Error::InvalidInput {
             detail: Detail::constant("the TXT value cannot be written in this dialect"),
         })?;
-        let ttl = match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => Some(ttl.as_secs()),
-            WriteTtl::New(None) => self.ttl,
-            // The set's TTL was not reported: send none, so that the provider decides.
-            WriteTtl::Existing(None) => None,
-        };
+        // The provider's default (requested, configured or as read) is sent as no `ttl`.
+        let ttl = api_ttl(ttl.resolve(self.ttl));
         let record = NewRecord {
             rtype: TXT,
             value: &data,

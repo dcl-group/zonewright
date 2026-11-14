@@ -34,7 +34,7 @@ use crate::values::{TxtBase, TxtRecord, ValueCalls, WriteTtl};
 
 use super::api::{MAX_RECORDS_PER_CALL, TXT};
 use super::client::Hetzner;
-use super::rrset::{rr_name, rrset_ttl, vanished};
+use super::rrset::{api_ttl, rr_name, rrset_ttl, vanished};
 
 /// How TXT data is read.
 const READ: TxtDialect = TxtDialect::Auto;
@@ -92,13 +92,10 @@ impl ValueCalls for Hetzner {
         let text = WRITE.write(value).ok_or(Error::InvalidInput {
             detail: Detail::constant("the TXT value cannot be written in this dialect"),
         })?;
-        let ttl = match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => Some(ttl.as_secs()),
-            WriteTtl::New(None) => Some(self.ttl),
-            // The set's TTL was not reported: it has none and the zone's default applies. Send
-            // none, so that the provider keeps it.
-            WriteTtl::Existing(None) => None,
-        };
+        // A number is sent as such. The provider's default, requested for a new set or read
+        // from an existing one, is sent as no TTL: "If not set, the Zone's Default TTL is used"
+        // (`add_zone_rrset_records`), and an existing set without one keeps it.
+        let ttl = ttl.resolve(self.ttl).and_then(api_ttl);
         let zone_id = self.write_zone_id(zone).await?;
         match self.api.add_records(&zone_id, &rr, &text, ttl).await? {
             Some(action) => self.api.wait(&self.poller, action).await,

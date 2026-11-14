@@ -104,7 +104,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::{DomainName, TargetName};
 use crate::provider::ZoneListing;
-use crate::record::{Mx, RecordData, RecordType, Srv, Ttl, Txt, TxtDialect, singleton};
+use crate::record::{Mx, RecordData, RecordType, RrsetTtl, Srv, Txt, TxtDialect, singleton};
 use crate::redact::Detail;
 use crate::rrsets::{
     self, Listing, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Step, Stored,
@@ -225,13 +225,13 @@ fn number(value: Option<&Value>) -> Option<u64> {
 }
 
 /// A TTL as the API states it: a number, or a decimal string (see `api::ApiRecord`).
-fn read_ttl(value: Option<&Value>) -> Option<Ttl> {
+fn read_ttl(value: Option<&Value>) -> Option<RrsetTtl> {
     let secs = match value? {
         Value::Number(n) => n.as_u64()?,
         Value::String(s) => s.trim().parse::<u64>().ok()?,
         _ => return None,
     };
-    Ttl::from_secs(u32::try_from(secs).ok()?).ok()
+    RrsetTtl::from_secs(u32::try_from(secs).ok()?).ok()
 }
 
 // ---- Writing -------------------------------------------------------------------------------------
@@ -476,10 +476,13 @@ impl PerRecord for VkCloud {
             });
         }
         let ttl = match ttl {
-            SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => ttl.as_secs(),
+            SetTtl::Requested(RrsetTtl::Explicit(ttl))
+            | SetTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
             // A new set, or one whose TTL was not reported: the configured TTL (the API requires
             // one on a create).
-            SetTtl::Default | SetTtl::Existing(None) => self.ttl,
+            SetTtl::Default
+            | SetTtl::Requested(RrsetTtl::ProviderDefault)
+            | SetTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => self.ttl,
         };
         match self
             .api
@@ -745,7 +748,7 @@ impl VkCloud {
 /// The records of one owner name of one type, as the listing gathers them.
 struct Group {
     name: Option<DomainName>,
-    ttl: Option<Ttl>,
+    ttl: Option<RrsetTtl>,
     records: Vec<RecordData>,
 }
 
@@ -754,7 +757,7 @@ mod tests {
     use super::{Encoded, check_steps, encode, read_record, read_ttl, srv_name_fits};
     use crate::error::ErrorKind;
     use crate::providers::vk_cloud::api::{ApiRecord, Kind};
-    use crate::record::{RecordData, RecordType, Ttl};
+    use crate::record::{RecordData, RecordType, RrsetTtl};
     use crate::rrsets::{RecordUpdate, SetTtl, Step, Stored};
 
     fn record(fields: serde_json::Value) -> ApiRecord {
@@ -858,11 +861,11 @@ mod tests {
         let ttl = |v: serde_json::Value| read_ttl(Some(&v));
         assert_eq!(
             ttl(serde_json::json!(60)),
-            Some(Ttl::from_secs(60).unwrap())
+            Some(RrsetTtl::from_secs(60).unwrap())
         );
         assert_eq!(
             ttl(serde_json::json!("300")),
-            Some(Ttl::from_secs(300).unwrap())
+            Some(RrsetTtl::from_secs(300).unwrap())
         );
         assert_eq!(ttl(serde_json::json!(2_147_483_648_u64)), None);
         assert_eq!(ttl(serde_json::json!(-1)), None);
@@ -978,7 +981,7 @@ mod tests {
         Stored {
             data: data(RecordType::CNAME, text),
             enabled: true,
-            ttl: Ttl::from_secs(ttl).ok(),
+            ttl: RrsetTtl::from_secs(ttl).ok(),
             handle: "u".to_owned(),
         }
     }
@@ -987,8 +990,8 @@ mod tests {
     fn plans_the_api_cannot_carry_out_are_refused() {
         let old = stored("old.example.net.", 300);
         let new = data(RecordType::CNAME, "new.example.net.");
-        let same = Ttl::from_secs(300).ok();
-        let other = Ttl::from_secs(600).ok();
+        let same = RrsetTtl::from_secs(300).ok();
+        let other = RrsetTtl::from_secs(600).ok();
         let change = |ttl, data| Step::Update {
             record: &old,
             update: RecordUpdate {

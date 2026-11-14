@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::Context;
 use crate::error::Error;
 use crate::http::Endpoint;
+use crate::record::{RrsetTtl, Ttl};
 use crate::redact::Detail;
 
 /// Default API endpoint.
@@ -61,7 +62,7 @@ pub struct Route53Config {
     pub hosted_zone_id: Option<String>,
     /// TTL of a new rrset, in seconds: 1 to 86400, default 60.
     #[serde(default = "default_ttl")]
-    pub ttl: u32,
+    pub ttl: RrsetTtl,
     /// Interval between two polls of a submitted change, in milliseconds: 250 to 60000, default
     /// 2000.
     #[serde(default = "default_change_poll_ms")]
@@ -71,8 +72,8 @@ pub struct Route53Config {
     pub base_url: String,
 }
 
-fn default_ttl() -> u32 {
-    DEFAULT_TTL
+fn default_ttl() -> RrsetTtl {
+    RrsetTtl::Explicit(Ttl::clamped(DEFAULT_TTL))
 }
 
 fn default_change_poll_ms() -> u64 {
@@ -90,7 +91,7 @@ impl Route53Config {
         Route53Config {
             access_key_id,
             hosted_zone_id: None,
-            ttl: DEFAULT_TTL,
+            ttl: default_ttl(),
             change_poll_ms: DEFAULT_CHANGE_POLL_MS,
             base_url: default_base_url(),
         }
@@ -116,9 +117,17 @@ impl Route53Config {
                 config("hosted_zone_id must be a hosted zone ID of up to 32 letters and digits")
             })?),
         };
-        if !(TTL_MIN..=TTL_MAX).contains(&self.ttl) {
-            return Err(config("ttl must be between 1 and 86400"));
-        }
+        let ttl = match self.ttl {
+            RrsetTtl::Explicit(ttl) if (TTL_MIN..=TTL_MAX).contains(&ttl.as_secs()) => {
+                ttl.as_secs()
+            }
+            RrsetTtl::Explicit(_) => return Err(config("ttl must be between 1 and 86400")),
+            RrsetTtl::ProviderDefault => {
+                return Err(config(
+                    "ttl cannot be provider_default: the provider has no default TTL of its own",
+                ));
+            }
+        };
         if !(CHANGE_POLL_MIN_MS..=CHANGE_POLL_MAX_MS).contains(&self.change_poll_ms) {
             return Err(config("change_poll_ms must be between 250 and 60000"));
         }
@@ -133,7 +142,7 @@ impl Route53Config {
         Ok(Settings {
             api,
             hosted_zone_id,
-            ttl: self.ttl,
+            ttl,
             change_poll_ms: self.change_poll_ms,
         })
     }

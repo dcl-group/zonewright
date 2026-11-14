@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::id::ProviderId;
 use crate::meta::{
-    Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
-    ValueGuarantee,
+    Capabilities, ConfigField, FieldKind, Preconditions, ProviderDefaultTtl, ProviderMeta,
+    TtlSupport, TypeSet, ValueGuarantee,
 };
 use crate::record::RecordType;
 
@@ -73,13 +73,14 @@ const FIELDS: &[ConfigField] = &[
         key: "ttl",
         secret: false,
         required: false,
-        kind: FieldKind::Integer {
+        kind: FieldKind::Ttl {
             min: 30,
             max: 86400,
+            provider_default: true,
         },
         default: Some("30"),
         label: "Record TTL, s",
-        help: "TTL of new records, in seconds.",
+        help: "TTL of new records, in seconds, or provider_default for the zone's default TTL.",
         advanced: true,
     },
     ConfigField {
@@ -167,7 +168,9 @@ const CAPABILITIES: Capabilities = Capabilities {
         max: 86_400,
     },
     // A record's `ttl` is optional and a record without one takes the zone's default (Docs 4.6):
-    // such a record reads as no TTL, and a write that keeps it sends none.
-    provider_default_ttl: true,
+    // such a record reads as the provider's default, and a write that keeps or requests it
+    // sends none. The API has no edit call; a TTL change, to the default as to a number, stages
+    // the value again and deletes the old record (see the client's `records.rs`).
+    provider_default_ttl: ProviderDefaultTtl::Requestable,
     asynchronous: false,
 };

@@ -6,7 +6,7 @@ use crate::error::{Error, Operation};
 use crate::id::ProviderId;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{RecordType, RrSet, Ttl, Txt};
+use crate::record::{RecordType, RrSet, RrsetTtl, Txt};
 use crate::redact::Detail;
 
 /// The operations of one provider client.
@@ -72,9 +72,11 @@ pub trait Provider: Send + Sync {
     /// Makes the rrset at `rrset.name()` / `rrset.rtype()` equal to `rrset`, if `expect` holds
     /// for the rrset as it is at the provider.
     ///
-    /// `rrset.ttl() == None` keeps the TTL of an existing rrset and gives a new one the client's
-    /// configured `ttl` (which, where [`Capabilities::provider_default_ttl`] is true, may be the
-    /// provider's own choice). A CNAME at a name that holds other data, or another type at a
+    /// `rrset.ttl()` is what the write asks for the TTL (design section 3.6): `None` keeps the
+    /// TTL of an existing rrset and gives a new one the client's `ttl` setting;
+    /// `Some(RrsetTtl::Explicit(n))` sets `n`; `Some(RrsetTtl::ProviderDefault)` gives the rrset
+    /// the provider's default TTL, and is `Error::InvalidInput` before any request where
+    /// [`Capabilities::provider_default_ttl`] does not allow it. A CNAME at a name that holds other data, or another type at a
     /// name that holds a CNAME (RFC 1034 section 3.6.2), is `Error::InvalidInput` where the
     /// client's read shows it; elsewhere the provider's own answer is returned (design section
     /// 3.4).
@@ -104,13 +106,16 @@ pub trait Provider: Send + Sync {
     }
 
     /// Adds one value to the TXT rrset at `name` without touching its other values.
-    /// `ttl` is used only if the rrset has to be created; `None` is the client's default.
+    /// `ttl` is used only if the rrset has to be created: a number, the provider's default
+    /// (`Error::InvalidInput` before any request where [`Capabilities::provider_default_ttl`]
+    /// does not allow it), or with `None` the client's `ttl` setting. An existing rrset keeps
+    /// its TTL.
     fn add_txt_value(
         &self,
         zone: &DomainName,
         name: &DomainName,
         value: &Txt,
-        ttl: Option<Ttl>,
+        ttl: Option<RrsetTtl>,
     ) -> impl Future<Output = Result<AddOutcome, Error>> + Send {
         let _ = (zone, name, value, ttl);
         let provider = self.id();
@@ -138,9 +143,11 @@ pub enum Expect<'a> {
     Any,
     /// The rrset must not exist: create only.
     Absent,
-    /// The rrset must have exactly these records and, if the given set has a TTL, that TTL.
-    /// The given set must have the name and type the operation is about; anything else is
-    /// `Error::InvalidInput` before any request.
+    /// The rrset must have exactly these records and, if the given set states a TTL, that
+    /// TTL: `Some(RrsetTtl::Explicit(n))` holds for an rrset that reads with `n`,
+    /// `Some(RrsetTtl::ProviderDefault)` for one that has the provider's default, and `None`
+    /// for any TTL. The given set must have the name and type the operation is about; anything
+    /// else is `Error::InvalidInput` before any request.
     Matches(&'a RrSet),
 }
 

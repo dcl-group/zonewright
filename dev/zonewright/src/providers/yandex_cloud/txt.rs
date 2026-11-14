@@ -33,7 +33,7 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, TxtDialect};
+use crate::record::{RrsetTtl, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{Member, SetRead, SetState, TxtBase, TxtRecord, TxtSet, WholeSet, WriteTtl};
 
@@ -136,8 +136,10 @@ impl YandexCloud {
         ttl: WriteTtl,
     ) -> Result<Value, Error> {
         let ttl = match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => ttl.as_secs(),
-            WriteTtl::New(None) | WriteTtl::Existing(None) => self.ttl,
+            WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))
+            | WriteTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
+            WriteTtl::New(None | Some(RrsetTtl::ProviderDefault))
+            | WriteTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => self.ttl,
         };
         let mut set = Map::new();
         set.insert(
@@ -154,7 +156,7 @@ impl YandexCloud {
 /// The value layer's view of a record set. A set without its `data` list or with a data element
 /// that is not a string is an answer the client cannot interpret.
 fn txt_set(set: Value) -> Result<TxtSet<String, RecordSet>, Error> {
-    let ttl = ttl_of(&set).and_then(|secs| Ttl::from_secs(secs).ok());
+    let ttl = ttl_of(&set).and_then(|secs| RrsetTtl::from_secs(secs).ok());
     let records = data_of(&set)?
         .into_iter()
         .map(|text| TxtRecord {

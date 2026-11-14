@@ -41,7 +41,7 @@ pub use rtype::RecordType;
 pub use srv::Srv;
 pub use svcb::{SvcParam, Svcb};
 pub use tlsa::Tlsa;
-pub use ttl::Ttl;
+pub use ttl::{RrsetTtl, Ttl};
 pub use txt::Txt;
 #[cfg(any(
     feature = "beget",

@@ -37,7 +37,7 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, Txt, TxtDialect};
+use crate::record::{RrsetTtl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
@@ -84,7 +84,7 @@ impl PerRecord for Yandex360 {
             if record.rtype.eq_ignore_ascii_case(TXT) && is_owner(&record.name, zone, form, name)? {
                 records.push(TxtRecord {
                     value: record.text().and_then(|text| READ.read(text)),
-                    ttl: record.ttl.and_then(|secs| Ttl::from_secs(secs).ok()),
+                    ttl: record.ttl.and_then(|secs| RrsetTtl::from_secs(secs).ok()),
                     handle: record.record_id,
                 });
             }
@@ -110,9 +110,11 @@ impl PerRecord for Yandex360 {
             detail: Detail::constant("the TXT value cannot be written in this dialect"),
         })?;
         let ttl = match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => ttl.as_secs(),
+            WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))
+            | WriteTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
             // The API requires a TTL: with none reported, the configured one is sent.
-            WriteTtl::New(None) | WriteTtl::Existing(None) => self.ttl,
+            WriteTtl::New(None | Some(RrsetTtl::ProviderDefault))
+            | WriteTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => self.ttl,
         };
         let record = NewRecord {
             rtype: TXT,

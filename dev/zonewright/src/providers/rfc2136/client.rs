@@ -20,7 +20,7 @@ use crate::name::DomainName;
 use crate::provider::{
     AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
 };
-use crate::record::{RecordType, RrSet, Ttl, Txt};
+use crate::record::{RecordType, RrSet, RrsetTtl, Txt};
 use crate::redact::Detail;
 use crate::rrsets;
 use crate::values;
@@ -171,7 +171,7 @@ impl Provider for Rfc2136 {
         zone: &DomainName,
         name: &DomainName,
         value: &Txt,
-        ttl: Option<Ttl>,
+        ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
         values::add_per_record(self, zone, name, value, ttl).await
     }

@@ -6,9 +6,9 @@
 //! # Overview
 //!
 //! - Names and records: [`DomainName`] for zone and owner names, [`TargetName`] for names inside
-//!   record data, [`RecordType`], [`Ttl`], [`RecordData`] in normalized zone-file text, and
-//!   [`RrSet`], the unit of every record operation. Typed views exist for [`Txt`], [`Mx`],
-//!   [`Srv`], [`Caa`], [`Tlsa`] and [`Svcb`].
+//!   record data, [`RecordType`], [`Ttl`] and [`RrsetTtl`] (a number or the provider's default),
+//!   [`RecordData`] in normalized zone-file text, and [`RrSet`], the unit of every record
+//!   operation. Typed views exist for [`Txt`], [`Mx`], [`Srv`], [`Caa`], [`Tlsa`] and [`Svcb`].
 //! - Providers: [`ProviderId`] names a provider and is what an application stores;
 //!   [`ProviderMeta`] describes its configuration fields and [`Capabilities`] in every build. The
 //!   [`Provider`] trait is implemented by each client in [`providers`], and [`AnyProvider`]
@@ -87,12 +87,12 @@ mod http;
 #[cfg(feature = "__crypto")]
 mod crypto;
 
-pub use context::{Context, ContextOptions};
+pub use context::{Context, ContextOptions, HttpProxy};
 pub use error::{Error, ErrorKind, Operation};
 pub use id::{ProviderId, UnknownProviderId};
 pub use meta::{
-    Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
-    ValueGuarantee,
+    Capabilities, ConfigField, FieldKind, Preconditions, ProviderDefaultTtl, ProviderMeta,
+    TtlSupport, TypeSet, ValueGuarantee,
 };
 pub use name::{DomainName, NameError, TargetName};
 pub use provider::{
@@ -101,7 +101,8 @@ pub use provider::{
 };
 pub use providers::AnyProvider;
 pub use record::{
-    Caa, Mx, RecordData, RecordError, RecordType, RrSet, Srv, SvcParam, Svcb, Tlsa, Ttl, Txt,
+    Caa, Mx, RecordData, RecordError, RecordType, RrSet, RrsetTtl, Srv, SvcParam, Svcb, Tlsa, Ttl,
+    Txt,
 };
 pub use redact::Detail;
 

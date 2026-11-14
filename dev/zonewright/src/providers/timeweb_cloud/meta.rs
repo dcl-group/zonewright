@@ -10,8 +10,8 @@
 
 use crate::id::ProviderId;
 use crate::meta::{
-    Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
-    ValueGuarantee,
+    Capabilities, ConfigField, FieldKind, Preconditions, ProviderDefaultTtl, ProviderMeta,
+    TtlSupport, TypeSet, ValueGuarantee,
 };
 use crate::record::RecordType;
 
@@ -41,13 +41,14 @@ const FIELDS: &[ConfigField] = &[
         key: "ttl",
         secret: false,
         required: false,
-        kind: FieldKind::Integer {
+        kind: FieldKind::Ttl {
             min: 60,
             max: 86400,
+            provider_default: true,
         },
-        default: None,
+        default: Some("provider_default"),
         label: "Record TTL, s",
-        help: "TTL of new records, in seconds; unset leaves the choice to the provider.",
+        help: "TTL of new records, in seconds, or provider_default (also null) to leave the choice to the provider.",
         advanced: true,
     },
     ConfigField {
@@ -98,6 +99,10 @@ const CAPABILITIES: Capabilities = Capabilities {
         min: 60,
         max: 86_400,
     },
-    provider_default_ttl: true,
+    // A record created without `ttl` (optional in the create schema) has the provider's choice
+    // and lists without one: it reads as the provider's default. Whether a `PATCH` without
+    // `ttl` turns an explicit TTL into that choice is not documented, so the default can be
+    // requested only for new records.
+    provider_default_ttl: ProviderDefaultTtl::ForNewRecords,
     asynchronous: false,
 };

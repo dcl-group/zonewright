@@ -75,11 +75,17 @@
 //!
 //! # TTL
 //!
-//! A TTL of `1` means automatic and reads as no TTL; the rrset's TTL is the smallest explicit
-//! one (design section 3.6, `TtlSupport::PerRecord`). "All proxied records have a TTL of Auto
-//! ... This value cannot be edited"
-//! (<https://developers.cloudflare.com/dns/manage-dns-records/reference/ttl/>): a requested TTL
-//! for a proxied record is `Error::InvalidInput`.
+//! A TTL of `1` means automatic and reads as the provider's default (`RrsetTtl::ProviderDefault`);
+//! the rrset's TTL is the smallest explicit one, else the provider's default (design section
+//! 3.6, `TtlSupport::PerRecord`). The provider's default is requested with `1` on a create and
+//! on a `PATCH`, which also turns an explicit TTL back into automatic: the schema of a record's
+//! `ttl` is the same for both, "Setting to 1 means 'automatic'"
+//! (<https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/create/>
+//! and `…/methods/edit/`, read on 2026-11-14). "All proxied records have a TTL of Auto ... This
+//! value cannot be edited"
+//! (<https://developers.cloudflare.com/dns/manage-dns-records/reference/ttl/>): a requested
+//! explicit TTL for a proxied record is `Error::InvalidInput`, while the provider's default is
+//! what a proxied record has anyway.
 //!
 //! Both refusals (a requested TTL for a proxied record, a create into an rrset whose records
 //! disagree) are made in `PerRecord::check_plan`, over every request of the plan before the
@@ -97,7 +103,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
 use crate::provider::ZoneListing;
-use crate::record::{Caa, RecordData, RecordType, Tlsa, Ttl, TxtDialect};
+use crate::record::{Caa, RecordData, RecordType, RrsetTtl, Tlsa, Ttl, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
     self, Listing, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Step, Stored,
@@ -208,12 +214,21 @@ fn read_tlsa(data: &Value) -> Option<RecordData> {
     .ok()
 }
 
-/// A record's TTL: `None` for automatic.
-pub(super) fn read_ttl(record: &Record) -> Option<Ttl> {
-    record
-        .ttl
-        .filter(|&ttl| ttl != TTL_AUTOMATIC)
-        .and_then(|ttl| Ttl::from_secs(ttl).ok())
+/// A record's TTL: `ProviderDefault` for automatic (`1`), `None` for an answer without a usable
+/// `ttl` (the schema requires one).
+pub(super) fn read_ttl(record: &Record) -> Option<RrsetTtl> {
+    match record.ttl? {
+        TTL_AUTOMATIC => Some(RrsetTtl::ProviderDefault),
+        secs => Ttl::from_secs(secs).ok().map(RrsetTtl::Explicit),
+    }
+}
+
+/// The `ttl` a write sends: the number, or `1` for the provider's default ("automatic").
+pub(super) fn write_ttl(ttl: RrsetTtl) -> u32 {
+    match ttl {
+        RrsetTtl::Explicit(ttl) => ttl.as_secs(),
+        RrsetTtl::ProviderDefault => TTL_AUTOMATIC,
+    }
 }
 
 // ---- Writing -------------------------------------------------------------------------------------
@@ -457,12 +472,9 @@ impl PerRecord for Cloudflare {
         let ttl = if inherit.proxied {
             TTL_AUTOMATIC
         } else {
-            match ttl {
-                SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => ttl.as_secs(),
-                // The records read report no TTL: they are automatic, and so is the new one.
-                SetTtl::Existing(None) => TTL_AUTOMATIC,
-                SetTtl::Default => self.ttl,
-            }
+            // Records read without a stated TTL, which the schema does not allow, are taken as
+            // automatic, as the new one is then.
+            ttl.resolve(self.ttl).map_or(TTL_AUTOMATIC, write_ttl)
         };
         let type_name = rtype.to_string();
         let (content, priority, fields) = match &encoded {
@@ -544,7 +556,7 @@ impl PerRecord for Cloudflare {
             content,
             priority,
             data: fields,
-            ttl: update.ttl.map(Ttl::as_secs),
+            ttl: update.ttl.map(write_ttl),
         };
         match self
             .api
@@ -613,7 +625,7 @@ impl PerRecord for Cloudflare {
 }
 
 /// The attributes a new record with `ttl` takes over, or the refusal: the records read disagree,
-/// or they are proxied and a TTL is requested.
+/// or they are proxied and an explicit TTL is requested.
 fn inherited(context: &ReadContext, ttl: SetTtl) -> Result<&Attributes, Error> {
     let Some(inherit) = &context.inherit else {
         return Err(Error::InvalidInput {
@@ -623,21 +635,21 @@ fn inherited(context: &ReadContext, ttl: SetTtl) -> Result<&Attributes, Error> {
             ),
         });
     };
-    if inherit.proxied && matches!(ttl, SetTtl::Requested(_)) {
+    if inherit.proxied && matches!(ttl, SetTtl::Requested(RrsetTtl::Explicit(_))) {
         return Err(proxied_ttl());
     }
     Ok(inherit)
 }
 
-/// A change of one record: a TTL cannot be set on a proxied record.
+/// A change of one record: an explicit TTL cannot be set on a proxied record.
 fn check_update(record: &Stored<Handle>, update: &RecordUpdate<'_>) -> Result<(), Error> {
-    if update.ttl.is_some() && record.handle.attributes.proxied {
+    if matches!(update.ttl, Some(RrsetTtl::Explicit(_))) && record.handle.attributes.proxied {
         return Err(proxied_ttl());
     }
     Ok(())
 }
 
-/// A requested TTL for a proxied record.
+/// A requested explicit TTL for a proxied record.
 fn proxied_ttl() -> Error {
     Error::InvalidInput {
         detail: Detail::constant(
@@ -721,7 +733,7 @@ impl Cloudflare {
     }
 
     /// `list_rrsets`: every record of the zone, all pages, under the zone-ID cache, grouped by
-    /// name and type. The TTL of a group is the smallest explicit one.
+    /// name and type. The TTL of a group is the smallest explicit one, else automatic.
     pub(super) async fn list_zone(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
         rrsets::check_list(self, zone)?;
         let (_, all) = self

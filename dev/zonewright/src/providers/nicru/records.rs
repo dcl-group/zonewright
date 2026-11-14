@@ -32,7 +32,8 @@
 //! name stay serialized.
 //!
 //! The API has no edit call, so a TTL change of a record that stays is staged as a new record
-//! with the same value and the new TTL followed by the deletion of the old one (for a CNAME or
+//! with the same value and the new TTL (none for the zone's default, which a record without
+//! `<ttl>` takes, Docs 4.6) followed by the deletion of the old one (for a CNAME or
 //! DNAME the deletion first, so that two records of the type are never staged at once), and a
 //! CNAME or DNAME is replaced by a deletion and a creation (`updates_in_place` false); both are
 //! published by the one commit.
@@ -102,7 +103,7 @@ use crate::locks::{NameGuard, NameLocks};
 use crate::meta::Capabilities;
 use crate::name::{DomainName, TargetName};
 use crate::provider::{SkipReason, ZoneListing};
-use crate::record::{Mx, RecordData, RecordType, Srv, Ttl, Txt, TxtDialect, singleton};
+use crate::record::{Mx, RecordData, RecordType, RrsetTtl, Srv, Ttl, Txt, TxtDialect, singleton};
 use crate::redact::Detail;
 use crate::rrsets::{
     self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
@@ -356,6 +357,22 @@ fn owner<'n>(name: &'n DomainName, zone: &DomainName) -> Result<&'n str, Error> 
     }
 }
 
+/// A record's TTL as listed: `ProviderDefault` for a record without `<ttl>`, which takes the
+/// zone's default ("If ttl setting has not been set in the request, TTL default value will be
+/// applied", Docs 4.6); `None` for a number outside the model's range.
+pub(super) fn read_ttl(secs: Option<u32>) -> Option<RrsetTtl> {
+    match secs {
+        None => Some(RrsetTtl::ProviderDefault),
+        Some(secs) => RrsetTtl::from_secs(secs).ok(),
+    }
+}
+
+/// The `<ttl>` a staged record carries: the number, or none for the zone's default (and for a
+/// TTL the read could not state, which a record added to such a set has always been given).
+pub(super) fn api_ttl(ttl: Option<RrsetTtl>) -> Option<u32> {
+    ttl.and_then(RrsetTtl::explicit).map(Ttl::as_secs)
+}
+
 fn not_sendable() -> Error {
     Error::InvalidInput {
         detail: Detail::constant("the provider's encoding of this record data is not established"),
@@ -573,7 +590,7 @@ impl PerRecord for RecordOp<'_> {
                 data: read_record(rtype, &rr),
                 // The API documents no disabled records.
                 enabled: true,
-                ttl: rr.ttl.and_then(|secs| Ttl::from_secs(secs).ok()),
+                ttl: read_ttl(rr.ttl),
                 handle: rr.id,
             })
             .collect();
@@ -594,13 +611,9 @@ impl PerRecord for RecordOp<'_> {
     ) -> Result<(), Error> {
         let encoded = encode(rtype, data).ok_or_else(not_sendable)?;
         let owner = owner(name, zone)?;
-        let ttl = match ttl {
-            SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => Some(ttl.as_secs()),
-            SetTtl::Default => Some(self.client.ttl),
-            // The set states no TTL: none is sent, and the zone's default applies (Docs 4.6),
-            // as it does for the records read.
-            SetTtl::Existing(None) => None,
-        };
+        // The provider's default, requested, configured or as read, is sent as no TTL: the
+        // zone's default applies (Docs 4.6). So is a TTL the read could not state, as before.
+        let ttl = api_ttl(ttl.resolve(self.client.ttl));
         let service = self.service()?;
         let type_name = rtype.to_string();
         self.stage(
@@ -693,7 +706,7 @@ struct Group {
     name: Option<DomainName>,
     type_name: String,
     rtype: Option<RecordType>,
-    ttl: Option<Ttl>,
+    ttl: Option<RrsetTtl>,
     records: Vec<RecordData>,
 }
 
@@ -737,7 +750,7 @@ impl Nicru {
                     .map_or_else(|| "raw:".to_owned(), |n| n.as_str().to_owned()),
                 rtype.map_or_else(|| format!("raw:{}", rr.rtype), |t| t.to_string()),
             );
-            let ttl = rr.ttl.and_then(|secs| Ttl::from_secs(secs).ok());
+            let ttl = read_ttl(rr.ttl);
             let group = groups.entry(key).or_insert_with(|| Group {
                 name: rr.owner.clone(),
                 type_name: rr.rtype.clone(),
@@ -746,10 +759,7 @@ impl Nicru {
                 records: Vec::new(),
             });
             // The smallest TTL of the set (design section 3.6, `TtlSupport::PerRecord`).
-            group.ttl = match (group.ttl, ttl) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
+            group.ttl = RrsetTtl::of_records([group.ttl, ttl]);
             if let Some(rtype) = rtype.filter(|&t| shown(t)) {
                 group.records.push(read_record(rtype, rr));
             }

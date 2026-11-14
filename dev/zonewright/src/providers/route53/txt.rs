@@ -33,7 +33,7 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, Txt, TxtDialect};
+use crate::record::{RrsetTtl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{Member, SetRead, SetState, TxtBase, TxtRecord, TxtSet, WholeSet, WriteTtl};
 
@@ -209,8 +209,10 @@ impl Route53 {
     /// The TTL of a new rrset: the caller's, else the configured one.
     fn new_ttl(&self, ttl: WriteTtl) -> u32 {
         match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => ttl.as_secs(),
-            WriteTtl::New(None) | WriteTtl::Existing(None) => self.ttl,
+            WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))
+            | WriteTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
+            WriteTtl::New(None | Some(RrsetTtl::ProviderDefault))
+            | WriteTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => self.ttl,
         }
     }
 }
@@ -219,7 +221,7 @@ impl Route53 {
 fn txt_set(rrset: Rrset) -> TxtSet<String, Rrset> {
     let ttl = u32::try_from(rrset.ttl)
         .ok()
-        .and_then(|secs| Ttl::from_secs(secs).ok());
+        .and_then(|secs| RrsetTtl::from_secs(secs).ok());
     let records = rrset
         .values
         .iter()

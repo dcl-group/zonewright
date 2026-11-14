@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::Context;
 use crate::error::Error;
 use crate::http::Endpoint;
+use crate::record::{RrsetTtl, Ttl};
 use crate::redact::Detail;
 
 /// Default DNS API endpoint.
@@ -59,7 +60,7 @@ pub struct SelectelV2Config {
     pub user_domain_name: Option<String>,
     /// TTL of a new rrset, in seconds: 60 to 604800, default 60.
     #[serde(default = "default_ttl")]
-    pub ttl: u32,
+    pub ttl: RrsetTtl,
     /// DNS API endpoint; default `https://api.selectel.ru/domains/v2`.
     #[serde(default = "default_base_url")]
     pub base_url: String,
@@ -68,8 +69,8 @@ pub struct SelectelV2Config {
     pub auth_url: String,
 }
 
-fn default_ttl() -> u32 {
-    DEFAULT_TTL
+fn default_ttl() -> RrsetTtl {
+    RrsetTtl::Explicit(Ttl::clamped(DEFAULT_TTL))
 }
 
 fn default_base_url() -> String {
@@ -91,7 +92,7 @@ impl SelectelV2Config {
             project_name: None,
             username,
             user_domain_name: None,
-            ttl: DEFAULT_TTL,
+            ttl: default_ttl(),
             base_url: default_base_url(),
             auth_url: default_auth_url(),
         }
@@ -140,15 +141,23 @@ impl SelectelV2Config {
             Some(domain) => domain.clone(),
             None => self.account_id.clone(),
         };
-        if !(TTL_MIN..=TTL_MAX).contains(&self.ttl) {
-            return Err(config("ttl must be between 60 and 604800"));
-        }
+        let ttl = match self.ttl {
+            RrsetTtl::Explicit(ttl) if (TTL_MIN..=TTL_MAX).contains(&ttl.as_secs()) => {
+                ttl.as_secs()
+            }
+            RrsetTtl::Explicit(_) => return Err(config("ttl must be between 60 and 604800")),
+            RrsetTtl::ProviderDefault => {
+                return Err(config(
+                    "ttl cannot be provider_default: the provider has no default TTL of its own",
+                ));
+            }
+        };
         Ok(Settings {
             api: Endpoint::parse("base_url", &self.base_url, ctx)?,
             identity: Endpoint::parse("auth_url", &self.auth_url, ctx)?,
             project,
             user_domain,
-            ttl: self.ttl,
+            ttl,
         })
     }
 }

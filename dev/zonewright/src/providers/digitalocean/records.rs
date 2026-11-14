@@ -95,7 +95,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::{DomainName, TargetName};
 use crate::provider::ZoneListing;
-use crate::record::{Caa, Mx, RecordData, RecordType, Srv, Ttl, Txt, TxtDialect};
+use crate::record::{Caa, Mx, RecordData, RecordType, RrsetTtl, Srv, Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
     self, Listing, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
@@ -471,7 +471,7 @@ impl PerRecord for DigitalOcean {
                 data: read_record(rtype, &record, zone),
                 // The API has no disabled records.
                 enabled: true,
-                ttl: record.ttl.and_then(|secs| Ttl::from_secs(secs).ok()),
+                ttl: record.ttl.and_then(|secs| RrsetTtl::from_secs(secs).ok()),
                 handle: record.id,
             })
             .collect();
@@ -492,11 +492,14 @@ impl PerRecord for DigitalOcean {
     ) -> Result<(), Error> {
         let encoded = encode(rtype, data).ok_or_else(not_sendable)?;
         let ttl = match ttl {
-            SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => Some(ttl.as_secs()),
+            SetTtl::Requested(RrsetTtl::Explicit(ttl))
+            | SetTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => Some(ttl.as_secs()),
             // The set's TTL was not reported: the configured TTL, as for a new set. In the
-            // model this provider has no "no explicit TTL" (`provider_default_ttl` is false), so
+            // model this provider has no "no explicit TTL" (`provider_default_ttl` is `Absent`), so
             // `None` is mapped to the client's `ttl` setting (design section 3.6).
-            SetTtl::Default | SetTtl::Existing(None) => Some(self.ttl),
+            SetTtl::Default
+            | SetTtl::Requested(RrsetTtl::ProviderDefault)
+            | SetTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => Some(self.ttl),
         };
         let type_name = rtype.to_string();
         let record = NewRecord {
@@ -536,7 +539,7 @@ impl PerRecord for DigitalOcean {
         let patch = RecordPatch {
             rtype: &type_name,
             data: encoded.as_ref().map(|e| e.data.as_str()),
-            ttl: update.ttl.map(Ttl::as_secs),
+            ttl: update.ttl.and_then(RrsetTtl::explicit).map(Ttl::as_secs),
             extra: encoded.as_ref().map(Encoded::extra).unwrap_or_default(),
         };
         match self.api.update_record(zone, record.handle, &patch).await? {
@@ -585,7 +588,7 @@ struct Group {
     name: Option<DomainName>,
     type_name: String,
     rtype: Option<RecordType>,
-    ttl: Option<Ttl>,
+    ttl: Option<RrsetTtl>,
     records: Vec<RecordData>,
 }
 
@@ -611,7 +614,7 @@ impl DigitalOcean {
                 // the record holds; the data is then never parsed.
                 None => RecordData::non_canonical(record.data.as_deref().unwrap_or_default()),
             };
-            let ttl = record.ttl.and_then(|secs| Ttl::from_secs(secs).ok());
+            let ttl = record.ttl.and_then(|secs| RrsetTtl::from_secs(secs).ok());
             let group = groups.entry(key).or_insert_with(|| Group {
                 name,
                 type_name: record.rtype.clone(),

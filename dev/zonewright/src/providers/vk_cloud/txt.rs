@@ -36,7 +36,7 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, Txt, TxtDialect};
+use crate::record::{RrsetTtl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
@@ -203,8 +203,10 @@ impl VkCloud {
     /// smallest TTL of the existing set, else the configured one.
     fn new_ttl(&self, ttl: WriteTtl) -> u32 {
         match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => ttl.as_secs(),
-            WriteTtl::New(None) | WriteTtl::Existing(None) => self.ttl,
+            WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))
+            | WriteTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
+            WriteTtl::New(None | Some(RrsetTtl::ProviderDefault))
+            | WriteTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => self.ttl,
         }
     }
 }
@@ -213,7 +215,7 @@ impl VkCloud {
 fn txt_record(record: api::TxtRecord) -> TxtRecord<String> {
     TxtRecord {
         value: READ.read(&record.content),
-        ttl: record.ttl.and_then(|ttl| Ttl::from_secs(ttl).ok()),
+        ttl: record.ttl.and_then(|ttl| RrsetTtl::from_secs(ttl).ok()),
         handle: record.uuid,
     }
 }

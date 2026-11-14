@@ -21,8 +21,8 @@ use zonewright::providers::yandex_cloud::{
 };
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, SkipReason,
-    Ttl, Txt,
+    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl, SetOutcome,
+    SkipReason, Ttl, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -148,7 +148,7 @@ fn rrset(name: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrS
     RrSet::new(
         dn(name),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         texts.iter().map(|t| rd(rtype, t)),
     )
     .unwrap()
@@ -977,7 +977,7 @@ async fn yandex_cloud_add_creates_rrset() {
 
     // A TTL given by the caller is used for a new set only.
     let other = dn("_acme-challenge.www.example.org");
-    let ttl = Ttl::from_secs(300).unwrap();
+    let ttl = RrsetTtl::from_secs(300).unwrap();
     client
         .add_txt_value(&zone(), &other, &txt("BBB"), Some(ttl))
         .await
@@ -987,7 +987,7 @@ async fn yandex_cloud_add_creates_rrset() {
             &zone(),
             &other,
             &txt("CCC"),
-            Some(Ttl::from_secs(900).unwrap()),
+            Some(RrsetTtl::from_secs(900).unwrap()),
         )
         .await
         .unwrap();
@@ -1109,7 +1109,7 @@ async fn yandex_cloud_caller_ttl_covers_the_api_range() {
                 &zone(),
                 &name,
                 &txt("AAA"),
-                Some(Ttl::from_secs(secs).unwrap()),
+                Some(RrsetTtl::from_secs(secs).unwrap()),
             )
             .await
             .unwrap();
@@ -3262,7 +3262,7 @@ async fn live_yandex_cloud_record_round_trip() {
     let a_set = RrSet::new(
         records.clone(),
         RecordType::A,
-        Some(Ttl::from_secs(120).unwrap()),
+        Some(RrsetTtl::from_secs(120).unwrap()),
         [
             rd(RecordType::A, "192.0.2.1"),
             rd(RecordType::A, "192.0.2.2"),

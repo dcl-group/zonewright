@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::Context;
 use crate::error::Error;
 use crate::http::Endpoint;
+use crate::record::RrsetTtl;
 use crate::redact::Detail;
 
 /// Default API endpoint.
@@ -33,29 +34,37 @@ pub(super) const TTL_MAX: u32 = 86_400;
 pub struct TimewebCloudConfig {
     /// API endpoint; default `https://api.timeweb.cloud/api`.
     pub base_url: String,
-    /// TTL of a new record, in seconds: 60 to 86400. Unset (the default): no TTL is sent and
-    /// the provider chooses.
-    pub ttl: Option<u32>,
+    /// TTL of a new record: 60 to 86400 seconds, or `"provider_default"` (the default): no TTL
+    /// is sent and the provider chooses. A missing key and `null` mean the provider's default,
+    /// as they always have.
+    #[serde(deserialize_with = "ttl_or_provider_default")]
+    pub ttl: RrsetTtl,
 }
 
 impl Default for TimewebCloudConfig {
     fn default() -> TimewebCloudConfig {
         TimewebCloudConfig {
             base_url: DEFAULT_BASE_URL.to_owned(),
-            ttl: None,
+            ttl: RrsetTtl::ProviderDefault,
         }
     }
+}
+
+/// `ttl`, with `null` read as the provider's default.
+fn ttl_or_provider_default<'de, D: serde::Deserializer<'de>>(d: D) -> Result<RrsetTtl, D::Error> {
+    Ok(Option::<RrsetTtl>::deserialize(d)?.unwrap_or(RrsetTtl::ProviderDefault))
 }
 
 impl TimewebCloudConfig {
     /// Checks everything that can be checked without the network. Error texts name the key,
     /// never its value.
     pub(super) fn validate(&self, ctx: &Context) -> Result<Settings, Error> {
-        if self
-            .ttl
-            .is_some_and(|ttl| !(TTL_MIN..=TTL_MAX).contains(&ttl))
+        if let RrsetTtl::Explicit(ttl) = self.ttl
+            && !(TTL_MIN..=TTL_MAX).contains(&ttl.as_secs())
         {
-            return Err(config("ttl must be between 60 and 86400"));
+            return Err(config(
+                "ttl must be between 60 and 86400, or provider_default",
+            ));
         }
         Ok(Settings {
             api: Endpoint::parse("base_url", &self.base_url, ctx)?,
@@ -69,8 +78,8 @@ impl TimewebCloudConfig {
 pub(super) struct Settings {
     /// The API.
     pub(super) api: Endpoint,
-    /// TTL of a new record; `None` leaves the choice to the provider.
-    pub(super) ttl: Option<u32>,
+    /// TTL of a new record: a number, or the provider's choice.
+    pub(super) ttl: RrsetTtl,
 }
 
 /// Credentials of the Timeweb Cloud client: the secret part of its configuration.

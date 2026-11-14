@@ -61,9 +61,10 @@
 //! as `NotPlainRecords`, since the content alone is not the value; any other type's content is
 //! carried as non-canonical data (design section 4.9), never parsed by a guessed rule.
 //!
-//! TTL, disabled records, SOA: the listing states no TTL per record (only the zone's `soa` object,
-//! which is not a record and not listed), so every rrset reads with no TTL; `state` is documented
-//! as obsolete and every record is published.
+//! TTL, disabled records, SOA: no function sets a TTL and the listing states none per record
+//! (only the zone's `soa` object, which is not a record and not listed): every TTL is the
+//! provider's, and every rrset reads with `RrsetTtl::ProviderDefault`, which a write may also ask
+//! for; `state` is documented as obsolete and every record is published.
 
 use std::collections::BTreeMap;
 
@@ -73,7 +74,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
 use crate::provider::{SkipReason, ZoneListing};
-use crate::record::{RecordData, RecordType, Txt, TxtDialect};
+use crate::record::{RecordData, RecordType, RrsetTtl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
     self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
@@ -307,8 +308,8 @@ impl PerRecord for Regru {
                 data: read_content(kind, &content),
                 // `state` is obsolete (documentation 9.11): every record is published.
                 enabled: true,
-                // The listing states no TTL per record.
-                ttl: None,
+                // No TTL is stated or settable: the provider's (module documentation).
+                ttl: Some(RrsetTtl::ProviderDefault),
                 handle: content,
             });
         }
@@ -454,7 +455,12 @@ impl Regru {
                 (Listed::Skip, Some(name)) if name.is_within(zone) => {
                     listing.skip(name, &group.type_name, SkipReason::NotPlainRecords);
                 }
-                (_, name) => listing.push(name, &group.type_name, None, group.records),
+                (_, name) => listing.push(
+                    name,
+                    &group.type_name,
+                    Some(RrsetTtl::ProviderDefault),
+                    group.records,
+                ),
             }
         }
         listing.finish(ProviderId::Regru)

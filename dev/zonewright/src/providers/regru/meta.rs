@@ -10,8 +10,8 @@
 
 use crate::id::ProviderId;
 use crate::meta::{
-    Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
-    ValueGuarantee,
+    Capabilities, ConfigField, FieldKind, Preconditions, ProviderDefaultTtl, ProviderMeta,
+    TtlSupport, TypeSet, ValueGuarantee,
 };
 use crate::record::RecordType;
 
@@ -116,6 +116,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     // No add function has a TTL parameter (documentation 9.2, 9.3, 9.9), and the listing states
     // none per record (9.11).
     ttl: TtlSupport::NotSettable,
-    provider_default_ttl: true,
+    // The provider's TTL is the only one: records read with it, and a write may ask for it.
+    provider_default_ttl: ProviderDefaultTtl::Requestable,
     asynchronous: false,
 };

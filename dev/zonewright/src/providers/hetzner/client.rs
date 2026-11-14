@@ -19,7 +19,7 @@ use crate::provider::{
     AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
     ZoneInfo, ZoneListing,
 };
-use crate::record::{RecordType, RrSet, Ttl, Txt};
+use crate::record::{RecordType, RrSet, RrsetTtl, Txt};
 use crate::redact::Detail;
 use crate::{rrsets, values};
 
@@ -53,8 +53,8 @@ pub struct Hetzner {
     pub(super) zones: ZoneCache,
     /// The per-name locks of the context.
     pub(super) locks: NameLocks,
-    /// TTL of a new rrset.
-    pub(super) ttl: u32,
+    /// TTL of a new rrset: a number, or the zone's default.
+    pub(super) ttl: RrsetTtl,
     /// How a running action is waited for.
     pub(super) poller: Poller,
 }
@@ -247,7 +247,7 @@ impl Provider for Hetzner {
         zone: &DomainName,
         name: &DomainName,
         value: &Txt,
-        ttl: Option<Ttl>,
+        ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
         values::add_value_calls(self, zone, name, value, ttl).await
     }

@@ -49,7 +49,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
 use crate::provider::{SkipReason, ZoneListing};
-use crate::record::{RecordData, RecordType, Ttl};
+use crate::record::{RecordData, RecordType, RrsetTtl};
 use crate::redact::Detail;
 use crate::rrsets::{
     self, Current, Found, Listing, Member, Neighbors, RrsetBase, SetTtl, Stored, WholeChange,
@@ -89,10 +89,10 @@ fn api_type(rtype: RecordType) -> Result<&'static str, Error> {
 }
 
 /// The TTL a record reports, if it is a valid one.
-fn ttl_of(record: &Record) -> Option<Ttl> {
+fn ttl_of(record: &Record) -> Option<RrsetTtl> {
     u32::try_from(record.ttl)
         .ok()
-        .and_then(|secs| Ttl::from_secs(secs).ok())
+        .and_then(|secs| RrsetTtl::from_secs(secs).ok())
 }
 
 /// The record layer's view of a record the API returned.
@@ -171,10 +171,13 @@ impl WholeSet for CloudRu {
             })
             .collect::<Result<Vec<String>, Error>>()?;
         let ttl = match ttl {
-            SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => u64::from(ttl.as_secs()),
+            SetTtl::Requested(RrsetTtl::Explicit(ttl))
+            | SetTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => u64::from(ttl.as_secs()),
             // A TTL outside the model's range travels back as read.
-            SetTtl::Existing(None) => prior.map_or(u64::from(self.ttl), |prior| prior.ttl),
-            SetTtl::Default => u64::from(self.ttl),
+            SetTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => {
+                prior.map_or(u64::from(self.ttl), |prior| prior.ttl)
+            }
+            SetTtl::Default | SetTtl::Requested(RrsetTtl::ProviderDefault) => u64::from(self.ttl),
         };
         match prior {
             None => {

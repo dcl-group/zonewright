@@ -22,7 +22,7 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, Txt, TxtDialect};
+use crate::record::{RrsetTtl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
@@ -74,7 +74,7 @@ impl PerRecord for DigitalOcean {
             })
             .map(|record| TxtRecord {
                 value: record.data.as_deref().and_then(|data| READ.read(data)),
-                ttl: record.ttl.and_then(|secs| Ttl::from_secs(secs).ok()),
+                ttl: record.ttl.and_then(|secs| RrsetTtl::from_secs(secs).ok()),
                 handle: record.id,
             })
             .collect();
@@ -92,10 +92,11 @@ impl PerRecord for DigitalOcean {
             detail: Detail::constant("the TXT value cannot be written in this dialect"),
         })?;
         let ttl = match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => Some(ttl.as_secs()),
-            WriteTtl::New(None) => Some(self.ttl),
+            WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))
+            | WriteTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => Some(ttl.as_secs()),
+            WriteTtl::New(None | Some(RrsetTtl::ProviderDefault)) => Some(self.ttl),
             // The set's TTL was not reported: send none, so that the provider decides.
-            WriteTtl::Existing(None) => None,
+            WriteTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => None,
         };
         let record = NewRecord {
             rtype: TXT,

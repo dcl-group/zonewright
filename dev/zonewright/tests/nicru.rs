@@ -17,8 +17,8 @@ use secrecy::SecretString;
 use zonewright::providers::nicru::{Nicru, NicruConfig, NicruCredentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, SkipReason,
-    Ttl, Txt,
+    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl, SetOutcome,
+    SkipReason, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum::http::{Method, StatusCode};
@@ -1494,7 +1494,7 @@ async fn nicru_ttl_and_apex() {
             &zone(),
             &name(),
             &txt("v1"),
-            Some(Ttl::from_secs(120).unwrap()),
+            Some(RrsetTtl::from_secs(120).unwrap()),
         )
         .await
         .unwrap();
@@ -1537,7 +1537,7 @@ async fn nicru_ttl_and_apex() {
             &zone(),
             &name(),
             &txt("v9"),
-            Some(Ttl::from_secs(10).unwrap()),
+            Some(RrsetTtl::from_secs(10).unwrap()),
         )
         .await
         .unwrap_err();
@@ -1686,7 +1686,7 @@ fn rr(owner: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrSet
     RrSet::new(
         dn(owner),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         texts.iter().map(|t| rdata(rtype, t)),
     )
     .unwrap()
@@ -1694,8 +1694,10 @@ fn rr(owner: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrSet
 
 /// `set` with the configured default TTL when it has none.
 fn with_default_ttl(set: &RrSet) -> RrSet {
-    set.clone()
-        .with_ttl(set.ttl().or(Some(Ttl::from_secs(DEFAULT_TTL).unwrap())))
+    set.clone().with_ttl(
+        set.ttl()
+            .or(Some(RrsetTtl::from_secs(DEFAULT_TTL).unwrap())),
+    )
 }
 
 /// The zone's listing shows every record at the name, so a CNAME next to other data, or other
@@ -2064,7 +2066,9 @@ async fn nicru_set_any_replaces_and_delete_converges() {
     );
     assert_eq!((puts(&mock), deletes(&mock), commits(&mock)), (1, 1, 1));
 
-    let retuned = next.clone().with_ttl(Some(Ttl::from_secs(120).unwrap()));
+    let retuned = next
+        .clone()
+        .with_ttl(Some(RrsetTtl::from_secs(120).unwrap()));
     assert_eq!(
         client
             .set_rrset(&zone(), &retuned, Expect::Any)
@@ -3177,4 +3181,133 @@ async fn live_nicru_record_round_trip() {
         std::panic::resume_unwind(e.into_panic());
     }
     assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
+}
+
+/// The zone's default TTL (design section 3.6): a record without `<ttl>`. A set staged without
+/// one, a switch from a number to it (the value staged again without `<ttl>`, the old record
+/// deleted) and back, unchanged round trips in both states, expectations of each kind, the
+/// `ttl` setting's spelling, and a TXT value added with it.
+#[tokio::test]
+async fn nicru_provider_default_ttl() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let default = Some(RrsetTtl::ProviderDefault);
+    let www = "www.example.org";
+    let set = |ttl: Option<RrsetTtl>| rr(www, RecordType::A, None, &["192.0.2.1"]).with_ttl(ttl);
+    let ttls = || -> Vec<Option<String>> {
+        control
+            .published("www", "A")
+            .into_iter()
+            .map(|r| r.ttl)
+            .collect()
+    };
+    let puts = |mock: &NicruMock| -> Vec<String> {
+        mock.log()
+            .matching(Some("PUT"), RECORDS)
+            .iter()
+            .map(|r| r.body_str().into_owned())
+            .collect()
+    };
+
+    // Staged without `<ttl>`.
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &set(default), Expect::Absent)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    let staged = puts(&mock);
+    assert_eq!(staged.len(), 1);
+    assert!(!staged[0].contains("<ttl>"), "{}", staged[0]);
+    assert_eq!(ttls(), [None]);
+    let read = client
+        .get_rrset(&zone(), &dn(www), RecordType::A)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, set(default));
+    let before = writes(&mock);
+    for wanted in [read.clone(), set(None)] {
+        assert_eq!(
+            client
+                .set_rrset(&zone(), &wanted, Expect::Matches(&read))
+                .await
+                .unwrap(),
+            SetOutcome::Unchanged
+        );
+    }
+    let e = client
+        .set_rrset(
+            &zone(),
+            &set(None),
+            Expect::Matches(&set(Some(RrsetTtl::from_secs(30).unwrap()))),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(writes(&mock), before);
+
+    // Default to explicit and back: the value staged again, the old record deleted.
+    let explicit = set(Some(RrsetTtl::from_secs(600).unwrap()));
+    mock.log().clear();
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &explicit, Expect::Matches(&set(default)))
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert!(puts(&mock)[0].contains("<ttl>600</ttl>"));
+    assert_eq!(ttls(), [Some("600".to_owned())]);
+    let before = writes(&mock);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &explicit, Expect::Matches(&explicit))
+            .await
+            .unwrap(),
+        SetOutcome::Unchanged
+    );
+    assert_eq!(writes(&mock), before);
+    mock.log().clear();
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &set(default), Expect::Matches(&explicit))
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    let staged = puts(&mock);
+    assert_eq!(staged.len(), 1);
+    assert!(!staged[0].contains("<ttl>"), "{}", staged[0]);
+    assert_eq!(ttls(), [None]);
+
+    // A TXT value added with the default is staged without `<ttl>`.
+    mock.log().clear();
+    client
+        .add_txt_value(&zone(), &name(), &txt("v1"), default)
+        .await
+        .unwrap();
+    assert!(!puts(&mock)[0].contains("<ttl>"));
+    assert_eq!(control.published(REL, "TXT")[0].ttl, None);
+
+    // The setting "provider_default": a new set without a TTL.
+    let seed = Seed::standard();
+    let mut config = settings(&mock, &seed);
+    config.ttl = RrsetTtl::ProviderDefault;
+    let configured = Nicru::new(
+        config,
+        credentials(&seed.password, &seed.client_id, &seed.client_secret),
+        &context(),
+    )
+    .unwrap();
+    configured
+        .set_rrset(
+            &zone(),
+            &rr("new.example.org", RecordType::A, None, &["192.0.2.9"]),
+            Expect::Absent,
+        )
+        .await
+        .unwrap();
+    assert_eq!(control.published("new", "A")[0].ttl, None);
 }

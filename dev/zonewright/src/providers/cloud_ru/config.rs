@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::Context;
 use crate::error::Error;
 use crate::http::Endpoint;
+use crate::record::{RrsetTtl, Ttl};
 use crate::redact::Detail;
 
 /// Default DNS API endpoint.
@@ -55,7 +56,7 @@ pub struct CloudRuConfig {
     pub key_id: String,
     /// TTL of a new record, in seconds: 60 to 86400, default 60.
     #[serde(default = "default_ttl")]
-    pub ttl: u32,
+    pub ttl: RrsetTtl,
     /// Interval between two polls of an operation, in milliseconds: 250 to 60000, default 1000.
     #[serde(default = "default_poll_ms")]
     pub operation_poll_ms: u64,
@@ -67,8 +68,8 @@ pub struct CloudRuConfig {
     pub iam_url: String,
 }
 
-fn default_ttl() -> u32 {
-    DEFAULT_TTL
+fn default_ttl() -> RrsetTtl {
+    RrsetTtl::Explicit(Ttl::clamped(DEFAULT_TTL))
 }
 
 fn default_poll_ms() -> u64 {
@@ -90,7 +91,7 @@ impl CloudRuConfig {
         CloudRuConfig {
             project_id,
             key_id,
-            ttl: DEFAULT_TTL,
+            ttl: default_ttl(),
             operation_poll_ms: DEFAULT_POLL_MS,
             dns_url: default_dns_url(),
             iam_url: default_iam_url(),
@@ -110,15 +111,24 @@ impl CloudRuConfig {
                 "key_id must be 1 to 128 characters without control characters",
             ));
         }
-        if !(TTL_MIN..=TTL_MAX).contains(&self.ttl) {
-            return Err(config("ttl must be between 60 and 86400"));
-        }
+        let ttl = match self.ttl {
+            RrsetTtl::Explicit(ttl) if (TTL_MIN..=TTL_MAX).contains(&ttl.as_secs()) => {
+                ttl.as_secs()
+            }
+            RrsetTtl::Explicit(_) => return Err(config("ttl must be between 60 and 86400")),
+            RrsetTtl::ProviderDefault => {
+                return Err(config(
+                    "ttl cannot be provider_default: the provider has no default TTL of its own",
+                ));
+            }
+        };
         if !(POLL_MS_MIN..=POLL_MS_MAX).contains(&self.operation_poll_ms) {
             return Err(config("operation_poll_ms must be between 250 and 60000"));
         }
         Ok(Settings {
             dns: Endpoint::parse("dns_url", &self.dns_url, ctx)?,
             iam: Endpoint::parse("iam_url", &self.iam_url, ctx)?,
+            ttl,
         })
     }
 }
@@ -135,6 +145,8 @@ pub(super) struct Settings {
     pub(super) dns: Endpoint,
     /// The token endpoint.
     pub(super) iam: Endpoint,
+    /// TTL of a new record.
+    pub(super) ttl: u32,
 }
 
 /// Credentials of the Cloud.ru client: the secret part of its configuration.

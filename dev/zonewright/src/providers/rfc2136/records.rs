@@ -67,7 +67,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::{DomainName, TargetName};
 use crate::provider::Expect;
-use crate::record::{RecordData, RecordType, RrSet, Ttl};
+use crate::record::{RecordData, RecordType, RrSet, RrsetTtl, Ttl};
 use crate::redact::Detail;
 use crate::rrsets::{Current, Found, Member, RrsetBase, SetTtl, Stored, WholeRead, WholeSet};
 
@@ -200,7 +200,7 @@ impl WholeSet for Rfc2136 {
             let prior = Prior(stored.iter().map(|record| record.handle.clone()).collect());
             Found {
                 records: stored,
-                ttl,
+                ttl: ttl.map(RrsetTtl::Explicit),
                 snapshot: prior,
             }
         });
@@ -222,8 +222,11 @@ impl WholeSet for Rfc2136 {
     ) -> Result<(), Error> {
         let code = code(rtype)?;
         let ttl = match ttl {
-            SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => ttl.as_secs(),
-            SetTtl::Existing(None) | SetTtl::Default => self.ttl,
+            SetTtl::Requested(RrsetTtl::Explicit(ttl))
+            | SetTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
+            SetTtl::Existing(None | Some(RrsetTtl::ProviderDefault))
+            | SetTtl::Default
+            | SetTtl::Requested(RrsetTtl::ProviderDefault) => self.ttl,
         };
         let mut update = Builder::update(zone);
         match prior {

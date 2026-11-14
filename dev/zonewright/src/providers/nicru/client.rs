@@ -19,7 +19,7 @@ use crate::provider::{
     AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
     ZoneInfo, ZoneListing,
 };
-use crate::record::{RecordType, RrSet, Ttl, Txt};
+use crate::record::{RecordType, RrSet, RrsetTtl, Txt};
 use crate::redact::Detail;
 use crate::{rrsets, values};
 
@@ -86,7 +86,7 @@ pub struct Nicru {
     /// The context, for the client's process-local state.
     ctx: Context,
     /// TTL of a new rrset.
-    pub(super) ttl: u32,
+    pub(super) ttl: RrsetTtl,
 }
 
 impl fmt::Debug for Nicru {
@@ -428,7 +428,7 @@ impl Provider for Nicru {
         zone: &DomainName,
         name: &DomainName,
         value: &Txt,
-        ttl: Option<Ttl>,
+        ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
         values::add_per_record(&Op::new(self), zone, name, value, ttl).await
     }

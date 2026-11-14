@@ -107,7 +107,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
 use crate::provider::ZoneListing;
-use crate::record::{Caa, RecordData, RecordType, SvcParam, Svcb, Ttl, Txt, TxtDialect};
+use crate::record::{Caa, RecordData, RecordType, RrsetTtl, SvcParam, Svcb, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{self, Current, Found, Listing, Member, RrsetBase, SetTtl, Stored, WholeSet};
 
@@ -286,7 +286,7 @@ fn found(
         .collect();
     Ok(Found {
         records,
-        ttl: ttl_of(&set).and_then(|secs| Ttl::from_secs(secs).ok()),
+        ttl: ttl_of(&set).and_then(|secs| RrsetTtl::from_secs(secs).ok()),
         snapshot: RecordSet(set),
     })
 }
@@ -341,8 +341,11 @@ impl WholeSet for YandexCloud {
         let (deletions, addition) = match prior {
             None => {
                 let ttl = match ttl {
-                    SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => ttl.as_secs(),
-                    SetTtl::Existing(None) | SetTtl::Default => self.ttl,
+                    SetTtl::Requested(RrsetTtl::Explicit(ttl))
+                    | SetTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
+                    SetTtl::Existing(None | Some(RrsetTtl::ProviderDefault))
+                    | SetTtl::Default
+                    | SetTtl::Requested(RrsetTtl::ProviderDefault) => self.ttl,
                 };
                 let mut set = Map::new();
                 set.insert(
@@ -401,7 +404,7 @@ fn replaced(prior: &RecordSet, data: Vec<Value>, ttl: SetTtl) -> Value {
             set.insert(key.to_owned(), value.clone());
         }
     }
-    if let SetTtl::Requested(ttl) = ttl {
+    if let SetTtl::Requested(RrsetTtl::Explicit(ttl)) = ttl {
         set.insert("ttl".into(), Value::String(ttl.as_secs().to_string()));
     }
     set.insert("data".into(), Value::Array(data));
@@ -456,7 +459,7 @@ impl YandexCloud {
         for set in &sets {
             let name = set.get("name").and_then(Value::as_str).ok_or_else(shape)?;
             let type_name = set.get("type").and_then(Value::as_str).ok_or_else(shape)?;
-            let ttl = ttl_of(set).and_then(|secs| Ttl::from_secs(secs).ok());
+            let ttl = ttl_of(set).and_then(|secs| RrsetTtl::from_secs(secs).ok());
             let data = data_of(set)?;
             // A type name that maps to no record type is skipped by the listing, whatever the
             // data hold; the data are then never parsed.

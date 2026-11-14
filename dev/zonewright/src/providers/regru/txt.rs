@@ -34,7 +34,7 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Txt, TxtDialect};
+use crate::record::{RrsetTtl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
@@ -101,8 +101,8 @@ impl PerRecord for Regru {
                 let content = rr.content.unwrap_or_default();
                 TxtRecord {
                     value: READ.read(&content),
-                    // The listing states no TTL per record.
-                    ttl: None,
+                    // No TTL is stated or settable: the provider's.
+                    ttl: Some(RrsetTtl::ProviderDefault),
                     handle: content,
                 }
             })

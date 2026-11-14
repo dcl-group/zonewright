@@ -17,9 +17,10 @@
 //! documents TXT content as quoted character strings, and plain values, the only ones the
 //! capabilities accept, need no escape.
 //!
-//! TTL: the API stores a TTL on every record, `1` meaning automatic, which reads as no TTL
-//! (design section 3.6). A record added to an existing set gets the smallest TTL read; when
-//! none was reported, the set is automatic and the record is created with `1`.
+//! TTL: the API stores a TTL on every record, `1` meaning automatic, which reads as the
+//! provider's default (design section 3.6). A record added to an existing set gets the smallest
+//! explicit TTL read; when there is none, the set is automatic and the record is created with
+//! `1`. A new set asked to have the provider's default is created with `1` as well.
 
 use crate::error::Error;
 use crate::http::{Attempt, ZoneId};
@@ -34,7 +35,7 @@ use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 use super::api::{NewRecord, TXT, Written};
 use super::client::Cloudflare;
 use super::config::TTL_AUTOMATIC;
-use super::records::read_ttl;
+use super::records::{read_ttl, write_ttl};
 
 /// How TXT content is read.
 const READ: TxtDialect = TxtDialect::Auto;
@@ -190,13 +191,9 @@ impl Cloudflare {
     }
 
     /// The TTL of a new record: the caller's, else the configured one for a new rrset; the TTL
-    /// of the existing set, or automatic when it reports none.
+    /// of the existing set, or automatic when it is automatic or reports none.
     fn new_ttl(&self, ttl: WriteTtl) -> u32 {
-        match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => ttl.as_secs(),
-            WriteTtl::New(None) => self.ttl,
-            WriteTtl::Existing(None) => TTL_AUTOMATIC,
-        }
+        ttl.resolve(self.ttl).map_or(TTL_AUTOMATIC, write_ttl)
     }
 }
 

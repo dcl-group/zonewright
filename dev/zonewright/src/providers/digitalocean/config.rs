@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::Context;
 use crate::error::Error;
 use crate::http::Endpoint;
+use crate::record::{RrsetTtl, Ttl};
 use crate::redact::Detail;
 
 /// Default API endpoint.
@@ -38,14 +39,14 @@ pub struct DigitalOceanConfig {
     /// API endpoint; default `https://api.digitalocean.com/v2`.
     pub base_url: String,
     /// TTL of a new record, in seconds: 30 to 86400, default 30.
-    pub ttl: u32,
+    pub ttl: RrsetTtl,
 }
 
 impl Default for DigitalOceanConfig {
     fn default() -> DigitalOceanConfig {
         DigitalOceanConfig {
             base_url: DEFAULT_BASE_URL.to_owned(),
-            ttl: DEFAULT_TTL,
+            ttl: RrsetTtl::Explicit(Ttl::clamped(DEFAULT_TTL)),
         }
     }
 }
@@ -54,12 +55,20 @@ impl DigitalOceanConfig {
     /// Checks everything that can be checked without the network. Error texts name the key,
     /// never its value.
     pub(super) fn validate(&self, ctx: &Context) -> Result<Settings, Error> {
-        if !(TTL_MIN..=TTL_MAX).contains(&self.ttl) {
-            return Err(config("ttl must be between 30 and 86400"));
-        }
+        let ttl = match self.ttl {
+            RrsetTtl::Explicit(ttl) if (TTL_MIN..=TTL_MAX).contains(&ttl.as_secs()) => {
+                ttl.as_secs()
+            }
+            RrsetTtl::Explicit(_) => return Err(config("ttl must be between 30 and 86400")),
+            RrsetTtl::ProviderDefault => {
+                return Err(config(
+                    "ttl cannot be provider_default: the provider has no default TTL of its own",
+                ));
+            }
+        };
         Ok(Settings {
             api: Endpoint::parse("base_url", &self.base_url, ctx)?,
-            ttl: self.ttl,
+            ttl,
         })
     }
 }

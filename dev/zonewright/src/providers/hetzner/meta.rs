@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::id::ProviderId;
 use crate::meta::{
-    Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
-    ValueGuarantee,
+    Capabilities, ConfigField, FieldKind, Preconditions, ProviderDefaultTtl, ProviderMeta,
+    TtlSupport, TypeSet, ValueGuarantee,
 };
 use crate::record::RecordType;
 
@@ -43,13 +43,14 @@ const FIELDS: &[ConfigField] = &[
         key: "ttl",
         secret: false,
         required: false,
-        kind: FieldKind::Integer {
+        kind: FieldKind::Ttl {
             min: 60,
             max: 2_147_483_647,
+            provider_default: true,
         },
         default: Some("60"),
         label: "Record TTL, s",
-        help: "TTL of a new rrset, in seconds; at least 60. An existing rrset keeps its TTL.",
+        help: "TTL of a new rrset, in seconds (at least 60), or provider_default for the zone's default TTL; an existing rrset keeps its TTL.",
         advanced: true,
     },
     ConfigField {
@@ -123,8 +124,9 @@ const CAPABILITIES: Capabilities = Capabilities {
         max: 2_147_483_647,
     },
     // An rrset whose `ttl` is `null` uses the zone's default TTL ("If not set, the Zone's
-    // Default TTL is used") and reads as `ttl() == None`. The client itself always sends a TTL
-    // for a new rrset; the `ttl` setting has no spelling for the zone's default.
-    provider_default_ttl: true,
+    // Default TTL is used") and reads as the provider's default. A create, an `add_records` and
+    // a `change_ttl` without a TTL (`change_ttl` with `ttl: null`, which its schema allows)
+    // request it, also in place of an explicit TTL (see the client's `records.rs`).
+    provider_default_ttl: ProviderDefaultTtl::Requestable,
     asynchronous: true,
 };

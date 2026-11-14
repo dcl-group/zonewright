@@ -16,7 +16,7 @@ use crate::provider::{
     AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneInfo,
     ZoneListing,
 };
-use crate::record::{RecordType, RrSet, Ttl, Txt};
+use crate::record::{RecordType, RrSet, RrsetTtl, Txt};
 
 pub mod acme_dns;
 pub mod beget;
@@ -352,7 +352,7 @@ impl Provider for AnyProvider {
         zone: &DomainName,
         name: &DomainName,
         value: &Txt,
-        ttl: Option<Ttl>,
+        ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
         forward!(self, client => client.add_txt_value(zone, name, value, ttl).await)
     }

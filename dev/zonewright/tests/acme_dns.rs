@@ -17,7 +17,7 @@ use secrecy::SecretString;
 use zonewright::providers::acme_dns::{AcmeDns, AcmeDnsConfig, AcmeDnsCredentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, DomainName, Error, ErrorKind, Expect, Provider, ProviderId,
-    RecordType, RrSet, Ttl, Txt,
+    RecordType, RrSet, RrsetTtl, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::acme_dns::{Account, AcmeDnsMock, Seed};
@@ -422,7 +422,7 @@ async fn acme_dns_invalid_input_sends_nothing() {
             &zone(),
             &own,
             &txt(&value('A')),
-            Some(Ttl::from_secs(60).unwrap()),
+            Some(RrsetTtl::from_secs(60).unwrap()),
         )
         .await
         .unwrap_err();

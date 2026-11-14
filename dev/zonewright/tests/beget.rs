@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use zonewright::providers::beget::{Beget, BegetConfig, BegetCredentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, DomainName, Error, ErrorKind, Expect, Provider, ProviderId,
-    RecordType, RemoveOutcome, RrSet, Ttl, Txt, ValueGuarantee,
+    RecordType, RemoveOutcome, RrSet, RrsetTtl, Txt, ValueGuarantee,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -519,7 +519,7 @@ async fn beget_invalid_input_sends_nothing() {
                 &zone(),
                 &name(),
                 &txt("v1"),
-                Some(Ttl::from_secs(ttl).unwrap()),
+                Some(RrsetTtl::from_secs(ttl).unwrap()),
             )
             .await
             .unwrap_err();
@@ -1369,7 +1369,7 @@ async fn beget_txt_text_in_either_field() {
 async fn beget_ttl_policy() {
     let mock = BegetMock::start(Seed::standard()).await;
     let mut config = settings(&mock);
-    config.ttl = 120;
+    config.ttl = RrsetTtl::from_secs(120).unwrap();
     let client = Beget::new(config, credentials(PASSWORD), &context()).unwrap();
     let ttl_of = |mock: &BegetMock| {
         mock.control()
@@ -1388,7 +1388,7 @@ async fn beget_ttl_policy() {
             &zone(),
             &name(),
             &txt("AAA"),
-            Some(Ttl::from_secs(900).unwrap()),
+            Some(RrsetTtl::from_secs(900).unwrap()),
         )
         .await
         .unwrap();
@@ -1400,7 +1400,7 @@ async fn beget_ttl_policy() {
             &zone(),
             &name(),
             &txt("BBB"),
-            Some(Ttl::from_secs(600).unwrap()),
+            Some(RrsetTtl::from_secs(600).unwrap()),
         )
         .await
         .unwrap();

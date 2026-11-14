@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::Context;
 use crate::error::Error;
 use crate::http::{Endpoint, poll_interval};
+use crate::record::{RrsetTtl, Ttl};
 use crate::redact::Detail;
 
 /// Default API endpoint.
@@ -53,9 +54,9 @@ pub(super) const ACTION_POLLS: u32 = 120;
 pub struct HetznerConfig {
     /// API endpoint; default `https://api.hetzner.cloud/v1`.
     pub base_url: String,
-    /// TTL of a new rrset, in seconds: 60 to 2147483647, default 60. An existing rrset keeps
-    /// its own TTL.
-    pub ttl: u32,
+    /// TTL of a new rrset: 60 to 2147483647 seconds, or `"provider_default"` for the zone's
+    /// default TTL. Default 60. An existing rrset keeps its own TTL.
+    pub ttl: RrsetTtl,
     /// Interval between two polls of a running action, in milliseconds: 250 to 60000, default
     /// 1000.
     pub action_poll_ms: u64,
@@ -65,7 +66,7 @@ impl Default for HetznerConfig {
     fn default() -> HetznerConfig {
         HetznerConfig {
             base_url: DEFAULT_BASE_URL.to_owned(),
-            ttl: DEFAULT_TTL,
+            ttl: RrsetTtl::Explicit(Ttl::clamped(DEFAULT_TTL)),
             action_poll_ms: DEFAULT_POLL_MS,
         }
     }
@@ -75,8 +76,12 @@ impl HetznerConfig {
     /// Checks everything that can be checked without the network. Error texts name the key,
     /// never its value.
     pub(super) fn validate(&self, ctx: &Context) -> Result<Settings, Error> {
-        if !(TTL_MIN..=TTL_MAX).contains(&self.ttl) {
-            return Err(config("ttl must be between 60 and 2147483647"));
+        if let RrsetTtl::Explicit(ttl) = self.ttl
+            && !(TTL_MIN..=TTL_MAX).contains(&ttl.as_secs())
+        {
+            return Err(config(
+                "ttl must be between 60 and 2147483647, or provider_default",
+            ));
         }
         if !(POLL_MS_MIN..=POLL_MS_MAX).contains(&self.action_poll_ms) {
             return Err(config("action_poll_ms must be between 250 and 60000"));
@@ -95,7 +100,7 @@ pub(super) struct Settings {
     /// The API.
     pub(super) api: Endpoint,
     /// TTL of a new rrset.
-    pub(super) ttl: u32,
+    pub(super) ttl: RrsetTtl,
     /// Interval between two looks at a running action.
     pub(super) poll: Duration,
 }

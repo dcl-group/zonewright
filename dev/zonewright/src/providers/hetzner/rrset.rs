@@ -24,7 +24,7 @@
 use crate::error::Error;
 use crate::http::{Attempt, ZoneId};
 use crate::name::DomainName;
-use crate::record::Ttl;
+use crate::record::{RrsetTtl, Ttl};
 use crate::redact::Detail;
 
 use super::api::{Action, NewRrset, Record, Rrset};
@@ -129,14 +129,15 @@ impl Hetzner {
         self.finish(zone, action).await
     }
 
-    /// Changes the TTL of the existing rrset and waits for the action.
+    /// Changes the TTL of the existing rrset (`None`: to the zone's default) and waits for the
+    /// action.
     pub(super) async fn change_ttl(
         &self,
         zone: &DomainName,
         zone_id: &str,
         rr: &str,
         rtype: &str,
-        ttl: u32,
+        ttl: Option<u32>,
     ) -> Result<(), Error> {
         let action = self.api.change_ttl(zone_id, rr, rtype, ttl).await?;
         self.finish(zone, action).await
@@ -182,18 +183,27 @@ impl Hetzner {
     }
 }
 
-/// The TTL of an rrset the API returned; `None` when the zone's default applies.
+/// The TTL of an rrset the API returned: `ProviderDefault` for `null`, when the zone's default
+/// applies.
 ///
 /// A TTL outside the crate's range is outside the documented one (60 to 2147483647) too. Read
-/// as "no TTL" it would make a write keep or send none and could change the rrset's TTL (design
-/// section 3.6), so it is an answer the client cannot use.
-pub(super) fn rrset_ttl(rrset: &Rrset) -> Result<Option<Ttl>, Error> {
+/// as the zone's default it would make a write keep or send none and could change the rrset's
+/// TTL (design section 3.6), so it is an answer the client cannot use.
+pub(super) fn rrset_ttl(rrset: &Rrset) -> Result<Option<RrsetTtl>, Error> {
     match rrset.ttl {
-        None => Ok(None),
-        Some(secs) => Ttl::from_secs(secs).map(Some).map_err(|_| Error::Protocol {
-            detail: Detail::constant("the provider's rrset has an unusable TTL"),
-        }),
+        None => Ok(Some(RrsetTtl::ProviderDefault)),
+        Some(secs) => RrsetTtl::from_secs(secs)
+            .map(Some)
+            .map_err(|_| Error::Protocol {
+                detail: Detail::constant("the provider's rrset has an unusable TTL"),
+            }),
     }
+}
+
+/// A TTL as the API's `ttl` spells it: the number, or `None` (left out or `null`) for the zone's
+/// default.
+pub(super) fn api_ttl(ttl: RrsetTtl) -> Option<u32> {
+    ttl.explicit().map(Ttl::as_secs)
 }
 
 /// The owner name relative to the zone, `@` for the apex.

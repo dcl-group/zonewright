@@ -72,6 +72,12 @@
 //! layer: a write without a TTL leaves every record's own, a write with one sets it on every
 //! record (design section 3.6).
 //!
+//! A record without `ttl` (optional in the create schema, absent or `null` in the listing) has
+//! the provider's choice and reads as `RrsetTtl::ProviderDefault`. A create that asks for the
+//! provider's default sends no `ttl`. Whether an update without `ttl` turns an explicit TTL into
+//! the provider's choice is not documented, so `ProviderDefaultTtl::ForNewRecords`: the record
+//! layer refuses a write that would need it, after the read and before any write.
+//!
 //! # The listing of a zone
 //!
 //! The listing of a domain is "all user DNS records of a domain or subdomain"; whether the
@@ -102,7 +108,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::{DomainName, TargetName};
 use crate::provider::{SkipReason, ZoneListing};
-use crate::record::{Mx, RecordData, RecordType, Ttl, Txt, TxtDialect};
+use crate::record::{Mx, RecordData, RecordType, RrsetTtl, Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
     self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
@@ -375,7 +381,7 @@ impl PerRecord for TimewebCloud {
                 data: read_record(rtype, record),
                 // The API documents no disabled records.
                 enabled: true,
-                ttl: record.ttl().and_then(|secs| Ttl::from_secs(secs).ok()),
+                ttl: read_ttl(record.ttl()),
                 handle: Handle {
                     id: record.id(),
                     value: record.value().map(str::to_owned),
@@ -399,13 +405,9 @@ impl PerRecord for TimewebCloud {
         ttl: SetTtl,
     ) -> Result<(), Error> {
         let encoded = encode(rtype, data).ok_or_else(not_sendable)?;
-        let ttl = match ttl {
-            SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => Some(ttl.as_secs()),
-            // The configured TTL; none leaves the choice to the provider.
-            SetTtl::Default => self.ttl,
-            // The set's TTL was not reported: send none, so that the provider decides.
-            SetTtl::Existing(None) => None,
-        };
+        // The provider's default (requested, configured or as read) is sent as no `ttl`, and
+        // so is a TTL the read could not state: the provider decides.
+        let ttl = api_ttl(ttl.resolve(self.ttl));
         let type_name = rtype.to_string();
         let record = NewRecord {
             rtype: &type_name,
@@ -470,7 +472,7 @@ impl PerRecord for TimewebCloud {
             },
             // A TTL that is not changed is sent as read: whether an update without one keeps it
             // is not documented.
-            ttl: update.ttl.or(record.ttl).map(Ttl::as_secs),
+            ttl: api_ttl(update.ttl.or(record.ttl)),
         };
         match self.api.update_record(name, id, &body).await? {
             Updated::Done => Ok(()),
@@ -517,12 +519,27 @@ impl PerRecord for TimewebCloud {
 
 // ---- Listing -------------------------------------------------------------------------------------
 
+/// A record's TTL as listed: `ProviderDefault` for a record without one (the provider's
+/// choice), `None` for a number outside the model's range.
+pub(super) fn read_ttl(secs: Option<u32>) -> Option<RrsetTtl> {
+    match secs {
+        None => Some(RrsetTtl::ProviderDefault),
+        Some(secs) => RrsetTtl::from_secs(secs).ok(),
+    }
+}
+
+/// The `ttl` a create or an update sends: the number, or none for the provider's choice (and
+/// for a TTL the read could not state, which has always been sent as none).
+pub(super) fn api_ttl(ttl: Option<RrsetTtl>) -> Option<u32> {
+    ttl.and_then(RrsetTtl::explicit).map(Ttl::as_secs)
+}
+
 /// The records of one owner name and type, as the listing gathers them.
 struct Group {
     name: Option<DomainName>,
     type_name: String,
     rtype: Option<RecordType>,
-    ttl: Option<Ttl>,
+    ttl: Option<RrsetTtl>,
     records: Vec<RecordData>,
 }
 
@@ -563,7 +580,7 @@ impl TimewebCloud {
                 // the record holds; the data is then never parsed.
                 None => RecordData::non_canonical(record.value().unwrap_or_default()),
             };
-            let ttl = record.ttl().and_then(|secs| Ttl::from_secs(secs).ok());
+            let ttl = read_ttl(record.ttl());
             let group = groups.entry((name_key, type_key)).or_insert_with(|| Group {
                 name,
                 type_name: record.rtype.clone(),

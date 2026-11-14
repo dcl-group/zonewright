@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::Context;
 use crate::error::Error;
 use crate::http::Endpoint;
+use crate::record::{RrsetTtl, Ttl};
 use crate::redact::Detail;
 
 /// Default API endpoint.
@@ -54,7 +55,7 @@ pub struct BegetConfig {
     /// TTL of a new TXT value, in seconds: 60 to 86400, default 300. A value that joins an
     /// existing TXT set takes the TTL of that set.
     #[serde(default = "default_ttl")]
-    pub ttl: u32,
+    pub ttl: RrsetTtl,
     /// Minimum time between two requests, in milliseconds: 0 to 60000, default 1000. The API
     /// allows 60 requests a minute per user.
     #[serde(default = "default_interval")]
@@ -64,8 +65,8 @@ pub struct BegetConfig {
     pub base_url: String,
 }
 
-fn default_ttl() -> u32 {
-    DEFAULT_TTL
+fn default_ttl() -> RrsetTtl {
+    RrsetTtl::Explicit(Ttl::clamped(DEFAULT_TTL))
 }
 
 fn default_interval() -> u64 {
@@ -82,7 +83,7 @@ impl BegetConfig {
     pub fn new(login: String) -> BegetConfig {
         BegetConfig {
             login,
-            ttl: DEFAULT_TTL,
+            ttl: default_ttl(),
             min_request_interval_ms: DEFAULT_INTERVAL_MS,
             base_url: default_base_url(),
         }
@@ -99,9 +100,17 @@ impl BegetConfig {
                 "login must be 1 to 255 characters long, without control characters",
             ));
         }
-        if !(TTL_MIN..=TTL_MAX).contains(&self.ttl) {
-            return Err(config("ttl must be between 60 and 86400"));
-        }
+        let ttl = match self.ttl {
+            RrsetTtl::Explicit(ttl) if (TTL_MIN..=TTL_MAX).contains(&ttl.as_secs()) => {
+                ttl.as_secs()
+            }
+            RrsetTtl::Explicit(_) => return Err(config("ttl must be between 60 and 86400")),
+            RrsetTtl::ProviderDefault => {
+                return Err(config(
+                    "ttl cannot be provider_default: the provider has no default TTL of its own",
+                ));
+            }
+        };
         if self.min_request_interval_ms > INTERVAL_MAX_MS {
             return Err(config(
                 "min_request_interval_ms must be between 0 and 60000",
@@ -109,7 +118,7 @@ impl BegetConfig {
         }
         Ok(Settings {
             api: Endpoint::parse("base_url", &self.base_url, ctx)?,
-            ttl: self.ttl,
+            ttl,
             interval_ms: self.min_request_interval_ms,
         })
     }

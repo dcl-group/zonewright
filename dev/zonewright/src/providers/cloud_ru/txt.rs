@@ -31,7 +31,7 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, TxtDialect};
+use crate::record::{RrsetTtl, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{Member, SetRead, SetState, TxtBase, TxtRecord, TxtSet, WholeSet, WriteTtl};
 
@@ -124,8 +124,10 @@ impl CloudRu {
     /// The TTL of a new record: the caller's, else the configured one.
     fn new_ttl(&self, ttl: WriteTtl) -> u32 {
         match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => ttl.as_secs(),
-            WriteTtl::New(None) | WriteTtl::Existing(None) => self.ttl,
+            WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))
+            | WriteTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
+            WriteTtl::New(None | Some(RrsetTtl::ProviderDefault))
+            | WriteTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => self.ttl,
         }
     }
 }
@@ -134,7 +136,7 @@ impl CloudRu {
 fn txt_set(record: Record) -> TxtSet<String, Record> {
     let ttl = u32::try_from(record.ttl)
         .ok()
-        .and_then(|secs| Ttl::from_secs(secs).ok());
+        .and_then(|secs| RrsetTtl::from_secs(secs).ok());
     let records = record
         .values
         .iter()

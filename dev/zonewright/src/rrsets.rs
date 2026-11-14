@@ -115,7 +115,7 @@ use crate::locks::NameLocks;
 use crate::meta::{Capabilities, Preconditions};
 use crate::name::DomainName;
 use crate::provider::{DeleteOutcome, Expect, SetOutcome, SkipReason, SkippedRrset, ZoneListing};
-use crate::record::{RecordData, RecordType, RrSet, Ttl, singleton};
+use crate::record::{RecordData, RecordType, RrSet, RrsetTtl, singleton};
 use crate::redact::Detail;
 
 // ---- Shared types --------------------------------------------------------------------------------
@@ -158,9 +158,10 @@ pub(crate) struct Stored<H> {
     /// not part of the rrset as read, is never deleted by the layer, and is enabled when a write
     /// asks for its value.
     pub(crate) enabled: bool,
-    /// The record's TTL where the API stores one per record (`TtlSupport::PerRecord`); a
-    /// whole-set client may leave it `None` and report the TTL in [`Found::ttl`].
-    pub(crate) ttl: Option<Ttl>,
+    /// The record's TTL where the API stores one per record (`TtlSupport::PerRecord`):
+    /// `ProviderDefault` for a record without a TTL of its own, `None` when the read does not
+    /// tell. A whole-set client may leave it `None` and report the TTL in [`Found::ttl`].
+    pub(crate) ttl: Option<RrsetTtl>,
     /// What the client needs to write the record back unchanged or delete it.
     pub(crate) handle: H,
 }
@@ -168,14 +169,27 @@ pub(crate) struct Stored<H> {
 /// The TTL a write is to carry (design section 3.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SetTtl {
-    /// The caller asked for this TTL.
-    Requested(Ttl),
-    /// The caller gave none and the rrset exists: its TTL as read. `None`: the provider reported
-    /// none; the client sends none, so the provider keeps what it has.
-    Existing(Option<Ttl>),
-    /// The caller gave none and the rrset is new: the client's configured default (which may
-    /// be "let the provider choose").
+    /// The caller asked for this TTL: a number, or the provider's default.
+    Requested(RrsetTtl),
+    /// The caller gave none and the rrset exists: its TTL as read. `None`: the read did not
+    /// state one; the client sends the provider's value back where it has it, and otherwise
+    /// what its documentation says.
+    Existing(Option<RrsetTtl>),
+    /// The caller gave none and the rrset is new: the client's `ttl` setting (which may be the
+    /// provider's default).
     Default,
+}
+
+impl SetTtl {
+    /// The TTL the write carries, `setting` standing for [`SetTtl::Default`]: a number, the
+    /// provider's default, or `None` for an existing rrset whose TTL the read did not state.
+    pub(crate) fn resolve(self, setting: RrsetTtl) -> Option<RrsetTtl> {
+        match self {
+            SetTtl::Requested(ttl) => Some(ttl),
+            SetTtl::Existing(ttl) => ttl,
+            SetTtl::Default => Some(setting),
+        }
+    }
 }
 
 // ---- Whole-set shape -----------------------------------------------------------------------------
@@ -186,11 +200,12 @@ pub(crate) struct Found<H, S> {
     /// Every record, disabled ones included. Empty only if the provider keeps an rrset without
     /// records, which then reads as absent.
     pub(crate) records: Vec<Stored<H>>,
-    /// The rrset's TTL, if the provider reports one. Where the API stores a TTL per record
-    /// (`TtlSupport::PerRecord`), the smallest of them; the records then carry their own in
-    /// [`Stored::ttl`], and a requested TTL counts as already set only when every record that
-    /// states one has it.
-    pub(crate) ttl: Option<Ttl>,
+    /// The rrset's TTL: a number, `ProviderDefault` for an rrset without a TTL of its own, or
+    /// `None` when the read does not tell. Where the API stores a TTL per record
+    /// (`TtlSupport::PerRecord`), [`RrsetTtl::of_records`] of them; the records then carry their
+    /// own in [`Stored::ttl`], and a requested TTL counts as already set only when every record
+    /// that states one has it.
+    pub(crate) ttl: Option<RrsetTtl>,
     /// The rrset as the client read it: what a write sends back for attributes the model does
     /// not carry, and what a conditional write sends as its condition.
     pub(crate) snapshot: S,
@@ -353,8 +368,8 @@ pub(crate) struct RecordsRead<H, C> {
 pub(crate) struct RecordUpdate<'a> {
     /// Enable the record (it was disabled).
     pub(crate) enable: bool,
-    /// The new TTL; `None` keeps the record's own.
-    pub(crate) ttl: Option<Ttl>,
+    /// The new TTL (a number or the provider's default); `None` keeps the record's own.
+    pub(crate) ttl: Option<RrsetTtl>,
     /// New content, for the in-place replacement of a singleton; `None` keeps the content.
     pub(crate) data: Option<&'a RecordData>,
 }
@@ -616,17 +631,47 @@ fn check_set<B: RrsetBase>(
     let (name, rtype) = (rrset.name(), rrset.rtype());
     check_target(backend, Operation::SetRrset, zone, name, rtype)?;
     check_write(zone, name, rtype, expect)?;
-    if let Some(ttl) = rrset.ttl()
-        && !backend.capabilities().ttl.accepts(ttl.as_secs())
-    {
-        return Err(invalid("the TTL is outside the range the provider accepts"));
-    }
+    check_ttl(backend.capabilities(), rrset.ttl())?;
     if backend
         .max_records()
         .is_some_and(|max| rrset.records().len() > max)
     {
         return Err(invalid(
             "the rrset has more records than the provider accepts",
+        ));
+    }
+    Ok(())
+}
+
+/// Check 4 for a requested TTL (design section 3.6): a number within the provider's range, or
+/// the provider's default where the provider has one that a write can ask for.
+fn check_ttl(caps: &Capabilities, ttl: Option<RrsetTtl>) -> Result<(), Error> {
+    match ttl {
+        Some(ttl) if !caps.accepts_ttl(ttl) => Err(invalid(match ttl {
+            RrsetTtl::ProviderDefault => {
+                "the provider has no default TTL of its own: the TTL must be a number"
+            }
+            _ => "the TTL is outside the range the provider accepts",
+        })),
+        _ => Ok(()),
+    }
+}
+
+/// After the read: a write that asks for the provider's default where the rrset, or a record
+/// that stays, has an explicit TTL needs a provider that can turn one into the default
+/// (`ProviderDefaultTtl::can_replace_explicit`).
+fn check_replace_explicit(
+    caps: &Capabilities,
+    wanted: Option<RrsetTtl>,
+    current: Option<RrsetTtl>,
+) -> Result<(), Error> {
+    if wanted == Some(RrsetTtl::ProviderDefault)
+        && current != Some(RrsetTtl::ProviderDefault)
+        && !caps.provider_default_ttl.can_replace_explicit()
+    {
+        return Err(invalid(
+            "the provider's API does not establish how an explicit TTL is turned into the \
+             provider's default; it can be requested only for new records",
         ));
     }
     Ok(())
@@ -665,7 +710,7 @@ pub(crate) fn check_list<B: RrsetBase>(backend: &B, zone: &DomainName) -> Result
 pub(crate) fn published<H>(
     name: &DomainName,
     rtype: RecordType,
-    ttl: Option<Ttl>,
+    ttl: Option<RrsetTtl>,
     records: &[Stored<H>],
 ) -> Result<Option<RrSet>, Error> {
     let data: Vec<RecordData> = records
@@ -714,7 +759,7 @@ impl Seen {
 fn published_for_write<H>(
     name: &DomainName,
     rtype: RecordType,
-    ttl: Option<Ttl>,
+    ttl: Option<RrsetTtl>,
     records: &[Stored<H>],
 ) -> Result<Seen, Error> {
     let mut enabled = records.iter().filter(|record| record.enabled);
@@ -746,8 +791,9 @@ fn evaluate_seen(expect: Expect<'_>, seen: &Seen) -> Result<(), Error> {
     }
 }
 
-/// The smallest TTL among the enabled records (design section 3.6, `TtlSupport::PerRecord`).
-fn smallest_ttl<H>(records: &[Stored<H>]) -> Option<Ttl> {
+/// The TTL of the enabled records (design section 3.6, `TtlSupport::PerRecord`): the smallest
+/// explicit one, else the provider's default if a record has it.
+fn smallest_ttl<H>(records: &[Stored<H>]) -> Option<RrsetTtl> {
     Listing::smallest_ttl(
         records
             .iter()
@@ -782,14 +828,14 @@ fn evaluate(expect: Expect<'_>, current: Option<&RrSet>) -> Result<(), Error> {
     }
 }
 
-/// Step 3: the rrset is already as requested (members, and the TTL when one is requested).
+/// Step 3: the rrset is already as requested (members, and the TTL when one is requested: the
+/// same number, or the provider's default).
 ///
 /// A requested TTL must be the rrset's TTL as read and also the TTL of every enabled record
 /// that states one of its own: where the API stores a TTL per record the rrset reports the
 /// smallest (design section 3.6), so the rrset's TTL alone can match while another record
-/// differs. `per_record`: a record that states no TTL does not have the requested one (an
-/// individual record without a TTL is one whose TTL the provider chooses); otherwise such a
-/// record takes the rrset's TTL.
+/// differs. `per_record`: a record whose TTL the read does not state does not have the
+/// requested one; otherwise such a record takes the rrset's TTL.
 fn unchanged<H>(
     current: Option<&RrSet>,
     wanted: &RrSet,
@@ -961,6 +1007,13 @@ async fn set_whole_set_once<B: WholeSet>(
         backend.holds_cname(rtype, context),
         backend.holds_other_data(rtype, context),
     )?;
+    if found.is_some() {
+        check_replace_explicit(
+            backend.capabilities(),
+            wanted.ttl(),
+            found.and_then(|found| found.ttl),
+        )?;
+    }
     let members = whole_set_members(backend, rtype, records, wanted)?;
     let ttl = match (wanted.ttl(), found) {
         (Some(ttl), _) => SetTtl::Requested(ttl),
@@ -1205,6 +1258,11 @@ async fn set_per_record_once<B: PerRecord>(
         None => SetTtl::Default,
     };
     let steps = plan.steps(rtype, wanted.ttl(), ttl, backend.updates_in_place());
+    for step in &steps {
+        if let Step::Update { record, update } = step {
+            check_replace_explicit(backend.capabilities(), update.ttl, record.ttl)?;
+        }
+    }
     backend.check_plan(zone, name, rtype, context, &steps)?;
     send_steps(backend, zone, name, rtype, context, &steps).await?;
     Ok(if seen.exists() {
@@ -1220,7 +1278,7 @@ impl<'a, H> Plan<'a, H> {
     fn steps(
         self,
         rtype: RecordType,
-        requested: Option<Ttl>,
+        requested: Option<RrsetTtl>,
         ttl: SetTtl,
         in_place: bool,
     ) -> Vec<Step<'a, H>> {
@@ -1368,11 +1426,13 @@ impl<'z> Listing<'z> {
     }
 
     /// The TTL of an rrset whose records state their own (design section 3.6,
-    /// `TtlSupport::PerRecord`): the smallest of `ttls`, one per enabled record, ignoring
-    /// records that state none. `None` when no record states one. For the `ttl` of
-    /// [`Listing::push`] where the API stores a TTL per record.
-    pub(crate) fn smallest_ttl(ttls: impl IntoIterator<Item = Option<Ttl>>) -> Option<Ttl> {
-        ttls.into_iter().flatten().min()
+    /// `TtlSupport::PerRecord`), one per enabled record: [`RrsetTtl::of_records`], the smallest
+    /// explicit TTL, else the provider's default when a record has it, else `None`. For the
+    /// `ttl` of [`Listing::push`] where the API stores a TTL per record.
+    pub(crate) fn smallest_ttl(
+        ttls: impl IntoIterator<Item = Option<RrsetTtl>>,
+    ) -> Option<RrsetTtl> {
+        RrsetTtl::of_records(ttls)
     }
 
     /// One rrset as the provider reported it. `name` is the owner name, `None` when the
@@ -1388,7 +1448,7 @@ impl<'z> Listing<'z> {
         &mut self,
         name: Option<DomainName>,
         type_name: &str,
-        ttl: Option<Ttl>,
+        ttl: Option<RrsetTtl>,
         records: Vec<RecordData>,
     ) {
         if records.is_empty() {
@@ -1467,13 +1527,35 @@ mod tests {
     use crate::error::{Error, ErrorKind};
     use crate::id::ProviderId;
     use crate::locks::NameLocks;
-    use crate::meta::{Capabilities, Preconditions, TtlSupport, TypeSet, ValueGuarantee};
+    use crate::meta::{
+        Capabilities, Preconditions, ProviderDefaultTtl, TtlSupport, TypeSet, ValueGuarantee,
+    };
     use crate::name::DomainName;
     use crate::provider::{DeleteOutcome, Expect, SetOutcome, SkipReason};
-    use crate::record::{RecordData, RecordType, RrSet, Ttl};
+    use crate::record::{RecordData, RecordType, RrSet, RrsetTtl};
 
     /// The TTL the fake gives a new rrset when the client sends none.
     const DEFAULT_TTL: u32 = 300;
+
+    /// The fake's spelling of "no TTL of its own: the provider's default" in a stored record.
+    const PD: u32 = u32::MAX;
+
+    /// A stored TTL as the layer sees it.
+    fn rrset_ttl(secs: u32) -> RrsetTtl {
+        if secs == PD {
+            RrsetTtl::ProviderDefault
+        } else {
+            RrsetTtl::from_secs(secs).unwrap()
+        }
+    }
+
+    /// A TTL as the fake stores it.
+    fn stored_ttl(ttl: RrsetTtl) -> u32 {
+        match ttl {
+            RrsetTtl::Explicit(ttl) => ttl.as_secs(),
+            RrsetTtl::ProviderDefault => PD,
+        }
+    }
 
     const TYPES: &[RecordType] = &[
         RecordType::A,
@@ -1503,7 +1585,7 @@ mod tests {
                 min: 60,
                 max: 86_400,
             },
-            provider_default_ttl: false,
+            provider_default_ttl: ProviderDefaultTtl::Absent,
             asynchronous: false,
         }
     }
@@ -1525,11 +1607,12 @@ mod tests {
         RecordData::parse(rtype, text).unwrap_or_else(|_| RecordData::non_canonical(text))
     }
 
+    /// A TTL of [`PD`] stands for the provider's default.
     fn set(rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrSet {
         RrSet::new(
             name(),
             rtype,
-            ttl.map(|t| Ttl::from_secs(t).unwrap()),
+            ttl.map(rrset_ttl),
             texts.iter().map(|t| data(rtype, t)),
         )
         .unwrap()
@@ -1665,16 +1748,14 @@ mod tests {
         Stored {
             data: data(rtype, &rec.text),
             enabled: rec.enabled,
-            ttl: Some(Ttl::from_secs(rec.ttl).unwrap()),
+            ttl: Some(rrset_ttl(rec.ttl)),
             handle: rec.clone(),
         }
     }
 
     fn ttl_secs(ttl: SetTtl) -> u32 {
-        match ttl {
-            SetTtl::Requested(t) | SetTtl::Existing(Some(t)) => t.as_secs(),
-            SetTtl::Existing(None) | SetTtl::Default => DEFAULT_TTL,
-        }
+        ttl.resolve(RrsetTtl::from_secs(DEFAULT_TTL).unwrap())
+            .map_or(DEFAULT_TTL, stored_ttl)
     }
 
     struct Base {
@@ -1749,7 +1830,7 @@ mod tests {
                 context: (),
                 found: recs.map(|recs| Found {
                     records: recs.iter().map(|r| stored(rtype, r)).collect(),
-                    ttl: recs.first().map(|r| Ttl::from_secs(r.ttl).unwrap()),
+                    ttl: recs.first().map(|r| rrset_ttl(r.ttl)),
                     snapshot: recs,
                 }),
             })
@@ -1921,7 +2002,7 @@ mod tests {
             {
                 rec.enabled |= update.enable;
                 if let Some(ttl) = update.ttl {
-                    rec.ttl = ttl.as_secs();
+                    rec.ttl = stored_ttl(ttl);
                 }
                 if let Some(data) = update.data {
                     rec.text = data.as_str().to_owned();
@@ -2379,6 +2460,236 @@ mod tests {
             assert_eq!(shape.writes().len(), before);
             assert_eq!(shape.get(RecordType::A).await.unwrap(), None);
         }
+    }
+
+    // ---- The provider's default TTL ------------------------------------------------------------
+
+    /// The three shapes with the provider's default at the given level.
+    fn shapes_with_default(level: ProviderDefaultTtl) -> Vec<Shape> {
+        let with = |preconditions, atomic| Capabilities {
+            provider_default_ttl: level,
+            ..caps(preconditions, atomic)
+        };
+        vec![
+            Shape::Rtw(WholeFake(base(with(Preconditions::ReadThenWrite, true)))),
+            Shape::Atomic(WholeFake(base(with(Preconditions::Atomic, true)))),
+            Shape::Records(RecordFake(
+                base(with(Preconditions::ReadThenWrite, false)),
+                true,
+            )),
+        ]
+    }
+
+    #[tokio::test]
+    async fn provider_default_is_refused_where_there_is_none() {
+        for shape in Shape::all() {
+            let label = shape.label();
+            shape.insert(RecordType::A, "192.0.2.1", true, 600);
+            let e = shape
+                .set(&a(Some(PD), &["192.0.2.1"]), Expect::Any)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidInput, "{label}");
+            assert!(e.to_string().contains("default TTL"), "{label}: {e}");
+            assert_eq!(shape.requests(), 0, "{label}: a request was made");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_default_is_created_kept_and_switched() {
+        for shape in shapes_with_default(ProviderDefaultTtl::Requestable) {
+            let label = shape.label();
+            // Created with the provider's default.
+            assert_eq!(
+                shape
+                    .set(&a(Some(PD), &["192.0.2.1"]), Expect::Absent)
+                    .await
+                    .unwrap(),
+                SetOutcome::Created,
+                "{label}"
+            );
+            assert_eq!(
+                shape.texts(RecordType::A),
+                [("192.0.2.1".to_owned(), true, PD)],
+                "{label}"
+            );
+            // It reads as the provider's default, and the set read is unchanged when written
+            // back, also with no TTL stated.
+            let read = shape.get(RecordType::A).await.unwrap().unwrap();
+            assert_eq!(read.ttl(), Some(RrsetTtl::ProviderDefault), "{label}");
+            let before = shape.writes().len();
+            for wanted in [read.clone(), read.clone().with_ttl(None)] {
+                assert_eq!(
+                    shape.set(&wanted, Expect::Matches(&read)).await.unwrap(),
+                    SetOutcome::Unchanged,
+                    "{label}"
+                );
+            }
+            assert_eq!(shape.writes().len(), before, "{label}: a round trip wrote");
+            // A new member without a TTL keeps the default; it does not acquire a number.
+            shape
+                .set(&a(None, &["192.0.2.1", "192.0.2.2"]), Expect::Any)
+                .await
+                .unwrap();
+            assert!(
+                shape.texts(RecordType::A).iter().all(|r| r.2 == PD),
+                "{label}: {:?}",
+                shape.texts(RecordType::A)
+            );
+            // Default to explicit.
+            assert_eq!(
+                shape
+                    .set(&a(Some(900), &["192.0.2.1", "192.0.2.2"]), Expect::Any)
+                    .await
+                    .unwrap(),
+                SetOutcome::Replaced,
+                "{label}"
+            );
+            assert!(
+                shape.texts(RecordType::A).iter().all(|r| r.2 == 900),
+                "{label}"
+            );
+            let read = shape.get(RecordType::A).await.unwrap().unwrap();
+            assert_eq!(
+                read.ttl(),
+                Some(RrsetTtl::from_secs(900).unwrap()),
+                "{label}"
+            );
+            let before = shape.writes().len();
+            assert_eq!(
+                shape.set(&read, Expect::Any).await.unwrap(),
+                SetOutcome::Unchanged,
+                "{label}"
+            );
+            assert_eq!(shape.writes().len(), before, "{label}");
+            // Explicit back to the default.
+            assert_eq!(
+                shape
+                    .set(&a(Some(PD), &["192.0.2.1", "192.0.2.2"]), Expect::Any)
+                    .await
+                    .unwrap(),
+                SetOutcome::Replaced,
+                "{label}"
+            );
+            assert!(
+                shape.texts(RecordType::A).iter().all(|r| r.2 == PD),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expectation_states_a_number_the_default_or_any_ttl() {
+        for shape in shapes_with_default(ProviderDefaultTtl::Requestable) {
+            let label = shape.label();
+            shape.insert(RecordType::A, "192.0.2.1", true, PD);
+            let wanted = a(None, &["192.0.2.7"]);
+            for expect in [a(Some(600), &["192.0.2.1"]), a(Some(60), &["192.0.2.1"])] {
+                let e = shape
+                    .set(&wanted, Expect::Matches(&expect))
+                    .await
+                    .unwrap_err();
+                assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{label}");
+            }
+            assert!(shape.writes().is_empty(), "{label}");
+            shape
+                .set(&wanted, Expect::Matches(&a(Some(PD), &["192.0.2.1"])))
+                .await
+                .unwrap();
+            shape
+                .set(
+                    &a(Some(600), &["192.0.2.8"]),
+                    Expect::Matches(&a(None, &["192.0.2.7"])),
+                )
+                .await
+                .unwrap();
+            let e = shape
+                .set(&wanted, Expect::Matches(&a(Some(PD), &["192.0.2.8"])))
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{label}");
+            shape
+                .set(&wanted, Expect::Matches(&a(Some(600), &["192.0.2.8"])))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_default_for_new_records_only() {
+        for shape in shapes_with_default(ProviderDefaultTtl::ForNewRecords) {
+            let label = shape.label();
+            // A new set can have it, and a value added to such a set keeps it.
+            shape
+                .set(&a(Some(PD), &["192.0.2.1"]), Expect::Absent)
+                .await
+                .unwrap();
+            shape
+                .set(&a(Some(PD), &["192.0.2.1", "192.0.2.2"]), Expect::Any)
+                .await
+                .unwrap();
+            assert!(
+                shape.texts(RecordType::A).iter().all(|r| r.2 == PD),
+                "{label}"
+            );
+            // The default can be turned into a number...
+            shape
+                .set(&a(Some(900), &["192.0.2.1", "192.0.2.2"]), Expect::Any)
+                .await
+                .unwrap();
+            // ...but not back: refused after the read, before any write.
+            let before = shape.writes();
+            let e = shape
+                .set(&a(Some(PD), &["192.0.2.1", "192.0.2.3"]), Expect::Any)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidInput, "{label}");
+            assert_eq!(shape.writes(), before, "{label}: a refused switch wrote");
+            assert!(
+                shape.texts(RecordType::A).iter().all(|r| r.2 == 900),
+                "{label}"
+            );
+        }
+    }
+
+    /// Records of one set that disagree, some with the default and some with a number, read
+    /// with the smallest number (design section 3.6), and a request for the default turns every
+    /// record into it.
+    #[tokio::test]
+    async fn per_record_mixed_default_and_number() {
+        let shape = shapes_with_default(ProviderDefaultTtl::Requestable)
+            .pop()
+            .unwrap();
+        shape.insert(RecordType::A, "192.0.2.1", true, PD);
+        shape.insert(RecordType::A, "192.0.2.2", true, 600);
+        let read = shape.get(RecordType::A).await.unwrap().unwrap();
+        assert_eq!(read.ttl(), Some(RrsetTtl::from_secs(600).unwrap()));
+        let e = shape
+            .set(
+                &read.clone().with_ttl(Some(RrsetTtl::ProviderDefault)),
+                Expect::Matches(&read.clone().with_ttl(Some(RrsetTtl::ProviderDefault))),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PreconditionFailed);
+        assert_eq!(
+            shape
+                .set(
+                    &read.clone().with_ttl(Some(RrsetTtl::ProviderDefault)),
+                    Expect::Matches(&read)
+                )
+                .await
+                .unwrap(),
+            SetOutcome::Replaced
+        );
+        assert!(shape.texts(RecordType::A).iter().all(|r| r.2 == PD));
+        assert_eq!(
+            shape
+                .set(&a(Some(PD), &["192.0.2.1", "192.0.2.2"]), Expect::Any)
+                .await
+                .unwrap(),
+            SetOutcome::Unchanged
+        );
     }
 
     // ---- Expectations ------------------------------------------------------------------------
@@ -3298,11 +3609,16 @@ mod tests {
 
     #[test]
     fn smallest_ttl_ignores_records_without_one() {
-        let ttl = |s| Some(Ttl::from_secs(s).unwrap());
+        let ttl = |s| Some(RrsetTtl::from_secs(s).unwrap());
+        let default = Some(RrsetTtl::ProviderDefault);
         assert_eq!(
             Listing::smallest_ttl([None, ttl(600), None, ttl(300)]),
             ttl(300)
         );
+        // A number wins over the provider's default (design section 3.6: the smallest stated
+        // TTL), and the default over records that state nothing.
+        assert_eq!(Listing::smallest_ttl([default, ttl(600), None]), ttl(600));
+        assert_eq!(Listing::smallest_ttl([None, default]), default);
         assert_eq!(Listing::smallest_ttl([None, None]), None);
         assert_eq!(Listing::smallest_ttl([]), None);
     }

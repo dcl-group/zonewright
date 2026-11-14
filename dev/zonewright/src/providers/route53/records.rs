@@ -58,7 +58,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
 use crate::provider::{SkipReason, ZoneListing};
-use crate::record::{RecordData, RecordType, Ttl};
+use crate::record::{RecordData, RecordType, RrsetTtl};
 use crate::redact::Detail;
 use crate::rrsets::{self, Current, Found, Listing, Member, RrsetBase, SetTtl, Stored, WholeSet};
 
@@ -109,10 +109,10 @@ fn found(rtype: RecordType, rrset: Rrset) -> Found<String, Rrset> {
     }
 }
 
-fn ttl(secs: u64) -> Option<Ttl> {
+fn ttl(secs: u64) -> Option<RrsetTtl> {
     u32::try_from(secs)
         .ok()
-        .and_then(|secs| Ttl::from_secs(secs).ok())
+        .and_then(|secs| RrsetTtl::from_secs(secs).ok())
 }
 
 impl WholeSet for Route53 {
@@ -163,10 +163,15 @@ impl WholeSet for Route53 {
         let type_name = rtype.to_string();
         let values = values(rtype, members)?;
         let ttl = match (ttl, prior) {
-            (SetTtl::Requested(ttl), _) => u64::from(ttl.as_secs()),
+            (SetTtl::Requested(RrsetTtl::Explicit(ttl)), _) => u64::from(ttl.as_secs()),
             // An existing rrset keeps its TTL exactly as read (design section 3.6).
             (SetTtl::Existing(_), Some(prior)) => prior.ttl,
-            (SetTtl::Existing(_) | SetTtl::Default, _) => u64::from(self.ttl),
+            (
+                SetTtl::Existing(_)
+                | SetTtl::Default
+                | SetTtl::Requested(RrsetTtl::ProviderDefault),
+                _,
+            ) => u64::from(self.ttl),
         };
         let create = Change {
             action: Action::Create,

@@ -18,8 +18,8 @@ use serde_json::{Value, json};
 use zonewright::providers::cloud_ru::{CloudRu, CloudRuConfig, CloudRuCredentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, SkipReason,
-    Ttl, Txt,
+    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl, SetOutcome,
+    SkipReason, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -129,7 +129,7 @@ fn rrset_of(name: &str, rtype: RecordType, ttl: Option<u32>, data: Vec<RecordDat
     RrSet::new(
         dn(name),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         data,
     )
     .unwrap()
@@ -1474,7 +1474,7 @@ async fn cloud_ru_add_creates_record() {
     assert_eq!(mock.control().record(NAME, "txt").unwrap().ttl, 60);
 
     let other = dn("_acme-challenge.www.example.org");
-    let ttl = zonewright::Ttl::from_secs(300).unwrap();
+    let ttl = zonewright::RrsetTtl::from_secs(300).unwrap();
     client
         .add_txt_value(&zone(), &other, &txt("AAA"), Some(ttl))
         .await
@@ -3271,7 +3271,7 @@ async fn live_cloud_ru_add_and_remove() {
         let rr_body = tokio::spawn({
             let (client, zone, rr_name) = (client.clone(), zone.clone(), rr_name.clone());
             async move {
-                let ttl = Some(Ttl::from_secs(300).unwrap());
+                let ttl = Some(RrsetTtl::from_secs(300).unwrap());
                 let one = RrSet::new(
                     rr_name.clone(),
                     RecordType::A,
@@ -3445,7 +3445,7 @@ async fn live_cloud_ru_record_round_trip() {
         RrSet::new(
             name.clone(),
             rtype,
-            ttl.map(|t| Ttl::from_secs(t).unwrap()),
+            ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
             data,
         )
         .unwrap()

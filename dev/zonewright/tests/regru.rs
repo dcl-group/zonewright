@@ -18,8 +18,8 @@ use serde_json::{Value, json};
 use zonewright::providers::regru::{Regru, RegruConfig, RegruCredentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, SkipReason,
-    Ttl, Txt,
+    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl, SetOutcome,
+    SkipReason, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -609,7 +609,7 @@ async fn regru_invalid_input_sends_nothing() {
                 &zone(),
                 &name(),
                 &txt("AAA"),
-                Some(Ttl::from_secs(ttl).unwrap()),
+                Some(RrsetTtl::from_secs(ttl).unwrap()),
             )
             .await
             .unwrap_err();
@@ -1790,11 +1790,13 @@ fn rdata(rtype: RecordType, text: &str) -> RecordData {
 }
 
 /// An rrset at `owner` without a TTL (the API cannot set one).
+/// An rrset with the provider's TTL, the only one there is: what a read returns, and a write
+/// may ask for it.
 fn rr(owner: &str, rtype: RecordType, texts: &[&str]) -> RrSet {
     RrSet::new(
         dn(owner),
         rtype,
-        None,
+        Some(RrsetTtl::ProviderDefault),
         texts.iter().map(|t| rdata(rtype, t)),
     )
     .unwrap()
@@ -1860,6 +1862,15 @@ async fn regru_record_round_trips() {
         let before = record_writes(&mock);
         assert_eq!(
             client.set_rrset(&zone(), set, Expect::Any).await.unwrap(),
+            SetOutcome::Unchanged,
+            "{label}"
+        );
+        // Without a TTL stated, too: the provider's stays.
+        assert_eq!(
+            client
+                .set_rrset(&zone(), &set.clone().with_ttl(None), Expect::Any)
+                .await
+                .unwrap(),
             SetOutcome::Unchanged,
             "{label}"
         );
@@ -1935,7 +1946,7 @@ async fn regru_failed_expectation_is_precondition_failed() {
     let other = rr(www, RecordType::A, &["192.0.2.2"]);
     let more = rr(www, RecordType::A, &["192.0.2.1", "192.0.2.2"]);
     let with_ttl =
-        rr(www, RecordType::A, &["192.0.2.1"]).with_ttl(Some(Ttl::from_secs(300).unwrap()));
+        rr(www, RecordType::A, &["192.0.2.1"]).with_ttl(Some(RrsetTtl::from_secs(300).unwrap()));
     for expect in [
         Expect::Absent,
         Expect::Matches(&other),
@@ -2120,7 +2131,7 @@ async fn regru_record_refusals_send_nothing() {
     // Every TTL is refused, the smallest and the largest included.
     for secs in [1, 300, 2_147_483_647] {
         let set = rr("www.example.org", RecordType::A, &["192.0.2.1"])
-            .with_ttl(Some(Ttl::from_secs(secs).unwrap()));
+            .with_ttl(Some(RrsetTtl::from_secs(secs).unwrap()));
         let e = client
             .set_rrset(&zone(), &set, Expect::Any)
             .await

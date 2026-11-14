@@ -17,8 +17,8 @@ use secrecy::SecretString;
 use zonewright::providers::route53::{Route53, Route53Config, Route53Credentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Operation, Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome,
-    SkipReason, Ttl, Txt,
+    Operation, Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl,
+    SetOutcome, SkipReason, Ttl, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum::http::{Method, StatusCode};
@@ -130,7 +130,7 @@ fn rrset(name: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrS
     RrSet::new(
         dn(name),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         texts.iter().map(|t| rd(rtype, t)),
     )
     .unwrap()
@@ -929,7 +929,7 @@ async fn route53_add_creates_rrset_with_the_ttl() {
     let rrset = mock.control().rrset(NAME, "TXT").unwrap();
     assert_eq!((rrset.ttl, rrset.zone_id.as_str()), (60, ZID));
     let other = dn("_acme-challenge.www.example.org");
-    let ttl = |s| Some(zonewright::Ttl::from_secs(s).unwrap());
+    let ttl = |s| Some(zonewright::RrsetTtl::from_secs(s).unwrap());
     client
         .add_txt_value(&zone(), &other, &txt("BBB"), ttl(300))
         .await
@@ -2469,7 +2469,7 @@ async fn route53_protected_sets_send_nothing() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(read.ttl(), Some(Ttl::from_secs(900).unwrap()));
+    assert_eq!(read.ttl(), Some(RrsetTtl::from_secs(900).unwrap()));
 }
 
 /// The API's TTL range, 0 to 2147483647, is the capabilities' range: every TTL the model holds
@@ -3162,7 +3162,7 @@ async fn live_route53_record_round_trip() {
     let first = RrSet::new(
         name.clone(),
         RecordType::A,
-        Some(Ttl::from_secs(60).unwrap()),
+        Some(RrsetTtl::from_secs(60).unwrap()),
         [
             rd(RecordType::A, "192.0.2.1"),
             rd(RecordType::A, "192.0.2.2"),

@@ -19,8 +19,8 @@ use zonewright::providers::timeweb_cloud::{
 };
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, SkipReason,
-    Ttl, Txt,
+    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl, SetOutcome,
+    SkipReason, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -414,7 +414,7 @@ async fn timeweb_cloud_invalid_input_sends_nothing() {
                 &zone(),
                 &name(),
                 &txt("v1"),
-                Some(Ttl::from_secs(ttl).unwrap()),
+                Some(RrsetTtl::from_secs(ttl).unwrap()),
             )
             .await
             .unwrap_err();
@@ -1057,7 +1057,7 @@ async fn timeweb_cloud_ttl_policy() {
     let mock = TimewebCloudMock::start(Seed::standard()).await;
     let plain = client_with(&mock, TOKEN, &context());
     let mut config = settings(mock.base_url());
-    config.ttl = Some(120);
+    config.ttl = RrsetTtl::from_secs(120).unwrap();
     let configured = TimewebCloud::new(config, credentials(TOKEN), &context()).unwrap();
     let ttl = |name: &str| mock.control().txt_records(name)[0].ttl;
     let on = |label: &str| dn(&format!("{label}.example.org"));
@@ -1080,7 +1080,7 @@ async fn timeweb_cloud_ttl_policy() {
             &zone(),
             &on("c"),
             &txt("v"),
-            Some(Ttl::from_secs(300).unwrap()),
+            Some(RrsetTtl::from_secs(300).unwrap()),
         )
         .await
         .unwrap();
@@ -1094,7 +1094,7 @@ async fn timeweb_cloud_ttl_policy() {
             &zone(),
             &name(),
             &txt("ours"),
-            Some(Ttl::from_secs(3000).unwrap()),
+            Some(RrsetTtl::from_secs(3000).unwrap()),
         )
         .await
         .unwrap();
@@ -1112,7 +1112,7 @@ async fn timeweb_cloud_ttl_policy() {
 async fn timeweb_cloud_unreported_ttl_is_not_invented() {
     let mock = TimewebCloudMock::start(Seed::standard()).await;
     let mut config = settings(mock.base_url());
-    config.ttl = Some(120);
+    config.ttl = RrsetTtl::from_secs(120).unwrap();
     let client = TimewebCloud::new(config, credentials(TOKEN), &context()).unwrap();
     mock.control()
         .insert_record("example.org", NAME, "TXT", "foreign", None);
@@ -1615,8 +1615,9 @@ fn timeweb_cloud_config_keys_match_metadata() {
             .map_or_else(|| value.to_string(), str::to_owned);
         assert_eq!(Some(text.as_str()), field.default, "{}", field.key);
     }
-    // The TTL has no default: the provider chooses.
-    assert!(settings["ttl"].is_null());
+    // The TTL's default is the provider's choice, which the setting spells "provider_default"
+    // (the loop above compared it with the metadata).
+    assert_eq!(settings["ttl"], "provider_default");
     let caps = &meta.capabilities;
     assert!(caps.list_zones && caps.add_txt_value && caps.remove_txt_value);
     assert!(caps.list_rrsets && caps.get_rrset && caps.set_rrset && caps.delete_rrset);
@@ -1634,7 +1635,7 @@ fn rr(owner: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrSet
     RrSet::new(
         dn(owner),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         texts.iter().map(|t| rdata(rtype, t)),
     )
     .unwrap()
@@ -1760,6 +1761,12 @@ async fn timeweb_cloud_record_round_trips() {
             &["\"token\""],
         ),
     ];
+    // A set without a TTL is created without one (the `ttl` setting is the provider's default)
+    // and reads with the provider's default.
+    let read_as = |set: &RrSet| {
+        set.clone()
+            .with_ttl(set.ttl().or(Some(RrsetTtl::ProviderDefault)))
+    };
     for set in &sets {
         let label = format!("{} {}", set.name(), set.rtype());
         assert_eq!(
@@ -1770,12 +1777,22 @@ async fn timeweb_cloud_record_round_trips() {
             SetOutcome::Created,
             "{label}"
         );
-        // A set without a TTL is created without one (the provider chooses) and reads so.
         let got = client
             .get_rrset(&zone(), set.name(), set.rtype())
             .await
             .unwrap();
-        assert_eq!(got.as_ref(), Some(set), "{label}");
+        assert_eq!(got, Some(read_as(set)), "{label}");
+        // The set as read, written back, changes nothing either.
+        let before = record_writes(&mock);
+        assert_eq!(
+            client
+                .set_rrset(&zone(), got.as_ref().unwrap(), Expect::Any)
+                .await
+                .unwrap(),
+            SetOutcome::Unchanged,
+            "{label}"
+        );
+        assert_eq!(record_writes(&mock), before, "{label}");
         assert!(got.unwrap().records().iter().all(RecordData::is_canonical));
         // A repeat changes nothing.
         let before = record_writes(&mock);
@@ -1797,7 +1814,7 @@ async fn timeweb_cloud_record_round_trips() {
         control.set_domain_listing_scope(scope);
         let listing = client.list_rrsets(&zone()).await.unwrap();
         assert!(listing.skipped.is_empty(), "{:?}", listing.skipped);
-        let mut expected = sets.to_vec();
+        let mut expected: Vec<RrSet> = sets.iter().map(read_as).collect();
         expected.sort_by(|a, b| (a.name(), a.rtype()).cmp(&(b.name(), b.rtype())));
         assert_eq!(listing.rrsets, expected, "{form:?} {scope:?}");
         for set in &sets {
@@ -1805,9 +1822,8 @@ async fn timeweb_cloud_record_round_trips() {
                 client
                     .get_rrset(&zone(), set.name(), set.rtype())
                     .await
-                    .unwrap()
-                    .as_ref(),
-                Some(set),
+                    .unwrap(),
+                Some(read_as(set)),
                 "{form:?} {scope:?}"
             );
         }
@@ -1869,7 +1885,11 @@ async fn timeweb_cloud_record_round_trips() {
             .get_rrset(&zone(), &dn("other.example.org"), RecordType::MX)
             .await
             .unwrap(),
-        Some(other.clone().with_ttl(Some(Ttl::from_secs(600).unwrap())))
+        Some(
+            other
+                .clone()
+                .with_ttl(Some(RrsetTtl::from_secs(600).unwrap()))
+        )
     );
     let before = record_writes(&mock);
     assert_eq!(
@@ -2005,7 +2025,7 @@ async fn timeweb_cloud_set_any_replaces_and_delete_converges() {
 
     let retuned = replaced
         .clone()
-        .with_ttl(Some(Ttl::from_secs(900).unwrap()));
+        .with_ttl(Some(RrsetTtl::from_secs(900).unwrap()));
     assert_eq!(
         client
             .set_rrset(&zone(), &retuned, Expect::Any)
@@ -2298,7 +2318,8 @@ async fn timeweb_cloud_listing_reports_skipped_sets() {
         let odd = get("odd.example.org", RecordType::A).unwrap();
         assert!(!odd.records()[0].is_canonical());
         assert_eq!(odd.records()[0].as_str(), "not an address");
-        assert_eq!(odd.ttl(), None);
+        // Listed without a TTL: the provider's choice.
+        assert_eq!(odd.ttl(), Some(RrsetTtl::ProviderDefault));
         let srv = get("_sip._tcp.example.org", RecordType::SRV).unwrap();
         assert!(!srv.records()[0].is_canonical());
         assert_eq!(srv.records()[0].as_str(), "sip.example.org");
@@ -2785,7 +2806,7 @@ async fn timeweb_cloud_record_operations_touch_only_their_rrset() {
         );
         let set = rr(www, RecordType::A, None, &["192.0.2.5", "192.0.2.6"]);
         client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
-        let set = set.with_ttl(Some(Ttl::from_secs(60).unwrap()));
+        let set = set.with_ttl(Some(RrsetTtl::from_secs(60).unwrap()));
         client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
         assert_eq!(
             client
@@ -2951,7 +2972,7 @@ async fn timeweb_cloud_record_ttls() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(read.ttl(), Some(Ttl::from_secs(300).unwrap()));
+    assert_eq!(read.ttl(), Some(RrsetTtl::from_secs(300).unwrap()));
 
     let three = rr(
         www,
@@ -2992,7 +3013,9 @@ async fn timeweb_cloud_record_ttls() {
     assert_eq!(record_writes(&mock), before);
 
     // A requested TTL: one update, for the record that lacks it.
-    let uniform = three.clone().with_ttl(Some(Ttl::from_secs(300).unwrap()));
+    let uniform = three
+        .clone()
+        .with_ttl(Some(RrsetTtl::from_secs(300).unwrap()));
     mock.log().clear();
     assert_eq!(
         client
@@ -3177,7 +3200,9 @@ async fn timeweb_cloud_record_writes_are_sent_once() {
         assert!(control.records().is_empty());
     }
     client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
-    let retuned = set.clone().with_ttl(Some(Ttl::from_secs(600).unwrap()));
+    let retuned = set
+        .clone()
+        .with_ttl(Some(RrsetTtl::from_secs(600).unwrap()));
     for (fault, kind) in [
         (Fault::on("PATCH", RECORD).status(502), ErrorKind::Transient),
         (
@@ -3294,7 +3319,7 @@ async fn timeweb_cloud_record_request_shapes() {
     );
     // The configured TTL for a new set.
     let mut config = settings(mock.base_url());
-    config.ttl = Some(120);
+    config.ttl = RrsetTtl::from_secs(120).unwrap();
     let configured = TimewebCloud::new(config, credentials(TOKEN), &context()).unwrap();
     let a = rr("a.example.org", RecordType::A, None, &["192.0.2.1"]);
     configured
@@ -3541,7 +3566,7 @@ async fn live_timeweb_cloud_record_round_trip() {
         RrSet::new(
             name.clone(),
             RecordType::A,
-            ttl.map(|t| Ttl::from_secs(t).unwrap()),
+            ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
             texts.iter().map(|t| rdata(RecordType::A, t)),
         )
         .unwrap()
@@ -3606,4 +3631,152 @@ async fn live_timeweb_cloud_record_round_trip() {
         std::panic::resume_unwind(e.into_panic());
     }
     assert!(cleanup.is_ok(), "cleanup failed: {cleanup:?}");
+}
+
+/// The provider's choice of TTL (design section 3.6): a record without `ttl`. A set created
+/// with it (no `ttl` in the create), a switch from it to a number, the refusal of the switch
+/// back (whether an update without `ttl` clears it is not documented) with nothing written,
+/// unchanged round trips in both states, expectations of each kind, the `ttl` setting's
+/// spellings, and a TXT value added with it.
+#[tokio::test]
+async fn timeweb_cloud_provider_default_ttl() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let default = Some(RrsetTtl::ProviderDefault);
+    let www = "www.example.org";
+    let set = |ttl: Option<RrsetTtl>| {
+        rr(www, RecordType::A, None, &["192.0.2.1", "192.0.2.2"]).with_ttl(ttl)
+    };
+    let ttls = || -> Vec<Option<u64>> {
+        control
+            .records_at(www, "A")
+            .into_iter()
+            .map(|r| r.ttl)
+            .collect()
+    };
+
+    // Created without `ttl`.
+    mock.log().clear();
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &set(default), Expect::Absent)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    let posts = mock.log().matching(Some("POST"), CREATE);
+    assert_eq!(posts.len(), 2);
+    assert!(
+        posts
+            .iter()
+            .all(|p| p.body_json().unwrap().get("ttl").is_none())
+    );
+    assert_eq!(ttls(), [None, None]);
+    let read = client
+        .get_rrset(&zone(), &dn(www), RecordType::A)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, set(default));
+    let before = writes(&mock);
+    for wanted in [read.clone(), set(None)] {
+        assert_eq!(
+            client
+                .set_rrset(&zone(), &wanted, Expect::Matches(&read))
+                .await
+                .unwrap(),
+            SetOutcome::Unchanged
+        );
+    }
+    let e = client
+        .set_rrset(
+            &zone(),
+            &set(None),
+            Expect::Matches(&set(Some(RrsetTtl::from_secs(60).unwrap()))),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(writes(&mock), before);
+
+    // Default to explicit: an update of each record with the number.
+    let explicit = set(Some(RrsetTtl::from_secs(600).unwrap()));
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &explicit, Expect::Matches(&set(default)))
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(ttls(), [Some(600), Some(600)]);
+    let before = writes(&mock);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &explicit, Expect::Matches(&explicit))
+            .await
+            .unwrap(),
+        SetOutcome::Unchanged
+    );
+    // Explicit back to the default: refused after the read, nothing written, also when a new
+    // value would be created along with it.
+    for wanted in [
+        set(default),
+        rr(www, RecordType::A, None, &["192.0.2.1", "192.0.2.3"]).with_ttl(default),
+    ] {
+        let e = client
+            .set_rrset(&zone(), &wanted, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e}");
+    }
+    assert_eq!(writes(&mock), before);
+    assert_eq!(ttls(), [Some(600), Some(600)]);
+
+    // A TXT value added with the default is created without `ttl`.
+    mock.log().clear();
+    client
+        .add_txt_value(&zone(), &name(), &txt("AAA"), default)
+        .await
+        .unwrap();
+    let post = mock.log().matching(Some("POST"), CREATE).pop().unwrap();
+    assert!(post.body_json().unwrap().get("ttl").is_none());
+
+    // The setting: "provider_default", `null` and a missing key all leave the choice to the
+    // provider; a number keeps its meaning.
+    let spellings = [
+        (Some(serde_json::json!("provider_default")), None),
+        (Some(serde_json::Value::Null), None),
+        (None, None),
+        (Some(serde_json::json!(300)), Some(300)),
+    ];
+    for (index, (ttl, stored)) in spellings.into_iter().enumerate() {
+        let mut settings: serde_json::Value = serde_json::from_str(&settings_json(&mock)).unwrap();
+        match &ttl {
+            Some(value) => settings["ttl"] = value.clone(),
+            None => {
+                settings.as_object_mut().unwrap().remove("ttl");
+            }
+        }
+        let configured = AnyProvider::from_json(
+            ProviderId::TimewebCloud,
+            &settings.to_string(),
+            &format!(r#"{{"token":"{TOKEN}"}}"#).into(),
+            &context(),
+        )
+        .unwrap();
+        let owner = format!("n{index}.example.org");
+        configured
+            .set_rrset(
+                &zone(),
+                &rr(&owner, RecordType::A, None, &["192.0.2.9"]),
+                Expect::Absent,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            control.records_at(&owner, "A").first().and_then(|r| r.ttl),
+            stored,
+            "{ttl:?}"
+        );
+    }
 }

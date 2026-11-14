@@ -38,7 +38,7 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, TxtDialect};
+use crate::record::{RrsetTtl, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{Member, SetRead, SetState, TxtBase, TxtRecord, TxtSet, WholeSet, WriteTtl};
 
@@ -87,7 +87,7 @@ impl WholeSet for Beget {
                 })
                 .collect();
             // The set's TTL is the smallest of its records' (design section 3.6).
-            let ttl = records.iter().filter_map(|record| record.ttl).min();
+            let ttl = RrsetTtl::of_records(records.iter().map(|record| record.ttl));
             Some(TxtSet {
                 records,
                 ttl,
@@ -139,19 +139,20 @@ impl Beget {
     /// The TTL of the value being added, as the JSON the API takes, or `None` to send none.
     fn added_ttl(&self, ttl: WriteTtl) -> Option<Value> {
         match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => Some(json!(ttl.as_secs())),
-            WriteTtl::New(None) => Some(json!(self.ttl)),
-            WriteTtl::Existing(None) => None,
+            WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))
+            | WriteTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => Some(json!(ttl.as_secs())),
+            WriteTtl::New(None | Some(RrsetTtl::ProviderDefault)) => Some(json!(self.ttl)),
+            WriteTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => None,
         }
     }
 }
 
 /// A TTL the API stated as a number or a string of digits.
-fn ttl_of(value: &Value) -> Option<Ttl> {
+fn ttl_of(value: &Value) -> Option<RrsetTtl> {
     let secs = match value {
         Value::Number(n) => n.as_u64()?,
         Value::String(s) => s.trim().parse().ok()?,
         _ => return None,
     };
-    Ttl::from_secs(u32::try_from(secs).ok()?).ok()
+    RrsetTtl::from_secs(u32::try_from(secs).ok()?).ok()
 }

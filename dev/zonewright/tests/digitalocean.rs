@@ -19,8 +19,8 @@ use zonewright::providers::digitalocean::{
 };
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, SkipReason,
-    Ttl, Txt,
+    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl, SetOutcome,
+    SkipReason, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -392,7 +392,7 @@ async fn digitalocean_invalid_input_sends_nothing() {
                 &zone(),
                 &name(),
                 &txt("v1"),
-                Some(Ttl::from_secs(ttl).unwrap()),
+                Some(RrsetTtl::from_secs(ttl).unwrap()),
             )
             .await
             .unwrap_err();
@@ -860,7 +860,7 @@ async fn digitalocean_exact_name_match_ignores_noisy_filter() {
 async fn digitalocean_ttl_policy() {
     let mock = DigitalOceanMock::start(Seed::standard()).await;
     let mut config = settings(mock.base_url());
-    config.ttl = 77;
+    config.ttl = RrsetTtl::from_secs(77).unwrap();
     let client = DigitalOcean::new(config, credentials(TOKEN), &context()).unwrap();
     let ttl = |name: &str| mock.control().txt_records(name)[0].ttl;
     let other = dn("a.example.org");
@@ -875,7 +875,7 @@ async fn digitalocean_ttl_policy() {
             &zone(),
             &third,
             &txt("v"),
-            Some(Ttl::from_secs(120).unwrap()),
+            Some(RrsetTtl::from_secs(120).unwrap()),
         )
         .await
         .unwrap();
@@ -889,7 +889,7 @@ async fn digitalocean_ttl_policy() {
             &zone(),
             &name(),
             &txt("ours"),
-            Some(Ttl::from_secs(3000).unwrap()),
+            Some(RrsetTtl::from_secs(3000).unwrap()),
         )
         .await
         .unwrap();
@@ -939,7 +939,11 @@ async fn digitalocean_record_level_unreported_ttl_takes_the_setting() {
         SetOutcome::Replaced
     );
     let post = mock.log().matching(Some("POST"), RECORDS).pop().unwrap();
-    let configured = u64::from(DigitalOceanConfig::default().ttl);
+    let configured = DigitalOceanConfig::default()
+        .ttl
+        .explicit()
+        .map(|ttl| u64::from(ttl.as_secs()))
+        .unwrap();
     assert_eq!(
         post.body_json().unwrap().get("ttl"),
         Some(&serde_json::json!(configured))
@@ -1362,7 +1366,7 @@ fn rr(owner: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrSet
     RrSet::new(
         dn(owner),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         texts.iter().map(|t| rdata(rtype, t)),
     )
     .unwrap()
@@ -1456,7 +1460,7 @@ async fn digitalocean_record_round_trips() {
         // A set without a TTL gets the configured default.
         let expected = set
             .clone()
-            .with_ttl(set.ttl().or(Some(Ttl::from_secs(30).unwrap())));
+            .with_ttl(set.ttl().or(Some(RrsetTtl::from_secs(30).unwrap())));
         let got = client
             .get_rrset(&zone(), set.name(), set.rtype())
             .await
@@ -1478,7 +1482,7 @@ async fn digitalocean_record_round_trips() {
     for set in &sets {
         let expected = set
             .clone()
-            .with_ttl(set.ttl().or(Some(Ttl::from_secs(30).unwrap())));
+            .with_ttl(set.ttl().or(Some(RrsetTtl::from_secs(30).unwrap())));
         assert!(listing.rrsets.contains(&expected), "{expected:?}");
     }
 
@@ -1542,7 +1546,11 @@ async fn digitalocean_record_round_trips() {
             .get_rrset(&zone(), &dn("other.example.org"), RecordType::MX)
             .await
             .unwrap(),
-        Some(other.clone().with_ttl(Some(Ttl::from_secs(600).unwrap())))
+        Some(
+            other
+                .clone()
+                .with_ttl(Some(RrsetTtl::from_secs(600).unwrap()))
+        )
     );
     let before = record_writes(&mock);
     assert_eq!(
@@ -1665,7 +1673,7 @@ async fn digitalocean_set_any_replaces_and_delete_converges() {
 
     let retuned = replaced
         .clone()
-        .with_ttl(Some(Ttl::from_secs(900).unwrap()));
+        .with_ttl(Some(RrsetTtl::from_secs(900).unwrap()));
     assert_eq!(
         client
             .set_rrset(&zone(), &retuned, Expect::Any)
@@ -2041,7 +2049,7 @@ async fn digitalocean_record_operations_touch_only_their_rrset() {
     );
     let set = rr(www, RecordType::A, None, &["192.0.2.5", "192.0.2.6"]);
     client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
-    let set = set.with_ttl(Some(Ttl::from_secs(60).unwrap()));
+    let set = set.with_ttl(Some(RrsetTtl::from_secs(60).unwrap()));
     client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
     assert_eq!(
         client
@@ -2218,7 +2226,7 @@ async fn digitalocean_record_ttls() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(read.ttl(), Some(Ttl::from_secs(300).unwrap()));
+    assert_eq!(read.ttl(), Some(RrsetTtl::from_secs(300).unwrap()));
 
     let three = rr(
         www,
@@ -2259,7 +2267,9 @@ async fn digitalocean_record_ttls() {
     assert_eq!(record_writes(&mock), before);
 
     // A requested TTL: one update, for the record that lacks it.
-    let uniform = three.clone().with_ttl(Some(Ttl::from_secs(300).unwrap()));
+    let uniform = three
+        .clone()
+        .with_ttl(Some(RrsetTtl::from_secs(300).unwrap()));
     mock.log().clear();
     assert_eq!(
         client
@@ -2405,7 +2415,9 @@ async fn digitalocean_record_writes_are_sent_once() {
         assert!(control.records().is_empty());
     }
     client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
-    let retuned = set.clone().with_ttl(Some(Ttl::from_secs(600).unwrap()));
+    let retuned = set
+        .clone()
+        .with_ttl(Some(RrsetTtl::from_secs(600).unwrap()));
     for (fault, kind) in [
         (Fault::on("PATCH", RECORD).status(502), ErrorKind::Transient),
         (
@@ -2738,7 +2750,7 @@ async fn live_digitalocean_record_round_trip() {
         RrSet::new(
             name.clone(),
             RecordType::A,
-            ttl.map(|t| Ttl::from_secs(t).unwrap()),
+            ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
             texts.iter().map(|t| rdata(RecordType::A, t)),
         )
         .unwrap()

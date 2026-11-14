@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::Context;
 use crate::error::Error;
 use crate::http::Endpoint;
+use crate::record::{RrsetTtl, Ttl};
 use crate::redact::Detail;
 
 /// Default DNS hosting API endpoint.
@@ -57,9 +58,10 @@ const TEXT_MAX: usize = 1024;
 pub struct NicruConfig {
     /// The contract number used as the user name, for example `123/NIC-REG`.
     pub username: String,
-    /// TTL of a new record, in seconds: 30 to 86400, default 30.
+    /// TTL of a new record: 30 to 86400 seconds, or `"provider_default"` for the zone's default
+    /// TTL (the record is staged without `<ttl>`). Default 30.
     #[serde(default = "default_ttl")]
-    pub ttl: u32,
+    pub ttl: RrsetTtl,
     /// The OAuth scope requested for the token; default `.+:/dns-master/.+` (full access to
     /// every DNS hosting service of the contract). It can be narrowed to the zones to manage.
     #[serde(default = "default_scope")]
@@ -75,8 +77,8 @@ pub struct NicruConfig {
     pub token_url: String,
 }
 
-fn default_ttl() -> u32 {
-    DEFAULT_TTL
+fn default_ttl() -> RrsetTtl {
+    RrsetTtl::Explicit(Ttl::clamped(DEFAULT_TTL))
 }
 
 fn default_scope() -> String {
@@ -101,7 +103,7 @@ impl NicruConfig {
     pub fn new(username: String) -> NicruConfig {
         NicruConfig {
             username,
-            ttl: DEFAULT_TTL,
+            ttl: default_ttl(),
             scope: default_scope(),
             min_request_interval_ms: DEFAULT_MIN_REQUEST_INTERVAL_MS,
             base_url: default_base_url(),
@@ -123,8 +125,12 @@ impl NicruConfig {
                 "scope must be 1 to 1024 bytes long, without control characters",
             ));
         }
-        if !(TTL_MIN..=TTL_MAX).contains(&self.ttl) {
-            return Err(config("ttl must be between 30 and 86400"));
+        if let RrsetTtl::Explicit(ttl) = self.ttl
+            && !(TTL_MIN..=TTL_MAX).contains(&ttl.as_secs())
+        {
+            return Err(config(
+                "ttl must be between 30 and 86400, or provider_default",
+            ));
         }
         if self.min_request_interval_ms > MIN_REQUEST_INTERVAL_MAX {
             return Err(config(
@@ -147,8 +153,8 @@ pub(super) struct Settings {
     pub(super) api: Endpoint,
     /// The token endpoint.
     pub(super) token: Endpoint,
-    /// TTL of a new record.
-    pub(super) ttl: u32,
+    /// TTL of a new record: a number, or the zone's default.
+    pub(super) ttl: RrsetTtl,
     /// Spacing of requests; zero for none.
     pub(super) interval: Duration,
 }

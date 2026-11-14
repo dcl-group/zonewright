@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use zonewright::name::{DomainName, NameError, TargetName};
 use zonewright::record::{
-    Caa, Mx, RecordData, RecordError, RecordType, RrSet, Srv, SvcParam, Svcb, Tlsa, Ttl, Txt,
+    Caa, Mx, RecordData, RecordError, RecordType, RrSet, RrsetTtl, Srv, SvcParam, Svcb, Tlsa, Ttl,
+    Txt,
 };
 
 fn dn(s: &str) -> DomainName {
@@ -200,6 +201,41 @@ fn ttl_serde() {
     assert!(serde_json::from_str::<Ttl>("2147483648").is_err());
     assert!(serde_json::from_str::<Ttl>("-1").is_err());
     assert!(serde_json::from_str::<Ttl>("\"300\"").is_err());
+}
+
+#[test]
+fn rrset_ttl_serde() {
+    let explicit = RrsetTtl::from_secs(300).unwrap();
+    assert_eq!(serde_json::to_string(&explicit).unwrap(), "300");
+    assert_eq!(
+        serde_json::to_string(&RrsetTtl::ProviderDefault).unwrap(),
+        "\"provider_default\""
+    );
+    assert_eq!(serde_json::from_str::<RrsetTtl>("300").unwrap(), explicit);
+    assert_eq!(
+        serde_json::from_str::<RrsetTtl>("\"provider_default\"").unwrap(),
+        RrsetTtl::ProviderDefault
+    );
+    assert_eq!(
+        serde_json::from_str::<RrsetTtl>("2147483647").unwrap(),
+        RrsetTtl::Explicit(Ttl::MAX)
+    );
+    let canary = "canary-7f3a";
+    for bad in [
+        "2147483648".to_owned(),
+        "-1".to_owned(),
+        "1.5".to_owned(),
+        "\"300\"".to_owned(),
+        "\"PROVIDER_DEFAULT\"".to_owned(),
+        "null".to_owned(),
+        "{}".to_owned(),
+        format!("\"{canary}\""),
+    ] {
+        let e = serde_json::from_str::<RrsetTtl>(&bad).unwrap_err();
+        assert!(!e.to_string().contains(canary), "{bad}: {e}");
+    }
+    assert_eq!(RrsetTtl::from(Ttl::MAX).explicit(), Some(Ttl::MAX));
+    assert_eq!(RrsetTtl::ProviderDefault.explicit(), None);
 }
 
 // ---- Canonical text per type ----------------------------------------------------------------
@@ -1225,7 +1261,7 @@ fn rrset_new_sorts_and_dedups() {
     let set = RrSet::new(
         dn("example.org"),
         RecordType::A,
-        Some(Ttl::from_secs(300).unwrap()),
+        Some(RrsetTtl::from_secs(300).unwrap()),
         [
             parse(RecordType::A, "192.0.2.2"),
             parse(RecordType::A, "192.0.2.1"),
@@ -1242,7 +1278,7 @@ fn rrset_new_sorts_and_dedups() {
     );
     assert_eq!(set.name(), &dn("example.org"));
     assert_eq!(set.rtype(), RecordType::A);
-    assert_eq!(set.ttl(), Some(Ttl::from_secs(300).unwrap()));
+    assert_eq!(set.ttl(), Some(RrsetTtl::from_secs(300).unwrap()));
     assert!(set.contains(&parse(RecordType::A, "192.0.2.1")));
     assert!(!set.contains(&parse(RecordType::A, "192.0.2.3")));
 
@@ -1345,7 +1381,7 @@ fn rrset_serde_round_trip() {
     let set = RrSet::new(
         dn("example.org"),
         RecordType::TXT,
-        Some(Ttl::from_secs(60).unwrap()),
+        Some(RrsetTtl::from_secs(60).unwrap()),
         [
             parse(RecordType::TXT, "\"b\""),
             parse(RecordType::TXT, "\"a\""),
@@ -1367,6 +1403,18 @@ fn rrset_serde_round_trip() {
         set_json(r#"{"name":"example.org","type":"txt","records":["\"a\"","b"]}"#),
         no_ttl
     );
+
+    // The provider's default is spelled as in the settings, and differs from no TTL stated.
+    let default = set.clone().with_ttl(Some(RrsetTtl::ProviderDefault));
+    let json = serde_json::to_string(&default).unwrap();
+    assert_eq!(
+        json,
+        r#"{"name":"example.org.","type":"TXT","ttl":"provider_default","records":["\"a\"","\"b\""]}"#
+    );
+    assert_eq!(set_json(&json), default);
+    assert_ne!(default, no_ttl);
+    assert_ne!(default, set);
+    assert!(default.same_records(&no_ttl));
 }
 
 #[test]
@@ -1413,6 +1461,9 @@ fn rrset_serde_rejections() {
         r#"{"name":"bad name","type":"A","records":["192.0.2.1"]}"#,
         r#"{"name":"example.org.","type":"NOPE","records":["192.0.2.1"]}"#,
         r#"{"name":"example.org.","type":"A","ttl":4294967295,"records":["192.0.2.1"]}"#,
+        r#"{"name":"example.org.","type":"A","ttl":"default","records":["192.0.2.1"]}"#,
+        r#"{"name":"example.org.","type":"A","ttl":"300","records":["192.0.2.1"]}"#,
+        r#"{"name":"example.org.","type":"A","ttl":{},"records":["192.0.2.1"]}"#,
         r#"{"name":"example.org.","type":"A","records":[{"raw":"x","other":1}]}"#,
         r#"{"name":"example.org.","type":"CNAME","records":["a.example.org","b.example.org"]}"#,
         r#"{"type":"A","records":["192.0.2.1"]}"#,

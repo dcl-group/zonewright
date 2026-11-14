@@ -22,7 +22,7 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
 use crate::provider::{AddOutcome, CheckReport, Provider, ZoneCheck};
-use crate::record::{Ttl, Txt};
+use crate::record::{RrsetTtl, Txt};
 use crate::redact::Detail;
 
 use super::api::Api;
@@ -193,15 +193,16 @@ impl Provider for AcmeDns {
     /// Stores `value` in the registration whose `fulldomain` is `name`; always `Accepted`.
     ///
     /// Checked before any request: the zone is neither the root nor a wildcard; `name` is within
-    /// `zone` (`NameOutsideZone`); no TTL is requested (the server chooses it); `value` is 43
-    /// characters of `A-Z a-z 0-9 - _`; `name` is the `fulldomain` of a configured registration
-    /// (`InvalidInput`, so the caller sees that the CNAME or the configuration is wrong).
+    /// `zone` (`NameOutsideZone`); no explicit TTL is requested (the server chooses it, so
+    /// `RrsetTtl::ProviderDefault` is accepted); `value` is 43 characters of `A-Z a-z 0-9 - _`;
+    /// `name` is the `fulldomain` of a configured registration (`InvalidInput`, so the caller
+    /// sees that the CNAME or the configuration is wrong).
     async fn add_txt_value(
         &self,
         zone: &DomainName,
         name: &DomainName,
         value: &Txt,
-        ttl: Option<Ttl>,
+        ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
         if zone.is_root() || zone.is_wildcard() {
             return Err(invalid("the zone must not be the root or a wildcard name"));
@@ -209,7 +210,7 @@ impl Provider for AcmeDns {
         if !name.is_within(zone) {
             return Err(Error::name_outside_zone(name.clone(), zone.clone()));
         }
-        if ttl.is_some() {
+        if matches!(ttl, Some(RrsetTtl::Explicit(_))) {
             return Err(invalid(
                 "the provider chooses the TTL; a requested TTL cannot be honored",
             ));

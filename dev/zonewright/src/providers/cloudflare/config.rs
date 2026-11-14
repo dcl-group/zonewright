@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::Context;
 use crate::error::Error;
 use crate::http::Endpoint;
+use crate::record::{RrsetTtl, Ttl};
 use crate::redact::Detail;
 
 /// Default API endpoint.
@@ -21,7 +22,9 @@ pub(super) const DEFAULT_BASE_URL: &str = "https://api.cloudflare.com/client/v4"
 /// (providers/dns/cloudflare/cloudflare.go, `minTTL = 120`).
 pub(super) const DEFAULT_TTL: u32 = 120;
 
-/// The TTL value the API defines as "automatic".
+/// The TTL value the API defines as "automatic", the provider's default. The `ttl` setting
+/// accepts it as a number as well, with the meaning it always had: a stored `1` is
+/// `"provider_default"`.
 // Source: the API schema of a record's `ttl` (https://developers.cloudflare.com/api/resources/
 // dns/subresources/records/methods/create/): "Setting to 1 means 'automatic'. Value must be
 // between 60 and 86400, with the minimum reduced to 30 for Enterprise zones."
@@ -39,15 +42,16 @@ pub(super) const TTL_MAX: u32 = 86_400;
 pub struct CloudflareConfig {
     /// API endpoint; default `https://api.cloudflare.com/client/v4`.
     pub base_url: String,
-    /// TTL of a new record, in seconds: `1` (automatic) or 60 to 86400, default 120.
-    pub ttl: u32,
+    /// TTL of a new rrset: 60 to 86400 seconds, or the provider's default (automatic), spelled
+    /// `"provider_default"` or, as the API spells it, `1`. Default 120.
+    pub ttl: RrsetTtl,
 }
 
 impl Default for CloudflareConfig {
     fn default() -> CloudflareConfig {
         CloudflareConfig {
             base_url: DEFAULT_BASE_URL.to_owned(),
-            ttl: DEFAULT_TTL,
+            ttl: RrsetTtl::Explicit(Ttl::clamped(DEFAULT_TTL)),
         }
     }
 }
@@ -56,12 +60,19 @@ impl CloudflareConfig {
     /// Checks everything that can be checked without the network. Error texts name the key,
     /// never its value.
     pub(super) fn validate(&self, ctx: &Context) -> Result<Settings, Error> {
-        if self.ttl != TTL_AUTOMATIC && !(TTL_MIN..=TTL_MAX).contains(&self.ttl) {
-            return Err(config("ttl must be 1 (automatic) or between 60 and 86400"));
-        }
+        let ttl = match self.ttl {
+            RrsetTtl::Explicit(ttl) if ttl.as_secs() == TTL_AUTOMATIC => RrsetTtl::ProviderDefault,
+            RrsetTtl::Explicit(ttl) if (TTL_MIN..=TTL_MAX).contains(&ttl.as_secs()) => self.ttl,
+            RrsetTtl::ProviderDefault => self.ttl,
+            _ => {
+                return Err(config(
+                    "ttl must be between 60 and 86400, or provider_default (also spelled 1)",
+                ));
+            }
+        };
         Ok(Settings {
             api: Endpoint::parse("base_url", &self.base_url, ctx)?,
-            ttl: self.ttl,
+            ttl,
         })
     }
 }
@@ -71,8 +82,8 @@ impl CloudflareConfig {
 pub(super) struct Settings {
     /// The API.
     pub(super) api: Endpoint,
-    /// TTL of a new record.
-    pub(super) ttl: u32,
+    /// TTL of a new rrset; a configured `1` is the provider's default.
+    pub(super) ttl: RrsetTtl,
 }
 
 /// Credentials of the Cloudflare client: the secret part of its configuration.

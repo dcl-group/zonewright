@@ -27,7 +27,7 @@ use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, Txt, TxtDialect};
+use crate::record::{RrsetTtl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{Member, SetRead, SetState, TxtBase, TxtRecord, TxtSet, WholeSet, WriteTtl};
 
@@ -109,15 +109,18 @@ impl SelectelV2 {
     /// The TTL of a new rrset: the caller's, else the configured one.
     fn new_ttl(&self, ttl: WriteTtl) -> u32 {
         match ttl {
-            WriteTtl::New(Some(ttl)) | WriteTtl::Existing(Some(ttl)) => ttl.as_secs(),
-            WriteTtl::New(None) | WriteTtl::Existing(None) => self.ttl,
+            WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))
+            | WriteTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
+            // No default TTL of its own: the layer never passes it, and the setting stands in.
+            WriteTtl::New(None | Some(RrsetTtl::ProviderDefault))
+            | WriteTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => self.ttl,
         }
     }
 }
 
 /// The value layer's view of an rrset.
 fn txt_set(rrset: Rrset) -> TxtSet<Record, Rrset> {
-    let ttl = Ttl::from_secs(rrset.ttl).ok();
+    let ttl = RrsetTtl::from_secs(rrset.ttl).ok();
     let records = rrset
         .records
         .iter()

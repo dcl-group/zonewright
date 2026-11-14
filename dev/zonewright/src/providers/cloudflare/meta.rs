@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::id::ProviderId;
 use crate::meta::{
-    Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
-    ValueGuarantee,
+    Capabilities, ConfigField, FieldKind, Preconditions, ProviderDefaultTtl, ProviderMeta,
+    TtlSupport, TypeSet, ValueGuarantee,
 };
 use crate::record::RecordType;
 
@@ -43,10 +43,14 @@ const FIELDS: &[ConfigField] = &[
         key: "ttl",
         secret: false,
         required: false,
-        kind: FieldKind::Integer { min: 1, max: 86400 },
+        kind: FieldKind::Ttl {
+            min: 60,
+            max: 86_400,
+            provider_default: true,
+        },
         default: Some("120"),
         label: "Record TTL, s",
-        help: "TTL of new records, in seconds: 1 means automatic, any other value is at least 60.",
+        help: "TTL of new records, in seconds, or provider_default for automatic (a stored 1 means the same).",
         advanced: true,
     },
     ConfigField {
@@ -101,9 +105,9 @@ const CAPABILITIES: Capabilities = Capabilities {
         min: 60,
         max: 86_400,
     },
-    // A TTL of 1 means "automatic" (design section 3.6); such a record reads as no TTL, and a
-    // set can be created with it through the `ttl` setting only. The TTL of a proxied record is
-    // always automatic and cannot be requested.
-    provider_default_ttl: true,
+    // A TTL of 1 means "automatic" (design section 3.6): such a record reads as the provider's
+    // default, and a create or a `PATCH` with `ttl: 1` requests it, also in place of an explicit
+    // TTL. The TTL of a proxied record is always automatic; an explicit one is refused there.
+    provider_default_ttl: ProviderDefaultTtl::Requestable,
     asynchronous: false,
 };

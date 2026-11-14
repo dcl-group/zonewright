@@ -17,8 +17,8 @@ use secrecy::SecretString;
 use zonewright::providers::selectel_v2::{SelectelV2, SelectelV2Config, SelectelV2Credentials};
 use zonewright::{
     AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
-    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, SkipReason,
-    Ttl, Txt,
+    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl, SetOutcome,
+    SkipReason, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -113,7 +113,7 @@ fn rrset(name: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrS
     RrSet::new(
         dn(name),
         rtype,
-        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        ttl.map(|t| RrsetTtl::from_secs(t).unwrap()),
         texts.iter().map(|t| rd(rtype, t)),
     )
     .unwrap()
@@ -1005,7 +1005,7 @@ async fn selectel_v2_add_creates_rrset() {
     assert_eq!(rrsets[0].records[0].content, "\"AAA\"");
     // A TTL given by the caller is used for a new rrset only.
     let other = dn("_acme-challenge.www.example.org");
-    let ttl = zonewright::Ttl::from_secs(300).unwrap();
+    let ttl = zonewright::RrsetTtl::from_secs(300).unwrap();
     client
         .add_txt_value(&zone(), &other, &txt("BBB"), Some(ttl))
         .await
@@ -1022,7 +1022,7 @@ async fn selectel_v2_add_creates_rrset() {
             &zone(),
             &other,
             &txt("CCC"),
-            Some(zonewright::Ttl::from_secs(900).unwrap()),
+            Some(zonewright::RrsetTtl::from_secs(900).unwrap()),
         )
         .await
         .unwrap();
@@ -1040,7 +1040,7 @@ async fn selectel_v2_add_creates_rrset() {
             &zone(),
             &name(),
             &txt("DDD"),
-            Some(zonewright::Ttl::from_secs(30).unwrap()),
+            Some(zonewright::RrsetTtl::from_secs(30).unwrap()),
         )
         .await
         .unwrap_err();
@@ -3351,7 +3351,7 @@ async fn live_selectel_v2_record_round_trip() {
     let a_set = RrSet::new(
         records.clone(),
         RecordType::A,
-        Some(Ttl::from_secs(120).unwrap()),
+        Some(RrsetTtl::from_secs(120).unwrap()),
         [
             rd(RecordType::A, "192.0.2.1"),
             rd(RecordType::A, "192.0.2.2"),

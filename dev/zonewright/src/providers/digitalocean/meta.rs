@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::id::ProviderId;
 use crate::meta::{
-    Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
-    ValueGuarantee,
+    Capabilities, ConfigField, FieldKind, Preconditions, ProviderDefaultTtl, ProviderMeta,
+    TtlSupport, TypeSet, ValueGuarantee,
 };
 use crate::record::RecordType;
 
@@ -43,9 +43,10 @@ const FIELDS: &[ConfigField] = &[
         key: "ttl",
         secret: false,
         required: false,
-        kind: FieldKind::Integer {
+        kind: FieldKind::Ttl {
             min: 30,
             max: 86400,
+            provider_default: false,
         },
         default: Some("30"),
         label: "Record TTL, s",
@@ -101,6 +102,6 @@ const CAPABILITIES: Capabilities = Capabilities {
         min: 30,
         max: 86_400,
     },
-    provider_default_ttl: false,
+    provider_default_ttl: ProviderDefaultTtl::Absent,
     asynchronous: false,
 };

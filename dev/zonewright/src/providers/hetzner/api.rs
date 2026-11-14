@@ -203,7 +203,9 @@ struct RemoveRecords<'a> {
 
 /// The body of `POST /zones/{id}/rrsets`. `labels` is not sent: a new rrset gets none.
 // Source: the reference, "Create an RRSet": `name`, `type` and `records` (required; distinct
-// values), `ttl` (optional, 60 to 2147483647 or null), `labels` (optional); no other property.
+// values), `ttl` (optional, 60 to 2147483647 or null: "If not set, the Zone's Default TTL is
+// used"), `labels` (optional); no other property. Read in the OpenAPI document
+// (https://docs.hetzner.cloud/cloud.spec.json, `create_zone_rrset`) on 2026-11-14.
 #[derive(Serialize)]
 pub(super) struct NewRrset<'a> {
     /// The owner name relative to the zone, `@` for the apex.
@@ -211,8 +213,9 @@ pub(super) struct NewRrset<'a> {
     /// The record type.
     #[serde(rename = "type")]
     pub(super) rtype: &'a str,
-    /// The TTL.
-    pub(super) ttl: u32,
+    /// The TTL; left out for the zone's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ttl: Option<u32>,
     /// The records.
     pub(super) records: &'a [Record],
 }
@@ -226,11 +229,16 @@ struct SetRecords<'a> {
 }
 
 /// The body of `change_ttl`.
-// Source: the reference, "Change an RRSet's TTL": `ttl` (required, 60 to 2147483647 or null);
-// no other property. This client never sends `null`.
+// Source: the reference, "Change an RRSet's TTL": `ttl` (required, type integer or null, 60 to
+// 2147483647, "If not set, the Zone's Default TTL is used"); no other property. Read in the
+// OpenAPI document (https://docs.hetzner.cloud/cloud.spec.json, `change_zone_rrset_ttl`) on
+// 2026-11-14. `null` is how the zone's default is asked for: the key is required and the schema
+// allows `null` with that description; the document does not say it in other words, and no live
+// run has confirmed it yet.
 #[derive(Serialize)]
 struct ChangeTtl {
-    ttl: u32,
+    /// `None` is sent as `null`: the zone's default.
+    ttl: Option<u32>,
 }
 
 /// The client's handle on the API: the transport and the endpoint.
@@ -535,8 +543,8 @@ impl Api {
             .await
     }
 
-    /// `change_ttl` of an existing rrset. Sent once, like every write. Returns the action to
-    /// wait for, or `None` for `404`.
+    /// `change_ttl` of an existing rrset; `None` asks for the zone's default. Sent once, like
+    /// every write. Returns the action to wait for, or `None` for `404`.
     // Source: the reference, "Change an RRSet's TTL": `201` with an action; hcloud-go
     // `ChangeRRSetTTL` (zone_rrset.go:350).
     pub(super) async fn change_ttl(
@@ -544,7 +552,7 @@ impl Api {
         zone_id: &str,
         rr_name: &str,
         rr_type: &str,
-        ttl: u32,
+        ttl: Option<u32>,
     ) -> Result<Option<Action>, Error> {
         let body = ChangeTtl { ttl };
         self.rrset_action(zone_id, rr_name, rr_type, "/actions/change_ttl", &body)
