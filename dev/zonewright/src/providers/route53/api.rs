@@ -11,7 +11,8 @@
 //! - [Endpoints]: the endpoint and the signing Region.
 //! - [SigV4] and its [troubleshooting] page: the signature (`crate::crypto::sigv4`) and the
 //!   texts of signature errors.
-//! - lego `providers/dns/route53/route53.go`.
+//! - lego `providers/dns/route53/route53.go` at commit
+//!   `c40c0a2a458a2dc77daaced6cb94a86e253dc8c1` (the file read on 2026-11-14).
 //!
 //! Endpoints used, all below the `base_url`:
 //!
@@ -406,7 +407,8 @@ impl Api {
     // Source: API reference, `ListHostedZonesByName`: `dnsname` and `hostedzoneid` (the
     // `NextDNSName` and `NextHostedZoneId` of the previous page), `maxitems`; zones sorted by
     // name with the labels reversed; `IsTruncated`, and `NextDNSName` and `NextHostedZoneId`
-    // "present only if IsTruncated is true". lego sends the zone name without the trailing dot.
+    // "present only if IsTruncated is true". lego (line 315) sends the zone name
+    // without the trailing dot.
     pub(super) async fn zones_page(
         &self,
         dnsname: Option<&str>,
@@ -610,18 +612,17 @@ impl Api {
         if !response.is_success() {
             return Err(self.refusal(&response));
         }
-        let text = response.text();
-        let doc = parse(&text)?;
-        let root = doc.root_element();
-        let info = (root.tag_name().name() == "ChangeResourceRecordSetsResponse")
-            .then(|| child(root, "ChangeInfo"))
-            .flatten()
-            .ok_or_else(|| protocol("the answer to the change is not in the expected form"))?;
-        let id = child_text(info, "Id")
-            .ok_or_else(|| protocol("the answer to the change names no change"))?;
-        let id = id.strip_prefix(CHANGE_PREFIX).unwrap_or(&id).to_owned();
-        path_id(&id)?;
-        if child_text(info, "Status").as_deref() == Some(INSYNC) {
+        // The batch was accepted: from here on, an answer the client cannot read leaves the
+        // outcome unknown, which is `Transient`, not `Protocol` (design section 3.7).
+        let Some((id, insync)) = accepted_change(&response.text()) else {
+            return Err(Error::Transient {
+                detail: Detail::constant(
+                    "the provider accepted the change, but its answer does not name the change \
+                     in the expected form; the outcome is unknown",
+                ),
+            });
+        };
+        if insync {
             return Ok(Submitted::Done);
         }
         self.poller.run(|| self.change_status(&id)).await?;
@@ -733,6 +734,23 @@ impl Api {
             },
         }
     }
+}
+
+/// The change ID (without the prefix, checked by [`path_id`]) and whether it is `INSYNC`
+/// already, from the answer to an accepted batch; `None` for an answer of another form.
+// Source: API reference, `ChangeResourceRecordSets` response: `ChangeInfo` with `Id` and
+// `Status`.
+fn accepted_change(text: &str) -> Option<(String, bool)> {
+    let doc = roxmltree::Document::parse(text).ok()?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "ChangeResourceRecordSetsResponse" {
+        return None;
+    }
+    let info = child(root, "ChangeInfo")?;
+    let id = child_text(info, "Id")?;
+    let id = id.strip_prefix(CHANGE_PREFIX).unwrap_or(&id);
+    let id = path_id(id).ok()?.to_owned();
+    Some((id, child_text(info, "Status").as_deref() == Some(INSYNC)))
 }
 
 /// The prefix of a change ID in `ChangeInfo.Id`.

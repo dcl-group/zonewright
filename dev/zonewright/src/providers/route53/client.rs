@@ -108,8 +108,9 @@ impl Route53 {
     /// an ambiguous name or an unusable `hosted_zone_id` is `Error::Config`.
     pub(super) async fn resolve_zone(&self, zone: &DomainName) -> Result<String, Error> {
         match self.find_zone(zone).await? {
-            Some(id) => Ok(id),
-            None => Err(Error::zone_not_found(zone.clone())),
+            Lookup::Found(id) => Ok(id),
+            Lookup::Missing => Err(Error::zone_not_found(zone.clone())),
+            Lookup::Unusable(why) => Err(config_error(why)),
         }
     }
 
@@ -125,17 +126,22 @@ impl Route53 {
     /// 11.3).
     // Source: API reference, `ListHostedZonesByName`: the listing starts at `dnsname` in sort
     // order, so the zones with that name come first; `HostedZone.Config.PrivateZone`. lego
-    // `findHostedZoneID` compares the name exactly and skips private zones; a configured
-    // hosted zone ID takes precedence.
-    async fn find_zone(&self, zone: &DomainName) -> Result<Option<String>, Error> {
+    // providers/dns/route53/route53.go at commit c40c0a2a458a2dc77daaced6cb94a86e253dc8c1,
+    // `getHostedZoneID` (lines 301-337): a configured hosted zone ID takes precedence; otherwise
+    // the name is compared exactly and private zones are skipped (`PrivateZone` defaults to
+    // false).
+    ///
+    /// What the answers say about the zone is the [`Lookup`]; an `Err` is a failure to obtain
+    /// them (transport, authentication, an unreadable answer) and is never a zone finding.
+    async fn find_zone(&self, zone: &DomainName) -> Result<Lookup, Error> {
         if let Some(id) = &self.hosted_zone_id {
             match self.api.hosted_zone(id).await? {
-                None => return Err(config_error(OVERRIDE_MISSING)),
+                None => return Ok(Lookup::Unusable(OVERRIDE_MISSING)),
                 Some(hz) if hz.name.as_ref() == Some(zone) => {
                     if hz.private {
-                        return Err(config_error(OVERRIDE_PRIVATE));
+                        return Ok(Lookup::Unusable(OVERRIDE_PRIVATE));
                     }
-                    return Ok(Some(hz.id));
+                    return Ok(Lookup::Found(hz.id));
                 }
                 // The configured zone has another name; this one is looked up by name.
                 Some(_) => {}
@@ -170,11 +176,11 @@ impl Route53 {
                     cursor = Some(next);
                 }
                 _ => {
-                    return match found.len() {
-                        0 => Ok(None),
-                        1 => Ok(found.pop()),
-                        _ => Err(config_error(AMBIGUOUS)),
-                    };
+                    return Ok(match found.pop() {
+                        None => Lookup::Missing,
+                        Some(id) if found.is_empty() => Lookup::Found(id),
+                        Some(_) => Lookup::Unusable(AMBIGUOUS),
+                    });
                 }
             }
         }
@@ -187,16 +193,31 @@ impl Route53 {
 
     async fn check_zone(&self, zone: &DomainName) -> Result<ZoneCheck, Error> {
         self.forget_zone(zone);
-        Ok(match self.find_zone(zone).await {
-            Ok(Some(id)) => {
+        // Only what the provider answered becomes a zone finding; any error, a `Config` one
+        // from the transport (a refused certificate, the URL policy) included, fails the
+        // check, so that `credentials_verified` is never reported without an answer.
+        Ok(match self.find_zone(zone).await? {
+            Lookup::Found(id) => {
                 self.zones.insert(zone, &id);
                 ZoneCheck::new(zone.clone(), true, None)
             }
-            Ok(None) => ZoneCheck::new(zone.clone(), false, None),
-            Err(Error::Config { detail }) => ZoneCheck::new(zone.clone(), false, Some(detail)),
-            Err(e) => return Err(e),
+            Lookup::Missing => ZoneCheck::new(zone.clone(), false, None),
+            Lookup::Unusable(why) => {
+                ZoneCheck::new(zone.clone(), false, Some(Detail::constant(why)))
+            }
         })
     }
+}
+
+/// What a zone lookup found in the provider's answers.
+enum Lookup {
+    /// Exactly one usable hosted zone.
+    Found(String),
+    /// No public hosted zone with the name.
+    Missing,
+    /// The name cannot be resolved to one usable zone: the reason (ambiguous name, a
+    /// `hosted_zone_id` that names a private zone or no zone).
+    Unusable(&'static str),
 }
 
 impl Provider for Route53 {

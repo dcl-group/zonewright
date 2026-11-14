@@ -932,6 +932,36 @@ async fn route53_txt_dialect() {
         control.rrset(NAME, "TXT").unwrap().values,
         ["\"ex\\344mple\"", "\"AAA\""]
     );
+
+    // A foreign value that decodes but is not in canonical form (two character-strings, extra
+    // spaces) is written back exactly as read, never re-encoded, across adds and removes.
+    let other = "_acme-challenge.www.example.org";
+    control.insert_rrset(ZID, other, "TXT", 60, &["\"a\"   \"b\""]);
+    let other_name = dn(other);
+    client
+        .add_txt_value(&zone(), &other_name, &txt("ours"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        control.rrset(other, "TXT").unwrap().values,
+        ["\"a\"   \"b\"", "\"ours\""]
+    );
+    client
+        .remove_txt_value(&zone(), &other_name, &txt("ours"))
+        .await
+        .unwrap();
+    assert_eq!(
+        control.rrset(other, "TXT").unwrap().values,
+        ["\"a\"   \"b\""]
+    );
+    // It is the value "ab".
+    assert_eq!(
+        client
+            .add_txt_value(&zone(), &other_name, &txt("ab"), None)
+            .await
+            .unwrap(),
+        AddOutcome::AlreadyPresent
+    );
 }
 
 /// An rrset with a routing policy is not plain records: a value operation that meets one is
@@ -1227,6 +1257,85 @@ async fn route53_check_exercises_the_credentials() {
         wrong.check(&[zone()]).await.unwrap_err().kind(),
         ErrorKind::Auth
     );
+}
+
+/// A TLS server on a loopback port whose certificate no trust store knows: every handshake
+/// fails on the client's side, so no request is ever answered. Returns its port.
+fn untrusted_tls_server() -> u16 {
+    use std::io::{Read as _, Write as _};
+    let key = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+    let chain = vec![key.cert.der().clone()];
+    let private = rustls_pki_types::PrivateKeyDer::Pkcs8(key.signing_key.serialize_der().into());
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, private)
+        .unwrap(),
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let mut conn = rustls::ServerConnection::new(config).unwrap();
+                let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+                let mut buf = [0u8; 1024];
+                // The handshake fails when the client refuses the certificate; were it ever
+                // to succeed, the server answers nothing usable.
+                if tls.read(&mut buf).is_ok() {
+                    let _ = tls.write_all(b"HTTP/1.1 500 Internal Server Error\r\n\r\n");
+                }
+            });
+        }
+    });
+    port
+}
+
+/// `check` never reports verified credentials without an answer from the provider: a refused
+/// TLS certificate (an `Error::Config` of the transport) fails the whole check, with or
+/// without zones, instead of turning into "zone not found".
+#[tokio::test]
+async fn route53_check_without_an_answer_is_an_error() {
+    let port = untrusted_tls_server();
+    let config = settings_for(&format!("https://127.0.0.1:{port}"));
+    let client = Route53::new(config, credentials(SECRET, None), &context()).unwrap();
+    for zones in [vec![zone()], Vec::new()] {
+        match client.check(&zones).await {
+            Err(e) => assert_eq!(e.kind(), ErrorKind::Config, "{e:?}"),
+            Ok(report) => panic!("{zones:?}: no request was answered: {report:?}"),
+        }
+    }
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Config, "{e:?}");
+}
+
+/// After a batch was accepted (2xx), an answer that does not name the change in the expected
+/// form leaves the outcome unknown: `Transient`, not `Protocol` (design section 3.7).
+#[tokio::test]
+async fn route53_unreadable_answer_to_an_accepted_change_is_transient() {
+    let (mock, client) = setup().await;
+    for body in [
+        "this is not XML".to_owned(),
+        format!("<ChangeResourceRecordSetsResponse xmlns=\"{XMLNS}\"/>"),
+        format!(
+            "<ChangeResourceRecordSetsResponse xmlns=\"{XMLNS}\"><ChangeInfo>\
+             <Id>/change/../admin</Id><Status>PENDING</Status></ChangeInfo>\
+             </ChangeResourceRecordSetsResponse>"
+        ),
+    ] {
+        let before = writes(&mock);
+        mock.faults()
+            .push(Fault::on("POST", CHANGE).respond(200, body.clone()));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Transient, "{body}: {e:?}");
+        assert_eq!(writes(&mock), before + 1, "{body}");
+    }
 }
 
 // ---- Authentication ----------------------------------------------------------------------------

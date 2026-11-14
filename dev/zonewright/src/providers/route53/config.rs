@@ -44,7 +44,7 @@ const ACCESS_KEY_ID_MAX: usize = 128;
 
 /// The prefix the API puts before a hosted zone ID in `HostedZone.Id`.
 // Source: API reference, `GetHostedZone` example response (`<Id>/hostedzone/Z1PA6795UKMFR9</Id>`);
-// lego providers/dns/route53/route53.go trims the same prefix.
+// lego providers/dns/route53/route53.go (line 335 at commit c40c0a2) trims the same prefix.
 pub(super) const HOSTED_ZONE_PREFIX: &str = "/hostedzone/";
 
 /// Settings of the Route 53 client: the non-secret part of its configuration.

@@ -25,7 +25,8 @@
 // (https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/ResourceRecordTypes.html#TXTFormat):
 // strings "enclosed in double quotation marks", "A single string can include up to 255
 // characters", "specify the characters by using escape codes in the format \three-digit octal
-// code", "To include a quotation mark ... put a backslash"; lego writes `"` + value + `"`.
+// code", "To include a quotation mark ... put a backslash"; lego (route53.go line 154 at
+// commit c40c0a2) writes `"` + value + `"`.
 
 use crate::error::Error;
 use crate::id::ProviderId;
