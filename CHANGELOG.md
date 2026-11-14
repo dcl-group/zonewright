@@ -50,6 +50,9 @@ All notable changes to this crate are recorded in this file. The format follows
   Record attributes the model does not carry (proxy status, comment, tags) are kept.
 - Record-level operations for Yandex Cloud: A, AAAA, ANAME, CAA, CNAME, HTTPS, MX, NS, PTR, SRV,
   SVCB and TXT with provider-checked preconditions; SOA is read only.
+- Record-level operations for Route 53: A, AAAA, CAA, CNAME, DS, HTTPS, MX, NAPTR, NS, PTR, SPF,
+  SRV, SSHFP, SVCB, TLSA and TXT through conditional change batches; SOA is read only. Alias and
+  routing-policy record sets are reported as skipped and never written.
 
 ### Changed
 

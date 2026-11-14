@@ -4,9 +4,9 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and
-//! the TXT value operations on plain values. The record-level operations are not written yet, so
-//! their flags are false and `record_types` is empty.
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones`, the
+//! record-level operations on the types the provider's documentation gives a value format for
+//! (`content.rs`), and the TXT value operations on plain values.
 
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use crate::meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
     ValueGuarantee,
 };
+use crate::record::RecordType;
 
 /// The metadata of Route 53.
 pub(crate) static META: ProviderMeta = ProviderMeta {
@@ -103,25 +104,55 @@ const FIELDS: &[ConfigField] = &[
     },
 ];
 
+/// The record types of the record-level operations: every type for which the Developer Guide,
+/// "Supported DNS record types", gives the `Value` format, and which `ChangeResourceRecordSets`
+/// accepts (`ResourceRecordSet.Type`, "Valid values for basic resource record sets").
+const RECORD_TYPES: &[RecordType] = &[
+    RecordType::A,
+    RecordType::AAAA,
+    RecordType::CAA,
+    RecordType::CNAME,
+    // DS
+    RecordType::from_code(43),
+    RecordType::HTTPS,
+    RecordType::MX,
+    // NAPTR
+    RecordType::from_code(35),
+    RecordType::NS,
+    RecordType::PTR,
+    RecordType::SOA,
+    // SPF
+    RecordType::from_code(99),
+    RecordType::SRV,
+    RecordType::SSHFP,
+    RecordType::SVCB,
+    RecordType::TLSA,
+    RecordType::TXT,
+];
+
 /// What this version of the crate implements for Route 53.
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: true,
-    list_rrsets: false,
-    get_rrset: false,
-    set_rrset: false,
-    delete_rrset: false,
+    list_rrsets: true,
+    get_rrset: true,
+    set_rrset: true,
+    delete_rrset: true,
     add_txt_value: true,
     remove_txt_value: true,
-    record_types: TypeSet::Listed(&[]),
-    read_only_types: &[],
+    record_types: TypeSet::Listed(RECORD_TYPES),
+    // Route 53 creates the SOA record with the hosted zone; the crate never writes SOA (design
+    // section 3.4).
+    read_only_types: &[RecordType::SOA],
     // Values outside printable ASCII are written by the API as octal escapes, unlike zone-file
     // text; until that is mapped, only plain values are accepted (design section 4.4).
     txt_plain_only: true,
     // Every write repeats the old set as a DELETE in the same atomic change batch (design
-    // section 3.5).
+    // sections 3.4 and 3.5).
     txt_values: ValueGuarantee::Conditional,
     preconditions: Preconditions::Atomic,
     atomic_rrset_write: true,
+    // The API accepts 0 to 2147483647 (API reference, `ResourceRecordSet.TTL`); the crate keeps
+    // the narrower range of its `ttl` setting, which the TXT value operations already enforce.
     ttl: TtlSupport::PerRrset {
         min: 1,
         max: 86_400,

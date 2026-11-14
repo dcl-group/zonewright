@@ -40,6 +40,9 @@ use crate::values::{Member, SetRead, SetState, TxtBase, TxtRecord, TxtSet, Whole
 use super::api::{Action, Change, Rrset, Submitted};
 use super::client::Route53;
 
+/// The record type of every change this file sends.
+const TXT: &str = "TXT";
+
 /// How TXT values are read.
 const READ: TxtDialect = TxtDialect::Auto;
 
@@ -48,7 +51,7 @@ const WRITE: TxtDialect = TxtDialect::Presentation;
 
 /// Most records of one rrset.
 // Source: Quotas, "Records in a record set: 400 per record set".
-const MAX_RECORDS: usize = 400;
+pub(super) const MAX_RECORDS: usize = 400;
 
 /// Most characters of all values of one change batch.
 // Source: Quotas, "The sum of the number of characters (including spaces) in all Value elements
@@ -57,7 +60,7 @@ const MAX_BATCH_CHARS: usize = 32_000;
 
 /// Longest value.
 // Source: API reference, `ResourceRecord.Value`: "Maximum length of 4000".
-const MAX_VALUE_CHARS: usize = 4000;
+pub(super) const MAX_VALUE_CHARS: usize = 4000;
 
 impl TxtBase for Route53 {
     fn provider(&self) -> ProviderId {
@@ -109,6 +112,7 @@ impl WholeSet for Route53 {
                 let create = Change {
                     action: Action::Create,
                     name,
+                    rtype: TXT,
                     ttl: u64::from(self.new_ttl(ttl)),
                     values: &values,
                 };
@@ -120,6 +124,7 @@ impl WholeSet for Route53 {
                 let delete = Change {
                     action: Action::Delete,
                     name,
+                    rtype: TXT,
                     ttl: prior.ttl,
                     values: &prior.values,
                 };
@@ -127,6 +132,7 @@ impl WholeSet for Route53 {
                 let create = Change {
                     action: Action::Create,
                     name,
+                    rtype: TXT,
                     ttl: prior.ttl,
                     values: &values,
                 };
@@ -147,6 +153,7 @@ impl WholeSet for Route53 {
         let delete = Change {
             action: Action::Delete,
             name,
+            rtype: TXT,
             ttl: prior.ttl,
             values: &prior.values,
         };
@@ -266,7 +273,7 @@ fn values(members: &[Member<'_, String>]) -> Result<Vec<String>, Error> {
 /// The size limits of one change batch, checked before it is sent.
 // Source: Quotas: at most 1,000 `ResourceRecord` elements and 32,000 characters in all `Value`
 // elements of a request.
-fn check_batch(sets: &[&Vec<String>]) -> Result<(), Error> {
+pub(super) fn check_batch(sets: &[&Vec<String>]) -> Result<(), Error> {
     let records: usize = sets.iter().map(|s| s.len()).sum();
     let chars: usize = sets
         .iter()

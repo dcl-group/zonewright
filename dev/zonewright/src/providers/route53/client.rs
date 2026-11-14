@@ -13,9 +13,13 @@ use crate::http::{Http, ZoneCache};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
+use crate::rrsets;
 use crate::values;
 
 use super::api::{self, Api};
@@ -32,10 +36,10 @@ const AMBIGUOUS: &str = "several public hosted zones have this name; set hosted_
 ///
 /// Every request is signed with AWS Signature Version 4 (Region `us-east-1`, service
 /// `route53`), with the session token of temporary credentials when one is given. The native
-/// unit is the rrset, changed by an atomic change batch: a TXT value operation reads the rrset
-/// and submits the old set as a `DELETE` together with the new set as a `CREATE`, so that a
-/// change made by anyone in between makes the provider refuse the batch instead of losing it
-/// (`ValueGuarantee::Conditional`). After the batch is accepted the client polls the change
+/// unit is the rrset, changed by an atomic change batch: every write reads the rrset and
+/// submits the old set as a `DELETE` together with the new set as a `CREATE`, so that a change
+/// made by anyone in between makes the provider refuse the batch instead of losing it
+/// (`ValueGuarantee::Conditional`, `Preconditions::Atomic`). After the batch is accepted the client polls the change
 /// until it is `INSYNC`.
 ///
 /// Zones are public hosted zones found by exact name; hosted zone IDs are cached for the life
@@ -277,6 +281,40 @@ impl Provider for Route53 {
                 ZoneInfo::new(name)
             })
             .collect())
+    }
+
+    /// Every rrset of the zone, all pages. Alias and routing-policy sets are reported in
+    /// `skipped` (see the record-level module).
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_whole_set(self, zone, name, rtype).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        rrsets::set_whole_set(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_whole_set(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(

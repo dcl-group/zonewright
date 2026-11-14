@@ -25,7 +25,8 @@ pub use rrset::RrSet;
     feature = "selectel_v2",
     feature = "digitalocean",
     feature = "cloudflare",
-    feature = "yandex_cloud"
+    feature = "yandex_cloud",
+    feature = "route53"
 ))]
 pub(crate) use rrset::singleton;
 pub use rtype::RecordType;

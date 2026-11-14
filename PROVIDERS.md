@@ -28,7 +28,7 @@ None yet.
 | Selectel v2   | `selectel_v2`   | TXT values, records   | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
 | Cloudflare    | `cloudflare`    | TXT values, records   |                                                                                                  |
 | Yandex Cloud  | `yandex_cloud`  | TXT values, records   | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
-| Route 53      | `route53`       | TXT values            |                                                                                                  |
+| Route 53      | `route53`       | TXT values, records   |                                                                                                  |
 | DigitalOcean  | `digitalocean`  | TXT values, records   |                                                                                                  |
 | VK Cloud      | `vk_cloud`      | TXT values            |                                                                                                  |
 | RFC 2136      | `rfc2136`       | TXT values            | Dynamic update has no operation that lists the records of a zone.                                |

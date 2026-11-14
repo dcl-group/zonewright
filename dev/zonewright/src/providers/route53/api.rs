@@ -78,6 +78,33 @@ const X_AMZ_DATE: HeaderName = HeaderName::from_static("x-amz-date");
 // the session token goes in `X-Amz-Security-Token`, which is signed.
 const X_AMZ_SECURITY_TOKEN: HeaderName = HeaderName::from_static("x-amz-security-token");
 
+/// Elements that make an rrset something other than plain records: an alias, or a routing
+/// policy other than simple (design section 3.4).
+// Source: API reference, `ResourceRecordSet`: `AliasTarget` ("Alias resource record sets
+// only"), `SetIdentifier` ("Resource record sets that have a routing policy other than
+// simple"), `Weight`, `Region`, `Failover`, `GeoLocation`, `GeoProximityLocation`,
+// `MultiValueAnswer`, `CidrRoutingConfig` (the routing policies), `HealthCheckId` ("useful
+// only when Route 53 is choosing between two or more resource record sets"),
+// `TrafficPolicyInstanceId` (sets a traffic policy instance created).
+const NOT_PLAIN: [&str; 11] = [
+    "AliasTarget",
+    "SetIdentifier",
+    "Weight",
+    "Region",
+    "Failover",
+    "GeoLocation",
+    "GeoProximityLocation",
+    "MultiValueAnswer",
+    "CidrRoutingConfig",
+    "HealthCheckId",
+    "TrafficPolicyInstanceId",
+];
+
+/// Page size of an rrset listing.
+// Source: API reference, `ListResourceRecordSets`: "returns up to 300 resource record sets at a
+// time".
+const RRSET_PAGE: &str = "300";
+
 /// Page size of a hosted zone listing.
 // Source: API reference, `ListHostedZonesByName`: "Route 53 returns up to 100 items in each
 // response".
@@ -154,7 +181,7 @@ pub(super) struct ZonePage {
     pub(super) next: Option<(String, String)>,
 }
 
-/// A TXT rrset as read: the old set a conditional write repeats exactly.
+/// An rrset as read: the old set a conditional write repeats exactly.
 // Source: API reference, `ChangeResourceRecordSets` ("To delete a resource record set, you must
 // specify all the same values that you specified when you created it"); `ResourceRecord.Value`
 // ("In the case of a DELETE action, if the current value does not match the actual value, an
@@ -165,6 +192,52 @@ pub(crate) struct Rrset {
     pub(super) ttl: u64,
     /// The values in the API's text form, as read.
     pub(super) values: Vec<String>,
+}
+
+/// What the record-level read of one name and type found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Lookup {
+    /// No rrset of the name and type.
+    Absent,
+    /// One plain rrset.
+    Plain(Rrset),
+    /// An alias, a routing-policy set, or several sets of the name and type (design section
+    /// 3.4): never presented as an rrset and never changed.
+    NotPlain,
+}
+
+/// Where the next page of an rrset listing starts.
+// Source: API reference, `ListResourceRecordSets` (`NextRecordName`, `NextRecordType`,
+// `NextRecordIdentifier`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Cursor {
+    /// `NextRecordName`, as the API spelled it.
+    name: String,
+    /// `NextRecordType`.
+    rtype: String,
+    /// `NextRecordIdentifier`, for a routing-policy set.
+    identifier: Option<String>,
+}
+
+/// One page of an rrset listing.
+#[derive(Debug)]
+pub(super) struct RrsetPage {
+    /// The rrsets of the page.
+    pub(super) sets: Vec<Listed>,
+    /// Where the listing continues.
+    pub(super) next: Option<Cursor>,
+}
+
+/// One rrset of a listing.
+#[derive(Debug)]
+pub(super) struct Listed {
+    /// The owner name, `None` when it is not a valid domain name.
+    pub(super) name: Option<DomainName>,
+    /// The type as the API spells it.
+    pub(super) rtype: String,
+    /// The TTL and values of a plain rrset; `None` for an alias, a routing-policy set, or a set
+    /// without its TTL or records.
+    pub(super) plain: Option<Rrset>,
 }
 
 /// The action of one change.
@@ -185,13 +258,15 @@ impl Action {
     }
 }
 
-/// One change of a batch: a whole TXT rrset.
+/// One change of a batch: a whole rrset.
 #[derive(Debug)]
 pub(super) struct Change<'a> {
     /// The action.
     pub(super) action: Action,
     /// The owner name.
     pub(super) name: &'a DomainName,
+    /// The record type, as the API spells it.
+    pub(super) rtype: &'a str,
     /// The TTL.
     pub(super) ttl: u64,
     /// The values in the API's text form.
@@ -552,10 +627,7 @@ impl Api {
         if !same_name || child_text(set, "Type").as_deref() != Some("TXT") {
             return Ok(Attempt::Done(None));
         }
-        if ["SetIdentifier", "AliasTarget", "TrafficPolicyInstanceId"]
-            .iter()
-            .any(|tag| child(set, tag).is_some())
-        {
+        if !is_plain(set) {
             return Err(Error::Rejected {
                 status: None,
                 detail: Detail::constant(
@@ -563,19 +635,158 @@ impl Api {
                 ),
             });
         }
-        let ttl = child_text(set, "TTL")
-            .and_then(|t| t.parse::<u64>().ok())
-            .ok_or_else(|| protocol("the TXT rrset has no TTL"))?;
-        let records = child(set, "ResourceRecords")
-            .ok_or_else(|| protocol("the TXT rrset has no records"))?;
-        let values = children(records, "ResourceRecord")
-            .map(|record| {
-                child(record, "Value")
-                    .map(|value| value.text().unwrap_or("").to_owned())
-                    .ok_or_else(|| protocol("a TXT record has no value"))
+        plain_rrset(set).map(|rrset| Attempt::Done(Some(rrset)))
+    }
+
+    /// The rrset of `name` and `rtype` in zone `zone_id` (record level), or `Stale` when the
+    /// API does not know the zone (`404`).
+    ///
+    /// Two items are requested: the listing starts at the given name and type, so the first
+    /// item is the rrset if there is one, and a second item of the same name and type means
+    /// several sets share them (routing-policy sets), which is not a plain rrset, whatever the
+    /// first one carries.
+    // Source: API reference, `ListResourceRecordSets` (start position, `maxitems`, `404
+    // NoSuchHostedZone`); `ResourceRecordSet.SetIdentifier`: "differentiates among multiple
+    // resource record sets that have the same combination of name and type".
+    pub(super) async fn rrset_at(
+        &self,
+        zone_id: &str,
+        name: &DomainName,
+        rtype: &str,
+    ) -> Result<Attempt<Lookup>, Error> {
+        let response = self
+            .get(
+                |u| u.path("/2013-04-01/hostedzone").id(zone_id).path("/rrset"),
+                &mut [("maxitems", "2"), ("name", name.as_str()), ("type", rtype)],
+            )
+            .await?;
+        if response.status() == 404 {
+            return Ok(Attempt::Stale);
+        }
+        if !response.is_success() {
+            return Err(self.refusal(&response));
+        }
+        let text = response.text();
+        let doc = parse(&text)?;
+        let listed = listed_sets(&doc)?;
+        let matching: Vec<roxmltree::Node<'_, '_>> = children(listed, "ResourceRecordSet")
+            .take_while(|set| {
+                child_text(*set, "Type").as_deref() == Some(rtype)
+                    && child_text(*set, "Name")
+                        .and_then(|raw| owner_name(&raw))
+                        .is_some_and(|found| &found == name)
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Attempt::Done(Some(Rrset { ttl, values })))
+            .collect();
+        Ok(Attempt::Done(match matching.as_slice() {
+            [] => Lookup::Absent,
+            [set] if is_plain(*set) => Lookup::Plain(plain_rrset(*set)?),
+            _ => Lookup::NotPlain,
+        }))
+    }
+
+    /// One page of the rrset listing of zone `zone_id`, from the start or from `cursor`, or
+    /// `Stale` when the API does not know the zone (`404`).
+    // Source: API reference, `ListResourceRecordSets`: `name`, `type` and `identifier` take
+    // the `NextRecordName`, `NextRecordType` and `NextRecordIdentifier` of the previous page;
+    // `IsTruncated`; `NextRecordName` and `NextRecordType` are "present only if IsTruncated is
+    // true"; at most 300 rrsets per page.
+    pub(super) async fn rrset_page(
+        &self,
+        zone_id: &str,
+        cursor: Option<&Cursor>,
+    ) -> Result<Attempt<RrsetPage>, Error> {
+        let mut query: Vec<(&'static str, &str)> = vec![("maxitems", RRSET_PAGE)];
+        if let Some(cursor) = cursor {
+            query.push(("name", &cursor.name));
+            query.push(("type", &cursor.rtype));
+            if let Some(identifier) = &cursor.identifier {
+                query.push(("identifier", identifier));
+            }
+        }
+        let response = self
+            .get(
+                |u| u.path("/2013-04-01/hostedzone").id(zone_id).path("/rrset"),
+                &mut query,
+            )
+            .await?;
+        if response.status() == 404 {
+            return Ok(Attempt::Stale);
+        }
+        if !response.is_success() {
+            return Err(self.refusal(&response));
+        }
+        let text = response.text();
+        let doc = parse(&text)?;
+        let listed = listed_sets(&doc)?;
+        let mut sets = Vec::new();
+        for set in children(listed, "ResourceRecordSet") {
+            let rtype = child_text(set, "Type")
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| protocol("a listed rrset has no type"))?;
+            let raw_name =
+                child_text(set, "Name").ok_or_else(|| protocol("a listed rrset has no name"))?;
+            // A set that is not plain, or that lacks its TTL or records, is reported as one
+            // the model cannot hold; it never fails the listing (design section 3.4).
+            let plain = if is_plain(set) {
+                plain_rrset(set).ok()
+            } else {
+                None
+            };
+            sets.push(Listed {
+                name: owner_name(&raw_name),
+                rtype,
+                plain,
+            });
+        }
+        let root = doc.root_element();
+        let next = match child_text(root, "IsTruncated").as_deref() {
+            Some("false") => None,
+            Some("true") => match (
+                child_text(root, "NextRecordName"),
+                child_text(root, "NextRecordType"),
+            ) {
+                (Some(name), Some(rtype)) if !name.is_empty() && !rtype.is_empty() => {
+                    Some(Cursor {
+                        name,
+                        rtype,
+                        identifier: child_text(root, "NextRecordIdentifier")
+                            .filter(|id| !id.is_empty()),
+                    })
+                }
+                _ => {
+                    return Err(protocol(
+                        "the rrset listing is truncated but names no next page",
+                    ));
+                }
+            },
+            _ => return Err(protocol("the rrset listing is not in the expected form")),
+        };
+        Ok(Attempt::Done(RrsetPage { sets, next }))
+    }
+
+    /// Every rrset of zone `zone_id`, all pages (at most [`MAX_PAGES`]), or `Stale` when the
+    /// API does not know the zone. A page that does not advance, or a listing longer than the
+    /// limit, is `Error::Protocol`, never a shorter list (design section 3.4).
+    pub(super) async fn all_rrsets(&self, zone_id: &str) -> Result<Attempt<Vec<Listed>>, Error> {
+        let mut sets = Vec::new();
+        let mut cursor: Option<Cursor> = None;
+        for _ in 0..MAX_PAGES {
+            let page = match self.rrset_page(zone_id, cursor.as_ref()).await? {
+                Attempt::Done(page) => page,
+                Attempt::Stale => return Ok(Attempt::Stale),
+            };
+            sets.extend(page.sets);
+            match page.next {
+                None => return Ok(Attempt::Done(sets)),
+                Some(next) if cursor.as_ref() == Some(&next) => {
+                    return Err(protocol("the provider's pagination did not advance"));
+                }
+                Some(next) => cursor = Some(next),
+            }
+        }
+        Err(protocol(
+            "the listing has more than 1000 pages, the limit of the client",
+        ))
     }
 
     /// Submits a change batch and waits until it is `INSYNC`. Sent once: a change is not
@@ -780,7 +991,7 @@ pub(super) fn change_batch(changes: &[Change<'_>]) -> String {
         xml.element("Action", change.action.as_str());
         xml.open("ResourceRecordSet");
         xml.element("Name", change.name.as_str());
-        xml.element("Type", "TXT");
+        xml.element("Type", change.rtype);
         xml.element("TTL", &change.ttl.to_string());
         xml.open("ResourceRecords");
         for value in change.values {
@@ -843,23 +1054,65 @@ impl XmlWriter {
 
 /// An owner name as the API returns it, as a [`DomainName`]: lowercase, with the trailing dot.
 /// The API returns every character other than `a-z`, `0-9`, `-` and `_` as a `\ooo` octal
-/// escape; of those, a valid owner name holds only `*` as its leftmost label (`\052`). Any
-/// other escape yields `None`: such a name is never one this client writes to.
+/// escape; each escape is decoded, and the result must be a valid owner name (design section
+/// 2.1), of which the only such character is the wildcard `*` (`\052`) as the leftmost label.
+/// A backslash that does not start three octal digits, an escaped dot or octet outside printable
+/// ASCII, or a name [`DomainName::parse`] refuses yields `None`.
 // Source: Developer Guide, "DNS domain name format"
 // (https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/DomainNameFormat.html): "Route 53
 // stores alphabetic characters as lowercase letters"; "If the domain name includes any
 // characters other than a to z, 0 to 9, - (hyphen), or _ (underscore), Route 53 API actions
 // return the characters as escape codes".
 pub(super) fn owner_name(raw: &str) -> Option<DomainName> {
-    let raw = raw.trim();
-    let unescaped = match raw.strip_prefix("\\052") {
-        Some(rest) if rest.is_empty() || rest.starts_with('.') => format!("*{rest}"),
-        _ => raw.to_owned(),
-    };
-    if unescaped.contains('\\') {
-        return None;
+    let mut text = String::with_capacity(raw.len());
+    let mut chars = raw.trim().chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            text.push(c);
+            continue;
+        }
+        let mut value: u32 = 0;
+        for _ in 0..3 {
+            value = value * 8 + chars.next()?.to_digit(8)?;
+        }
+        // A decoded `.` is an octet of a label, not a separator; `DomainName` cannot hold it.
+        let octet = u8::try_from(value)
+            .ok()
+            .filter(|b| b.is_ascii_graphic() && *b != b'.')?;
+        text.push(char::from(octet));
     }
-    DomainName::parse(&unescaped).ok()
+    DomainName::parse(&text).ok()
+}
+
+/// The `ResourceRecordSets` element of a `ListResourceRecordSetsResponse`.
+fn listed_sets<'a, 'i>(doc: &'a roxmltree::Document<'i>) -> Result<roxmltree::Node<'a, 'i>, Error> {
+    let root = doc.root_element();
+    (root.tag_name().name() == "ListResourceRecordSetsResponse")
+        .then(|| child(root, "ResourceRecordSets"))
+        .flatten()
+        .ok_or_else(|| protocol("the rrset listing is not in the expected form"))
+}
+
+/// True for a set without any of the [`NOT_PLAIN`] elements.
+fn is_plain(set: roxmltree::Node<'_, '_>) -> bool {
+    !NOT_PLAIN.iter().any(|tag| child(set, tag).is_some())
+}
+
+/// The TTL and the values of a plain rrset, as the API returned them.
+fn plain_rrset(set: roxmltree::Node<'_, '_>) -> Result<Rrset, Error> {
+    let ttl = child_text(set, "TTL")
+        .and_then(|t| t.parse::<u64>().ok())
+        .ok_or_else(|| protocol("the rrset has no TTL"))?;
+    let records =
+        child(set, "ResourceRecords").ok_or_else(|| protocol("the rrset has no records"))?;
+    let values = children(records, "ResourceRecord")
+        .map(|record| {
+            child(record, "Value")
+                .map(|value| value.text().unwrap_or("").to_owned())
+                .ok_or_else(|| protocol("a record has no value"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Rrset { ttl, values })
 }
 
 /// A hosted zone element.
@@ -999,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_names_unescape_only_the_wildcard() {
+    fn owner_names_decode_octal_escapes() {
         assert_eq!(
             owner_name("_acme-challenge.example.org.").unwrap().as_str(),
             "_acme-challenge.example.org."
@@ -1008,8 +1261,18 @@ mod tests {
             owner_name("\\052.example.org.").unwrap().as_str(),
             "*.example.org."
         );
+        assert_eq!(
+            owner_name("\\141\\142.example.org.").unwrap().as_str(),
+            "ab.example.org."
+        );
+        // Not a valid owner name, or not an octal escape.
         assert!(owner_name("a\\052b.example.org.").is_none());
+        assert!(owner_name("a\\056b.example.org.").is_none());
         assert!(owner_name("a\\.b.example.org.").is_none());
+        assert!(owner_name("a\\08b.example.org.").is_none());
+        assert!(owner_name("a\\400.example.org.").is_none());
+        assert!(owner_name("a\\040.example.org.").is_none());
+        assert!(owner_name("a\\05").is_none());
     }
 
     #[test]
@@ -1019,6 +1282,7 @@ mod tests {
         let xml = change_batch(&[Change {
             action: Action::Delete,
             name: &name,
+            rtype: "TXT",
             ttl: 300,
             values: &values,
         }]);

@@ -8,10 +8,14 @@
 //!   `NextHostedZoneId` only when truncated), `GetHostedZone` (`NoSuchHostedZone`, 404),
 //!   `ListResourceRecordSets` (starts at the first rrset whose name and type are greater than or
 //!   equal to the ones given, at most 300 per page, `type` without `name` is `InvalidInput`,
-//!   `NoSuchHostedZone`, 404), `ChangeResourceRecordSets` (all changes or none; `CREATE` of an
+//!   `NoSuchHostedZone`, 404; `identifier` and `NextRecordIdentifier` for routing-policy sets of
+//!   one name and type), `ChangeResourceRecordSets` (all changes or none; `CREATE` of an
 //!   existing rrset, `DELETE` of one that does not match exactly, and deleting the same rrset
 //!   twice are `InvalidChangeBatch`, 400; `ChangeInfo` with `PENDING`), `GetChange` (`PENDING`,
 //!   then `INSYNC`; `NoSuchChange`, 404).
+//! - `ResourceRecordSet`: TTL 0 to 2147483647; no wildcard NS; alias sets without TTL and
+//!   records. "Supported DNS record types": no CNAME at the apex nor next to other records at
+//!   its name.
 //! - Developer Guide: names returned lowercase with every character other than `a-z`, `0-9`,
 //!   `-` and `_` as a `\ooo` octal escape; TXT values as quoted strings of at most 255
 //!   characters; quotas (400 records per rrset, 1,000 `ResourceRecord` elements and 32,000 value
@@ -37,7 +41,17 @@
 //! - `maxitems` above the documented page size is served as the page size;
 //! - a new hosted zone holds an SOA and an NS rrset at its apex;
 //! - a change stays `PENDING` for [`Control::set_pending_polls`] looks (0 by default), then is
-//!   `INSYNC`; the change ID is returned with the `/change/` prefix.
+//!   `INSYNC`; the change ID is returned with the `/change/` prefix;
+//! - values are stored and returned exactly as written (Route 53 may normalize them), and a
+//!   `DELETE` must repeat them character for character;
+//! - a value is checked against the format "Supported DNS record types" gives for its type (the
+//!   checks are the mock's reading of that page), and a value outside it is `InvalidChangeBatch`;
+//! - in a quoted string, an octal escape counts as one character towards the 255;
+//! - `CREATE` or `DELETE` of the SOA rrset is `InvalidChangeBatch`;
+//! - the elements of a listed rrset come in the order `Name`, `Type`, `SetIdentifier`, the
+//!   routing elements, then `TTL` and `ResourceRecords` or `AliasTarget`; a set with an
+//!   identifier and no other routing element is listed with `<Weight>10</Weight>`;
+//! - routing-policy sets of one name and type are sorted by `SetIdentifier`.
 //!
 //! Error texts are invented.
 
@@ -73,6 +87,9 @@ const MAX_RECORDS_PER_BATCH: usize = 1000;
 const MAX_VALUE_CHARS_PER_BATCH: usize = 32_000;
 const MAX_RECORDS_PER_SET: usize = 400;
 const MAX_VALUE_CHARS: usize = 4000;
+
+/// Largest TTL (API reference, `ResourceRecordSet.TTL`).
+const MAX_TTL: u64 = 2_147_483_647;
 
 /// Largest difference between `x-amz-date` and the mock's clock.
 const MAX_SKEW_S: i64 = 300;
@@ -153,8 +170,13 @@ pub struct Rrset {
     pub ttl: u64,
     /// The values in the API's text form.
     pub values: Vec<String>,
-    /// The identifier of a routing-policy set (weighted, here); `None` for a simple one.
+    /// The identifier of a routing-policy set; `None` for a simple one.
     pub set_identifier: Option<String>,
+    /// Further elements of the set as XML (`<Weight>`, `<HealthCheckId>`, ...), rendered after
+    /// `SetIdentifier`; `None` renders `<Weight>10</Weight>` for a set with an identifier.
+    pub routing: Option<String>,
+    /// The `DNSName` of an alias set, which has no TTL and no records.
+    pub alias: Option<String>,
 }
 
 #[derive(Debug)]
@@ -195,6 +217,8 @@ impl Inner {
                 "ns-1.awsdns-00.test. hostmaster.awsdns.test. 1 7200 900 1209600 86400".into(),
             ],
             set_identifier: None,
+            routing: None,
+            alias: None,
         });
         self.rrsets.push(Rrset {
             zone_id: id.to_owned(),
@@ -203,6 +227,8 @@ impl Inner {
             ttl: 172_800,
             values: vec!["ns-1.awsdns-00.test.".into(), "ns-2.awsdns-00.test.".into()],
             set_identifier: None,
+            routing: None,
+            alias: None,
         });
     }
 }
@@ -351,6 +377,49 @@ impl Control {
             ttl,
             values: values.iter().map(|v| (*v).to_owned()).collect(),
             set_identifier: None,
+            routing: None,
+            alias: None,
+        });
+    }
+
+    /// Adds a routing-policy set of `name` and `rtype` with this identifier and these extra
+    /// elements (`routing`, XML), next to the other sets of the name and type.
+    #[allow(clippy::too_many_arguments)] // Reason: one argument per element of the set.
+    pub fn insert_policy_set(
+        &self,
+        zone_id: &str,
+        name: &str,
+        rtype: &str,
+        identifier: Option<&str>,
+        routing: &str,
+        ttl: u64,
+        values: &[&str],
+    ) {
+        let name = fqdn(name);
+        lock(&self.state).rrsets.push(Rrset {
+            zone_id: zone_id.to_owned(),
+            name,
+            rtype: rtype.to_owned(),
+            ttl,
+            values: values.iter().map(|v| (*v).to_owned()).collect(),
+            set_identifier: identifier.map(str::to_owned),
+            routing: Some(routing.to_owned()),
+            alias: None,
+        });
+    }
+
+    /// Adds an alias set of `name` and `rtype` pointing at `dns_name`.
+    pub fn insert_alias(&self, zone_id: &str, name: &str, rtype: &str, dns_name: &str) {
+        let name = fqdn(name);
+        lock(&self.state).rrsets.push(Rrset {
+            zone_id: zone_id.to_owned(),
+            name,
+            rtype: rtype.to_owned(),
+            ttl: 0,
+            values: Vec::new(),
+            set_identifier: None,
+            routing: None,
+            alias: Some(dns_name.to_owned()),
         });
     }
 
@@ -882,22 +951,32 @@ fn rrset_xml(r: &Rrset) -> String {
         .iter()
         .map(|v| format!("<ResourceRecord><Value>{}</Value></ResourceRecord>", esc(v)))
         .collect();
-    let routing = r
+    let identifier = r
         .set_identifier
         .as_ref()
-        .map(|id| {
-            format!(
-                "<SetIdentifier>{}</SetIdentifier><Weight>10</Weight>",
-                esc(id)
-            )
-        })
+        .map(|id| format!("<SetIdentifier>{}</SetIdentifier>", esc(id)))
         .unwrap_or_default();
+    let routing = match (&r.routing, &r.set_identifier) {
+        (Some(xml), _) => xml.clone(),
+        (None, Some(_)) => "<Weight>10</Weight>".to_owned(),
+        (None, None) => String::new(),
+    };
+    let body = match &r.alias {
+        Some(target) => format!(
+            "<AliasTarget><HostedZoneId>ZALIASTARGET0001</HostedZoneId><DNSName>{}</DNSName>\
+             <EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget>",
+            esc(target)
+        ),
+        None => format!(
+            "<TTL>{}</TTL><ResourceRecords>{values}</ResourceRecords>",
+            r.ttl
+        ),
+    };
     format!(
-        "<ResourceRecordSet><Name>{}</Name><Type>{}</Type>{routing}<TTL>{}</TTL>\
-         <ResourceRecords>{values}</ResourceRecords></ResourceRecordSet>",
+        "<ResourceRecordSet><Name>{}</Name><Type>{}</Type>{identifier}{routing}{body}\
+         </ResourceRecordSet>",
         esc(&render_name(&r.name)),
         r.rtype,
-        r.ttl
     )
 }
 
@@ -937,11 +1016,22 @@ async fn list_rrsets(
             &b.set_identifier,
         ))
     });
+    let identifier = param(&pairs, "identifier");
+    if identifier.is_some() && rtype.is_empty() {
+        return invalid_input("identifier requires name and type");
+    }
     let from: Vec<&Rrset> = all
         .iter()
         .filter(|r| match name {
             None => true,
-            Some(name) => (sort_key(&r.name), r.rtype.as_str()) >= (sort_key(name), rtype),
+            Some(name) => {
+                let here = (sort_key(&r.name), r.rtype.as_str());
+                let start = (sort_key(name), rtype);
+                match identifier {
+                    Some(id) if here == start => r.set_identifier.as_deref() >= Some(id),
+                    _ => here >= start,
+                }
+            }
         })
         .collect();
     let page: String = from.iter().take(max).map(|r| rrset_xml(r)).collect();
@@ -949,8 +1039,14 @@ async fn list_rrsets(
     let next = from
         .get(max)
         .map(|r| {
+            let identifier = r
+                .set_identifier
+                .as_ref()
+                .map(|id| format!("<NextRecordIdentifier>{}</NextRecordIdentifier>", esc(id)))
+                .unwrap_or_default();
             format!(
-                "<NextRecordName>{}</NextRecordName><NextRecordType>{}</NextRecordType>",
+                "<NextRecordName>{}</NextRecordName><NextRecordType>{}</NextRecordType>\
+                 {identifier}",
                 esc(&render_name(&r.name)),
                 r.rtype
             )
@@ -1016,10 +1112,134 @@ fn parse_batch(zone_id: &str, body: &str) -> Option<Vec<ParsedChange>> {
                 ttl: element_text(set, "TTL")?.trim().parse().ok()?,
                 values,
                 set_identifier: element_text(set, "SetIdentifier"),
+                routing: None,
+                alias: None,
             },
         });
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// A value in the format "Supported DNS record types" gives for `rtype`; types the page does
+/// not describe are accepted as they are.
+fn valid_value(rtype: &str, value: &str) -> bool {
+    let fields: Vec<&str> = value.split_whitespace().collect();
+    let num = |s: &str, max: u64| {
+        !s.is_empty()
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && s.parse::<u64>().is_ok_and(|n| n <= max)
+    };
+    let hex = |s: &str| {
+        !s.is_empty() && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit())
+    };
+    let name = |s: &str| {
+        s == "."
+            || (!s.is_empty()
+                && s.trim_end_matches('.').split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"-_*\\".contains(&b))
+                }))
+    };
+    match rtype {
+        "A" => {
+            fields.len() == 1
+                && value.split('.').count() == 4
+                && value
+                    .split('.')
+                    .all(|o| num(o, 255) && (o == "0" || !o.starts_with('0')))
+        }
+        "AAAA" => fields.len() == 1 && value.parse::<std::net::Ipv6Addr>().is_ok(),
+        "CNAME" | "NS" | "PTR" => fields.len() == 1 && name(value),
+        "MX" => matches!(fields.as_slice(), [p, n] if num(p, 65_535) && name(n)),
+        "SRV" => matches!(fields.as_slice(), [p, w, port, n]
+            if num(p, 65_535) && num(w, 65_535) && num(port, 65_535) && name(n)),
+        "CAA" => {
+            let mut parts = value.splitn(3, ' ');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(flags), Some(tag), Some(quoted)) => {
+                    num(flags, 255)
+                        && !tag.is_empty()
+                        && tag.bytes().all(|b| b.is_ascii_alphanumeric())
+                        && quoted.starts_with('"')
+                        && valid_txt(quoted)
+                }
+                _ => false,
+            }
+        }
+        "DS" => matches!(fields.as_slice(), [t, a, d, digest]
+            if num(t, 65_535) && num(a, 255) && num(d, 255) && hex(digest)),
+        "SSHFP" => matches!(fields.as_slice(), [a, t, f] if num(a, 255) && num(t, 255) && hex(f)),
+        "TLSA" => matches!(fields.as_slice(), [u, s, m, d]
+            if num(u, 255) && num(s, 255) && num(m, 255) && hex(d)),
+        "SVCB" | "HTTPS" => match fields.as_slice() {
+            [p, n, params @ ..] => {
+                num(p, 32_767)
+                    && name(n)
+                    && !params.iter().any(|param| {
+                        param
+                            .strip_prefix("key")
+                            .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+                    })
+            }
+            _ => false,
+        },
+        "NAPTR" => valid_naptr(value),
+        "SPF" => valid_txt(value),
+        _ => true,
+    }
+}
+
+/// `order preference "flags" "service" "regexp" replacement`, the replacement of `a-z`, `0-9`,
+/// `-` and dots.
+fn valid_naptr(value: &str) -> bool {
+    let mut rest = value.trim();
+    for _ in 0..2 {
+        let Some((n, tail)) = rest.split_once(' ') else {
+            return false;
+        };
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) || n.parse::<u16>().is_err() {
+            return false;
+        }
+        rest = tail;
+    }
+    for _ in 0..3 {
+        let Some(inner) = rest.strip_prefix('"') else {
+            return false;
+        };
+        let mut end = None;
+        let mut escaped = false;
+        for (i, c) in inner.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                end = Some(i);
+                break;
+            }
+        }
+        let Some(end) = end else {
+            return false;
+        };
+        if !valid_txt(&rest[..end + 2]) {
+            return false;
+        }
+        let Some(tail) = inner[end + 1..].strip_prefix(' ') else {
+            return false;
+        };
+        rest = tail;
+    }
+    rest == "."
+        || (!rest.is_empty()
+            && rest.trim_end_matches('.').split('.').all(|label| {
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            }))
 }
 
 /// A TXT value is one or more quoted strings of at most 255 characters each.
@@ -1034,13 +1254,22 @@ fn valid_txt(value: &str) -> bool {
         };
         let mut len = 0;
         let mut end = None;
-        let mut escaped = false;
-        for (i, c) in inner.char_indices() {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-                continue;
+        let mut chars = inner.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some((_, d)) if d.is_ascii_digit() => {
+                        // An escape code: exactly three octal digits, one character.
+                        let code: String = std::iter::once(d)
+                            .chain(chars.by_ref().take(2).map(|(_, c)| c))
+                            .collect();
+                        if code.len() != 3 || u8::from_str_radix(&code, 8).is_err() {
+                            return false;
+                        }
+                    }
+                    Some(_) => {}
+                    None => return false,
+                }
             } else if c == '"' {
                 end = Some(i);
                 break;
@@ -1113,6 +1342,24 @@ async fn change_rrsets(
         if set.rtype == "TXT" && !set.values.iter().all(|v| valid_txt(v)) {
             return invalid_batch("Invalid Resource Record: TXT value is not quoted correctly.");
         }
+        if !set.values.iter().all(|v| valid_value(&set.rtype, v)) {
+            return invalid_batch(&format!(
+                "Invalid Resource Record: the {} value is not in the documented format.",
+                set.rtype
+            ));
+        }
+        if set.ttl > MAX_TTL {
+            return invalid_input("TTL is outside the valid range");
+        }
+        if set.rtype == "SOA" && change.action != "UPSERT" {
+            return invalid_batch("The SOA record can only be changed, not created or deleted.");
+        }
+        if set.rtype == "NS" && set.name.starts_with("*.") {
+            return invalid_batch("A wildcard cannot be used for NS records.");
+        }
+        if set.rtype == "CNAME" && change.action == "CREATE" && set.name == zone.name {
+            return invalid_batch("RRSet of type CNAME is not permitted at apex.");
+        }
     }
     let mut inner = lock(&state);
     let mut next = inner.rrsets.clone();
@@ -1158,6 +1405,22 @@ async fn change_rrsets(
                 next.push(set.clone());
             }
             _ => return invalid_input("unknown action"),
+        }
+    }
+    // A CNAME and any other set at one name cannot coexist.
+    for set in next
+        .iter()
+        .filter(|r| r.zone_id == id && r.rtype == "CNAME")
+    {
+        if next
+            .iter()
+            .any(|r| r.zone_id == id && r.name == set.name && r.rtype != "CNAME")
+        {
+            return invalid_batch(&format!(
+                "RRSet of type CNAME with DNS name {} is not permitted as it conflicts with \
+                 other records with the same DNS name",
+                set.name
+            ));
         }
     }
     inner.rrsets = next;
