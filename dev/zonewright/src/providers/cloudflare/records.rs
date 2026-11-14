@@ -714,7 +714,7 @@ impl Cloudflare {
         }
         let mut listing = Listing::new(zone);
         for ((_, type_name), (name, records)) in groups {
-            let ttl = records.iter().filter_map(|r| read_ttl(r)).min();
+            let ttl = Listing::smallest_ttl(records.iter().map(|r| read_ttl(r)));
             // A type name that maps to no record type is skipped by the listing, whatever the
             // records hold; the content is then never parsed.
             let values = match type_name.parse::<RecordType>() {

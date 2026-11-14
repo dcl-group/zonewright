@@ -176,9 +176,9 @@ fn account_then(errors: Render) -> Render {
     })
 }
 
-fn echo_client(echo: &EchoServer) -> DigitalOcean {
+fn echo_client(echo: &EchoServer, ctx: &Context) -> DigitalOcean {
     let config = settings(echo.url("/v2"));
-    DigitalOcean::new(config, credentials(CANARY_TOKEN), &context()).unwrap()
+    DigitalOcean::new(config, credentials(CANARY_TOKEN), ctx).unwrap()
 }
 
 /// `check` and a write against an echo that quotes every request back: no canary in any error,
@@ -222,24 +222,28 @@ enum Write {
 /// the account read, the domain read, the create and the delete.
 #[tokio::test]
 async fn digitalocean_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     for dialect in dialects() {
         // The account read is the echo.
         for status in [400, 401] {
             let label = format!("{} {:?} {status} account", dialect.name, dialect.spelling);
-            let echo = dialect.echo(status).start().await;
-            let client = echo_client(&echo);
+            echo.reset(dialect.echo(status));
+            let client = echo_client(&echo, &ctx);
             echo_round(&label, &client, Write::Add).await;
             assert!(echo.api_requests() > 0, "{label}: the API was not reached");
         }
         // The account read is answered; the domain read is the echo.
         for status in [400, 401, 403] {
             let label = format!("{} {:?} {status} domain", dialect.name, dialect.spelling);
-            let echo = dialect
-                .echo(status)
-                .render_under("/v2/account", account_then(dialect.render.clone()))
-                .start()
-                .await;
-            let client = echo_client(&echo);
+            echo.reset(
+                dialect
+                    .echo(status)
+                    .render_under("/v2/account", account_then(dialect.render.clone())),
+            );
+            let client = echo_client(&echo, &ctx);
             let e = client.check(&[zone()]).await.unwrap_err();
             let text = format!("{e} | {e:?} | {client:?}");
             assert_clean(&label, &text, &[CANARY_TOKEN]);
@@ -272,16 +276,16 @@ async fn digitalocean_secret_echo() {
         ] {
             for &status in statuses {
                 let label = format!("{} {:?} {status} {write:?}", dialect.name, dialect.spelling);
-                let echo = dialect
-                    .echo(status)
-                    .render_under("/v2/account", account_then(dialect.render.clone()))
-                    .render_under(
-                        "/v2/domains",
-                        listings_then(dialect.render.clone(), existing),
-                    )
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(
+                    dialect
+                        .echo(status)
+                        .render_under("/v2/account", account_then(dialect.render.clone()))
+                        .render_under(
+                            "/v2/domains",
+                            listings_then(dialect.render.clone(), existing),
+                        ),
+                );
+                let client = echo_client(&echo, &ctx);
                 echo_round(&label, &client, write).await;
                 let (method, path) = match write {
                     Write::Add => ("POST", RECORDS),
@@ -909,6 +913,37 @@ async fn digitalocean_unreported_ttl_is_not_invented() {
     assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Appended);
     let post = mock.log().matching(Some("POST"), RECORDS).pop().unwrap();
     assert!(post.body_json().unwrap().get("ttl").is_none());
+}
+
+/// At the record level, an rrset whose TTL the API does not state reads with no TTL; a record
+/// added to it without a requested TTL gets the configured `ttl`, since this provider has no
+/// "no explicit TTL" in the model (`provider_default_ttl` is false, design section 3.6).
+#[tokio::test]
+async fn digitalocean_record_level_unreported_ttl_takes_the_setting() {
+    let (mock, client) = setup().await;
+    mock.faults().push(Fault::on("GET", RECORDS).respond(
+        200,
+        r#"{"domain_records":[{"id":1,"type":"A","name":"www","data":"192.0.2.1","ttl":null}],"links":{},"meta":{"total":1}}"#,
+    ));
+    let wanted = rr(
+        "www.example.org",
+        RecordType::A,
+        None,
+        &["192.0.2.1", "192.0.2.2"],
+    );
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &wanted, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    let post = mock.log().matching(Some("POST"), RECORDS).pop().unwrap();
+    let configured = u64::from(DigitalOceanConfig::default().ttl);
+    assert_eq!(
+        post.body_json().unwrap().get("ttl"),
+        Some(&serde_json::json!(configured))
+    );
 }
 
 // ---- Listings ----------------------------------------------------------------------------------
@@ -2451,6 +2486,10 @@ enum RecordWrite {
 /// redaction.
 #[tokio::test]
 async fn digitalocean_secret_echo_record_level() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     for dialect in dialects() {
         for (kind, statuses) in [
             (RecordWrite::Create, [400, 401, 403, 422, 500].as_slice()),
@@ -2467,17 +2506,17 @@ async fn digitalocean_secret_echo_record_level() {
                     RecordWrite::Update => Existing::Cname,
                     RecordWrite::Delete => Existing::Ours,
                 };
-                let mut echo = dialect
+                let mut config = dialect
                     .echo(status)
                     .render_under("/v2/account", account_then(dialect.render.clone()));
                 if !matches!(kind, RecordWrite::List) {
-                    echo = echo.render_under(
+                    config = config.render_under(
                         "/v2/domains",
                         listings_then(dialect.render.clone(), existing),
                     );
                 }
-                let echo = echo.start().await;
-                let client = echo_client(&echo);
+                echo.reset(config);
+                let client = echo_client(&echo, &ctx);
                 let result = match kind {
                     RecordWrite::Create => {
                         let set = rr(NAME, RecordType::A, None, &["192.0.2.1"]);

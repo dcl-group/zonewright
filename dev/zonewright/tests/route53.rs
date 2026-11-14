@@ -193,12 +193,16 @@ assert_not_impl!(Route53Credentials: std::fmt::Display, serde::Serialize);
 /// the echo.
 #[tokio::test]
 async fn route53_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     let secrets = [CANARY_PASSWORD, CANARY_TOKEN];
     for dialect in dialects() {
         for status in [400, 401, 403] {
             let label = format!("{} {:?} {status} api", dialect.name, dialect.spelling);
-            let echo = dialect.echo(status).start().await;
-            let client = echo_client(&echo);
+            echo.reset(dialect.echo(status));
+            let client = echo_client(&echo, &ctx);
             echo_round(&label, &client, &secrets).await;
             assert!(echo.api_requests() > 0, "{label}: the API was not reached");
         }
@@ -208,15 +212,11 @@ async fn route53_secret_echo() {
                     "{} {:?} {status} write existing={existing}",
                     dialect.name, dialect.spelling
                 );
-                let echo = dialect
-                    .echo(status)
-                    .render_under(
-                        "/2013-04-01/",
-                        listings_then(dialect.render.clone(), existing),
-                    )
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(dialect.echo(status).render_under(
+                    "/2013-04-01/",
+                    listings_then(dialect.render.clone(), existing),
+                ));
+                let client = echo_client(&echo, &ctx);
                 echo_round(&label, &client, &secrets).await;
                 assert_eq!(
                     echo.log().count(Some("POST"), CHANGE),
@@ -233,6 +233,10 @@ async fn route53_secret_echo() {
 /// and each change batch reached the echo.
 #[tokio::test]
 async fn route53_secret_echo_record_level() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     let secrets = [CANARY_PASSWORD, CANARY_TOKEN];
     for dialect in dialects() {
         for status in [400, 403, 500] {
@@ -241,15 +245,11 @@ async fn route53_secret_echo_record_level() {
                     "{} {:?} {status} record existing={existing}",
                     dialect.name, dialect.spelling
                 );
-                let echo = dialect
-                    .echo(status)
-                    .render_under(
-                        "/2013-04-01/",
-                        listings_then(dialect.render.clone(), existing),
-                    )
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(dialect.echo(status).render_under(
+                    "/2013-04-01/",
+                    listings_then(dialect.render.clone(), existing),
+                ));
+                let client = echo_client(&echo, &ctx);
                 let mut texts = vec![format!("{client:?}")];
                 match client.list_rrsets(&zone()).await {
                     Ok(listing) => texts.push(format!("{listing:?}")),
@@ -320,11 +320,11 @@ fn listings_then(errors: Render, existing: bool) -> Render {
     })
 }
 
-fn echo_client(echo: &EchoServer) -> Route53 {
+fn echo_client(echo: &EchoServer, ctx: &Context) -> Route53 {
     Route53::new(
         settings_for(&echo.base_url()),
         credentials(CANARY_PASSWORD, Some(CANARY_TOKEN)),
-        &context(),
+        ctx,
     )
     .unwrap()
 }
@@ -920,7 +920,8 @@ async fn route53_merge_two_values_and_delete_last_with_exact_ttl() {
 }
 
 /// The first value creates the rrset with the configured TTL, or the caller's; an existing
-/// rrset keeps its TTL; a TTL outside the range is refused before any request.
+/// rrset keeps its TTL; the caller's TTL may be anything the API accepts, beyond the range of
+/// the `ttl` setting.
 #[tokio::test]
 async fn route53_add_creates_rrset_with_the_ttl() {
     let (mock, client) = setup().await;
@@ -944,13 +945,18 @@ async fn route53_add_creates_rrset_with_the_ttl() {
             .ttl,
         300
     );
-    let requests = mock.log().len();
-    let e = client
-        .add_txt_value(&zone(), &name(), &txt("DDD"), ttl(86_401))
+    let deep = dn("_acme-challenge.deep.example.org");
+    client
+        .add_txt_value(&zone(), &deep, &txt("DDD"), ttl(172_800))
         .await
-        .unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
-    assert_eq!(mock.log().len(), requests);
+        .unwrap();
+    assert_eq!(
+        mock.control()
+            .rrset("_acme-challenge.deep.example.org", "TXT")
+            .unwrap()
+            .ttl,
+        172_800
+    );
 }
 
 /// The listing starts at the requested name and returns the next rrset in sort order when
@@ -2452,20 +2458,13 @@ async fn route53_protected_sets_send_nothing() {
     assert_eq!(read.ttl(), Some(Ttl::from_secs(900).unwrap()));
 }
 
-/// A TTL outside the range is refused before any request; the bounds are accepted.
+/// The API's TTL range, 0 to 2147483647, is the capabilities' range: every TTL the model holds
+/// is accepted, the bounds and a delegation's 172800 included.
 #[tokio::test]
 async fn route53_record_ttl_bounds() {
     let (mock, client) = setup().await;
-    for ttl in [0, 86_401] {
-        let set = rrset(REC, RecordType::A, Some(ttl), &["192.0.2.1"]);
-        let e = client
-            .set_rrset(&zone(), &set, Expect::Any)
-            .await
-            .unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{ttl}: {e:?}");
-    }
-    assert!(mock.log().is_empty());
-    for ttl in [1, 86_400] {
+    assert!(Ttl::from_secs(2_147_483_648).is_err());
+    for ttl in [0, 1, 86_400, 86_401, 172_800, 2_147_483_647] {
         let set = rrset(REC, RecordType::A, Some(ttl), &["192.0.2.1"]);
         client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
         assert_eq!(mock.control().rrset(REC, "A").unwrap().ttl, u64::from(ttl));

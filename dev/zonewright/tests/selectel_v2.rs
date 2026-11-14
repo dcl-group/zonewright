@@ -165,23 +165,23 @@ assert_not_impl!(SelectelV2Credentials: std::fmt::Display, serde::Serialize);
 /// request).
 #[tokio::test]
 async fn selectel_v2_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     let secrets = [CANARY_PASSWORD, DEFAULT_ISSUED_TOKEN];
     for dialect in dialects() {
         for status in [400, 401] {
             let label = format!("{} {:?} {status} api", dialect.name, dialect.spelling);
-            let echo = dialect.echo(status).start().await;
-            let client = echo_client(&echo, &echo.token_url());
+            echo.reset(dialect.echo(status));
+            let client = echo_client(&echo, &echo.token_url(), &ctx);
             echo_round(&label, &client, &secrets).await;
             assert!(echo.api_requests() > 0, "{label}: the API was not reached");
             assert!(echo.token_requests() > 0, "{label}: no token was issued");
 
             let label = format!("{} {:?} {status} identity", dialect.name, dialect.spelling);
-            let echo = dialect
-                .echo(status)
-                .token_path("/no-token-endpoint")
-                .start()
-                .await;
-            let client = echo_client(&echo, &echo.url("/identity/v3"));
+            echo.reset(dialect.echo(status).token_path("/no-token-endpoint"));
+            let client = echo_client(&echo, &echo.url("/identity/v3"), &ctx);
             echo_round(&label, &client, &secrets).await;
             assert!(
                 echo.log().count(Some("POST"), TOKENS) > 0,
@@ -196,15 +196,11 @@ async fn selectel_v2_secret_echo() {
                     "{} {:?} {status} write existing={existing}",
                     dialect.name, dialect.spelling
                 );
-                let echo = dialect
-                    .echo(status)
-                    .render_under(
-                        "/domains/v2/zones",
-                        listings_then(dialect.render.clone(), existing),
-                    )
-                    .start()
-                    .await;
-                let client = echo_client(&echo, &echo.token_url());
+                echo.reset(dialect.echo(status).render_under(
+                    "/domains/v2/zones",
+                    listings_then(dialect.render.clone(), existing),
+                ));
+                let client = echo_client(&echo, &echo.token_url(), &ctx);
                 echo_round(&label, &client, &secrets).await;
                 // The value operation and the set each reached the write.
                 let (method, path) = if existing {
@@ -258,12 +254,12 @@ fn listings_then(errors: Render, existing: bool) -> Render {
     })
 }
 
-fn echo_client(echo: &EchoServer, auth_url: &str) -> SelectelV2 {
+fn echo_client(echo: &EchoServer, auth_url: &str, ctx: &Context) -> SelectelV2 {
     let mut config = SelectelV2Config::new("123456".into(), "zw-test-user".into());
     config.project_id = Some("project-a".into());
     config.base_url = echo.url("/domains/v2");
     config.auth_url = auth_url.to_owned();
-    SelectelV2::new(config, credentials(CANARY_PASSWORD), &context()).unwrap()
+    SelectelV2::new(config, credentials(CANARY_PASSWORD), ctx).unwrap()
 }
 
 async fn echo_round(label: &str, client: &SelectelV2, secrets: &[&str]) {

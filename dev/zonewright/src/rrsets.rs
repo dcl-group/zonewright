@@ -19,16 +19,38 @@
 //!
 //! # Order of a per-record replacement
 //!
-//! For every type except the singletons (CNAME, SOA, DNAME, ALIAS, ANAME) the layer sends, in
-//! this order: enabling of disabled records that hold a requested value, TTL changes of records
-//! that stay, creates of the missing values, and only then deletes of the surplus records. So the
-//! name never loses all its values: the intermediate states are "old values plus some new ones"
-//! and "all new values plus some old ones", never fewer published records than either end. If a
+//! The layer computes every request of a replacement from one read, as a list of [`Step`]s,
+//! hands the whole list to [`PerRecord::check_plan`] (which may refuse it before anything is
+//! sent), and then sends the steps in the list's order. The order is fixed: within each group
+//! below, records that were read go in the order of the read, and new values in the order of
+//! [`RrSet::records`] of the requested set (which is sorted).
+//!
+//! For every type except the singletons (CNAME, SOA, DNAME, ALIAS, ANAME) the groups are, in this
+//! order: enabling of disabled records that hold a requested value, TTL changes of records that
+//! stay, creates of the missing values, and only then deletes of the surplus records. So the name
+//! never loses all its values: the intermediate states are "old values plus some new ones" and
+//! "all new values plus some old ones", never fewer published records than either end. If a
 //! request fails part-way the error is returned with the rrset holding such a mixture; repeating
-//! the call reads the mixture and sends only the remaining difference. A singleton is replaced in
-//! place when the API can ([`PerRecord::updates_in_place`]); otherwise its old record is deleted
-//! before the new one is created, since two records of a singleton type cannot coexist, and a
-//! failure between the two leaves the name without the record until the call is repeated.
+//! the call reads the mixture and sends only the remaining difference.
+//!
+//! A singleton type never has two published records, not even for one request: the surplus
+//! records are deleted first. When exactly one value is to be created and the API can change a
+//! record in place ([`PerRecord::updates_in_place`]), the last surplus record is kept and changed
+//! to the new value instead of being deleted. Otherwise the order is deletes, enables, TTL
+//! changes, creates, and a failure between the deletes and the create leaves the name without the
+//! record until the call is repeated.
+//!
+//! # A CNAME and other data at one name
+//!
+//! A CNAME owner has no other data (RFC 1034 section 3.6.2; RRSIG and NSEC are the exceptions
+//! of RFC 4035 section 2.5). The layer reads one name and type, so it learns what else is at the
+//! name only from the client: [`PerRecord::holds_cname`] and [`PerRecord::holds_other_data`] (and
+//! the same methods of [`WholeSet`]) answer from what the operation's read already returned, and
+//! answer `None` (the default) when that read does not tell. When the answer is known, a
+//! `set_rrset` of a CNAME at a name with other data, or of another type at a name with a CNAME,
+//! is `Error::InvalidInput` after the read and before any write. When it is not known, the write
+//! is sent and a refusal by the provider is mapped as any other refusal. No request is made only
+//! to find out.
 //!
 //! # Rules a client keeps when it implements a trait
 //!
@@ -38,7 +60,12 @@
 //! - The handle (and for a whole set, the snapshot) carries whatever the client needs to write a
 //!   record back exactly as the provider returned it, attributes the model does not carry (a
 //!   comment, a managing resource) included, or to delete it by identifier.
-//! - A per-record delete by identifier answered "not found" counts as done.
+//! - A delete answered "not found" is not done on the strength of that answer alone, since the
+//!   answer can also mean that the zone, or the zone identifier the client used, changed after
+//!   the read while the value is still published (design sections 3.5 and 3.8). The client drops
+//!   a cached zone identifier and reads again: when the new read no longer finds the deleted
+//!   record's value (per-record) or the rrset (whole set), the delete is done; otherwise the
+//!   result is [`Error::Conflict`].
 //! - Only a conditional write that the provider refused because the rrset changed returns
 //!   [`Error::Conflict`] from an atomic provider. A read-then-write client may return it for a
 //!   change it detected itself (an rrset created by someone else after the read); the layer does
@@ -54,6 +81,8 @@
 //!     async fn read(&self, zone, name, rtype) -> Result<Current<..>, Error>   // GET by name+type
 //!     async fn write(&self, zone, name, rtype, ctx, prior, members, ttl)      // POST or PATCH
 //!     async fn delete(&self, zone, name, rtype, ctx, prior)                   // DELETE
+//!     // optional: check_write, reread_before_write + same_snapshot,
+//!     //           holds_cname, holds_other_data
 //! }
 //! impl Provider for MyClient {
 //!     async fn get_rrset(..)    { rrsets::get_whole_set(self, zone, name, rtype).await }
@@ -148,7 +177,10 @@ pub(crate) struct Found<H, S> {
     /// Every record, disabled ones included. Empty only if the provider keeps an rrset without
     /// records, which then reads as absent.
     pub(crate) records: Vec<Stored<H>>,
-    /// The rrset's TTL, if the provider reports one.
+    /// The rrset's TTL, if the provider reports one. Where the API stores a TTL per record
+    /// (`TtlSupport::PerRecord`), the smallest of them; the records then carry their own in
+    /// [`Stored::ttl`], and a requested TTL counts as already set only when every record that
+    /// states one has it.
     pub(crate) ttl: Option<Ttl>,
     /// The rrset as the client read it: what a write sends back for attributes the model does
     /// not carry, and what a conditional write sends as its condition.
@@ -177,6 +209,23 @@ pub(crate) enum Member<'a, H> {
     /// A value the provider does not hold, encoded by the client. Always canonical, and
     /// [`RrsetBase::can_send`] accepted it.
     Added(&'a RecordData),
+}
+
+/// What a [`WholeSet`] operation is about to send, as [`WholeSet::check_write`] sees it.
+#[derive(Debug)]
+pub(crate) enum WholeChange<'a, H, S> {
+    /// [`WholeSet::write`] with these arguments.
+    Write {
+        /// The rrset as read; `None`: the write creates it.
+        prior: Option<&'a S>,
+        /// The members of the rrset after the write.
+        members: &'a [Member<'a, H>],
+    },
+    /// [`WholeSet::delete`] of the rrset as read.
+    Delete {
+        /// The rrset as read.
+        prior: &'a S,
+    },
 }
 
 /// The answer of [`WholeSet::read`].
@@ -217,7 +266,8 @@ pub(crate) trait WholeSet: RrsetBase {
         ttl: SetTtl,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
-    /// Deletes the rrset; an atomic client makes the delete conditional on `prior`.
+    /// Deletes the rrset; an atomic client makes the delete conditional on `prior`. A "not
+    /// found" answer is done only when a new read finds no rrset (module documentation).
     fn delete(
         &self,
         zone: &DomainName,
@@ -226,6 +276,56 @@ pub(crate) trait WholeSet: RrsetBase {
         context: &Self::Context,
         prior: &Self::Snapshot,
     ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Called after the read and the layer's own checks, before any further request, with what
+    /// is about to be sent. An error ends the operation with nothing more sent, not even the
+    /// read of [`WholeSet::reread_before_write`]. For refusals that need the read (a read-only
+    /// rrset, a combination the API does not offer). The default accepts everything.
+    fn check_write(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        context: &Self::Context,
+        change: &WholeChange<'_, Self::Handle, Self::Snapshot>,
+    ) -> Result<(), Error> {
+        let _ = (zone, name, rtype, context, change);
+        Ok(())
+    }
+
+    /// Read the rrset again immediately before each write or delete, after
+    /// [`WholeSet::check_write`]: when [`WholeSet::same_snapshot`] says it changed since the
+    /// first read (or it appeared or vanished), the result is `Error::Conflict` and nothing is
+    /// written (design section 3.5, "re-read first"). The layer does not repeat that `Conflict`
+    /// for a read-then-write provider; the caller's repeat starts with a fresh read. Default:
+    /// no second read.
+    fn reread_before_write(&self) -> bool {
+        false
+    }
+
+    /// The rrset read first and the rrset read again are the same: nothing a write would carry
+    /// differs. Asked only when [`WholeSet::reread_before_write`] is true; a client that turns
+    /// that on implements this. The default answers "changed", so that a missing implementation
+    /// can only refuse a write, never let one through.
+    fn same_snapshot(&self, first: &Self::Snapshot, again: &Self::Snapshot) -> bool {
+        let _ = (first, again);
+        false
+    }
+
+    /// The read that produced `context` found a published CNAME at the name, the operation
+    /// being about `rtype`, another type. `None` (the default): the read does not tell. See
+    /// the module documentation, "A CNAME and other data at one name".
+    fn holds_cname(&self, rtype: RecordType, context: &Self::Context) -> Option<bool> {
+        let _ = (rtype, context);
+        None
+    }
+
+    /// The read that produced `context` found published data at the name of a type other than
+    /// CNAME, `rtype`, RRSIG and NSEC. `None` (the default): the read does not tell.
+    fn holds_other_data(&self, rtype: RecordType, context: &Self::Context) -> Option<bool> {
+        let _ = (rtype, context);
+        None
+    }
 }
 
 // ---- Per-record shape ----------------------------------------------------------------------------
@@ -248,6 +348,28 @@ pub(crate) struct RecordUpdate<'a> {
     pub(crate) ttl: Option<Ttl>,
     /// New content, for the in-place replacement of a singleton; `None` keeps the content.
     pub(crate) data: Option<&'a RecordData>,
+}
+
+/// One request of a per-record write, as computed from the read (module documentation, "Order
+/// of a per-record replacement").
+#[derive(Debug)]
+pub(crate) enum Step<'a, H> {
+    /// [`PerRecord::update`] of `record` with `update`.
+    Update {
+        /// The record as read.
+        record: &'a Stored<H>,
+        /// The change.
+        update: RecordUpdate<'a>,
+    },
+    /// [`PerRecord::create`] of `data` with `ttl`.
+    Create {
+        /// The new value.
+        data: &'a RecordData,
+        /// The TTL the record gets.
+        ttl: SetTtl,
+    },
+    /// [`PerRecord::delete`] of the record as read.
+    Delete(&'a Stored<H>),
 }
 
 /// Individual records with identifiers.
@@ -287,7 +409,9 @@ pub(crate) trait PerRecord: RrsetBase {
         update: &RecordUpdate<'_>,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
-    /// Deletes one record by identifier. "Not found" counts as done.
+    /// Deletes one record by identifier. A "not found" answer is done only when a new read no
+    /// longer finds the record's value; when it does, the zone changed after the read and the
+    /// result is `Error::Conflict` (module documentation).
     fn delete(
         &self,
         zone: &DomainName,
@@ -301,6 +425,39 @@ pub(crate) trait PerRecord: RrsetBase {
     /// update instead of a delete followed by a create.
     fn updates_in_place(&self) -> bool {
         true
+    }
+
+    /// Called with every request of a `set_rrset` or a `delete_rrset`, in the order they will
+    /// be sent, after the read and the layer's own checks and before the first write. An error
+    /// ends the operation with nothing written, so a request the API is known to refuse (a TTL
+    /// change of a record whose TTL cannot be changed, a combination of attributes) does not
+    /// fail after earlier requests of the same plan were applied. The default accepts every
+    /// plan.
+    fn check_plan(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        context: &Self::Context,
+        steps: &[Step<'_, Self::Handle>],
+    ) -> Result<(), Error> {
+        let _ = (zone, name, rtype, context, steps);
+        Ok(())
+    }
+
+    /// The read that produced `context` found a published CNAME at the name, the operation
+    /// being about `rtype`, another type. `None` (the default): the read does not tell. See
+    /// the module documentation, "A CNAME and other data at one name".
+    fn holds_cname(&self, rtype: RecordType, context: &Self::Context) -> Option<bool> {
+        let _ = (rtype, context);
+        None
+    }
+
+    /// The read that produced `context` found published data at the name of a type other than
+    /// CNAME, `rtype`, RRSIG and NSEC. `None` (the default): the read does not tell.
+    fn holds_other_data(&self, rtype: RecordType, context: &Self::Context) -> Option<bool> {
+        let _ = (rtype, context);
+        None
     }
 }
 
@@ -463,11 +620,12 @@ pub(crate) fn published<H>(
 
 /// The smallest TTL among the enabled records (design section 3.6, `TtlSupport::PerRecord`).
 fn smallest_ttl<H>(records: &[Stored<H>]) -> Option<Ttl> {
-    records
-        .iter()
-        .filter(|record| record.enabled)
-        .filter_map(|record| record.ttl)
-        .min()
+    Listing::smallest_ttl(
+        records
+            .iter()
+            .filter(|record| record.enabled)
+            .map(|record| record.ttl),
+    )
 }
 
 /// Step 2 of `set_rrset` (design section 3.4), also used by `delete_rrset`.
@@ -497,10 +655,51 @@ fn evaluate(expect: Expect<'_>, current: Option<&RrSet>) -> Result<(), Error> {
 }
 
 /// Step 3: the rrset is already as requested (members, and the TTL when one is requested).
-fn unchanged(current: Option<&RrSet>, wanted: &RrSet) -> bool {
+///
+/// A requested TTL must be the rrset's TTL as read and also the TTL of every enabled record
+/// that states one of its own: where the API stores a TTL per record the rrset reports the
+/// smallest (design section 3.6), so the rrset's TTL alone can match while another record
+/// differs. `per_record`: a record that states no TTL does not have the requested one (an
+/// individual record without a TTL is one whose TTL the provider chooses); otherwise such a
+/// record takes the rrset's TTL.
+fn unchanged<H>(
+    current: Option<&RrSet>,
+    wanted: &RrSet,
+    records: &[Stored<H>],
+    per_record: bool,
+) -> bool {
     current.is_some_and(|current| {
-        current.same_records(wanted) && wanted.ttl().is_none_or(|ttl| current.ttl() == Some(ttl))
+        current.same_records(wanted)
+            && wanted.ttl().is_none_or(|ttl| {
+                current.ttl() == Some(ttl)
+                    && records
+                        .iter()
+                        .filter(|record| record.enabled)
+                        .all(|record| record.ttl.map_or(!per_record, |own| own == ttl))
+            })
     })
+}
+
+/// The CNAME rule of RFC 1034 section 3.6.2, where the client can tell what else is at the name
+/// (module documentation).
+fn check_coexistence(
+    rtype: RecordType,
+    holds_cname: Option<bool>,
+    holds_other_data: Option<bool>,
+) -> Result<(), Error> {
+    if rtype == RecordType::CNAME && holds_other_data == Some(true) {
+        return Err(invalid(
+            "a CNAME cannot be written at a name that holds data of other types",
+        ));
+    }
+    // RRSIG (46) and NSEC (47) may share a name with a CNAME (RFC 4035 section 2.5).
+    let beside_cname = matches!(rtype.code(), Some(46 | 47));
+    if rtype != RecordType::CNAME && !beside_cname && holds_cname == Some(true) {
+        return Err(invalid(
+            "the name holds a CNAME, which cannot share its name with other data",
+        ));
+    }
+    Ok(())
 }
 
 /// A requested value the provider does not hold: it must be canonical (design section 4.9) and
@@ -624,10 +823,16 @@ async fn set_whole_set_once<B: WholeSet>(
         None => None,
     };
     evaluate(expect, published.as_ref())?;
-    if unchanged(published.as_ref(), wanted) {
+    let records = found.map_or(&[][..], |found| found.records.as_slice());
+    if unchanged(published.as_ref(), wanted, records, false) {
         return Ok(SetOutcome::Unchanged);
     }
-    let records = found.map_or(&[][..], |found| found.records.as_slice());
+    let context = &current.context;
+    check_coexistence(
+        rtype,
+        backend.holds_cname(rtype, context),
+        backend.holds_other_data(rtype, context),
+    )?;
     let members = whole_set_members(backend, rtype, records, wanted)?;
     let ttl = match (wanted.ttl(), found) {
         (Some(ttl), _) => SetTtl::Requested(ttl),
@@ -635,8 +840,14 @@ async fn set_whole_set_once<B: WholeSet>(
         (None, None) => SetTtl::Default,
     };
     let prior = found.map(|found| &found.snapshot);
+    let change = WholeChange::Write {
+        prior,
+        members: &members,
+    };
+    backend.check_write(zone, name, rtype, context, &change)?;
+    reread_unchanged(backend, zone, name, rtype, prior).await?;
     backend
-        .write(zone, name, rtype, &current.context, prior, &members, ttl)
+        .write(zone, name, rtype, context, prior, &members, ttl)
         .await?;
     Ok(if published.is_some() {
         SetOutcome::Replaced
@@ -682,30 +893,60 @@ async fn delete_whole_set_once<B: WholeSet>(
     if published.is_none() {
         return Ok(DeleteOutcome::NotPresent);
     }
+    let context = &current.context;
+    let prior = &found.snapshot;
     let disabled: Vec<Member<'_, B::Handle>> = found
         .records
         .iter()
         .filter(|record| !record.enabled)
         .map(Member::Kept)
         .collect();
+    let ttl = SetTtl::Existing(found.ttl);
+    let change = if disabled.is_empty() {
+        WholeChange::Delete { prior }
+    } else {
+        WholeChange::Write {
+            prior: Some(prior),
+            members: &disabled,
+        }
+    };
+    backend.check_write(zone, name, rtype, context, &change)?;
+    reread_unchanged(backend, zone, name, rtype, Some(prior)).await?;
     if disabled.is_empty() {
-        backend
-            .delete(zone, name, rtype, &current.context, &found.snapshot)
-            .await?;
+        backend.delete(zone, name, rtype, context, prior).await?;
     } else {
         backend
-            .write(
-                zone,
-                name,
-                rtype,
-                &current.context,
-                Some(&found.snapshot),
-                &disabled,
-                SetTtl::Existing(found.ttl),
-            )
+            .write(zone, name, rtype, context, Some(prior), &disabled, ttl)
             .await?;
     }
     Ok(DeleteOutcome::Deleted)
+}
+
+/// For [`WholeSet::reread_before_write`]: reads again and fails with `Error::Conflict` unless
+/// the rrset is as it was (`prior`; `None`: there was none).
+async fn reread_unchanged<B: WholeSet>(
+    backend: &B,
+    zone: &DomainName,
+    name: &DomainName,
+    rtype: RecordType,
+    prior: Option<&B::Snapshot>,
+) -> Result<(), Error> {
+    if !backend.reread_before_write() {
+        return Ok(());
+    }
+    let again = backend.read(zone, name, rtype).await?;
+    let same = match (prior, again.found.as_ref()) {
+        (None, None) => true,
+        (Some(prior), Some(found)) => backend.same_snapshot(prior, &found.snapshot),
+        _ => false,
+    };
+    if same {
+        Ok(())
+    } else {
+        Err(Error::Conflict {
+            detail: Detail::constant("the rrset changed between the read and the write"),
+        })
+    }
 }
 
 // ---- Per-record operations -----------------------------------------------------------------------
@@ -816,87 +1057,131 @@ async fn set_per_record_once<B: PerRecord>(
     let current_ttl = smallest_ttl(&read.records);
     let published = published(name, rtype, current_ttl, &read.records)?;
     evaluate(expect, published.as_ref())?;
-    // The reported TTL is the smallest; a requested one must be on every record.
-    let uniform = wanted.ttl().is_none_or(|ttl| {
-        read.records
-            .iter()
-            .filter(|record| record.enabled)
-            .all(|record| record.ttl == Some(ttl))
-    });
-    if uniform && unchanged(published.as_ref(), wanted) {
+    if unchanged(published.as_ref(), wanted, &read.records, true) {
         return Ok(SetOutcome::Unchanged);
     }
+    check_coexistence(
+        rtype,
+        backend.holds_cname(rtype, context),
+        backend.holds_other_data(rtype, context),
+    )?;
     let plan = per_record_plan(backend, rtype, &read.records, wanted)?;
     let ttl = match wanted.ttl() {
         Some(ttl) => SetTtl::Requested(ttl),
         None if published.is_some() => SetTtl::Existing(current_ttl),
         None => SetTtl::Default,
     };
-    let record_ttl = match ttl {
-        SetTtl::Requested(ttl) => Some(ttl),
-        SetTtl::Existing(ttl) => ttl,
-        SetTtl::Default => None,
-    };
-    let outcome = if published.is_some() {
+    let steps = plan.steps(rtype, wanted.ttl(), ttl, backend.updates_in_place());
+    backend.check_plan(zone, name, rtype, context, &steps)?;
+    send_steps(backend, zone, name, rtype, context, &steps).await?;
+    Ok(if published.is_some() {
         SetOutcome::Replaced
     } else {
         SetOutcome::Created
-    };
+    })
+}
 
-    // A singleton whose one record changes value.
-    if singleton(rtype)
-        && let ([old], [new], []) = (
-            plan.delete.as_slice(),
-            plan.create.as_slice(),
-            plan.enable.as_slice(),
-        )
-    {
-        if backend.updates_in_place() {
-            let update = RecordUpdate {
+impl<'a, H> Plan<'a, H> {
+    /// The requests of the plan in the order they are sent (module documentation). `requested`
+    /// is the caller's TTL, `ttl` what a new record gets.
+    fn steps(
+        self,
+        rtype: RecordType,
+        requested: Option<Ttl>,
+        ttl: SetTtl,
+        in_place: bool,
+    ) -> Vec<Step<'a, H>> {
+        // A record that is enabled gets the TTL a new record would get, so that it matches the
+        // rest of the set.
+        let enable_ttl = match ttl {
+            SetTtl::Requested(ttl) => Some(ttl),
+            SetTtl::Existing(ttl) => ttl,
+            SetTtl::Default => None,
+        };
+        let enable = |record| Step::Update {
+            record,
+            update: RecordUpdate {
+                enable: true,
+                ttl: enable_ttl,
+                data: None,
+            },
+        };
+        let retune = |record| Step::Update {
+            record,
+            update: RecordUpdate {
                 enable: false,
-                ttl: wanted.ttl(),
-                data: Some(new),
-            };
-            backend
-                .update(zone, name, rtype, context, old, &update)
-                .await?;
-        } else {
-            backend.delete(zone, name, rtype, context, old).await?;
-            backend.create(zone, name, rtype, context, new, ttl).await?;
+                ttl: requested,
+                data: None,
+            },
+        };
+        let create = |data| Step::Create { data, ttl };
+        let Plan {
+            enable: enabled,
+            retune: retuned,
+            create: created,
+            delete: mut deleted,
+        } = self;
+        let mut steps =
+            Vec::with_capacity(enabled.len() + retuned.len() + created.len() + deleted.len());
+        if !singleton(rtype) {
+            // Deletes last: the name never loses all its values.
+            steps.extend(enabled.into_iter().map(enable));
+            steps.extend(retuned.into_iter().map(retune));
+            steps.extend(created.into_iter().map(create));
+            steps.extend(deleted.into_iter().map(Step::Delete));
+            return steps;
         }
-        return Ok(outcome);
+        // A singleton: never two published records, so the surplus goes first; the last of it
+        // is changed in place to the one new value where the API can.
+        let in_place_target = match (in_place, enabled.is_empty(), created.as_slice()) {
+            (true, true, [new]) => deleted.pop().map(|old| (old, *new)),
+            _ => None,
+        };
+        steps.extend(deleted.into_iter().map(Step::Delete));
+        if let Some((old, new)) = in_place_target {
+            steps.push(Step::Update {
+                record: old,
+                update: RecordUpdate {
+                    enable: false,
+                    ttl: requested,
+                    data: Some(new),
+                },
+            });
+            steps.extend(retuned.into_iter().map(retune));
+            return steps;
+        }
+        steps.extend(enabled.into_iter().map(enable));
+        steps.extend(retuned.into_iter().map(retune));
+        steps.extend(created.into_iter().map(create));
+        steps
     }
+}
 
-    for record in &plan.enable {
-        let update = RecordUpdate {
-            enable: true,
-            ttl: record_ttl,
-            data: None,
-        };
-        backend
-            .update(zone, name, rtype, context, record, &update)
-            .await?;
+/// Sends `steps` in order; the first error ends the sequence.
+async fn send_steps<B: PerRecord>(
+    backend: &B,
+    zone: &DomainName,
+    name: &DomainName,
+    rtype: RecordType,
+    context: &B::Context,
+    steps: &[Step<'_, B::Handle>],
+) -> Result<(), Error> {
+    for step in steps {
+        match step {
+            Step::Update { record, update } => {
+                backend
+                    .update(zone, name, rtype, context, record, update)
+                    .await?;
+            }
+            Step::Create { data, ttl } => {
+                backend
+                    .create(zone, name, rtype, context, data, *ttl)
+                    .await?;
+            }
+            Step::Delete(record) => backend.delete(zone, name, rtype, context, record).await?,
+        }
     }
-    for record in &plan.retune {
-        let update = RecordUpdate {
-            enable: false,
-            ttl: wanted.ttl(),
-            data: None,
-        };
-        backend
-            .update(zone, name, rtype, context, record, &update)
-            .await?;
-    }
-    for data in &plan.create {
-        backend
-            .create(zone, name, rtype, context, data, ttl)
-            .await?;
-    }
-    // Deletes last: the name never loses all its values (module documentation).
-    for record in &plan.delete {
-        backend.delete(zone, name, rtype, context, record).await?;
-    }
-    Ok(outcome)
+    Ok(())
 }
 
 /// `delete_rrset` for a [`PerRecord`] provider: every enabled record by identifier. Disabled
@@ -916,11 +1201,14 @@ pub(crate) async fn delete_per_record<B: PerRecord>(
     if published.is_none() {
         return Ok(DeleteOutcome::NotPresent);
     }
-    for record in read.records.iter().filter(|record| record.enabled) {
-        backend
-            .delete(zone, name, rtype, &read.context, record)
-            .await?;
-    }
+    let steps: Vec<Step<'_, B::Handle>> = read
+        .records
+        .iter()
+        .filter(|record| record.enabled)
+        .map(Step::Delete)
+        .collect();
+    backend.check_plan(zone, name, rtype, &read.context, &steps)?;
+    send_steps(backend, zone, name, rtype, &read.context, &steps).await?;
     Ok(DeleteOutcome::Deleted)
 }
 
@@ -946,9 +1234,18 @@ impl<'z> Listing<'z> {
         }
     }
 
+    /// The TTL of an rrset whose records state their own (design section 3.6,
+    /// `TtlSupport::PerRecord`): the smallest of `ttls`, one per enabled record, ignoring
+    /// records that state none. `None` when no record states one. For the `ttl` of
+    /// [`Listing::push`] where the API stores a TTL per record.
+    pub(crate) fn smallest_ttl(ttls: impl IntoIterator<Item = Option<Ttl>>) -> Option<Ttl> {
+        ttls.into_iter().flatten().min()
+    }
+
     /// One rrset as the provider reported it. `name` is the owner name, `None` when the
     /// provider's spelling is not a valid `DomainName`; `records` are its enabled records only
-    /// (an rrset whose records are all disabled is not part of the listing).
+    /// (an rrset whose records are all disabled is not part of the listing); `ttl` is the
+    /// rrset's TTL ([`Listing::smallest_ttl`] where the records state their own).
     ///
     /// A name that is not a valid `DomainName`, or not within the zone, is skipped as
     /// `UnsupportedName` under the zone's name, since `SkippedRrset::name` must be a valid name.
@@ -1032,7 +1329,7 @@ mod tests {
 
     use super::{
         Current, Found, Listing, Member, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl,
-        Stored, WholeRead, WholeSet,
+        Step, Stored, WholeChange, WholeRead, WholeSet,
     };
     use crate::error::{Error, ErrorKind};
     use crate::id::ProviderId;
@@ -1128,6 +1425,15 @@ mod tests {
         fail_write: Option<usize>,
         writes: usize,
         write_delay: Duration,
+        /// Reads so far, and a value another writer adds right after the read with this number.
+        reads: usize,
+        foreign_after_read: Option<(usize, String)>,
+        /// The whole-set fake reads again before every write.
+        reread: bool,
+        /// The fakes answer the coexistence hooks from the store; otherwise they do not tell.
+        coexistence: bool,
+        /// The plan hooks refuse any plan that creates a value.
+        refuse_creates: bool,
     }
 
     impl Store {
@@ -1174,6 +1480,34 @@ mod tests {
             if self.sets.get(&(name(), rtype)).is_some_and(Vec::is_empty) {
                 self.sets.remove(&(name(), rtype));
             }
+        }
+
+        /// Counts a read and lets another writer act right after it.
+        fn after_read(&mut self, rtype: RecordType) {
+            self.reads += 1;
+            if let Some((at, text)) = self.foreign_after_read.clone()
+                && at == self.reads
+            {
+                self.insert(rtype, &text, true, 600);
+            }
+        }
+
+        /// The coexistence hooks: whether the name holds published data of another type
+        /// than `rtype` that is (`cname`) or is not a CNAME.
+        fn holds(&self, rtype: RecordType, cname: bool) -> Option<bool> {
+            self.coexistence.then(|| {
+                self.sets.iter().any(|((owner, t), recs)| {
+                    *owner == name()
+                        && *t != rtype
+                        && (*t == RecordType::CNAME) == cname
+                        && recs.iter().any(|r| r.enabled)
+                })
+            })
+        }
+
+        fn refusal(&mut self) -> Error {
+            self.log.push("plan-refused".into());
+            Error::rejected(None, "the plan creates a value")
         }
 
         fn writes_logged(&self) -> Vec<&str> {
@@ -1277,6 +1611,7 @@ mod tests {
             let mut store = self.0.store.lock().unwrap();
             store.log.push("read".into());
             let recs = store.sets.get(&(name.clone(), rtype)).cloned();
+            store.after_read(rtype);
             Ok(Current {
                 context: (),
                 found: recs.map(|recs| Found {
@@ -1285,6 +1620,43 @@ mod tests {
                     snapshot: recs,
                 }),
             })
+        }
+
+        fn check_write(
+            &self,
+            _zone: &DomainName,
+            _name: &DomainName,
+            _rtype: RecordType,
+            _context: &(),
+            change: &WholeChange<'_, Rec, Vec<Rec>>,
+        ) -> Result<(), Error> {
+            let mut store = self.0.store.lock().unwrap();
+            let creates = match change {
+                WholeChange::Write { members, .. } => {
+                    members.iter().any(|m| matches!(m, Member::Added(_)))
+                }
+                WholeChange::Delete { .. } => false,
+            };
+            if store.refuse_creates && creates {
+                return Err(store.refusal());
+            }
+            Ok(())
+        }
+
+        fn reread_before_write(&self) -> bool {
+            self.0.store.lock().unwrap().reread
+        }
+
+        fn same_snapshot(&self, first: &Vec<Rec>, again: &Vec<Rec>) -> bool {
+            first == again
+        }
+
+        fn holds_cname(&self, rtype: RecordType, _context: &()) -> Option<bool> {
+            self.0.store.lock().unwrap().holds(rtype, true)
+        }
+
+        fn holds_other_data(&self, rtype: RecordType, _context: &()) -> Option<bool> {
+            self.0.store.lock().unwrap().holds(rtype, false)
         }
 
         async fn write(
@@ -1372,6 +1744,7 @@ mod tests {
             let mut store = self.0.store.lock().unwrap();
             store.log.push("read".into());
             let records = store.recs(rtype).iter().map(|r| stored(rtype, r)).collect();
+            store.after_read(rtype);
             Ok(RecordsRead {
                 context: (),
                 records,
@@ -1445,6 +1818,30 @@ mod tests {
 
         fn updates_in_place(&self) -> bool {
             self.1
+        }
+
+        fn check_plan(
+            &self,
+            _zone: &DomainName,
+            _name: &DomainName,
+            _rtype: RecordType,
+            _context: &(),
+            steps: &[Step<'_, Rec>],
+        ) -> Result<(), Error> {
+            let mut store = self.0.store.lock().unwrap();
+            let creates = steps.iter().any(|s| matches!(s, Step::Create { .. }));
+            if store.refuse_creates && creates {
+                return Err(store.refusal());
+            }
+            Ok(())
+        }
+
+        fn holds_cname(&self, rtype: RecordType, _context: &()) -> Option<bool> {
+            self.0.store.lock().unwrap().holds(rtype, true)
+        }
+
+        fn holds_other_data(&self, rtype: RecordType, _context: &()) -> Option<bool> {
+            self.0.store.lock().unwrap().holds(rtype, false)
         }
     }
 
@@ -2298,7 +2695,17 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(store(&fake.0).texts(RecordType::A).len(), 2);
+        assert_eq!(
+            store(&fake.0).writes_logged(),
+            ["create 192.0.2.3", "write-failed"]
+        );
+        assert_eq!(
+            store(&fake.0).texts(RecordType::A),
+            [
+                ("192.0.2.1".to_owned(), true, 600),
+                ("192.0.2.3".to_owned(), true, 600)
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2415,6 +2822,356 @@ mod tests {
                 "{label}: the second read did not wait for the first write: {log:?}"
             );
         }
+    }
+
+    /// A singleton never has two published records, not even for one request: duplicates of
+    /// the old value, and a disabled record that holds the new one, are dealt with by deleting
+    /// the surplus first.
+    #[tokio::test]
+    async fn per_record_singletons_are_never_duplicated() {
+        let cname = |target: &str| set(RecordType::CNAME, None, &[target]);
+        let b = || ("b.example.net.".to_owned(), true, 600);
+
+        // Two records with the old value, in place: one is deleted, the other changed.
+        let fake = per_record(true);
+        store(&fake.0).insert(RecordType::CNAME, "a.example.net.", true, 600);
+        store(&fake.0).insert(RecordType::CNAME, "a.example.net.", true, 600);
+        super::set_per_record(&fake, &zone(), &cname("b.example.net."), Expect::Any)
+            .await
+            .unwrap();
+        assert_eq!(
+            store(&fake.0).writes_logged(),
+            ["delete a.example.net.", "update a.example.net."]
+        );
+        assert_eq!(store(&fake.0).texts(RecordType::CNAME), [b()]);
+
+        // The same without in-place updates: both deleted, then the create.
+        let fake = per_record(false);
+        store(&fake.0).insert(RecordType::CNAME, "a.example.net.", true, 600);
+        store(&fake.0).insert(RecordType::CNAME, "a.example.net.", true, 600);
+        super::set_per_record(&fake, &zone(), &cname("b.example.net."), Expect::Any)
+            .await
+            .unwrap();
+        assert_eq!(
+            store(&fake.0).writes_logged(),
+            [
+                "delete a.example.net.",
+                "delete a.example.net.",
+                "create b.example.net."
+            ]
+        );
+        assert_eq!(store(&fake.0).texts(RecordType::CNAME), [b()]);
+
+        // The new value is held by a disabled record: the old record goes before it is enabled.
+        let fake = per_record(true);
+        store(&fake.0).insert(RecordType::CNAME, "a.example.net.", true, 600);
+        store(&fake.0).insert(RecordType::CNAME, "b.example.net.", false, 600);
+        super::set_per_record(&fake, &zone(), &cname("b.example.net."), Expect::Any)
+            .await
+            .unwrap();
+        assert_eq!(
+            store(&fake.0).writes_logged(),
+            ["delete a.example.net.", "update b.example.net."]
+        );
+        assert_eq!(store(&fake.0).texts(RecordType::CNAME), [b()]);
+    }
+
+    /// An in-place change of a singleton carries a requested TTL.
+    #[tokio::test]
+    async fn per_record_in_place_update_carries_the_requested_ttl() {
+        let fake = per_record(true);
+        store(&fake.0).insert(RecordType::CNAME, "a.example.net.", true, 600);
+        let wanted = set(RecordType::CNAME, Some(900), &["b.example.net."]);
+        super::set_per_record(&fake, &zone(), &wanted, Expect::Any)
+            .await
+            .unwrap();
+        assert_eq!(store(&fake.0).writes_logged(), ["update a.example.net."]);
+        assert_eq!(
+            store(&fake.0).texts(RecordType::CNAME),
+            [("b.example.net.".to_owned(), true, 900)]
+        );
+    }
+
+    /// Where the client can tell what else is at the name, a CNAME next to other data is
+    /// refused after the read and before any write, in both directions; where it cannot, the
+    /// write is sent and the provider's answer decides.
+    #[tokio::test]
+    async fn cname_next_to_other_data_is_refused_where_the_client_can_tell() {
+        let cname = set(RecordType::CNAME, None, &["a.example.net."]);
+        for shape in Shape::all() {
+            let label = shape.label();
+            store(shape.base()).coexistence = true;
+            shape.insert(RecordType::A, "192.0.2.1", true, 600);
+            let e = shape.set(&cname, Expect::Any).await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidInput, "{label}: {e:?}");
+            assert!(shape.writes().is_empty(), "{label}: {:?}", shape.writes());
+            // A disabled record is not published data.
+            store(shape.base()).sets.clear();
+            shape.insert(RecordType::A, "192.0.2.1", false, 600);
+            assert_eq!(
+                shape.set(&cname, Expect::Any).await.unwrap(),
+                SetOutcome::Created,
+                "{label}"
+            );
+            // The other direction: a name with a CNAME takes no other type.
+            let before = shape.writes().len();
+            let e = shape
+                .set(&set(RecordType::TXT, None, &["\"v\""]), Expect::Any)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidInput, "{label}: {e:?}");
+            assert_eq!(shape.writes().len(), before, "{label}");
+            // Replacing the CNAME itself is not affected.
+            assert_eq!(
+                shape
+                    .set(
+                        &set(RecordType::CNAME, None, &["b.example.net."]),
+                        Expect::Any
+                    )
+                    .await
+                    .unwrap(),
+                SetOutcome::Replaced,
+                "{label}"
+            );
+        }
+        // The client does not tell: the write is sent.
+        for shape in Shape::all() {
+            shape.insert(RecordType::A, "192.0.2.1", true, 600);
+            assert_eq!(
+                shape.set(&cname, Expect::Any).await.unwrap(),
+                SetOutcome::Created,
+                "{}",
+                shape.label()
+            );
+        }
+    }
+
+    /// The whole plan reaches the client before the first write: a refusal leaves everything
+    /// as it was, including TTL changes that would have come before the refused create.
+    #[tokio::test]
+    async fn per_record_plan_is_checked_before_any_write() {
+        let fake = per_record(true);
+        store(&fake.0).insert(RecordType::A, "192.0.2.1", true, 600);
+        store(&fake.0).refuse_creates = true;
+        let e = super::set_per_record(
+            &fake,
+            &zone(),
+            &a(Some(300), &["192.0.2.1", "192.0.2.2"]),
+            Expect::Any,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected);
+        assert_eq!(store(&fake.0).writes_logged(), ["plan-refused"]);
+        assert_eq!(
+            store(&fake.0).texts(RecordType::A),
+            [("192.0.2.1".to_owned(), true, 600)]
+        );
+        // A plan without creates passes.
+        super::set_per_record(&fake, &zone(), &a(Some(300), &["192.0.2.1"]), Expect::Any)
+            .await
+            .unwrap();
+        assert_eq!(
+            store(&fake.0).texts(RecordType::A),
+            [("192.0.2.1".to_owned(), true, 300)]
+        );
+
+        // The whole-set counterpart is asked before the second read.
+        let fake = rtw();
+        store(&fake.0).reread = true;
+        store(&fake.0).refuse_creates = true;
+        store(&fake.0).insert(RecordType::A, "192.0.2.1", true, 600);
+        let e = super::set_whole_set(
+            &fake,
+            &zone(),
+            &a(None, &["192.0.2.1", "192.0.2.2"]),
+            Expect::Any,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected);
+        assert_eq!(store(&fake.0).log, ["read", "plan-refused"]);
+    }
+
+    /// The order of the requests: enables, TTL changes, creates, deletes; records in the order
+    /// of the read, new values in the order of the requested set (sorted).
+    #[tokio::test]
+    async fn per_record_requests_have_a_fixed_order() {
+        let mut fake = per_record(true);
+        fake.0.max = None;
+        store(&fake.0).insert(RecordType::A, "192.0.2.1", true, 600);
+        store(&fake.0).insert(RecordType::A, "192.0.2.2", true, 300);
+        store(&fake.0).insert(RecordType::A, "192.0.2.3", false, 600);
+        store(&fake.0).insert(RecordType::A, "192.0.2.4", true, 600);
+        let wanted = a(
+            Some(900),
+            &[
+                "192.0.2.6",
+                "192.0.2.2",
+                "192.0.2.5",
+                "192.0.2.1",
+                "192.0.2.3",
+            ],
+        );
+        super::set_per_record(&fake, &zone(), &wanted, Expect::Any)
+            .await
+            .unwrap();
+        assert_eq!(
+            store(&fake.0).writes_logged(),
+            [
+                "update 192.0.2.3",
+                "update 192.0.2.1",
+                "update 192.0.2.2",
+                "create 192.0.2.5",
+                "create 192.0.2.6",
+                "delete 192.0.2.4"
+            ]
+        );
+        assert!(
+            store(&fake.0)
+                .texts(RecordType::A)
+                .iter()
+                .all(|(_, enabled, ttl)| *enabled && *ttl == 900)
+        );
+    }
+
+    /// A whole-set read whose records state their own TTLs: a requested TTL equal to the
+    /// rrset's (the smallest) is not "unchanged" while another record differs.
+    #[tokio::test]
+    async fn whole_set_with_per_record_ttls_writes_a_differing_ttl() {
+        for fake in [rtw(), atomic()] {
+            store(&fake.0).insert(RecordType::A, "192.0.2.1", true, 300);
+            store(&fake.0).insert(RecordType::A, "192.0.2.2", true, 600);
+            let wanted = a(Some(300), &["192.0.2.1", "192.0.2.2"]);
+            assert_eq!(
+                super::set_whole_set(&fake, &zone(), &wanted, Expect::Any)
+                    .await
+                    .unwrap(),
+                SetOutcome::Replaced
+            );
+            assert_eq!(
+                store(&fake.0).texts(RecordType::A),
+                [
+                    ("192.0.2.1".to_owned(), true, 300),
+                    ("192.0.2.2".to_owned(), true, 300)
+                ]
+            );
+            assert_eq!(
+                super::set_whole_set(&fake, &zone(), &wanted, Expect::Any)
+                    .await
+                    .unwrap(),
+                SetOutcome::Unchanged
+            );
+        }
+    }
+
+    /// `Expect::Matches` with a TTL against records that disagree on their TTLs compares with
+    /// the smallest, the TTL the rrset reads with.
+    #[tokio::test]
+    async fn per_record_expectation_with_a_ttl_uses_the_smallest() {
+        let fake = per_record(true);
+        store(&fake.0).insert(RecordType::A, "192.0.2.1", true, 600);
+        store(&fake.0).insert(RecordType::A, "192.0.2.2", true, 300);
+        let both = ["192.0.2.1", "192.0.2.2"];
+        let wanted = a(None, &["192.0.2.1"]);
+        let e = super::set_per_record(
+            &fake,
+            &zone(),
+            &wanted,
+            Expect::Matches(&a(Some(600), &both)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PreconditionFailed);
+        let e = super::delete_per_record(
+            &fake,
+            &zone(),
+            &name(),
+            RecordType::A,
+            Expect::Matches(&a(Some(600), &both)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PreconditionFailed);
+        assert!(store(&fake.0).writes_logged().is_empty());
+        assert_eq!(
+            super::set_per_record(
+                &fake,
+                &zone(),
+                &wanted,
+                Expect::Matches(&a(Some(300), &both))
+            )
+            .await
+            .unwrap(),
+            SetOutcome::Replaced
+        );
+        assert_eq!(store(&fake.0).writes_logged(), ["delete 192.0.2.2"]);
+    }
+
+    /// With `reread_before_write`, a change between the read and the second read is
+    /// `Conflict` for a create, an update and a delete, nothing is written, and the
+    /// read-then-write layer does not repeat it; the caller's repeat succeeds.
+    #[tokio::test]
+    async fn reread_before_write_turns_a_change_into_conflict() {
+        let reread = |existing: &[&str]| {
+            let fake = rtw();
+            store(&fake.0).reread = true;
+            for text in existing {
+                store(&fake.0).insert(RecordType::A, text, true, 600);
+            }
+            store(&fake.0).foreign_after_read = Some((1, "192.0.2.66".into()));
+            fake
+        };
+        let wanted = a(None, &["192.0.2.2"]);
+        for existing in [&[][..], &["192.0.2.1"][..]] {
+            let fake = reread(existing);
+            let e = super::set_whole_set(&fake, &zone(), &wanted, Expect::Any)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Conflict, "{existing:?}: {e:?}");
+            assert!(e.is_retryable());
+            assert_eq!(store(&fake.0).log, ["read", "read"], "{existing:?}");
+            store(&fake.0).log.clear();
+            assert_ne!(
+                super::set_whole_set(&fake, &zone(), &wanted, Expect::Any)
+                    .await
+                    .unwrap(),
+                SetOutcome::Unchanged
+            );
+            assert_eq!(
+                store(&fake.0).log,
+                ["read", "read", "write"],
+                "{existing:?}"
+            );
+            assert_eq!(
+                store(&fake.0).texts(RecordType::A),
+                [("192.0.2.2".to_owned(), true, 600)]
+            );
+        }
+        let fake = reread(&["192.0.2.1"]);
+        let e = super::delete_whole_set(&fake, &zone(), &name(), RecordType::A, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+        assert_eq!(store(&fake.0).texts(RecordType::A).len(), 2);
+        assert_eq!(
+            super::delete_whole_set(&fake, &zone(), &name(), RecordType::A, Expect::Any)
+                .await
+                .unwrap(),
+            DeleteOutcome::Deleted
+        );
+        assert!(store(&fake.0).texts(RecordType::A).is_empty());
+    }
+
+    #[test]
+    fn smallest_ttl_ignores_records_without_one() {
+        let ttl = |s| Some(Ttl::from_secs(s).unwrap());
+        assert_eq!(
+            Listing::smallest_ttl([None, ttl(600), None, ttl(300)]),
+            ttl(300)
+        );
+        assert_eq!(Listing::smallest_ttl([None, None]), None);
+        assert_eq!(Listing::smallest_ttl([]), None);
     }
 
     // ---- Listings ----------------------------------------------------------------------------

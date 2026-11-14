@@ -631,10 +631,7 @@ impl VkCloud {
                     records: Vec::new(),
                 });
                 // The smallest TTL of the set (design section 3.6, `TtlSupport::PerRecord`).
-                group.ttl = match (group.ttl, read_ttl(record.ttl.as_ref())) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
+                group.ttl = Listing::smallest_ttl([group.ttl, read_ttl(record.ttl.as_ref())]);
                 group.records.push(read_record(*kind, record));
             }
             let type_name = kind.rtype().to_string();

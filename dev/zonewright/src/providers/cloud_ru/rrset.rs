@@ -1,7 +1,7 @@
 //! The record primitives both layers build on: read the record of one name and type under the
-//! zone cache, create it, replace its values, delete it, and read it again before a write.
-//! `txt.rs` (the TXT value layer) and `records.rs` (the record layer) call these with the API's
-//! type name; the rules for each answer live here once.
+//! zone cache, create it, replace its values and delete it. `txt.rs` (the TXT value layer) and
+//! `records.rs` (the record layer) call these with the API's type name; the rules for each
+//! answer live here once.
 //!
 //! - read: `GET /v1/publicRecordsSole?publicZoneId=` (the whole zone, every page), under the
 //!   zone-ID cache; the record whose type and owner name are exactly the requested ones. More
@@ -19,7 +19,8 @@
 //!   success only when a new read finds no record; the zone may have been recreated with the
 //!   record in it, and then its values are still published (`Error::Conflict`).
 //! - re-read: the record read again immediately before a write; a change since the first read
-//!   is `Error::Conflict` and nothing is written (design section 3.5).
+//!   is `Error::Conflict` and nothing is written (design section 3.5). Both layers do it through
+//!   their `reread_before_write` hook, with the comparison `api::Record` defines.
 //!
 //! A record marked read-only is `Error::Rejected` for any write (design section 11.3). Every write
 //! waits for its operation (design section 3.7). An update or a delete answered "not found" drops
@@ -142,25 +143,6 @@ impl CloudRu {
             });
         }
         Ok(Attempt::Done(found.pop()))
-    }
-
-    /// Reads the record again and fails with `Error::Conflict` unless it is as it was (`prior`;
-    /// `None`: there was none). Called immediately before a write (design section 3.5).
-    pub(super) async fn reread_unchanged(
-        &self,
-        zone: &DomainName,
-        name: &DomainName,
-        rtype: &str,
-        prior: Option<&Record>,
-    ) -> Result<(), Error> {
-        let (_, again) = self.read_record(zone, name, rtype).await?;
-        if again.as_ref() == prior {
-            Ok(())
-        } else {
-            Err(Error::Conflict {
-                detail: Detail::constant("the record changed between the read and the write"),
-            })
-        }
     }
 
     /// Creates the record in the zone the read used.

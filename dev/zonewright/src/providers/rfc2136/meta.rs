@@ -105,9 +105,13 @@ const CAPABILITIES: Capabilities = Capabilities {
     // One UPDATE can delete the RRset and add its new RRs, applied as one transaction (RFC 2136
     // sections 2.5.2, 3.3.2 and 3.4.2.1; design section 11.1).
     atomic_rrset_write: true,
+    // What the protocol carries for a TTL a caller requests: 0 to 2^31 - 1 (RFC 2181 section
+    // 8; RFC 1035 section 3.2.1). A delegation NS at 172800, the common parent-side TTL, is
+    // accepted. The narrower range of the `ttl` setting (config.rs) concerns the configured
+    // default only.
     ttl: TtlSupport::PerRrset {
-        min: 1,
-        max: 86_400,
+        min: 0,
+        max: 2_147_483_647,
     },
     provider_default_ttl: false,
     asynchronous: false,

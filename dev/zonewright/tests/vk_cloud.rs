@@ -163,23 +163,23 @@ enum Write {
 /// record of ours) and a delete (the listing holds our value).
 #[tokio::test]
 async fn vk_cloud_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     let secrets = [CANARY_PASSWORD, DEFAULT_ISSUED_TOKEN];
     for dialect in dialects() {
         for status in [400, 401] {
             let label = format!("{} {:?} {status} api", dialect.name, dialect.spelling);
-            let echo = dialect.echo(status).start().await;
-            let client = echo_client(&echo, &echo.token_url());
+            echo.reset(dialect.echo(status));
+            let client = echo_client(&echo, &echo.token_url(), &ctx);
             echo_round(&label, &client, Write::Add, &secrets).await;
             assert!(echo.api_requests() > 0, "{label}: the API was not reached");
             assert!(echo.token_requests() > 0, "{label}: no token was issued");
 
             let label = format!("{} {:?} {status} identity", dialect.name, dialect.spelling);
-            let echo = dialect
-                .echo(status)
-                .token_path("/no-token-endpoint")
-                .start()
-                .await;
-            let client = echo_client(&echo, &echo.url("/identity/v3"));
+            echo.reset(dialect.echo(status).token_path("/no-token-endpoint"));
+            let client = echo_client(&echo, &echo.url("/identity/v3"), &ctx);
             echo_round(&label, &client, Write::Add, &secrets).await;
             assert!(
                 echo.log().count(Some("POST"), TOKENS) > 0,
@@ -197,15 +197,11 @@ async fn vk_cloud_secret_echo() {
                     "{} {:?} {status} write {write:?}",
                     dialect.name, dialect.spelling
                 );
-                let echo = dialect
-                    .echo(status)
-                    .render_under(
-                        "/public-dns/v2/dns",
-                        listings_then(dialect.render.clone(), matches!(write, Write::Remove)),
-                    )
-                    .start()
-                    .await;
-                let client = echo_client(&echo, &echo.token_url());
+                echo.reset(dialect.echo(status).render_under(
+                    "/public-dns/v2/dns",
+                    listings_then(dialect.render.clone(), matches!(write, Write::Remove)),
+                ));
+                let client = echo_client(&echo, &echo.token_url(), &ctx);
                 echo_round(&label, &client, write, &secrets).await;
                 let (method, path) = match write {
                     Write::Add => ("POST", TXTS),
@@ -255,11 +251,11 @@ fn listings_then(errors: Render, with_ours: bool) -> Render {
     })
 }
 
-fn echo_client(echo: &EchoServer, identity_url: &str) -> VkCloud {
+fn echo_client(echo: &EchoServer, identity_url: &str, ctx: &Context) -> VkCloud {
     let mut config = VkCloudConfig::new(PROJECT.into(), USER.into());
     config.dns_url = echo.url("/public-dns/v2/dns");
     config.identity_url = identity_url.to_owned();
-    VkCloud::new(config, credentials(CANARY_PASSWORD), &context()).unwrap()
+    VkCloud::new(config, credentials(CANARY_PASSWORD), ctx).unwrap()
 }
 
 async fn echo_round(label: &str, client: &VkCloud, write: Write, secrets: &[&str]) {
@@ -3090,6 +3086,10 @@ fn record_listings_then(errors: Render, records_echo: bool) -> Render {
 /// the redaction.
 #[tokio::test]
 async fn vk_cloud_secret_echo_record_level() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     let secrets = [CANARY_PASSWORD, DEFAULT_ISSUED_TOKEN];
     for dialect in dialects() {
         for (kind, statuses) in [
@@ -3103,18 +3103,14 @@ async fn vk_cloud_secret_echo_record_level() {
         ] {
             for &status in statuses {
                 let label = format!("{} {:?} {status} {kind:?}", dialect.name, dialect.spelling);
-                let echo = dialect
-                    .echo(status)
-                    .render_under(
-                        "/public-dns/v2/dns",
-                        record_listings_then(
-                            dialect.render.clone(),
-                            matches!(kind, RecordRequest::List),
-                        ),
-                    )
-                    .start()
-                    .await;
-                let client = echo_client(&echo, &echo.token_url());
+                echo.reset(dialect.echo(status).render_under(
+                    "/public-dns/v2/dns",
+                    record_listings_then(
+                        dialect.render.clone(),
+                        matches!(kind, RecordRequest::List),
+                    ),
+                ));
+                let client = echo_client(&echo, &echo.token_url(), &ctx);
                 let result = match kind {
                     RecordRequest::Create => {
                         let set = rr(NAME, RecordType::A, None, &["192.0.2.1"]);

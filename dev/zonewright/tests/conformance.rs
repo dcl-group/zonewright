@@ -352,6 +352,79 @@ fn atomic_rrset_write_follows_the_native_unit() {
     }
 }
 
+/// `Capabilities::provider_default_ttl` per provider: true exactly where an rrset or a record
+/// can have no explicit TTL at the provider, so that it reads as `ttl() == None` (design
+/// sections 2.5 and 3.6). Written out, with the reason, so that a change is deliberate.
+const PROVIDER_DEFAULT_TTL: &[(ProviderId, bool)] = &[
+    // The server serves every value with a TTL of its own choosing.
+    (ProviderId::AcmeDns, true),
+    // Every record carries a TTL; no read, so nothing reads as `None`.
+    (ProviderId::Beget, false),
+    // A record's `ttl` is a number of seconds.
+    (ProviderId::CloudRu, false),
+    // `1` means automatic and reads as no TTL.
+    (ProviderId::Cloudflare, true),
+    // Every record carries a TTL in the documented answers.
+    (ProviderId::DigitalOcean, false),
+    // An rrset's `ttl` may be `null`: the zone's default TTL applies.
+    (ProviderId::Hetzner, true),
+    // A record created without `ttl` takes the zone's default, so a record can lack one; the
+    // flag still says false (open point for the maintainer, see the layer-batch report).
+    (ProviderId::Nicru, false),
+    // No TTL can be set, and the listing states none.
+    (ProviderId::Regru, true),
+    // Every RR carries a TTL on the wire.
+    (ProviderId::Rfc2136, false),
+    // A plain rrset carries a TTL.
+    (ProviderId::Route53, false),
+    (ProviderId::SelectelV2, false),
+    // A record may have no `ttl`; the setting left unset sends none.
+    (ProviderId::TimewebCloud, true),
+    (ProviderId::VkCloud, false),
+    (ProviderId::Yandex360, false),
+    (ProviderId::YandexCloud, false),
+];
+
+#[test]
+fn provider_default_ttl_is_consistent() {
+    assert_eq!(PROVIDER_DEFAULT_TTL.len(), ProviderId::ALL.len());
+    for &(id, expected) in PROVIDER_DEFAULT_TTL {
+        let meta = id.meta();
+        let caps = &meta.capabilities;
+        assert_eq!(caps.provider_default_ttl, expected, "{id}");
+        // A provider that chooses every TTL itself has nothing but its own TTL.
+        if caps.ttl == TtlSupport::NotSettable {
+            assert!(
+                caps.provider_default_ttl,
+                "{id}: NotSettable without a provider TTL"
+            );
+            continue;
+        }
+        // Where a TTL can be set, a write without one falls back on the `ttl` setting (design
+        // section 3.6): for a new rrset always, and for an existing one that reads with no TTL
+        // where the provider has no TTL of its own.
+        if caps.set_rrset || caps.add_txt_value {
+            let field = meta.field("ttl");
+            assert!(field.is_some(), "{id}: no ttl setting to fall back on");
+            if let Some(FieldKind::Integer { min, max }) = field.map(|f| f.kind) {
+                let (cap_min, cap_max) = match caps.ttl {
+                    TtlSupport::PerRrset { min, max } | TtlSupport::PerRecord { min, max } => {
+                        (min, max)
+                    }
+                    _ => panic!("{id}: unknown TTL support"),
+                };
+                // Below the range only where the setting can spell "let the provider choose"
+                // (Cloudflare's `1`).
+                assert!(
+                    (caps.provider_default_ttl || i64::from(cap_min) <= min)
+                        && max <= i64::from(cap_max),
+                    "{id}: the ttl setting allows a TTL the capabilities refuse"
+                );
+            }
+        }
+    }
+}
+
 // ---- Metadata fields and configuration types ---------------------------------------------------
 
 /// The provider's `…Config` type with `settings` deserialized into it and serialized again, as

@@ -199,13 +199,13 @@ fn canary_key() -> Value {
     })
 }
 
-fn echo_client(echo: &EchoServer, iam_url: &str) -> YandexCloud {
+fn echo_client(echo: &EchoServer, iam_url: &str, ctx: &Context) -> YandexCloud {
     let mut config = YandexCloudConfig::new("b1gtestfolder000001".into());
     config.dns_url = echo.url("/dns/v1");
     config.iam_url = iam_url.to_owned();
     config.operation_url = echo.url("/operations");
     config.operation_poll_ms = 250;
-    YandexCloud::new(config, credentials_from(canary_key()), &context()).unwrap()
+    YandexCloud::new(config, credentials_from(canary_key()), ctx).unwrap()
 }
 
 /// `check` and a write against an echo that quotes every request back, for every dialect: no
@@ -216,23 +216,23 @@ fn echo_client(echo: &EchoServer, iam_url: &str) -> YandexCloud {
 /// echo.
 #[tokio::test]
 async fn yandex_cloud_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     let secrets = [CANARY_KEY, CANARY_USER, DEFAULT_ISSUED_TOKEN];
     for dialect in dialects() {
         for status in [400, 401] {
             let label = format!("{} {:?} {status} api", dialect.name, dialect.spelling);
-            let echo = dialect.echo(status).start().await;
-            let client = echo_client(&echo, &echo.token_url());
+            echo.reset(dialect.echo(status));
+            let client = echo_client(&echo, &echo.token_url(), &ctx);
             echo_round(&label, &client, &secrets, false).await;
             assert!(echo.api_requests() > 0, "{label}: the API was not reached");
             assert!(echo.token_requests() > 0, "{label}: no token was issued");
 
             let label = format!("{} {:?} {status} iam", dialect.name, dialect.spelling);
-            let echo = dialect
-                .echo(status)
-                .token_path("/no-token-endpoint")
-                .start()
-                .await;
-            let client = echo_client(&echo, &echo.url(TOKENS));
+            echo.reset(dialect.echo(status).token_path("/no-token-endpoint"));
+            let client = echo_client(&echo, &echo.url(TOKENS), &ctx);
             echo_round(&label, &client, &secrets, false).await;
             let token_requests = echo.log().matching(Some("POST"), TOKENS);
             assert!(
@@ -254,15 +254,11 @@ async fn yandex_cloud_secret_echo() {
                         "{} {:?} {status} write existing={existing} poll={poll}",
                         dialect.name, dialect.spelling
                     );
-                    let echo = dialect
-                        .echo(status)
-                        .render_under(
-                            "/dns/v1/zones",
-                            reads_then(dialect.render.clone(), existing, poll),
-                        )
-                        .start()
-                        .await;
-                    let client = echo_client(&echo, &echo.token_url());
+                    echo.reset(dialect.echo(status).render_under(
+                        "/dns/v1/zones",
+                        reads_then(dialect.render.clone(), existing, poll),
+                    ));
+                    let client = echo_client(&echo, &echo.token_url(), &ctx);
                     echo_round(&label, &client, &secrets, status < 500).await;
                     assert_eq!(
                         echo.log().count(Some("POST"), UPDATE),
@@ -291,12 +287,12 @@ async fn yandex_cloud_secret_echo() {
     // decoded JWT back in its error message puts them in plain text: they are redacted too.
     for status in [400, 401] {
         let label = format!("{status} iam decoded jwt");
-        let echo = Echo::new(status)
-            .token_path("/no-token-endpoint")
-            .render_under(TOKENS, decoded_jwt(status))
-            .start()
-            .await;
-        let client = echo_client(&echo, &echo.url(TOKENS));
+        echo.reset(
+            Echo::new(status)
+                .token_path("/no-token-endpoint")
+                .render_under(TOKENS, decoded_jwt(status)),
+        );
+        let client = echo_client(&echo, &echo.url(TOKENS), &ctx);
         let mut texts = Vec::new();
         match client.check(&[zone()]).await {
             Ok(report) => panic!("{label}: check passed without a token: {report:?}"),

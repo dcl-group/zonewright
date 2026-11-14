@@ -560,10 +560,7 @@ impl TimewebCloud {
                     records: Vec::new(),
                 });
                 // The smallest TTL of the set (design section 3.6, `TtlSupport::PerRecord`).
-                group.ttl = match (group.ttl, ttl) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
+                group.ttl = Listing::smallest_ttl([group.ttl, ttl]);
                 group.records.push(data);
             }
         }

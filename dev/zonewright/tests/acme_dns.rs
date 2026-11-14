@@ -149,11 +149,21 @@ fn canary_pairs() -> [(String, String, &'static str); 2] {
     ]
 }
 
-fn echo_client(echo: &EchoServer, username: &str, password: &str) -> AcmeDns {
+/// A client of the echo under the path `/case-<case>`. The context's memory of recent sends is
+/// keyed by the server URL, so a URL of its own per case gives each case the empty memory a
+/// context of its own would (no send suppressed or paced by an earlier case), while every case
+/// shares the context's pooled connection to the one echo server.
+fn echo_client(
+    echo: &EchoServer,
+    case: usize,
+    username: &str,
+    password: &str,
+    ctx: &Context,
+) -> AcmeDns {
     AcmeDns::new(
-        config(echo.base_url()),
+        config(echo.url(&format!("/case-{case}"))),
         credentials(registrations_with(username, password)),
-        &context(),
+        ctx,
     )
     .unwrap()
 }
@@ -200,12 +210,18 @@ async fn echo_round(label: &str, client: &AcmeDns, canary: &str) {
 /// `acme_dns_writes_are_sent_once`).
 #[tokio::test]
 async fn acme_dns_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
+    let mut case = 0;
     for dialect in dialects() {
         for status in [400, 401, 403, 404, 500] {
             let label = format!("{} {:?} {status}", dialect.name, dialect.spelling);
             for (username, password, canary) in canary_pairs() {
-                let echo = dialect.echo(status).start().await;
-                let client = echo_client(&echo, &username, &password);
+                echo.reset(dialect.echo(status));
+                case += 1;
+                let client = echo_client(&echo, case, &username, &password, &ctx);
                 echo_round(&label, &client, canary).await;
                 assert!(echo.api_requests() > 0, "{label}: the API was not reached");
                 // The write itself reached the echo.

@@ -980,19 +980,20 @@ async fn rfc2136_ttl_policy() {
         ttls(&mock),
         [("v2".to_owned(), 120), ("v3".to_owned(), 120)]
     );
-    // A TTL outside the capability's range is refused before any request.
-    mock.control().clear_calls();
-    let err = client
-        .add_txt_value(
-            &zone(),
-            &name(),
-            &txt("v4"),
-            Some(Ttl::from_secs(0).unwrap()),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::InvalidInput);
-    assert!(mock.control().calls().is_empty());
+    // Every TTL the protocol carries (RFC 2181 section 8) is accepted for a new RRset, beyond
+    // the range of the `ttl` setting.
+    for (owner, secs) in [("z0.example.org", 0), ("zmax.example.org", 2_147_483_647)] {
+        client
+            .add_txt_value(
+                &zone(),
+                &dn(owner),
+                &txt("v4"),
+                Some(Ttl::from_secs(secs).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mock.control().records(&format!("{owner}."))[0].ttl, secs);
+    }
     // The configured TTL.
     let mut config = settings(&mock, KEY);
     config.ttl = 300;
@@ -2258,20 +2259,13 @@ async fn rfc2136_record_soa_and_apex_ns_are_not_writable() {
     assert_eq!(updates(&mock), 0);
 }
 
-/// The TTL range of the capabilities, refused before any request; the configured TTL for a new
-/// set.
+/// The TTL range of the capabilities is the protocol's, 0 to 2^31 - 1 (RFC 2181 section 8): the
+/// bounds and a delegation's 172800 are accepted; the configured TTL for a new set.
 #[tokio::test]
 async fn rfc2136_record_ttl_bounds() {
     let (mock, client) = setup().await;
-    for ttl in [0, 86_401] {
-        let wanted = rrset("t.example.org", RecordType::A, Some(ttl), &["192.0.2.1"]);
-        assert_eq!(
-            set(&client, &wanted, Expect::Any).await.unwrap_err().kind(),
-            ErrorKind::InvalidInput
-        );
-    }
-    assert!(mock.control().calls().is_empty());
-    for ttl in [1, 86_400] {
+    assert!(Ttl::from_secs(2_147_483_648).is_err());
+    for ttl in [0, 1, 86_400, 86_401, 172_800, 2_147_483_647] {
         let wanted = rrset("t.example.org", RecordType::A, Some(ttl), &["192.0.2.1"]);
         set(&client, &wanted, Expect::Any).await.unwrap();
         assert_eq!(

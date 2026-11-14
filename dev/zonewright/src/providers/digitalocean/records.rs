@@ -475,9 +475,10 @@ impl PerRecord for DigitalOcean {
         let encoded = encode(rtype, data).ok_or_else(not_sendable)?;
         let ttl = match ttl {
             SetTtl::Requested(ttl) | SetTtl::Existing(Some(ttl)) => Some(ttl.as_secs()),
-            SetTtl::Default => Some(self.ttl),
-            // The set's TTL was not reported: send none, so that the provider decides.
-            SetTtl::Existing(None) => None,
+            // The set's TTL was not reported: the configured TTL, as for a new set. In the
+            // model this provider has no "no explicit TTL" (`provider_default_ttl` is false), so
+            // `None` is mapped to the client's `ttl` setting (design section 3.6).
+            SetTtl::Default | SetTtl::Existing(None) => Some(self.ttl),
         };
         let type_name = rtype.to_string();
         let record = NewRecord {
@@ -587,10 +588,7 @@ impl DigitalOcean {
                 records: Vec::new(),
             });
             // The smallest TTL of the set (design section 3.6, `TtlSupport::PerRecord`).
-            group.ttl = match (group.ttl, ttl) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
+            group.ttl = Listing::smallest_ttl([group.ttl, ttl]);
             group.records.push(data);
         }
         let mut listing = Listing::new(zone);

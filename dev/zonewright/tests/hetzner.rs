@@ -267,9 +267,9 @@ fn answering(errors: Render, existing: Existing, mode: Echo) -> Render {
     })
 }
 
-fn echo_client(echo: &EchoServer) -> Hetzner {
+fn echo_client(echo: &EchoServer, ctx: &Context) -> Hetzner {
     let config = settings(echo.url("/v1"));
-    Hetzner::new(config, credentials(CANARY_TOKEN), &context()).unwrap()
+    Hetzner::new(config, credentials(CANARY_TOKEN), ctx).unwrap()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -315,27 +315,27 @@ async fn echo_round(label: &str, client: &Hetzner, write: Write) {
 /// seconds per dialect without coverage.
 #[tokio::test]
 async fn hetzner_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     for dialect in dialects() {
         // The probe is the echo.
         for status in [400, 401] {
             let label = format!("{} {:?} {status} probe", dialect.name, dialect.spelling);
-            let echo = dialect.echo(status).start().await;
-            let client = echo_client(&echo);
+            echo.reset(dialect.echo(status));
+            let client = echo_client(&echo, &ctx);
             echo_round(&label, &client, Write::Add).await;
             assert!(echo.api_requests() > 0, "{label}: the API was not reached");
         }
         // The probe is answered; the zone read is the echo.
         for status in [400, 401, 403] {
             let label = format!("{} {:?} {status} zone", dialect.name, dialect.spelling);
-            let echo = dialect
-                .echo(status)
-                .render_under(
-                    "/v1",
-                    answering(dialect.render.clone(), Existing::Nothing, Echo::Probe),
-                )
-                .start()
-                .await;
-            let client = echo_client(&echo);
+            echo.reset(dialect.echo(status).render_under(
+                "/v1",
+                answering(dialect.render.clone(), Existing::Nothing, Echo::Probe),
+            ));
+            let client = echo_client(&echo, &ctx);
             let e = client.check(&[zone()]).await.unwrap_err();
             let text = format!("{e} | {e:?} | {client:?}");
             assert_clean(&label, &text, &[CANARY_TOKEN]);
@@ -365,15 +365,11 @@ async fn hetzner_secret_echo() {
         ] {
             for &status in statuses {
                 let label = format!("{} {:?} {status} {write:?}", dialect.name, dialect.spelling);
-                let echo = dialect
-                    .echo(status)
-                    .render_under(
-                        "/v1",
-                        answering(dialect.render.clone(), existing, Echo::Writes),
-                    )
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(dialect.echo(status).render_under(
+                    "/v1",
+                    answering(dialect.render.clone(), existing, Echo::Writes),
+                ));
+                let client = echo_client(&echo, &ctx);
                 echo_round(&label, &client, write).await;
                 let path = match write {
                     Write::Add => ADD,
@@ -396,15 +392,11 @@ async fn hetzner_secret_echo() {
                     "{} {:?} {status} action {write:?}",
                     dialect.name, dialect.spelling
                 );
-                let echo = dialect
-                    .echo(status)
-                    .render_under(
-                        "/v1",
-                        answering(dialect.render.clone(), existing, Echo::Poll),
-                    )
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(dialect.echo(status).render_under(
+                    "/v1",
+                    answering(dialect.render.clone(), existing, Echo::Poll),
+                ));
+                let client = echo_client(&echo, &ctx);
                 echo_round(&label, &client, write).await;
                 assert!(
                     echo.log().count(Some("GET"), ACTION) >= 1,
@@ -412,14 +404,14 @@ async fn hetzner_secret_echo() {
                 );
             }
         }
-        record_echo_rounds(&dialect).await;
+        record_echo_rounds(&dialect, &echo, &ctx).await;
     }
 }
 
 /// The record-level requests, each the echo in turn: the rrset listing, the create, the record
 /// replacement, the TTL change and the delete; then the look at the action of a create and of
 /// a delete.
-async fn record_echo_rounds(dialect: &common::echo::Dialect) {
+async fn record_echo_rounds(dialect: &common::echo::Dialect, echo: &EchoServer, ctx: &Context) {
     for (existing, op, statuses) in [
         (
             Existing::Nothing,
@@ -449,15 +441,11 @@ async fn record_echo_rounds(dialect: &common::echo::Dialect) {
     ] {
         for &status in statuses {
             let label = format!("{} {:?} {status} {op:?}", dialect.name, dialect.spelling);
-            let echo = dialect
-                .echo(status)
-                .render_under(
-                    "/v1",
-                    answering(dialect.render.clone(), existing, Echo::Writes),
-                )
-                .start()
-                .await;
-            let client = echo_client(&echo);
+            echo.reset(dialect.echo(status).render_under(
+                "/v1",
+                answering(dialect.render.clone(), existing, Echo::Writes),
+            ));
+            let client = echo_client(echo, ctx);
             record_echo_round(&label, &client, op).await;
             let (method, path) = op.request();
             assert_eq!(
@@ -476,15 +464,11 @@ async fn record_echo_rounds(dialect: &common::echo::Dialect) {
                 "{} {:?} {status} action {op:?}",
                 dialect.name, dialect.spelling
             );
-            let echo = dialect
-                .echo(status)
-                .render_under(
-                    "/v1",
-                    answering(dialect.render.clone(), existing, Echo::Poll),
-                )
-                .start()
-                .await;
-            let client = echo_client(&echo);
+            echo.reset(dialect.echo(status).render_under(
+                "/v1",
+                answering(dialect.render.clone(), existing, Echo::Poll),
+            ));
+            let client = echo_client(echo, ctx);
             record_echo_round(&label, &client, op).await;
             assert!(
                 echo.log().count(Some("GET"), ACTION) >= 1,

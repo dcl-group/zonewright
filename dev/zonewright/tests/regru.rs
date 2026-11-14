@@ -291,12 +291,13 @@ fn reads_then(errors: Render, existing: Existing) -> Render {
 }
 
 /// The canary credentials: the user name is a setting here but is sent in the same form, and the
-/// password has a newline and non-ASCII letters.
-fn echo_client(echo: &EchoServer) -> Regru {
+/// password has a newline and non-ASCII letters. Built on the test's shared context, so that it
+/// reuses the pooled connection to the echo.
+fn echo_client(echo: &EchoServer, ctx: &Context) -> Regru {
     let mut config = RegruConfig::new(CANARY_KEY.to_owned());
     config.base_url = echo.url("/api/regru2");
     config.min_request_interval_ms = 0;
-    Regru::new(config, credentials(CANARY_PASSWORD), &context()).unwrap()
+    Regru::new(config, credentials(CANARY_PASSWORD), ctx).unwrap()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -356,13 +357,17 @@ fn styles(name: &str) -> Vec<Style> {
 /// `200` with the error in the JSON body.
 #[tokio::test]
 async fn regru_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     for dialect in dialects() {
         // Everything is the echo: the credentials call is the first request. A 5xx is left out
         // here, as reads are retried with real back-off sleeps; the write rounds cover it.
         for status in [400, 401] {
             let label = format!("{} {:?} {status} nop", dialect.name, dialect.spelling);
-            let echo = dialect.echo(status).start().await;
-            let client = echo_client(&echo);
+            echo.reset(dialect.echo(status));
+            let client = echo_client(&echo, &ctx);
             echo_round(&label, &client, Write::Add).await;
             assert!(echo.log().count(Some("POST"), NOP) > 0, "{label}");
             assert!(echo.log().count(Some("POST"), READ) > 0, "{label}");
@@ -370,16 +375,16 @@ async fn regru_secret_echo() {
         // The credentials call is answered; the zone call is the echo.
         for status in [400, 401, 403] {
             let label = format!("{} {:?} {status} zone/nop", dialect.name, dialect.spelling);
-            let echo = dialect
-                .echo(status)
-                .render_under("/api/regru2/zone", dialect.render.clone())
-                .render_under(
-                    "/api/regru2/nop",
-                    reads_then(dialect.render.clone(), Existing::Nothing),
-                )
-                .start()
-                .await;
-            let client = echo_client(&echo);
+            echo.reset(
+                dialect
+                    .echo(status)
+                    .render_under("/api/regru2/zone", dialect.render.clone())
+                    .render_under(
+                        "/api/regru2/nop",
+                        reads_then(dialect.render.clone(), Existing::Nothing),
+                    ),
+            );
+            let client = echo_client(&echo, &ctx);
             // A refusal of the zone call is an error or, as the provider's reason for a zone it
             // will not manage, the detail of the zone's entry; either way it is clean.
             let text = match client.check(&[zone()]).await {
@@ -417,12 +422,12 @@ async fn regru_secret_echo() {
         ] {
             for &status in statuses {
                 let label = format!("{} {:?} {status} {write:?}", dialect.name, dialect.spelling);
-                let echo = dialect
-                    .echo(status)
-                    .render(reads_then(dialect.render.clone(), existing))
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(
+                    dialect
+                        .echo(status)
+                        .render(reads_then(dialect.render.clone(), existing)),
+                );
+                let client = echo_client(&echo, &ctx);
                 echo_round(&label, &client, write).await;
                 let path = match write {
                     Write::Add => ADD,
@@ -446,12 +451,8 @@ async fn regru_secret_echo() {
                     "{} {:?} {style:?} {level:?} {code}",
                     dialect.name, dialect.spelling
                 );
-                let echo = dialect
-                    .echo(200)
-                    .render(envelope(level, code, style))
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(dialect.echo(200).render(envelope(level, code, style)));
+                let client = echo_client(&echo, &ctx);
                 echo_round(&label, &client, Write::Add).await;
             }
             for (code, write, existing) in [
@@ -468,12 +469,12 @@ async fn regru_secret_echo() {
                     "{} {:?} {style:?} domain {code} {write:?}",
                     dialect.name, dialect.spelling
                 );
-                let echo = dialect
-                    .echo(200)
-                    .render(reads_then(envelope(Level::Domain, code, style), existing))
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(
+                    dialect
+                        .echo(200)
+                        .render(reads_then(envelope(Level::Domain, code, style), existing)),
+                );
+                let client = echo_client(&echo, &ctx);
                 echo_round(&label, &client, write).await;
                 let path = match write {
                     Write::Add => ADD,
@@ -487,12 +488,12 @@ async fn regru_secret_echo() {
         }
         // A 200 answer in the dialect's own body, which is not the API's envelope at all.
         let label = format!("{} {:?} 200 body", dialect.name, dialect.spelling);
-        let echo = dialect
-            .echo(200)
-            .render(reads_then(dialect.render.clone(), Existing::Nothing))
-            .start()
-            .await;
-        let client = echo_client(&echo);
+        echo.reset(
+            dialect
+                .echo(200)
+                .render(reads_then(dialect.render.clone(), Existing::Nothing)),
+        );
+        let client = echo_client(&echo, &ctx);
         echo_round(&label, &client, Write::Add).await;
     }
 }
@@ -2745,6 +2746,10 @@ fn reads_with(errors: Render, rrs: Value) -> Render {
 /// a removal each reach the echo, and no canary is in the error.
 #[tokio::test]
 async fn regru_secret_echo_record_level() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     let existing = json!([{"subname": "www", "rectype": "A", "content": "192.0.2.1"}]);
     for dialect in dialects() {
         let mut renders: Vec<(String, u16, Render)> = [400, 401, 403, 500]
@@ -2765,12 +2770,12 @@ async fn regru_secret_echo_record_level() {
         }
         for (what, status, render) in renders {
             // One echo per rendering, every write against it: fewer listeners and connections.
-            let echo = dialect
-                .echo(status)
-                .render(reads_with(render.clone(), existing.clone()))
-                .start()
-                .await;
-            let client = echo_client(&echo);
+            echo.reset(
+                dialect
+                    .echo(status)
+                    .render(reads_with(render.clone(), existing.clone())),
+            );
+            let client = echo_client(&echo, &ctx);
             let www = "www.example.org";
             for (op, path) in [
                 ("a", ADD_A),

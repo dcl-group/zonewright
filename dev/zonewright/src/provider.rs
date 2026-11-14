@@ -71,6 +71,13 @@ pub trait Provider: Send + Sync {
 
     /// Makes the rrset at `rrset.name()` / `rrset.rtype()` equal to `rrset`, if `expect` holds
     /// for the rrset as it is at the provider.
+    ///
+    /// `rrset.ttl() == None` keeps the TTL of an existing rrset and gives a new one the client's
+    /// configured `ttl` (which, where [`Capabilities::provider_default_ttl`] is true, may be the
+    /// provider's own choice). A CNAME at a name that holds other data, or another type at a
+    /// name that holds a CNAME (RFC 1034 section 3.6.2), is `Error::InvalidInput` where the
+    /// client's read shows it; elsewhere the provider's own answer is returned (design section
+    /// 3.4).
     fn set_rrset(
         &self,
         zone: &DomainName,

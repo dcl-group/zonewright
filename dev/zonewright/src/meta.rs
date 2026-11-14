@@ -119,8 +119,15 @@ pub struct Capabilities {
     pub atomic_rrset_write: bool,
     /// How TTLs can be set.
     pub ttl: TtlSupport,
-    /// The provider can choose a TTL itself (an "automatic" TTL, or a default it applies when
-    /// none is sent). Such an rrset reads as `ttl() == None`.
+    /// The provider can choose a TTL itself: an rrset or a record can have no explicit TTL at
+    /// the provider (an "automatic" TTL, or a zone default that applies while none is stored).
+    /// Such an rrset reads as `ttl() == None`, and a write without a TTL leaves the provider's
+    /// choice in place. True for every provider whose TTL is
+    /// [`TtlSupport::NotSettable`]. Where it is false, a write of `ttl() == None` keeps the TTL
+    /// as read and a new rrset gets the client's `ttl` setting; an rrset whose TTL the model
+    /// cannot hold keeps the provider's value where the client can send it back, and gets the
+    /// `ttl` setting otherwise (design section 3.6). Whether the `ttl` setting can itself spell
+    /// "let the provider choose" is per provider and said in its documentation.
     pub provider_default_ttl: bool,
     /// Writes complete through a provider-side operation that the client polls.
     pub asynchronous: bool,
@@ -198,7 +205,8 @@ pub enum TtlSupport {
         max: u32,
     },
     /// The API stores a TTL on every record. The crate writes the same TTL to all records of an
-    /// rrset and reports the smallest one it reads.
+    /// rrset and reports the smallest one it reads; a requested TTL counts as already set only
+    /// when every record has it.
     PerRecord {
         /// Smallest accepted TTL.
         min: u32,

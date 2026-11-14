@@ -151,11 +151,12 @@ const CAPABILITIES: Capabilities = Capabilities {
     txt_values: ValueGuarantee::Conditional,
     preconditions: Preconditions::Atomic,
     atomic_rrset_write: true,
-    // The API accepts 0 to 2147483647 (API reference, `ResourceRecordSet.TTL`); the crate keeps
-    // the narrower range of its `ttl` setting, which the TXT value operations already enforce.
+    // What the API accepts for a TTL a caller requests: 0 to 2147483647 (API reference,
+    // `ResourceRecordSet.TTL`).
+    // The narrower range of the `ttl` setting (config.rs) concerns the configured default only.
     ttl: TtlSupport::PerRrset {
-        min: 1,
-        max: 86_400,
+        min: 0,
+        max: 2_147_483_647,
     },
     provider_default_ttl: false,
     asynchronous: true,

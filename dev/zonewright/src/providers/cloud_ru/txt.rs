@@ -19,6 +19,10 @@
 //! Wildcard owner names are refused (`Error::InvalidInput`) before any request: TXT values at a
 //! wildcard name are not offered by the value operations.
 //!
+//! A TXT record with GSLB links answers from its links, not from its values: it is not an rrset
+//! (design section 3.4, `records.rs`) and is never modified. An add or a remove at its name
+//! fails with `Error::Rejected` after the read, before any write, whatever the values hold.
+//!
 //! TXT dialect (design sections 4.4 and 11.2): read `Auto`, write `Raw`. Plain values, the only
 //! ones the capabilities accept, are spelled the same in either.
 
@@ -71,6 +75,9 @@ impl WholeSet for CloudRu {
             });
         }
         let (zone_id, record) = self.read_record(zone, name, TXT).await?;
+        if record.as_ref().is_some_and(Record::is_gslb) {
+            return Err(super::records::not_plain());
+        }
         Ok(SetState {
             context: zone_id,
             set: record.map(txt_set),

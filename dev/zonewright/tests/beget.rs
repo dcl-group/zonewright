@@ -215,11 +215,11 @@ fn envelopes() -> Vec<(&'static str, Render)> {
     ]
 }
 
-fn echo_client(echo: &EchoServer) -> Beget {
+fn echo_client(echo: &EchoServer, ctx: &Context) -> Beget {
     let mut config = BegetConfig::new(CANARY_KEY.to_owned());
     config.base_url = echo.url("/api");
     config.min_request_interval_ms = 0;
-    Beget::new(config, credentials(CANARY_PASSWORD), &context()).unwrap()
+    Beget::new(config, credentials(CANARY_PASSWORD), ctx).unwrap()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -285,6 +285,10 @@ async fn beget_secret_echo() {
 
 /// The rounds of [`beget_secret_echo`] for one dialect.
 async fn echo_dialect(dialect: Dialect) {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     {
         // Everything is the echo: the domain list is the first request of `check`, and the
         // read of the name the first of a write.
@@ -295,8 +299,8 @@ async fn echo_dialect(dialect: Dialect) {
         variants.extend(envelopes().into_iter().map(|(n, r)| (n.to_owned(), r, 200)));
         for (what, render, status) in &variants {
             let label = format!("{} {:?} {what} list", dialect.name, dialect.spelling);
-            let echo = dialect.echo(*status).render(render.clone()).start().await;
-            let client = echo_client(&echo);
+            echo.reset(dialect.echo(*status).render(render.clone()));
+            let client = echo_client(&echo, &ctx);
             echo_round(&label, &client, Write::Add).await;
             assert!(echo.api_requests() > 0, "{label}: the API was not reached");
             assert!(
@@ -308,12 +312,8 @@ async fn echo_dialect(dialect: Dialect) {
         // The domain list is answered; the read of a name is the echo.
         for (what, render, status) in &variants {
             let label = format!("{} {:?} {what} read", dialect.name, dialect.spelling);
-            let echo = dialect
-                .echo(*status)
-                .render(list_then(render.clone()))
-                .start()
-                .await;
-            let client = echo_client(&echo);
+            echo.reset(dialect.echo(*status).render(list_then(render.clone())));
+            let client = echo_client(&echo, &ctx);
             let mut texts = vec![format!("{client:?}")];
             match client.check(&[zone()]).await {
                 Ok(report) => texts.extend(
@@ -359,12 +359,12 @@ async fn echo_dialect(dialect: Dialect) {
                     continue;
                 }
                 let label = format!("{} {:?} {what} {write:?}", dialect.name, dialect.spelling);
-                let echo = dialect
-                    .echo(*status)
-                    .render(reads_then(render.clone(), existing))
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(
+                    dialect
+                        .echo(*status)
+                        .render(reads_then(render.clone(), existing)),
+                );
+                let client = echo_client(&echo, &ctx);
                 echo_round(&label, &client, write).await;
                 assert_eq!(
                     echo.log().count(Some("POST"), CHANGE),

@@ -236,23 +236,23 @@ enum Poll {
 /// `delete_rrset`.
 #[tokio::test]
 async fn cloud_ru_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     let secrets = [CANARY_PASSWORD, CANARY_KEY, DEFAULT_ISSUED_TOKEN];
     for dialect in dialects() {
         for status in [400, 401] {
             let label = format!("{} {:?} {status} api", dialect.name, dialect.spelling);
-            let echo = dialect.echo(status).start().await;
-            let client = echo_client(&echo, &echo.token_url());
+            echo.reset(dialect.echo(status));
+            let client = echo_client(&echo, &echo.token_url(), &ctx);
             echo_round(&label, &client, Write::Create, &secrets).await;
             assert!(echo.api_requests() > 0, "{label}: the API was not reached");
             assert!(echo.token_requests() > 0, "{label}: no token was issued");
 
             let label = format!("{} {:?} {status} iam", dialect.name, dialect.spelling);
-            let echo = dialect
-                .echo(status)
-                .token_path("/no-token-endpoint")
-                .start()
-                .await;
-            let client = echo_client(&echo, &echo.url(TOKENS));
+            echo.reset(dialect.echo(status).token_path("/no-token-endpoint"));
+            let client = echo_client(&echo, &echo.url(TOKENS), &ctx);
             echo_round(&label, &client, Write::Create, &secrets).await;
             assert!(
                 echo.log().count(Some("POST"), TOKENS) > 0,
@@ -272,22 +272,22 @@ async fn cloud_ru_secret_echo() {
                         "{} {:?} {status} {write:?} poll={poll:?}",
                         dialect.name, dialect.spelling
                     );
-                    let echo = dialect
-                        .echo(status)
-                        .render_under("/v1", reads_then(dialect.render.clone(), write, poll))
-                        .start()
-                        .await;
-                    let client = echo_client(&echo, &echo.token_url());
+                    echo.reset(
+                        dialect
+                            .echo(status)
+                            .render_under("/v1", reads_then(dialect.render.clone(), write, poll)),
+                    );
+                    let client = echo_client(&echo, &echo.token_url(), &ctx);
                     echo_round(&label, &client, write, &secrets).await;
                     assert_write_reached(&echo, &label, write, poll);
                     // The same write through the record level.
                     let label = format!("{label} record");
-                    let echo = dialect
-                        .echo(status)
-                        .render_under("/v1", reads_then(dialect.render.clone(), write, poll))
-                        .start()
-                        .await;
-                    let client = echo_client(&echo, &echo.token_url());
+                    echo.reset(
+                        dialect
+                            .echo(status)
+                            .render_under("/v1", reads_then(dialect.render.clone(), write, poll)),
+                    );
+                    let client = echo_client(&echo, &echo.token_url(), &ctx);
                     echo_round_at(&label, &client, write, true, &secrets).await;
                     assert_write_reached(&echo, &label, write, poll);
                 }
@@ -362,12 +362,12 @@ fn reads_then(errors: Render, write: Write, poll: Poll) -> Render {
     })
 }
 
-fn echo_client(echo: &EchoServer, iam_url: &str) -> CloudRu {
+fn echo_client(echo: &EchoServer, iam_url: &str, ctx: &Context) -> CloudRu {
     let mut config = CloudRuConfig::new(PROJECT.into(), CANARY_KEY.into());
     config.dns_url = echo.base_url();
     config.iam_url = iam_url.to_owned();
     config.operation_poll_ms = 250;
-    CloudRu::new(config, credentials(CANARY_PASSWORD), &context()).unwrap()
+    CloudRu::new(config, credentials(CANARY_PASSWORD), ctx).unwrap()
 }
 
 async fn echo_round(label: &str, client: &CloudRu, write: Write, secrets: &[&str]) {
@@ -1466,6 +1466,35 @@ async fn cloud_ru_read_only_record_is_rejected() {
     let e = remove(&client, "AAA").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
     assert_eq!(writes(&mock), 0);
+}
+
+/// A TXT record with GSLB links is not an rrset: an add or a remove at its name is `Rejected`
+/// after the read, whatever the values hold, and nothing is written (design section 3.4).
+#[tokio::test]
+async fn cloud_ru_gslb_txt_record_is_rejected() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_record(ZONE, NAME, "txt", 60, &["AAA"]);
+    control.set_gslb(
+        NAME,
+        "txt",
+        Some(json!({
+            "links": [{"fqdn": "server1.example.org", "isEnabled": true}],
+            "balancingPolicy": "BALANCING_POLICY_ROUND_ROBIN"
+        })),
+    );
+    let before = control.record(NAME, "txt").unwrap();
+    for value in ["AAA", "BBB"] {
+        let e = add(&client, value).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{value}: {e:?}");
+        let e = remove(&client, value).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{value}: {e:?}");
+    }
+    assert_eq!(writes(&mock), 0);
+    assert_eq!(control.record(NAME, "txt").unwrap(), before);
+    // GSLB data without links leaves the record an rrset.
+    control.set_gslb(NAME, "txt", Some(json!({"links": []})));
+    assert_eq!(add(&client, "BBB").await.unwrap(), AddOutcome::Appended);
 }
 
 #[tokio::test]

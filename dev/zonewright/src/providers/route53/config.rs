@@ -20,8 +20,9 @@ pub(super) const DEFAULT_BASE_URL: &str = "https://route53.amazonaws.com";
 /// TTL of a new rrset when the caller gives none.
 pub(super) const DEFAULT_TTL: u32 = 60;
 
-/// TTL range the client accepts for a new rrset, in seconds: the range of the setting in the
-/// metadata. The API itself accepts 0 to 2147483647 (API reference, `ResourceRecordSet.TTL`).
+/// TTL range of the `ttl` setting, in seconds: the range of the setting in the metadata. The
+/// API accepts 0 to 2147483647 (API reference, `ResourceRecordSet.TTL`), and so does the TTL a
+/// caller passes to an operation (the capabilities say so); the setting keeps a narrower range.
 pub(super) const TTL_MIN: u32 = 1;
 pub(super) const TTL_MAX: u32 = 86_400;
 

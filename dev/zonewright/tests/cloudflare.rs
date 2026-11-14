@@ -238,10 +238,10 @@ fn envelope_errors() -> Render {
     })
 }
 
-fn echo_client(echo: &EchoServer) -> Cloudflare {
+fn echo_client(echo: &EchoServer, ctx: &Context) -> Cloudflare {
     let mut config = CloudflareConfig::default();
     config.base_url = echo.url("/client/v4");
-    Cloudflare::new(config, credentials(CANARY_TOKEN), &context()).unwrap()
+    Cloudflare::new(config, credentials(CANARY_TOKEN), ctx).unwrap()
 }
 
 /// What an echo round does for its write.
@@ -286,6 +286,10 @@ async fn echo_round(label: &str, client: &Cloudflare, write: Write) {
 /// delete (the listing holds our value).
 #[tokio::test]
 async fn cloudflare_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     let mut all = dialects();
     // The API's own error envelope, with the echo in `errors[].message`.
     all.push(common::echo::Dialect {
@@ -296,8 +300,8 @@ async fn cloudflare_secret_echo() {
     for dialect in all {
         for status in [400, 401, 403] {
             let label = format!("{} {:?} {status} read", dialect.name, dialect.spelling);
-            let echo = dialect.echo(status).start().await;
-            let client = echo_client(&echo);
+            echo.reset(dialect.echo(status));
+            let client = echo_client(&echo, &ctx);
             echo_round(&label, &client, Write::Add).await;
             assert!(echo.api_requests() > 0, "{label}: the API was not reached");
         }
@@ -313,12 +317,12 @@ async fn cloudflare_secret_echo() {
                     dialect.name, dialect.spelling
                 );
                 let records = echo_records(matches!(write, Write::Remove));
-                let echo = dialect
-                    .echo(status)
-                    .render_under(ZONES, listings_then(dialect.render.clone(), records))
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(
+                    dialect
+                        .echo(status)
+                        .render_under(ZONES, listings_then(dialect.render.clone(), records)),
+                );
+                let client = echo_client(&echo, &ctx);
                 echo_round(&label, &client, write).await;
                 let (method, path) = match write {
                     Write::Add => ("POST", RECORDS),
@@ -2863,6 +2867,10 @@ async fn cloudflare_record_delete_not_found_reads_again() {
 /// canary in any error, and each write reached its request.
 #[tokio::test]
 async fn cloudflare_record_level_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     let mut all = dialects();
     all.push(common::echo::Dialect {
         name: "cloudflare_envelope",
@@ -2889,12 +2897,12 @@ async fn cloudflare_record_level_secret_echo() {
                 } else {
                     existing.clone()
                 };
-                let echo = dialect
-                    .echo(status)
-                    .render_under(ZONES, listings_then(dialect.render.clone(), records))
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(
+                    dialect
+                        .echo(status)
+                        .render_under(ZONES, listings_then(dialect.render.clone(), records)),
+                );
+                let client = echo_client(&echo, &ctx);
                 let result = match kind {
                     "create" => client
                         .set_rrset(

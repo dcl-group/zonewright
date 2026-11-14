@@ -556,10 +556,7 @@ impl Yandex360 {
                 records: Vec::new(),
             });
             // The smallest TTL of the set (design section 3.6, `TtlSupport::PerRecord`).
-            group.ttl = match (group.ttl, ttl) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
+            group.ttl = Listing::smallest_ttl([group.ttl, ttl]);
             if let Some(rtype) = rtype.filter(|&t| mapped(t)) {
                 group.records.push(read_record(rtype, record));
             }

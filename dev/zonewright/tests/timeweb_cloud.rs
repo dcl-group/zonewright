@@ -191,9 +191,9 @@ fn answering(errors: Render, domains: bool, records: Option<Existing>) -> Render
     })
 }
 
-fn echo_client(echo: &EchoServer) -> TimewebCloud {
+fn echo_client(echo: &EchoServer, ctx: &Context) -> TimewebCloud {
     let config = settings(echo.url("/api"));
-    TimewebCloud::new(config, credentials(CANARY_TOKEN), &context()).unwrap()
+    TimewebCloud::new(config, credentials(CANARY_TOKEN), ctx).unwrap()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -238,12 +238,16 @@ async fn echo_round(label: &str, client: &TimewebCloud, write: Write) {
 /// listing, the create and the delete.
 #[tokio::test]
 async fn timeweb_cloud_secret_echo() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     for dialect in dialects() {
         // The credentials probe is the echo.
         for status in [400, 401] {
             let label = format!("{} {:?} {status} probe", dialect.name, dialect.spelling);
-            let echo = dialect.echo(status).start().await;
-            let client = echo_client(&echo);
+            echo.reset(dialect.echo(status));
+            let client = echo_client(&echo, &ctx);
             echo_round(&label, &client, Write::Add).await;
             assert!(echo.api_requests() > 0, "{label}: the API was not reached");
             let e = client.list_zones().await.unwrap_err();
@@ -252,12 +256,12 @@ async fn timeweb_cloud_secret_echo() {
         // The probe is answered; the zone read is the echo.
         for status in [400, 401, 403] {
             let label = format!("{} {:?} {status} zone", dialect.name, dialect.spelling);
-            let echo = dialect
-                .echo(status)
-                .render(answering(dialect.render.clone(), true, None))
-                .start()
-                .await;
-            let client = echo_client(&echo);
+            echo.reset(
+                dialect
+                    .echo(status)
+                    .render(answering(dialect.render.clone(), true, None)),
+            );
+            let client = echo_client(&echo, &ctx);
             let e = client.check(&[zone()]).await.unwrap_err();
             let text = format!("{e} | {e:?} | {client:?}");
             assert_clean(&label, &text, &[CANARY_TOKEN]);
@@ -285,12 +289,12 @@ async fn timeweb_cloud_secret_echo() {
         ] {
             for &status in statuses {
                 let label = format!("{} {:?} {status} {write:?}", dialect.name, dialect.spelling);
-                let echo = dialect
-                    .echo(status)
-                    .render(answering(dialect.render.clone(), true, Some(existing)))
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(dialect.echo(status).render(answering(
+                    dialect.render.clone(),
+                    true,
+                    Some(existing),
+                )));
+                let client = echo_client(&echo, &ctx);
                 echo_round(&label, &client, write).await;
                 let (method, path) = match write {
                     Write::Add => ("POST", CREATE),
@@ -2941,6 +2945,10 @@ enum RecordWrite {
 /// redaction.
 #[tokio::test]
 async fn timeweb_cloud_secret_echo_record_level() {
+    // One server and one context for every case: each case reconfigures the server, and
+    // every client reuses the context's pooled connection (see `EchoServer::reset`).
+    let ctx = context();
+    let echo = EchoServer::start(200).await;
     for dialect in dialects() {
         for (kind, statuses) in [
             (RecordWrite::Create, [400, 401, 403, 409, 500].as_slice()),
@@ -2958,12 +2966,12 @@ async fn timeweb_cloud_secret_echo_record_level() {
                     RecordWrite::Delete => Some(Existing::Ours),
                     RecordWrite::List => None,
                 };
-                let echo = dialect
-                    .echo(status)
-                    .render(answering(dialect.render.clone(), true, existing))
-                    .start()
-                    .await;
-                let client = echo_client(&echo);
+                echo.reset(dialect.echo(status).render(answering(
+                    dialect.render.clone(),
+                    true,
+                    existing,
+                )));
+                let client = echo_client(&echo, &ctx);
                 let result = match kind {
                     RecordWrite::Create => {
                         let set = rr(NAME, RecordType::A, None, &["192.0.2.1"]);

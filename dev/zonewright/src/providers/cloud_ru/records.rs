@@ -14,11 +14,12 @@
 //!
 //! The design gives this provider a second read immediately before every write, which turns a
 //! change seen since the first read into `Error::Conflict` (design section 3.5, "re-read
-//! first"). The value layer has a hook for it (`values::WholeSet::reread_before_write`); the
-//! record layer has none, so [`WholeSet::write`] and [`WholeSet::delete`] here read the record
-//! again themselves, compare it with the record the layer's read returned (`prior`), and send
-//! nothing on a difference. The layer does not repeat a `Conflict` from a read-then-write client,
-//! so the caller's repeat starts with a fresh read.
+//! first"). Both layers have a hook for it: here [`WholeSet::reread_before_write`], with
+//! [`WholeSet::same_snapshot`] comparing the two reads as `api::Record` defines it. The refusals
+//! that need the read (a read-only record, a wildcard NS record) are made in
+//! [`WholeSet::check_write`], which the layer calls before the second read, so that a refused
+//! write sends nothing after the first read. The layer does not repeat a `Conflict` from a
+//! read-then-write client, so the caller's repeat starts with a fresh read.
 //!
 //! # What the model does not carry
 //!
@@ -50,7 +51,9 @@ use crate::name::DomainName;
 use crate::provider::{SkipReason, ZoneListing};
 use crate::record::{RecordData, RecordType, Ttl};
 use crate::redact::Detail;
-use crate::rrsets::{self, Current, Found, Listing, Member, RrsetBase, SetTtl, Stored, WholeSet};
+use crate::rrsets::{
+    self, Current, Found, Listing, Member, RrsetBase, SetTtl, Stored, WholeChange, WholeSet,
+};
 
 use super::api::Record;
 use super::client::CloudRu;
@@ -110,8 +113,9 @@ fn found(rtype: RecordType, record: Record) -> Found<String, Record> {
     }
 }
 
-/// A record with GSLB links at the name and type (see the module documentation).
-fn not_plain() -> Error {
+/// A record with GSLB links at the name and type (see the module documentation). The TXT value
+/// operations refuse such a record in the same way (`txt.rs`).
+pub(super) fn not_plain() -> Error {
     Error::Rejected {
         status: None,
         detail: Detail::constant(
@@ -154,11 +158,6 @@ impl WholeSet for CloudRu {
         ttl: SetTtl,
     ) -> Result<(), Error> {
         let api = api_type(rtype)?;
-        if rtype == RecordType::NS && name.is_wildcard() {
-            return Err(Error::InvalidInput {
-                detail: Detail::constant("the provider does not offer wildcard NS records"),
-            });
-        }
         let values = members
             .iter()
             .map(|member| match member {
@@ -176,11 +175,6 @@ impl WholeSet for CloudRu {
             SetTtl::Existing(None) => prior.map_or(u64::from(self.ttl), |prior| prior.ttl),
             SetTtl::Default => u64::from(self.ttl),
         };
-        // A read-only record is refused before the re-read, so that nothing at all is sent.
-        if let Some(prior) = prior {
-            writable(prior)?;
-        }
-        self.reread_unchanged(zone, name, api, prior).await?;
         match prior {
             None => {
                 self.create_record(zone, name, api, zone_id, &values, ttl)
@@ -198,10 +192,54 @@ impl WholeSet for CloudRu {
         _zone_id: &String,
         prior: &Record,
     ) -> Result<(), Error> {
-        let api = api_type(rtype)?;
-        writable(prior)?;
-        self.reread_unchanged(zone, name, api, Some(prior)).await?;
-        self.delete_record(zone, name, api, prior).await
+        self.delete_record(zone, name, api_type(rtype)?, prior)
+            .await
+    }
+
+    /// A read-only record, a wildcard NS record and a value without an established encoding are
+    /// refused before the second read, so that nothing at all is sent after the first one.
+    fn check_write(
+        &self,
+        _zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        _zone_id: &String,
+        change: &WholeChange<'_, String, Record>,
+    ) -> Result<(), Error> {
+        let (prior, members) = match change {
+            WholeChange::Write { prior, members } => (*prior, *members),
+            WholeChange::Delete { prior } => (Some(*prior), &[][..]),
+        };
+        if matches!(change, WholeChange::Write { .. })
+            && rtype == RecordType::NS
+            && name.is_wildcard()
+        {
+            return Err(Error::InvalidInput {
+                detail: Detail::constant("the provider does not offer wildcard NS records"),
+            });
+        }
+        // `can_send` has accepted every added value; checked here once more so that the write
+        // itself cannot fail on an encoding after the second read.
+        let unsendable = members.iter().any(|member| match member {
+            Member::Added(data) => content::encode(rtype, data).is_none(),
+            Member::Kept(_) | Member::Enabled(_) => false,
+        });
+        if unsendable {
+            return Err(Error::InvalidInput {
+                detail: Detail::constant(
+                    "the provider's encoding of this record data is not established",
+                ),
+            });
+        }
+        prior.map_or(Ok(()), writable)
+    }
+
+    fn reread_before_write(&self) -> bool {
+        true
+    }
+
+    fn same_snapshot(&self, first: &Record, again: &Record) -> bool {
+        first == again
     }
 }
 
