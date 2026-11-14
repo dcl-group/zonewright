@@ -76,7 +76,7 @@ use crate::provider::{SkipReason, ZoneListing};
 use crate::record::{RecordData, RecordType, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
-    self, Listing, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
+    self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
 };
 
 use super::api::{A, AAAA, Rr, TXT};
@@ -191,12 +191,16 @@ fn is_at(rr: &Rr, zone: &DomainName, name: &DomainName, kind: Kind) -> bool {
     rr.rectype
         .as_deref()
         .is_some_and(|rtype| rtype.eq_ignore_ascii_case(kind.api_name()))
-        && rr
-            .subname
-            .as_deref()
-            .and_then(|sub| DomainName::from_relative(sub.trim(), zone).ok())
-            .as_ref()
-            == Some(name)
+        && owner_is(rr, zone, name)
+}
+
+/// Whether `rr`, of any type, is at `name`, compared as [`is_at`] compares.
+fn owner_is(rr: &Rr, zone: &DomainName, name: &DomainName) -> bool {
+    rr.subname
+        .as_deref()
+        .and_then(|sub| DomainName::from_relative(sub.trim(), zone).ok())
+        .as_ref()
+        == Some(name)
 }
 
 // ---- Writing -------------------------------------------------------------------------------------
@@ -272,19 +276,26 @@ impl RrsetBase for Regru {
 impl PerRecord for Regru {
     /// The record's content exactly as the API returned it.
     type Handle = String;
-    /// Nothing: the domain's name is the key of every call.
-    type Context = ();
+    /// The domain's name is the key of every call, so no identifier is carried; the read lists
+    /// the whole zone and carries what else is at the name.
+    type Context = Neighbors;
 
     async fn read(
         &self,
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-    ) -> Result<RecordsRead<String, ()>, Error> {
+    ) -> Result<RecordsRead<String, Neighbors>, Error> {
         let kind = kind_of(rtype)?;
         let mut records: Vec<Stored<String>> = Vec::new();
+        // The listing holds every record of the zone, all published (`state` is obsolete): the
+        // types of the other records at the name are all the data there besides this type.
+        let mut others: Vec<Option<RecordType>> = Vec::new();
         for rr in self.api.records(zone).await? {
             if !is_at(&rr, zone, name, kind) {
+                if owner_is(&rr, zone, name) {
+                    others.push(rr.rectype.as_deref().and_then(|t| t.parse().ok()));
+                }
                 continue;
             }
             let content = rr.content.unwrap_or_default();
@@ -302,7 +313,7 @@ impl PerRecord for Regru {
             });
         }
         Ok(RecordsRead {
-            context: (),
+            context: Neighbors::of(rtype, others),
             records,
         })
     }
@@ -312,7 +323,7 @@ impl PerRecord for Regru {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &(),
+        _context: &Neighbors,
         data: &RecordData,
         // No add function takes a TTL (documentation 9.2, 9.3, 9.9); the record layer refuses a
         // requested one before any request, and the others leave the zone's settings in charge.
@@ -335,7 +346,7 @@ impl PerRecord for Regru {
         _zone: &DomainName,
         _name: &DomainName,
         _rtype: RecordType,
-        _context: &(),
+        _context: &Neighbors,
         _record: &Stored<String>,
         update: &RecordUpdate<'_>,
     ) -> Result<(), Error> {
@@ -360,7 +371,7 @@ impl PerRecord for Regru {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &(),
+        _context: &Neighbors,
         record: &Stored<String>,
     ) -> Result<(), Error> {
         let kind = kind_of(rtype)?;
@@ -385,6 +396,14 @@ impl PerRecord for Regru {
 
     fn updates_in_place(&self) -> bool {
         false
+    }
+
+    fn holds_cname(&self, _rtype: RecordType, context: &Neighbors) -> Option<bool> {
+        context.holds_cname()
+    }
+
+    fn holds_other_data(&self, _rtype: RecordType, context: &Neighbors) -> Option<bool> {
+        context.holds_other_data()
     }
 }
 

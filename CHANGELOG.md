@@ -73,6 +73,11 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ### Changed
 
+- Cloud.ru, nic.ru, reg.ru, Timeweb Cloud and Yandex 360: `set_rrset` of a CNAME at a name that
+  holds other data, or of other data at a name that holds a CNAME, is `Error::InvalidInput` after
+  the read and before any write.
+- nic.ru: `Capabilities::provider_default_ttl` is true; a record without a TTL takes the zone's
+  default and reads as no TTL.
 - Route 53 and RFC 2136 accept a requested TTL from 0 to 2147483647; the `ttl` setting keeps its
   narrower range.
 - A record-level `set_rrset` at a per-record API never publishes two records of a singleton type
@@ -86,3 +91,8 @@ All notable changes to this crate are recorded in this file. The format follows
 - `Rfc2136Config`: `algorithm` is a `String` and `ttl` a `u32` with the documented defaults; `null`
   is still read as the default.
 - `Yandex360Config` no longer implements `Default`: `org_id` is required.
+
+### Fixed
+
+- DigitalOcean and Yandex 360: a record delete answered "not found" is confirmed by a read; while
+  the value is still published the result is `Error::Conflict` instead of success.

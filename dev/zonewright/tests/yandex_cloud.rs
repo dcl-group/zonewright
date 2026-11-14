@@ -1048,14 +1048,27 @@ async fn yandex_cloud_operations_are_polled() {
     );
 }
 
-/// An operation still running after the last of the 60 polls is `Transient`.
+/// An operation that never finishes keeps the add waiting through look after look, and the
+/// write is sent once. That the looks are bounded, and that the add then ends with `Transient`,
+/// is the unit test `an_operation_that_keeps_running_is_transient_after_the_last_look` in
+/// `src/providers/yandex_cloud/api.rs` with a lowered bound: the production bound of 60 looks at the 250 ms floor takes 15
+/// seconds.
 #[tokio::test]
-async fn yandex_cloud_unfinished_operation_is_transient() {
+async fn yandex_cloud_unfinished_operation_keeps_being_polled() {
     let (mock, client) = setup().await;
-    mock.control().set_operation_polls(1000);
-    let e = add(&client, "AAA").await.unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
-    assert_eq!(mock.log().count(Some("GET"), OPERATIONS), 60);
+    mock.control().set_operation_polls(u32::MAX);
+    let polled = async {
+        while mock.log().count(Some("GET"), OPERATIONS) < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {
+        outcome = add(&client, "AAA") => {
+            panic!("the add ended while its operation was running: {outcome:?}")
+        }
+        () = polled => {}
+    }
+    assert_eq!(writes(&mock), 1);
 }
 
 /// The TXT dialect: quoted character-strings are joined, unquoted text is read as it is, and

@@ -21,9 +21,14 @@
 //!   were.
 //! - The handle carries whatever the client needs to write a record back exactly as the provider
 //!   returned it (same text, same attributes) or to delete it by identifier.
-//! - A delete by identifier answered "not found" counts as done.
+//! - A delete answered "not found" is not done on the strength of that answer alone, since the
+//!   answer can also mean that the zone identifier the client used went stale, or that the domain
+//!   was deleted and created again, while the value is still published (design sections 3.5 and
+//!   3.8). The client drops a cached zone identifier and reads again: when the new read no longer
+//!   finds the deleted record's value (per-record) or the rrset (whole set), the delete is done;
+//!   otherwise the result is [`Error::Conflict`].
 //! - A conditional write that the provider refused because the rrset changed returns
-//!   [`Error::Conflict`]; nothing else does.
+//!   [`Error::Conflict`]; apart from the delete above, nothing else does.
 //!
 //! acme-dns does not use this layer: it has no read (design section 11.3).
 
@@ -150,7 +155,8 @@ pub(crate) trait PerRecord: TxtBase {
         ttl: WriteTtl,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
-    /// Deletes one record. "Not found" counts as done.
+    /// Deletes one record. A "not found" answer is done only when a new read no longer finds
+    /// the record's value; when it does, the result is `Error::Conflict` (module documentation).
     fn delete(
         &self,
         zone: &DomainName,

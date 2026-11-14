@@ -1295,12 +1295,15 @@ Rules common to all of them:
   foreign value whose text the client's dialect cannot decode is treated the same way: it is kept as
   opaque text, is never equal to the value being added or removed, and is written back unchanged. It
   does not make the operation fail.
-- A delete by identifier that is answered "not found" counts as done, on the first attempt and on a
-  repeated one: the record is gone, by an earlier attempt of this operation or by someone else. This
-  holds for one record of a per-record API. The delete of a whole rrset (the last value of a
-  whole-set provider) is sent once, and its "not found" is a success only when a new read finds no
-  rrset: the answer can also mean that the zone identifier went stale while the rrset, and with it
-  the value, is still published; then the result is `Error::Conflict`.
+- A delete answered "not found" is not done on the strength of that answer alone. The record may be
+  gone, by an earlier attempt of this operation or by someone else; but the same answer comes when
+  the zone identifier the client used went stale, or when the domain was deleted and created again
+  with the value under a new record identifier, while the value is still published. For one record
+  of a per-record API the delete is done when a new read, under a zone identifier looked up afresh,
+  no longer finds the record's value; when it still finds it, the result is `Error::Conflict`
+  (section 3.8). The delete of a whole rrset (the last value of a whole-set provider) is sent once,
+  and its "not found" is a success only when a new read finds no rrset; otherwise the result is
+  `Error::Conflict` as well.
 - A create of a whole rrset whose refusal the provider does not document for an existing rrset is
   followed by a new read: an rrset found there now was created by another writer after the
   operation's read, nothing of it was overwritten, and the result is `Error::Conflict`; otherwise
@@ -1725,8 +1728,10 @@ a whole rrset, which can hold values another writer added after the read: it is 
   rejected"); the caller's repeat of the operation starts with a read, which obtains the new token.
   The token is discarded also when the 401 answer is over the size limit. Tokens are renewed well
   before they expire, so this path is for revoked tokens, not for normal expiry.
-- A delete of one record by identifier that is repeated and answered "not found" is a success
-  (section 3.5).
+- A delete of one record by identifier that is answered "not found" counts as done only after a
+  fresh read no longer finds the value; while the value is still published the result is
+  `Error::Conflict`, because the zone identifier the delete used may be stale (sections 3.5 and
+  3.8).
 - A request can carry a finisher (`Request::finish_with`), which the transport calls for every
   attempt right before it is sent, with exactly the method, URL and body of that attempt; the
   headers it returns are inserted last. Route 53 signs with it, so every attempt carries its own

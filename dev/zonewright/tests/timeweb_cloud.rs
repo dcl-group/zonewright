@@ -1591,6 +1591,64 @@ fn record_writes(mock: &TimewebCloudMock) -> usize {
         + log.count(Some("DELETE"), RECORD)
 }
 
+/// The listing of a name shows its records of every type, so a CNAME next to other data, or
+/// other data next to a CNAME, is refused after the read and before any write (RFC 1034 section
+/// 3.6.2). Data at other names does not count.
+#[tokio::test]
+async fn timeweb_cloud_cname_next_to_other_data_is_refused() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_record("example.org", "www", "A", "192.0.2.1", Some(300));
+    control.insert_record(
+        "example.org",
+        "alias",
+        "CNAME",
+        "target.example.net",
+        Some(300),
+    );
+    let before = control.records();
+
+    let cname = rr(
+        "www.example.org",
+        RecordType::CNAME,
+        None,
+        &["target.example.net."],
+    );
+    let e = client
+        .set_rrset(&zone(), &cname, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    let a = rr("alias.example.org", RecordType::A, None, &["192.0.2.2"]);
+    let e = client
+        .set_rrset(&zone(), &a, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    assert_eq!(record_writes(&mock), 0);
+    assert_eq!(control.records(), before);
+
+    // At names without the other kind of data the same writes go through.
+    let cname = rr(
+        "new.example.org",
+        RecordType::CNAME,
+        None,
+        &["target.example.net."],
+    );
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &cname, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    let a = rr("www2.example.org", RecordType::A, None, &["192.0.2.2"]);
+    assert_eq!(
+        client.set_rrset(&zone(), &a, Expect::Any).await.unwrap(),
+        SetOutcome::Created
+    );
+}
+
 /// The values of the records of `rtype` at `owner`, sorted.
 fn stored(mock: &TimewebCloudMock, owner: &str, rtype: &str) -> Vec<String> {
     let mut values: Vec<String> = mock

@@ -2298,6 +2298,60 @@ async fn digitalocean_record_ttls() {
     assert!(control.records_at(www, "A").is_empty());
 }
 
+/// The domain is deleted and created again, with the records under new identifiers, between
+/// the read and the delete of an rrset: the delete is answered 404 while the values are still
+/// published, so the result is `Conflict`, not `Deleted` (design sections 3.5 and 3.8). The
+/// repeat reads the new identifiers and deletes. The same holds for the surplus record of a
+/// replacement.
+#[tokio::test]
+async fn digitalocean_record_delete_not_found_reads_again() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = "www.example.org";
+    let set = rr(www, RecordType::A, None, &["192.0.2.1", "192.0.2.2"]);
+    client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
+
+    let hook = control.clone();
+    mock.faults()
+        .push(Fault::on("DELETE", RECORD).run(move || hook.recreate_domain("example.org")));
+    let e = client
+        .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+    assert!(e.is_retryable());
+    assert_eq!(stored(&mock, www, "A"), ["192.0.2.1", "192.0.2.2"]);
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(stored(&mock, www, "A").is_empty());
+
+    // A replacement whose surplus delete meets the recreated domain.
+    client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
+    let hook = control.clone();
+    mock.faults()
+        .push(Fault::on("DELETE", RECORD).run(move || hook.recreate_domain("example.org")));
+    let fewer = rr(www, RecordType::A, None, &["192.0.2.1"]);
+    let e = client
+        .set_rrset(&zone(), &fewer, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+    assert_eq!(stored(&mock, www, "A"), ["192.0.2.1", "192.0.2.2"]);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &fewer, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(stored(&mock, www, "A"), ["192.0.2.1"]);
+}
+
 /// Two clients sharing a `Context` write one name at once, the first create delayed: the
 /// second reads after the first wrote, so its `Expect::Absent` fails.
 #[tokio::test]

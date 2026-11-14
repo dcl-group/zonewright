@@ -102,7 +102,7 @@ use crate::provider::{SkipReason, ZoneListing};
 use crate::record::{Mx, RecordData, RecordType, Srv, Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
-    self, Listing, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
+    self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
 };
 
 use super::Pending;
@@ -525,15 +525,16 @@ impl RrsetBase for RecordOp<'_> {
 impl PerRecord for RecordOp<'_> {
     /// The record's identifier.
     type Handle = String;
-    /// The service is kept by the operation.
-    type Context = ();
+    /// The service is kept by the operation; the read lists the whole zone and carries what
+    /// else is at the name.
+    type Context = Neighbors;
 
     async fn read(
         &self,
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-    ) -> Result<RecordsRead<String, ()>, Error> {
+    ) -> Result<RecordsRead<String, Neighbors>, Error> {
         self.lock_zone(zone).await;
         let target = self.client.resolve_zone(zone).await?;
         if self.writing {
@@ -552,13 +553,19 @@ impl PerRecord for RecordOp<'_> {
                 STAGED_READ
             }));
         }
-        let records = listing
+        let (records, others): (Vec<_>, Vec<_>) = listing
             .records
             .into_iter()
-            .filter(|rr| {
-                rr.owner.as_ref() == Some(name)
-                    && rr.rtype.parse::<RecordType>().ok() == Some(rtype)
-            })
+            .filter(|rr| rr.owner.as_ref() == Some(name))
+            .partition(|rr| rr.rtype.parse::<RecordType>().ok() == Some(rtype));
+        // The listing holds every record of the zone, and the API documents no disabled
+        // records: the other records of the name are all the data there besides this type.
+        let neighbors = Neighbors::of(
+            rtype,
+            others.iter().map(|rr| rr.rtype.parse::<RecordType>().ok()),
+        );
+        let records = records
+            .into_iter()
             .map(|rr| Stored {
                 data: read_record(rtype, &rr),
                 // The API documents no disabled records.
@@ -568,7 +575,7 @@ impl PerRecord for RecordOp<'_> {
             })
             .collect();
         Ok(RecordsRead {
-            context: (),
+            context: neighbors,
             records,
         })
     }
@@ -578,7 +585,7 @@ impl PerRecord for RecordOp<'_> {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &(),
+        _context: &Neighbors,
         data: &RecordData,
         ttl: SetTtl,
     ) -> Result<(), Error> {
@@ -607,7 +614,7 @@ impl PerRecord for RecordOp<'_> {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        context: &(),
+        context: &Neighbors,
         record: &Stored<String>,
         update: &RecordUpdate<'_>,
     ) -> Result<(), Error> {
@@ -647,7 +654,7 @@ impl PerRecord for RecordOp<'_> {
         zone: &DomainName,
         _name: &DomainName,
         _rtype: RecordType,
-        _context: &(),
+        _context: &Neighbors,
         record: &Stored<String>,
     ) -> Result<(), Error> {
         let service = self.service()?;
@@ -662,6 +669,14 @@ impl PerRecord for RecordOp<'_> {
 
     fn updates_in_place(&self) -> bool {
         false
+    }
+
+    fn holds_cname(&self, _rtype: RecordType, context: &Neighbors) -> Option<bool> {
+        context.holds_cname()
+    }
+
+    fn holds_other_data(&self, _rtype: RecordType, context: &Neighbors) -> Option<bool> {
+        context.holds_other_data()
     }
 }
 

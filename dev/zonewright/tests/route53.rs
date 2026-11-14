@@ -1108,8 +1108,12 @@ async fn route53_rrset_record_limit() {
     assert_eq!(remove(&client, "v7").await.unwrap(), RemoveOutcome::Removed);
 }
 
-/// The change is polled until `INSYNC`; a poll that fails or a change that stays `PENDING` is
-/// `Transient` (the write was accepted, its outcome is unknown).
+/// The change is polled until `INSYNC`; a poll that fails is `Transient` (the write was accepted,
+/// its outcome is unknown); a change that stays `PENDING` keeps the add waiting through look
+/// after look, with the batch sent once. That the looks are bounded, and that the add then ends
+/// with `Transient`, is the unit test `a_change_that_stays_pending_is_transient_after_the_last_look`
+/// in `src/providers/route53/api.rs` with a lowered bound: the production bound of 60 looks at
+/// the 250 ms floor takes 15 seconds.
 #[tokio::test]
 async fn route53_change_is_polled_until_insync() {
     let (mock, client) = setup().await;
@@ -1142,9 +1146,19 @@ async fn route53_change_is_polled_until_insync() {
             ),
         ));
     let before = mock.log().count(Some("GET"), STATUS);
-    let e = add(&client, "CCC").await.unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
-    assert_eq!(mock.log().count(Some("GET"), STATUS), before + 60);
+    let writes_before = writes(&mock);
+    let polled = async {
+        while mock.log().count(Some("GET"), STATUS) < before + 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {
+        outcome = add(&client, "CCC") => {
+            panic!("the add ended while its change was pending: {outcome:?}")
+        }
+        () = polled => {}
+    }
+    assert_eq!(writes(&mock), writes_before + 1);
 }
 
 /// The request: signed with SigV4 (host, x-amz-date and the session token signed), the change

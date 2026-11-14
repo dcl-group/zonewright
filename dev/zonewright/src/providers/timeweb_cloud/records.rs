@@ -99,7 +99,7 @@ use crate::provider::ZoneListing;
 use crate::record::{Mx, RecordData, RecordType, Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
-    self, Listing, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
+    self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
 };
 
 use super::api::{Created, Deleted, NewRecord, Record, Updated, check_named, owner, stated_names};
@@ -321,23 +321,32 @@ fn identifier(record: &Stored<Handle>) -> Result<u64, Error> {
 
 impl PerRecord for TimewebCloud {
     type Handle = Handle;
-    /// The owner name is the key of every path: nothing to carry.
-    type Context = ();
+    /// The owner name is the key of every path, so no identifier is carried; the read lists
+    /// every record of the name and carries what else is there.
+    type Context = Neighbors;
 
     async fn read(
         &self,
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-    ) -> Result<RecordsRead<Handle, ()>, Error> {
+    ) -> Result<RecordsRead<Handle, Neighbors>, Error> {
         let listed = self.api.records(zone, name).await?;
         check_named(&listed, name == zone)?;
-        let records = listed
+        let (records, others): (Vec<Record>, Vec<Record>) = listed
             .into_iter()
-            .filter(|record| {
-                record.rtype.parse::<RecordType>().ok() == Some(rtype)
-                    && stated_names(record.subdomain(), zone).contains(name)
-            })
+            .filter(|record| stated_names(record.subdomain(), zone).contains(name))
+            .partition(|record| record.rtype.parse::<RecordType>().ok() == Some(rtype));
+        // The listing holds the records of the name of every type, and the API documents no
+        // disabled records: the other records are all the data there besides this type.
+        let neighbors = Neighbors::of(
+            rtype,
+            others
+                .iter()
+                .map(|record| record.rtype.parse::<RecordType>().ok()),
+        );
+        let records = records
+            .into_iter()
             .map(|record| Stored {
                 data: read_record(rtype, &record),
                 // The API documents no disabled records.
@@ -351,7 +360,7 @@ impl PerRecord for TimewebCloud {
             })
             .collect();
         Ok(RecordsRead {
-            context: (),
+            context: neighbors,
             records,
         })
     }
@@ -361,7 +370,7 @@ impl PerRecord for TimewebCloud {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &(),
+        _context: &Neighbors,
         data: &RecordData,
         ttl: SetTtl,
     ) -> Result<(), Error> {
@@ -397,7 +406,7 @@ impl PerRecord for TimewebCloud {
         _zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &(),
+        _context: &Neighbors,
         record: &Stored<Handle>,
         update: &RecordUpdate<'_>,
     ) -> Result<(), Error> {
@@ -453,7 +462,7 @@ impl PerRecord for TimewebCloud {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &(),
+        _context: &Neighbors,
         record: &Stored<Handle>,
     ) -> Result<(), Error> {
         let id = identifier(record)?;
@@ -471,6 +480,14 @@ impl PerRecord for TimewebCloud {
             }
         }
         Ok(())
+    }
+
+    fn holds_cname(&self, _rtype: RecordType, context: &Neighbors) -> Option<bool> {
+        context.holds_cname()
+    }
+
+    fn holds_other_data(&self, _rtype: RecordType, context: &Neighbors) -> Option<bool> {
+        context.holds_other_data()
     }
 }
 

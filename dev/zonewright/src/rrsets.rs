@@ -461,6 +461,61 @@ pub(crate) trait PerRecord: RrsetBase {
     }
 }
 
+/// What a read that returned every published record of a name learned about the data there
+/// besides the operation's type: the answers of `holds_cname` and `holds_other_data` of both
+/// shapes (module documentation, "A CNAME and other data at one name"). A client whose read
+/// lists the whole zone or the whole name builds it from the records of the name with
+/// [`Neighbors::of`] and carries it in its context.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Neighbors {
+    /// A published CNAME, the operation being about another type.
+    cname: bool,
+    /// Published data of a type other than CNAME, the operation's type, RRSIG and NSEC.
+    other: bool,
+    /// A published record whose type the client does not recognize.
+    unknown: bool,
+}
+
+impl Neighbors {
+    /// Built from the stated types of every published record at the name, for an operation
+    /// about `rtype`; `None` is a type the client does not recognize, which may or may not be
+    /// other data, so that "no other data" is then not known.
+    pub(crate) fn of(
+        rtype: RecordType,
+        types: impl IntoIterator<Item = Option<RecordType>>,
+    ) -> Self {
+        let mut neighbors = Neighbors::default();
+        for stated in types {
+            match stated {
+                None => neighbors.unknown = true,
+                Some(t) if t == rtype => {}
+                Some(t) if t == RecordType::CNAME => neighbors.cname = true,
+                // RRSIG (46) and NSEC (47) may share a name with a CNAME (RFC 4035 section 2.5).
+                Some(t) if matches!(t.code(), Some(46 | 47)) => {}
+                Some(_) => neighbors.other = true,
+            }
+        }
+        neighbors
+    }
+
+    /// The answer of `holds_cname`. A CNAME is always recognized, so the answer is known.
+    pub(crate) fn holds_cname(&self) -> Option<bool> {
+        Some(self.cname)
+    }
+
+    /// The answer of `holds_other_data`; `None` when the only candidates are records of a type
+    /// the client does not recognize.
+    pub(crate) fn holds_other_data(&self) -> Option<bool> {
+        if self.other {
+            Some(true)
+        } else if self.unknown {
+            None
+        } else {
+            Some(false)
+        }
+    }
+}
+
 // ---- Checks before any request (design section 3.1) ----------------------------------------------
 
 /// How many times an operation runs at a provider with atomic preconditions: once, and once more
@@ -1328,8 +1383,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Current, Found, Listing, Member, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl,
-        Step, Stored, WholeChange, WholeRead, WholeSet,
+        Current, Found, Listing, Member, Neighbors, PerRecord, RecordUpdate, RecordsRead,
+        RrsetBase, SetTtl, Step, Stored, WholeChange, WholeRead, WholeSet,
     };
     use crate::error::{Error, ErrorKind};
     use crate::id::ProviderId;
@@ -3172,6 +3227,41 @@ mod tests {
         );
         assert_eq!(Listing::smallest_ttl([None, None]), None);
         assert_eq!(Listing::smallest_ttl([]), None);
+    }
+
+    #[test]
+    fn neighbors_answer_from_the_types_at_the_name() {
+        let t = |name: &str| Some(name.parse::<RecordType>().unwrap());
+        let answers = |rtype: RecordType, types: Vec<Option<RecordType>>| {
+            let n = Neighbors::of(rtype, types);
+            (n.holds_cname(), n.holds_other_data())
+        };
+        // Nothing else at the name.
+        assert_eq!(answers(RecordType::A, vec![]), (Some(false), Some(false)));
+        // The operation's own type is not "other data", nor is a CNAME for a CNAME operation.
+        assert_eq!(
+            answers(RecordType::CNAME, vec![t("CNAME")]),
+            (Some(false), Some(false))
+        );
+        assert_eq!(
+            answers(RecordType::A, vec![t("CNAME")]),
+            (Some(true), Some(false))
+        );
+        assert_eq!(
+            answers(RecordType::CNAME, vec![t("TXT")]),
+            (Some(false), Some(true))
+        );
+        // RRSIG and NSEC may share a name with a CNAME.
+        assert_eq!(
+            answers(RecordType::CNAME, vec![t("RRSIG"), t("NSEC")]),
+            (Some(false), Some(false))
+        );
+        // An unrecognized type leaves "other data" unknown, unless known data is there too.
+        assert_eq!(answers(RecordType::CNAME, vec![None]), (Some(false), None));
+        assert_eq!(
+            answers(RecordType::CNAME, vec![None, t("MX")]),
+            (Some(false), Some(true))
+        );
     }
 
     // ---- Listings ----------------------------------------------------------------------------

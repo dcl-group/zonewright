@@ -1295,4 +1295,54 @@ mod tests {
         let doc = roxmltree::Document::parse(&xml).unwrap();
         assert_eq!(doc.root_element().tag_name().namespace(), Some(XMLNS));
     }
+
+    /// The number of looks at a pending change is bounded: a change that stays `PENDING` ends
+    /// the write with `Transient` after the last look, and the batch is not sent again. The
+    /// bound of the client is `MAX_POLLS`; the test lowers it so that it does not wait 60
+    /// looks at the 250 ms floor.
+    #[tokio::test]
+    async fn a_change_that_stays_pending_is_transient_after_the_last_look() {
+        use std::time::Duration;
+
+        use crate::context::{Context, ContextOptions};
+        use crate::error::ErrorKind;
+        use crate::http::Poller;
+        use crate::name::DomainName;
+        use crate::provider::Provider as _;
+        use crate::record::Txt;
+
+        let ctx = Context::new(ContextOptions {
+            loopback_only: true,
+            ..ContextOptions::default()
+        })
+        .unwrap();
+        let seed = zonewright_mock::route53::Seed::standard();
+        let secret = seed.secret_access_key.clone();
+        let mock = zonewright_mock::route53::Route53Mock::start(seed).await;
+        mock.control().set_pending_polls(u32::MAX);
+        let mut config =
+            crate::providers::route53::Route53Config::new("AKIAZWTEST0000000001".into());
+        config.base_url = mock.base_url();
+        config.change_poll_ms = 250;
+        let credentials =
+            crate::providers::route53::Route53Credentials::new(secrecy::SecretString::from(secret));
+        let mut client =
+            crate::providers::route53::Route53::new(config, credentials, &ctx).unwrap();
+        assert_eq!(MAX_POLLS, 60);
+        client.api.poller = Poller::new(Duration::from_millis(250), 3);
+        let zone = DomainName::parse("example.org").unwrap();
+        let name = DomainName::parse("_acme-challenge.example.org").unwrap();
+        let value = Txt::new("v1").unwrap();
+        let e = client
+            .add_txt_value(&zone, &name, &value, None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+        assert_eq!(mock.log().count(Some("GET"), "/2013-04-01/change/*"), 3);
+        assert_eq!(
+            mock.log()
+                .count(Some("POST"), "/2013-04-01/hostedzone/*/rrset/"),
+            1
+        );
+    }
 }

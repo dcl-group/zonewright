@@ -869,6 +869,86 @@ async fn cloud_ru_delete_not_found_reads_again() {
     assert!(control.records().is_empty());
 }
 
+/// The zone's listing shows every record at the name, so a CNAME next to other data, or other
+/// data next to a CNAME, is refused after the read and before the second read and any write
+/// (RFC 1034 section 3.6.2). Wildcard owners are told apart from the name below which they
+/// apply, and data at other names does not count.
+#[tokio::test]
+async fn cloud_ru_cname_next_to_other_data_is_refused() {
+    let (mock, client) = setup_records().await;
+    let control = mock.control();
+    control.insert_record(ZONE, "www.example.org", "a", 300, &["192.0.2.1"]);
+    control.insert_record(
+        ZONE,
+        "alias.example.org",
+        "cname",
+        300,
+        &["target.example.net"],
+    );
+    control.insert_record(ZONE, "*.w.example.org", "a", 300, &["192.0.2.1"]);
+    control.insert_record(ZONE, "v.example.org", "a", 300, &["192.0.2.1"]);
+    let before = control.records();
+
+    let refused = [
+        rrset(
+            "www.example.org",
+            RecordType::CNAME,
+            None,
+            &["target.example.net."],
+        ),
+        rrset("alias.example.org", RecordType::A, None, &["192.0.2.2"]),
+        rrset("alias.example.org", RecordType::TXT, None, &["\"v\""]),
+        rrset(
+            "*.w.example.org",
+            RecordType::CNAME,
+            None,
+            &["target.example.net."],
+        ),
+    ];
+    for set in &refused {
+        let listed = listings(&mock);
+        let e = client
+            .set_rrset(&zone(), set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{set:?}: {e:?}");
+        // One read, no second read before a write, no write.
+        assert_eq!(listings(&mock), listed + 1, "{set:?}");
+    }
+    assert_eq!(writes(&mock), 0);
+    assert_eq!(control.records(), before);
+
+    // At names without the other kind of data the same writes go through: the wildcard below
+    // `v` is not `v`, and `w` is not the wildcard below it.
+    for set in [
+        rrset(
+            "*.v.example.org",
+            RecordType::CNAME,
+            None,
+            &["target.example.net."],
+        ),
+        rrset(
+            "w.example.org",
+            RecordType::CNAME,
+            None,
+            &["target.example.net."],
+        ),
+        rrset(
+            "new.example.org",
+            RecordType::CNAME,
+            None,
+            &["target.example.net."],
+        ),
+        rrset("www2.example.org", RecordType::A, None, &["192.0.2.2"]),
+    ] {
+        assert_eq!(
+            client.set_rrset(&zone(), &set, Expect::Any).await.unwrap(),
+            SetOutcome::Created,
+            "{set:?}"
+        );
+    }
+}
+
 // ---- The re-read before the write (design section 3.5) -----------------------------------------
 
 /// A foreign value appears between the read and the re-read of an add that appends: nothing is
@@ -1066,14 +1146,27 @@ async fn cloud_ru_operation_error_without_code() {
     }
 }
 
-/// An operation still running after the last of the 60 polls is `Transient`.
+/// An operation that never finishes keeps the add waiting through look after look, and the
+/// write is sent once. That the looks are bounded, and that the add then ends with `Transient`,
+/// is the unit test `an_operation_that_keeps_running_is_transient_after_the_last_look` in
+/// `src/providers/cloud_ru/api.rs` with a lowered bound: the production bound of 60 looks at the 250 ms floor takes 15
+/// seconds.
 #[tokio::test]
-async fn cloud_ru_unfinished_operation_is_transient() {
+async fn cloud_ru_unfinished_operation_keeps_being_polled() {
     let (mock, client) = setup().await;
-    mock.control().set_operation_polls(1000);
-    let e = add(&client, "AAA").await.unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
-    assert_eq!(mock.log().count(Some("GET"), OPERATIONS), 60);
+    mock.control().set_operation_polls(u32::MAX);
+    let polled = async {
+        while mock.log().count(Some("GET"), OPERATIONS) < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {
+        outcome = add(&client, "AAA") => {
+            panic!("the add ended while its operation was running: {outcome:?}")
+        }
+        () = polled => {}
+    }
+    assert_eq!(writes(&mock), 1);
 }
 
 /// A delete whose operation finishes with `NOT_FOUND` is treated like a delete answered 404:

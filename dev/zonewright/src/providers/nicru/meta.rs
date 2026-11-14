@@ -166,6 +166,8 @@ const CAPABILITIES: Capabilities = Capabilities {
         min: 30,
         max: 86_400,
     },
-    provider_default_ttl: false,
+    // A record's `ttl` is optional and a record without one takes the zone's default (Docs 4.6):
+    // such a record reads as no TTL, and a write that keeps it sends none.
+    provider_default_ttl: true,
     asynchronous: false,
 };

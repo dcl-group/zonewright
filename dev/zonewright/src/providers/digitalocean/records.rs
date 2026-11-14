@@ -533,15 +533,29 @@ impl PerRecord for DigitalOcean {
     async fn delete(
         &self,
         zone: &DomainName,
-        _name: &DomainName,
-        _rtype: RecordType,
+        name: &DomainName,
+        rtype: RecordType,
         _context: &(),
         record: &Stored<u64>,
     ) -> Result<(), Error> {
-        // "Not found" counts as done: the record is gone (the record layer's rule for a
-        // per-record API).
         match self.api.delete_record(zone, record.handle).await? {
-            Written::Done | Written::NotFound => Ok(()),
+            Written::Done => Ok(()),
+            // The record is gone, or the domain is and was created again with the value under
+            // a new identifier. Only a new read tells them apart (the record layer's rule for a
+            // per-record API, design sections 3.5 and 3.8).
+            Written::NotFound => {
+                let now = <Self as PerRecord>::read(self, zone, name, rtype).await?;
+                if now.records.iter().any(|r| r.data == record.data) {
+                    Err(Error::Conflict {
+                        detail: Detail::constant(
+                            "the record was found again after its delete was answered \"not \
+                             found\"; the domain changed between the read and the delete",
+                        ),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }

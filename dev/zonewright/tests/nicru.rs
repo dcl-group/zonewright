@@ -1698,6 +1698,60 @@ fn with_default_ttl(set: &RrSet) -> RrSet {
         .with_ttl(set.ttl().or(Some(Ttl::from_secs(DEFAULT_TTL).unwrap())))
 }
 
+/// The zone's listing shows every record at the name, so a CNAME next to other data, or other
+/// data next to a CNAME, is refused after the read and before any edit or commit (RFC 1034
+/// section 3.6.2). Data at other names does not count.
+#[tokio::test]
+async fn nicru_cname_next_to_other_data_is_refused() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_record("example.org", "www", "A", "192.0.2.1", None);
+    control.insert_record("example.org", "alias", "CNAME", "target.example.net.", None);
+    let before = control.published_all("example.org");
+
+    let cname = rr(
+        "www.example.org",
+        RecordType::CNAME,
+        None,
+        &["target.example.net."],
+    );
+    let e = client
+        .set_rrset(&zone(), &cname, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    let a = rr("alias.example.org", RecordType::A, None, &["192.0.2.2"]);
+    let e = client
+        .set_rrset(&zone(), &a, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    assert_eq!(writes(&mock), 0);
+    assert_eq!(mock.log().count(Some("POST"), ROLLBACK), 0);
+    assert_eq!(control.published_all("example.org"), before);
+    assert!(!control.has_changes("example.org"));
+
+    // At names without the other kind of data the same writes go through.
+    let cname = rr(
+        "new.example.org",
+        RecordType::CNAME,
+        None,
+        &["target.example.net."],
+    );
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &cname, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    let a = rr("www2.example.org", RecordType::A, None, &["192.0.2.2"]);
+    assert_eq!(
+        client.set_rrset(&zone(), &a, Expect::Any).await.unwrap(),
+        SetOutcome::Created
+    );
+}
+
 fn rollbacks(mock: &NicruMock) -> usize {
     mock.log().count(Some("POST"), ROLLBACK)
 }

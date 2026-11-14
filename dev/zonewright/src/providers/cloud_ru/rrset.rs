@@ -59,6 +59,7 @@
 use crate::error::Error;
 use crate::http::{Attempt, ZoneId};
 use crate::name::DomainName;
+use crate::record::RecordType;
 use crate::redact::Detail;
 
 use super::api::{NewRecord, Record, RecordUpdate, Written};
@@ -73,7 +74,21 @@ impl CloudRu {
         name: &DomainName,
         rtype: &str,
     ) -> Result<(String, Option<Record>), Error> {
-        let (zone_id, record) = self
+        let (zone_id, record, _) = self.read_name(zone, name, rtype).await?;
+        Ok((zone_id, record))
+    }
+
+    /// [`CloudRu::read_record`], and the types of the other records the same listing holds at
+    /// the name: `None` for a type that is no record type, or for a record whose name may or
+    /// may not be this one (an ambiguous spelling). The listing holds the whole zone, so these
+    /// are all the data at the name besides the record.
+    pub(super) async fn read_name(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: &str,
+    ) -> Result<(String, Option<Record>, Vec<Option<RecordType>>), Error> {
+        let (zone_id, (record, others)) = self
             .zones
             .read_zone(
                 zone,
@@ -81,18 +96,18 @@ impl CloudRu {
                 |id| self.read_record_in(zone, name, rtype, id),
             )
             .await?;
-        Ok((zone_id.id, record))
+        Ok((zone_id.id, record, others))
     }
 
-    /// The read phase under the zone cache: the record in the zone `id`, or `Stale` when the API
-    /// does not know the zone.
+    /// The read phase under the zone cache: the record in the zone `id` and the types of the
+    /// other records at the name, or `Stale` when the API does not know the zone.
     async fn read_record_in(
         &self,
         zone: &DomainName,
         name: &DomainName,
         rtype: &str,
         id: ZoneId,
-    ) -> Result<Attempt<Option<Record>>, Error> {
+    ) -> Result<Attempt<(Option<Record>, Vec<Option<RecordType>>)>, Error> {
         let listed = match self.api.records(zone, &id.id).await {
             Ok(listed) => listed,
             Err(Error::ZoneNotFound { .. }) => return Ok(Attempt::Stale),
@@ -101,6 +116,7 @@ impl CloudRu {
         // The owner the requested name is below of, for a wildcard name.
         let base = name.is_wildcard().then(|| name.parent()).flatten();
         let mut found = Vec::new();
+        let mut others = Vec::new();
         for item in listed {
             let text = |key: &str| item.get(key).and_then(serde_json::Value::as_str);
             if text("publicZoneId") != Some(id.id.as_str()) {
@@ -110,9 +126,7 @@ impl CloudRu {
                     ),
                 });
             }
-            if !text("type").is_some_and(|t| t.eq_ignore_ascii_case(rtype)) {
-                continue;
-            }
+            let same_type = text("type").is_some_and(|t| t.eq_ignore_ascii_case(rtype));
             let wildcard = item
                 .get("wildcard")
                 .and_then(serde_json::Value::as_bool)
@@ -124,11 +138,21 @@ impl CloudRu {
                 (true, None) => None,
             };
             let same_name = match (owner, text("name")) {
-                (Some(owner), Some(spelled)) => is_owner(zone, owner, spelled)?,
-                (Some(owner), None) => owner == zone,
-                (None, _) => false,
+                (Some(owner), Some(spelled)) => is_owner(zone, owner, spelled),
+                (Some(owner), None) => Ok(owner == zone),
+                (None, _) => Ok(false),
             };
-            if same_name {
+            if !same_type {
+                // Another type: only what else is at the name. A spelling that may or may not
+                // be this name counts as data of an unknown type, never as an error.
+                match same_name {
+                    Ok(false) => {}
+                    Ok(true) => others.push(text("type").and_then(|t| t.parse().ok())),
+                    Err(_) => others.push(None),
+                }
+                continue;
+            }
+            if same_name? {
                 let record: Record = serde_json::from_value(item).map_err(|_| Error::Protocol {
                     detail: Detail::constant("the provider's record is not in the expected form"),
                 })?;
@@ -142,7 +166,7 @@ impl CloudRu {
                 ),
             });
         }
-        Ok(Attempt::Done(found.pop()))
+        Ok(Attempt::Done((found.pop(), others)))
     }
 
     /// Creates the record in the zone the read used.

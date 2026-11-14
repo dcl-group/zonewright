@@ -368,9 +368,8 @@ const PROVIDER_DEFAULT_TTL: &[(ProviderId, bool)] = &[
     (ProviderId::DigitalOcean, false),
     // An rrset's `ttl` may be `null`: the zone's default TTL applies.
     (ProviderId::Hetzner, true),
-    // A record created without `ttl` takes the zone's default, so a record can lack one; the
-    // flag still says false (open point for the maintainer, see the layer-batch report).
-    (ProviderId::Nicru, false),
+    // A record's `ttl` is optional; without one the zone's default applies (Docs 4.6).
+    (ProviderId::Nicru, true),
     // No TTL can be set, and the listing states none.
     (ProviderId::Regru, true),
     // Every RR carries a TTL on the wire.

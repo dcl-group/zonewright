@@ -2522,6 +2522,112 @@ async fn yandex_360_record_ttls() {
     assert!(control.records_at(www, "A").is_empty());
 }
 
+/// The domain is deleted and created again, with the records under new identifiers, between
+/// the read and the delete of an rrset: the delete is answered 404 while the values are still
+/// published, so the result is `Conflict`, not `Deleted` (design sections 3.5 and 3.8). The
+/// repeat reads the new identifiers and deletes. The same holds for the surplus record of a
+/// replacement.
+#[tokio::test]
+async fn yandex_360_record_delete_not_found_reads_again() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = "www.example.org";
+    let set = rr(www, RecordType::A, None, &["192.0.2.1", "192.0.2.2"]);
+    client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
+
+    let hook = control.clone();
+    mock.faults()
+        .push(Fault::on("DELETE", RECORD).run(move || hook.recreate_domain("example.org")));
+    let e = client
+        .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+    assert!(e.is_retryable());
+    assert_eq!(stored(&mock, www, "A"), ["192.0.2.1", "192.0.2.2"]);
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(stored(&mock, www, "A").is_empty());
+
+    // A replacement whose surplus delete meets the recreated domain.
+    client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
+    let hook = control.clone();
+    mock.faults()
+        .push(Fault::on("DELETE", RECORD).run(move || hook.recreate_domain("example.org")));
+    let fewer = rr(www, RecordType::A, None, &["192.0.2.1"]);
+    let e = client
+        .set_rrset(&zone(), &fewer, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+    assert_eq!(stored(&mock, www, "A"), ["192.0.2.1", "192.0.2.2"]);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &fewer, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(stored(&mock, www, "A"), ["192.0.2.1"]);
+}
+
+/// The domain's listing shows every record at the name, so a CNAME next to other data, or other
+/// data next to a CNAME, is refused after the read and before any write (RFC 1034 section
+/// 3.6.2). Data at other names does not count, and an unchanged CNAME is not a write.
+#[tokio::test]
+async fn yandex_360_cname_next_to_other_data_is_refused() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_record("example.org", "www", "A", "192.0.2.1", 300);
+    control.insert_record("example.org", "alias", "CNAME", "target.example.net.", 300);
+    let before = control.records();
+
+    let cname = rr(
+        "www.example.org",
+        RecordType::CNAME,
+        None,
+        &["target.example.net."],
+    );
+    let e = client
+        .set_rrset(&zone(), &cname, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    let a = rr("alias.example.org", RecordType::A, None, &["192.0.2.2"]);
+    let e = client
+        .set_rrset(&zone(), &a, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    assert_eq!(record_writes(&mock), 0);
+    assert_eq!(control.records(), before);
+
+    // At names without the other kind of data the same writes go through.
+    let cname = rr(
+        "new.example.org",
+        RecordType::CNAME,
+        None,
+        &["target.example.net."],
+    );
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &cname, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    let a = rr("www2.example.org", RecordType::A, None, &["192.0.2.2"]);
+    assert_eq!(
+        client.set_rrset(&zone(), &a, Expect::Any).await.unwrap(),
+        SetOutcome::Created
+    );
+}
+
 /// Two clients sharing a `Context` write one name at once, the first create delayed: the
 /// second reads after the first wrote, so its `Expect::Absent` fails.
 #[tokio::test]

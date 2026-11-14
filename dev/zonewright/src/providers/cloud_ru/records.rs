@@ -52,7 +52,8 @@ use crate::provider::{SkipReason, ZoneListing};
 use crate::record::{RecordData, RecordType, Ttl};
 use crate::redact::Detail;
 use crate::rrsets::{
-    self, Current, Found, Listing, Member, RrsetBase, SetTtl, Stored, WholeChange, WholeSet,
+    self, Current, Found, Listing, Member, Neighbors, RrsetBase, SetTtl, Stored, WholeChange,
+    WholeSet,
 };
 
 use super::api::Record;
@@ -128,21 +129,21 @@ impl WholeSet for CloudRu {
     /// A value as the API spells it, written back unchanged.
     type Handle = String;
     type Snapshot = Record;
-    /// The zone identifier the read used.
-    type Context = String;
+    /// The zone identifier the read used, and what else the read found at the name.
+    type Context = (String, Neighbors);
 
     async fn read(
         &self,
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-    ) -> Result<Current<String, Record, String>, Error> {
-        let (zone_id, record) = self.read_record(zone, name, api_type(rtype)?).await?;
+    ) -> Result<Current<String, Record, (String, Neighbors)>, Error> {
+        let (zone_id, record, others) = self.read_name(zone, name, api_type(rtype)?).await?;
         if record.as_ref().is_some_and(Record::is_gslb) {
             return Err(not_plain());
         }
         Ok(Current {
-            context: zone_id,
+            context: (zone_id, Neighbors::of(rtype, others)),
             found: record.map(|record| found(rtype, record)),
         })
     }
@@ -152,7 +153,7 @@ impl WholeSet for CloudRu {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        zone_id: &String,
+        (zone_id, _): &(String, Neighbors),
         prior: Option<&Record>,
         members: &[Member<'_, String>],
         ttl: SetTtl,
@@ -189,7 +190,7 @@ impl WholeSet for CloudRu {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _zone_id: &String,
+        _context: &(String, Neighbors),
         prior: &Record,
     ) -> Result<(), Error> {
         self.delete_record(zone, name, api_type(rtype)?, prior)
@@ -203,7 +204,7 @@ impl WholeSet for CloudRu {
         _zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _zone_id: &String,
+        _context: &(String, Neighbors),
         change: &WholeChange<'_, String, Record>,
     ) -> Result<(), Error> {
         let (prior, members) = match change {
@@ -240,6 +241,22 @@ impl WholeSet for CloudRu {
 
     fn same_snapshot(&self, first: &Record, again: &Record) -> bool {
         first == again
+    }
+
+    fn holds_cname(
+        &self,
+        _rtype: RecordType,
+        (_, neighbors): &(String, Neighbors),
+    ) -> Option<bool> {
+        neighbors.holds_cname()
+    }
+
+    fn holds_other_data(
+        &self,
+        _rtype: RecordType,
+        (_, neighbors): &(String, Neighbors),
+    ) -> Option<bool> {
+        neighbors.holds_other_data()
     }
 }
 

@@ -89,7 +89,7 @@ use crate::provider::{SkipReason, ZoneListing};
 use crate::record::{Caa, Mx, RecordData, RecordType, Srv, Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
-    self, Listing, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
+    self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
 };
 
 use super::api::{Fields, NewRecord, Record, Written, owner_name, write_name};
@@ -383,24 +383,33 @@ impl Yandex360 {
 impl PerRecord for Yandex360 {
     /// The record as read: its identifier, and its fields for an edit that keeps them.
     type Handle = Record;
-    /// The domain's name is the key of every path: nothing to carry.
-    type Context = ();
+    /// The domain's name is the key of every path, so no identifier is carried; the read
+    /// lists the whole domain and carries what else is at the name.
+    type Context = Neighbors;
 
     async fn read(
         &self,
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-    ) -> Result<RecordsRead<Record, ()>, Error> {
-        let records = self
+    ) -> Result<RecordsRead<Record, Neighbors>, Error> {
+        let (records, others): (Vec<Record>, Vec<Record>) = self
             .api
             .records(zone)
             .await?
             .into_iter()
-            .filter(|record| {
-                record.rtype.parse::<RecordType>().ok() == Some(rtype)
-                    && owner_name(&record.name, zone).as_ref() == Some(name)
-            })
+            .filter(|record| owner_name(&record.name, zone).as_ref() == Some(name))
+            .partition(|record| record.rtype.parse::<RecordType>().ok() == Some(rtype));
+        // Every record of the domain is listed, and the API has no disabled records: the other
+        // records of the name are all the data there besides this type.
+        let neighbors = Neighbors::of(
+            rtype,
+            others
+                .iter()
+                .map(|record| record.rtype.parse::<RecordType>().ok()),
+        );
+        let records = records
+            .into_iter()
             .map(|record| Stored {
                 data: read_record(rtype, &record),
                 // The API has no disabled records.
@@ -410,7 +419,7 @@ impl PerRecord for Yandex360 {
             })
             .collect();
         Ok(RecordsRead {
-            context: (),
+            context: neighbors,
             records,
         })
     }
@@ -420,7 +429,7 @@ impl PerRecord for Yandex360 {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &(),
+        _context: &Neighbors,
         data: &RecordData,
         ttl: SetTtl,
     ) -> Result<(), Error> {
@@ -452,7 +461,7 @@ impl PerRecord for Yandex360 {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &(),
+        _context: &Neighbors,
         record: &Stored<Record>,
         update: &RecordUpdate<'_>,
     ) -> Result<(), Error> {
@@ -504,20 +513,42 @@ impl PerRecord for Yandex360 {
     async fn delete(
         &self,
         zone: &DomainName,
-        _name: &DomainName,
-        _rtype: RecordType,
-        _context: &(),
+        name: &DomainName,
+        rtype: RecordType,
+        _context: &Neighbors,
         record: &Stored<Record>,
     ) -> Result<(), Error> {
-        // "Not found" counts as done: the record is gone (the record layer's rule for a
-        // per-record API).
         match self
             .api
             .delete_record(zone, record.handle.record_id)
             .await?
         {
-            Written::Done | Written::NotFound => Ok(()),
+            Written::Done => Ok(()),
+            // The record is gone, or the domain is and was created again with the value under
+            // a new identifier. Only a new read tells them apart (the record layer's rule for a
+            // per-record API, design sections 3.5 and 3.8).
+            Written::NotFound => {
+                let now = <Self as PerRecord>::read(self, zone, name, rtype).await?;
+                if now.records.iter().any(|r| r.data == record.data) {
+                    Err(Error::Conflict {
+                        detail: Detail::constant(
+                            "the record was found again after its delete was answered \"not \
+                             found\"; the domain changed between the read and the delete",
+                        ),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
         }
+    }
+
+    fn holds_cname(&self, _rtype: RecordType, context: &Neighbors) -> Option<bool> {
+        context.holds_cname()
+    }
+
+    fn holds_other_data(&self, _rtype: RecordType, context: &Neighbors) -> Option<bool> {
+        context.holds_other_data()
     }
 }
 

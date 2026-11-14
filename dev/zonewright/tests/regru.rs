@@ -2388,7 +2388,10 @@ async fn regru_record_operations_touch_only_their_rrset() {
     for (sub, rtype, content) in [
         ("www", "TXT", "192.0.2.1"),
         ("www", "AAAA", "2001:db8::1"),
-        ("www", "CNAME", "192.0.2.1"),
+        // Not a CNAME: a CNAME next to other data is refused before any write
+        // (`regru_cname_next_to_other_data_is_refused`).
+        ("www", "MX", "10 mail.example.org."),
+        ("alias", "CNAME", "www.example.org."),
         ("www2", "A", "192.0.2.1"),
         ("a.www", "A", "192.0.2.1"),
         ("@", "A", "192.0.2.1"),
@@ -2428,6 +2431,39 @@ async fn regru_record_operations_touch_only_their_rrset() {
         assert_eq!(input["record_type"], "A", "{input}");
     }
     assert_eq!(mock.log().count(Some("POST"), REMOVE), 3);
+}
+
+/// The zone's listing shows every record at the name, so data next to a CNAME is refused after
+/// the read and before any write (RFC 1034 section 3.6.2). A CNAME itself is not writable here,
+/// so only this direction exists. A CNAME at another name does not count.
+#[tokio::test]
+async fn regru_cname_next_to_other_data_is_refused() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.add_record("example.org", "www", "CNAME", "target.example.net.");
+    control.add_record("example.org", "other", "CNAME", "target.example.net.");
+    let before = control.records();
+    for rtype in [RecordType::A, RecordType::AAAA, RecordType::TXT] {
+        let text = match rtype {
+            RecordType::A => "192.0.2.1",
+            RecordType::AAAA => "2001:db8::1",
+            _ => "\"v\"",
+        };
+        let set = rr("www.example.org", rtype, &[text]);
+        let err = client
+            .set_rrset(&zone(), &set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{rtype}: {err}");
+        assert_eq!(record_writes(&mock), 0, "{rtype}");
+    }
+    assert_eq!(control.records(), before);
+    // At a name without a CNAME the same write goes through.
+    let set = rr("www2.example.org", RecordType::A, &["192.0.2.1"]);
+    assert_eq!(
+        client.set_rrset(&zone(), &set, Expect::Any).await.unwrap(),
+        SetOutcome::Created
+    );
 }
 
 /// A replacement creates every missing record before it removes any surplus one. A failure after

@@ -1042,7 +1042,10 @@ async fn dropping_a_wait_stops_its_queries() {
             .await
             .is_err()
     );
-    let asked = mock.log().len();
+    // A UDP query sent just before the drop may reach the mock's log only after the drop, the
+    // more so on a loaded machine, so the count is taken once the log has been quiet for five
+    // polling intervals; a wait that kept running would ask every 20 ms and never get there.
+    let asked = settled_log_len(&mock).await;
     assert!(asked >= 2);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
@@ -1050,6 +1053,25 @@ async fn dropping_a_wait_stops_its_queries() {
         asked,
         "nothing keeps asking after the drop"
     );
+}
+
+/// The length of `mock`'s query log once it has not grown for 100 ms; panics when it is still
+/// growing after 10 s (queries that never stop).
+async fn settled_log_len(mock: &DnsMock) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = mock.log().len();
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = mock.log().len();
+        if now == last {
+            return now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nothing keeps asking after the drop"
+        );
+        last = now;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

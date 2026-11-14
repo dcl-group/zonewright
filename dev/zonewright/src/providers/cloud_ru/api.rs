@@ -703,4 +703,55 @@ mod tests {
         assert_ne!(record(r#"["a"]"#, 60), record(r#"["a"]"#, 120));
         assert_ne!(record(r#"["a","a"]"#, 60), record(r#"["a"]"#, 60));
     }
+
+    /// The number of looks at a running operation is bounded: an operation that never finishes
+    /// ends the write with `Transient` after the last look, and the write is not repeated. The
+    /// bound of the client is `MAX_POLLS`; the test lowers it so that it does not wait 60
+    /// looks at the 250 ms floor.
+    #[tokio::test]
+    async fn an_operation_that_keeps_running_is_transient_after_the_last_look() {
+        use std::time::Duration;
+
+        use crate::context::{Context, ContextOptions};
+        use crate::error::ErrorKind;
+        use crate::http::Poller;
+        use crate::name::DomainName;
+        use crate::provider::Provider as _;
+        use crate::record::Txt;
+
+        let ctx = Context::new(ContextOptions {
+            loopback_only: true,
+            ..ContextOptions::default()
+        })
+        .unwrap();
+        let mock = zonewright_mock::cloud_ru::CloudRuMock::start(
+            zonewright_mock::cloud_ru::Seed::standard(),
+        )
+        .await;
+        mock.control().set_operation_polls(u32::MAX);
+        let mut config = crate::providers::cloud_ru::CloudRuConfig::new(
+            "0f1e2d3c-0000-4000-8000-000000000001".into(),
+            "zw-test-key-id".into(),
+        );
+        config.dns_url = mock.dns_url();
+        config.iam_url = mock.iam_url();
+        config.operation_poll_ms = 250;
+        let credentials = crate::providers::cloud_ru::CloudRuCredentials::new(
+            secrecy::SecretString::from("test-only-secret".to_owned()),
+        );
+        let mut client =
+            crate::providers::cloud_ru::CloudRu::new(config, credentials, &ctx).unwrap();
+        assert_eq!(super::MAX_POLLS, 60);
+        client.api.poller = Poller::new(Duration::from_millis(250), 3);
+        let zone = DomainName::parse("example.org").unwrap();
+        let name = DomainName::parse("_acme-challenge.example.org").unwrap();
+        let value = Txt::new("v1").unwrap();
+        let e = client
+            .add_txt_value(&zone, &name, &value, None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+        assert_eq!(mock.log().count(Some("GET"), "/v1/operations/*"), 3);
+        assert_eq!(mock.log().count(Some("POST"), "/v1/publicRecordsSole"), 1);
+    }
 }
