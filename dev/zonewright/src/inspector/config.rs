@@ -60,7 +60,9 @@ impl IpFamilies {
 /// never queried, and in [`Inspector::observe`](super::Inspector::observe) and
 /// [`Inspector::wait`](super::Inspector::wait) it is a row whose answers are
 /// [`Answer::NotAsked`](super::Answer::NotAsked) and which never satisfies anything. A wait
-/// over a zone with such a server therefore runs to its timeout, and the report says why.
+/// over a zone with such a server therefore runs to its timeout, and the report says why,
+/// unless [`WaitOptions::ignore_unaskable_name_servers`](super::WaitOptions::ignore_unaskable_name_servers)
+/// leaves such servers out of the condition.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct NameServer {

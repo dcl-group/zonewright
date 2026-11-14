@@ -33,6 +33,29 @@ pub struct WaitOptions {
     pub interval: Duration,
     /// The pause varies by up to this percentage either way. Default 20; at most 50.
     pub jitter_percent: u8,
+    /// Leave the name servers that cannot be asked out of the condition "every server agrees".
+    /// Default false.
+    ///
+    /// A server that cannot be asked is one discovery reported with
+    /// [`NameServer::not_asked`] set — the NS name has no address in the configured address
+    /// families ([`NotAsked::NoAddress`](super::NotAsked::NoAddress)) or the address policy
+    /// refuses its address ([`NotAsked::AddressRefused`](super::NotAsked::AddressRefused)) —
+    /// that is, a server known before any query to be impossible to ask. With this option on,
+    /// the wait is satisfied once every server that is asked satisfies every expectation in the
+    /// same round; the servers that cannot be asked are not waited for.
+    ///
+    /// Nothing else is ignored. A server that is asked and times out, refuses, fails, is not
+    /// authoritative or answers anything that does not satisfy an expectation still keeps the
+    /// wait from being satisfied. The servers that cannot be asked stay in the [`Report`] as
+    /// rows with their reason and `satisfied` false, exactly as with the option off, and
+    /// [`Report::unaskable_ignored`] counts them.
+    ///
+    /// The option never makes a wait succeed without a server that was asked: when every name
+    /// server of the zone cannot be asked, the wait runs to its timeout and ends in
+    /// [`InspectorError::Timeout`], as it does with the option off.
+    ///
+    /// It has no effect on a static name-server list, every entry of which is asked.
+    pub ignore_unaskable_name_servers: bool,
 }
 
 impl WaitOptions {
@@ -41,13 +64,15 @@ impl WaitOptions {
     /// [`InspectorError::InvalidInput`]. With the largest jitter the shortest pause is 500 ms.
     pub const MIN_INTERVAL: Duration = Duration::from_secs(1);
 
-    /// Options with this timeout, a 5 s interval and 20 % jitter.
+    /// Options with this timeout, a 5 s interval, 20 % jitter, and every name server waited
+    /// for (`ignore_unaskable_name_servers` false).
     #[must_use]
     pub fn new(timeout: Duration) -> WaitOptions {
         WaitOptions {
             timeout,
             interval: Duration::from_secs(5),
             jitter_percent: 20,
+            ignore_unaskable_name_servers: false,
         }
     }
 }
@@ -81,6 +106,12 @@ pub struct Report {
     pub rounds: u32,
     /// Time from the start of the first round to the end of the last.
     pub elapsed: Duration,
+    /// How many servers that cannot be asked were left out of the condition because
+    /// [`WaitOptions::ignore_unaskable_name_servers`] was on: the number of rows with
+    /// [`NameServer::not_asked`] set. Always zero with the option off. A report of a satisfied
+    /// wait with a non-zero count means the expectations were met at every server that was
+    /// asked, and these servers were not checked.
+    pub unaskable_ignored: usize,
 }
 
 /// True when `answer` satisfies `condition` (the table of design section 8.6). Only an answer
@@ -273,6 +304,20 @@ impl<T: Transport> Engine<T> {
         let servers = self.name_servers(zone).await?;
         Self::check_round_size(&servers, asks.len())?;
 
+        // Servers that cannot be asked, left out of the condition when the option is on. The
+        // list is fixed for the whole wait, so the count is too.
+        let ignore = options.ignore_unaskable_name_servers;
+        let unaskable_ignored = if ignore {
+            servers
+                .iter()
+                .filter(|server| server.reason().is_some())
+                .count()
+        } else {
+            0
+        };
+        // With every server left out nothing was asked: never satisfied, never vacuously.
+        let any_counted = !ignore || unaskable_ignored < servers.len();
+
         let start = Instant::now();
         let mut first: Vec<Option<Duration>> = vec![None; servers.len()];
         let mut rounds: u32 = 0;
@@ -302,13 +347,27 @@ impl<T: Transport> Engine<T> {
                     first_satisfied_after: *first,
                 });
             }
-            let done = reports.iter().all(|report| report.satisfied);
+            let done = any_counted
+                && reports
+                    .iter()
+                    .all(|report| report.satisfied || (ignore && report.server.reason().is_some()));
             let report = Report {
                 servers: reports,
                 rounds,
                 elapsed,
+                unaskable_ignored,
             };
             if done {
+                if unaskable_ignored > 0 {
+                    tracing::warn!(
+                        target: super::TARGET,
+                        zone = %zone,
+                        unaskable_ignored,
+                        rounds,
+                        elapsed_ms = super::duration_ms(elapsed),
+                        "expectations met with name servers that cannot be asked left out"
+                    );
+                }
                 return Ok(report);
             }
             if elapsed >= options.timeout {
@@ -914,6 +973,293 @@ mod tests {
                 Answer::NotAsked(NotAsked::NoAddress),
                 Answer::NotAsked(NotAsked::NoAddress)
             ]
+        );
+    }
+
+    /// An engine with recursive discovery through the fake resolver `addr(1)`: one NS name per
+    /// entry, `nsN.example.net` with the given IPv4 address, or with none (NODATA for `A`).
+    /// What the servers answer is up to the test.
+    fn engine_with(addresses: &[Option<&str>]) -> Engine<Fake> {
+        use crate::inspector::testing::config_with;
+        let r1 = addr(1);
+        let e = Engine::new(config_with(vec![r1]), Fake::default()).unwrap();
+        let hosts: Vec<String> = (1..=addresses.len())
+            .map(|i| format!("ns{i}.example.net"))
+            .collect();
+        e.transport.reply(
+            r1,
+            "example.org",
+            RecordType::NS,
+            ok(hosts
+                .iter()
+                .map(|host| rec("example.org", RecordType::NS, 300, &format!("{host}.")))
+                .collect()),
+        );
+        for (host, ip) in hosts.iter().zip(addresses) {
+            let outcome = match ip {
+                Some(ip) => ok(vec![rec(host, RecordType::A, 300, ip)]),
+                None => nodata(),
+            };
+            e.transport.reply(r1, host, RecordType::A, outcome);
+        }
+        e
+    }
+
+    fn ignoring(timeout: Duration) -> WaitOptions {
+        let mut options = WaitOptions::new(timeout);
+        options.jitter_percent = 0;
+        options.ignore_unaskable_name_servers = true;
+        options
+    }
+
+    fn present_v() -> [Expectation; 1] {
+        [Expectation::new(
+            question(),
+            Condition::Present(vec![txt("v")]),
+        )]
+    }
+
+    /// The queries that went to name servers rather than to the resolver `addr(1)`.
+    fn server_calls(e: &Engine<Fake>) -> Vec<SocketAddr> {
+        e.transport
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(server, _)| *server != addr(1))
+            .map(|(server, _)| *server)
+            .collect()
+    }
+
+    #[test]
+    fn unaskable_servers_are_waited_for_by_default() {
+        assert!(!WaitOptions::new(Duration::from_secs(1)).ignore_unaskable_name_servers);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_the_option_off_the_report_counts_nothing_ignored() {
+        let e = engine_with_unasked_servers();
+        let mut options = WaitOptions::new(Duration::from_secs(5));
+        options.jitter_percent = 0;
+        let err = e.wait(&zone(), &present_v(), &options).await.unwrap_err();
+        let InspectorError::Timeout { report } = err else {
+            panic!("expected a timeout");
+        };
+        assert_eq!(report.unaskable_ignored, 0);
+        assert_eq!(report.rounds, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ignoring_unaskable_servers_is_satisfied_by_the_asked_ones_and_keeps_the_rows() {
+        use crate::inspector::{AddressRefusal, NotAsked};
+        // ns1 asked and agreeing, ns2 refused (loopback), ns3 without an IPv4 address.
+        let e = engine_with_unasked_servers();
+        let report = e
+            .wait(&zone(), &present_v(), &ignoring(Duration::from_secs(20)))
+            .await
+            .unwrap();
+        assert_eq!(report.rounds, 1);
+        assert_eq!(report.elapsed, Duration::ZERO);
+        assert_eq!(report.unaskable_ignored, 2);
+        type Row = (Option<NotAsked>, bool, Vec<Answer>, Option<Duration>);
+        let refused = NotAsked::AddressRefused(AddressRefusal::Loopback);
+        let rows: Vec<Row> = report
+            .servers
+            .iter()
+            .map(|s| {
+                (
+                    s.server.not_asked,
+                    s.satisfied,
+                    s.answers.clone(),
+                    s.first_satisfied_after,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (None, true, vec![records(&["v"])], Some(Duration::ZERO)),
+                (Some(refused), false, vec![Answer::NotAsked(refused)], None),
+                (
+                    Some(NotAsked::NoAddress),
+                    false,
+                    vec![Answer::NotAsked(NotAsked::NoAddress)],
+                    None
+                ),
+            ]
+        );
+        assert_eq!(server_calls(&e), vec![addr(53)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_reason_alone_is_left_out() {
+        use crate::inspector::{AddressRefusal, NotAsked};
+        let cases = [
+            (
+                Some("10.0.0.53"),
+                NotAsked::AddressRefused(AddressRefusal::Private),
+            ),
+            (None, NotAsked::NoAddress),
+        ];
+        for (address, reason) in cases {
+            let e = engine_with(&[Some("192.0.2.53"), address]);
+            e.transport
+                .reply(addr(53), name(), RecordType::TXT, txt_reply(&["v"]));
+            let report = e
+                .wait(&zone(), &present_v(), &ignoring(Duration::from_secs(20)))
+                .await
+                .unwrap();
+            assert_eq!(report.rounds, 1, "{reason:?}");
+            assert_eq!(report.unaskable_ignored, 1, "{reason:?}");
+            assert_eq!(report.servers.len(), 2, "{reason:?}");
+            assert_eq!(report.servers[1].server.not_asked, Some(reason));
+            assert_eq!(report.servers[1].answers, vec![Answer::NotAsked(reason)]);
+            assert!(!report.servers[1].satisfied);
+
+            // The same zone with the option off runs to its timeout.
+            let mut off = ignoring(Duration::from_secs(20));
+            off.ignore_unaskable_name_servers = false;
+            let err = e.wait(&zone(), &present_v(), &off).await.unwrap_err();
+            assert!(
+                matches!(&err, InspectorError::Timeout { report } if report.rounds == 5),
+                "{reason:?} {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_asked_server_that_disagrees_or_fails_still_blocks_with_the_option_on() {
+        let failures = [
+            Behavior::Seq(vec![nodata()]),
+            Behavior::Seq(vec![txt_reply(&["other"])]),
+            Behavior::Hang,
+            Behavior::Seq(vec![Ok(crate::inspector::testing::reply(
+                5,
+                true,
+                Vec::new(),
+            ))]),
+            Behavior::Seq(vec![Ok(crate::inspector::testing::reply(
+                0,
+                false,
+                Vec::new(),
+            ))]),
+            Behavior::Seq(vec![Err(Failure::Network("unreachable".to_owned()))]),
+        ];
+        for behavior in failures {
+            // ns1 agrees, ns2 is asked and does not, ns3 has no IPv4 address.
+            let e = engine_with(&[Some("192.0.2.53"), Some("192.0.2.54"), None]);
+            e.transport
+                .reply(addr(53), name(), RecordType::TXT, txt_reply(&["v"]));
+            e.transport
+                .on(addr(54), name(), RecordType::TXT, behavior.clone());
+            let err = e
+                .wait(&zone(), &present_v(), &ignoring(Duration::from_secs(20)))
+                .await
+                .unwrap_err();
+            let InspectorError::Timeout { report } = err else {
+                panic!("expected a timeout for {behavior:?}");
+            };
+            assert!(report.rounds >= 3, "{behavior:?} {}", report.rounds);
+            assert_eq!(report.unaskable_ignored, 1, "{behavior:?}");
+            let satisfied: Vec<bool> = report.servers.iter().map(|s| s.satisfied).collect();
+            assert_eq!(satisfied, vec![true, false, false], "{behavior:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zone_none_of_whose_servers_can_be_asked_is_never_satisfied() {
+        use crate::inspector::{AddressRefusal, NotAsked};
+        let e = engine_with(&[Some("127.0.0.1"), None]);
+        // Absent would hold for any answer that says something; nothing is asked at all.
+        let expectations = [Expectation::new(
+            question(),
+            Condition::Absent(vec![txt("v")]),
+        )];
+        let started = Instant::now();
+        let err = e
+            .wait(&zone(), &expectations, &ignoring(Duration::from_secs(20)))
+            .await
+            .unwrap_err();
+        let InspectorError::Timeout { report } = err else {
+            panic!("expected a timeout");
+        };
+        // The wait ran to its timeout: rounds at 0, 5, 10, 15 and 20 s.
+        assert_eq!(started.elapsed(), Duration::from_secs(20));
+        assert_eq!(report.rounds, 5);
+        assert_eq!(report.unaskable_ignored, 2);
+        let reasons: Vec<Option<NotAsked>> =
+            report.servers.iter().map(|s| s.server.not_asked).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                Some(NotAsked::AddressRefused(AddressRefusal::Loopback)),
+                Some(NotAsked::NoAddress)
+            ]
+        );
+        assert!(report.servers.iter().all(|s| !s.satisfied));
+        assert!(server_calls(&e).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_satisfied_with_servers_left_out_emits_one_warning() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let e = engine_with_unasked_servers();
+        e.wait(&zone(), &present_v(), &ignoring(Duration::from_secs(20)))
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
+        let ours: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("cannot be asked left out"))
+            .collect();
+        assert_eq!(ours.len(), 1, "{text}");
+        let line = ours[0];
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("zonewright::inspector"), "{line}");
+        assert!(line.contains("zone=example.org"), "{line}");
+        assert!(line.contains("unaskable_ignored=2"), "{line}");
+        assert!(line.contains("rounds=1"), "{line}");
+        assert!(!line.contains("_acme-challenge"), "{line}");
+
+        // A wait with nothing left out emits no such event.
+        let s1 = addr(1);
+        let plain = engine(&[s1]);
+        plain
+            .transport
+            .reply(s1, name(), RecordType::TXT, txt_reply(&["v"]));
+        let report = plain
+            .wait(&zone(), &present_v(), &ignoring(Duration::from_secs(20)))
+            .await
+            .unwrap();
+        assert_eq!(report.unaskable_ignored, 0);
+        let text = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
+        assert_eq!(
+            text.matches("cannot be asked left out").count(),
+            1,
+            "{text}"
         );
     }
 

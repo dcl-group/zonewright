@@ -816,6 +816,145 @@ async fn a_wait_over_servers_that_cannot_be_asked_runs_to_its_timeout_and_says_w
     assert_eq!(resolver.count(CHALLENGE, TYPE_TXT), 0);
 }
 
+/// A resolver for a zone whose name servers all cannot be asked: ns1 at loopback (refused by
+/// the address policy), ns2 with an IPv6 address only (no address in the default IPv4 family).
+async fn unaskable_delegation() -> DnsMock {
+    let resolver = DnsMock::start(Role::Recursive).await;
+    for ns in ["ns1.example.net", "ns2.example.net"] {
+        resolver.add(ZONE, TYPE_NS, 300, Data::name(ns));
+    }
+    resolver.add("ns1.example.net", TYPE_A, 300, Data::a([127, 0, 0, 1]));
+    resolver.add(
+        "ns2.example.net",
+        TYPE_AAAA,
+        300,
+        Data::aaaa("2001:db8::53".parse().unwrap()),
+    );
+    resolver
+}
+
+#[tokio::test]
+async fn ignoring_unaskable_servers_never_satisfies_a_zone_none_of_whose_servers_can_be_asked() {
+    let resolver = unaskable_delegation().await;
+    let inspector = resolver_inspector(&[resolver.addr()]);
+    let mut options = WaitOptions::new(Duration::from_millis(1500));
+    options.interval = WaitOptions::MIN_INTERVAL;
+    options.jitter_percent = 0;
+    options.ignore_unaskable_name_servers = true;
+    // Exact-empty would hold for an answer of NODATA; no server is asked at all.
+    let started = Instant::now();
+    let result = inspector
+        .wait(
+            &name(ZONE),
+            &[Expectation::new(
+                question(CHALLENGE, RecordType::TXT),
+                Condition::Exact(Vec::new()),
+            )],
+            &options,
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let Err(InspectorError::Timeout { report }) = result else {
+        panic!("expected a timeout, got {result:?}");
+    };
+    assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(report.rounds, 2);
+    assert_eq!(report.unaskable_ignored, 2);
+    let servers: Vec<NameServer> = report.servers.iter().map(|s| s.server.clone()).collect();
+    let loopback = NotAsked::AddressRefused(AddressRefusal::Loopback);
+    assert_eq!(
+        rows(&servers),
+        vec![
+            row("ns1.example.net.", Some("127.0.0.1:53"), Some(loopback)),
+            row("ns2.example.net.", None, Some(NotAsked::NoAddress)),
+        ]
+    );
+    for server in &report.servers {
+        assert!(!server.satisfied);
+        assert_eq!(
+            server.answers,
+            vec![Answer::NotAsked(server.server.not_asked.unwrap())]
+        );
+    }
+    assert_eq!(resolver.count(CHALLENGE, TYPE_TXT), 0);
+}
+
+#[tokio::test]
+async fn by_default_unaskable_servers_are_waited_for_and_nothing_is_counted_ignored() {
+    let resolver = unaskable_delegation().await;
+    let inspector = resolver_inspector(&[resolver.addr()]);
+    let mut options = WaitOptions::new(Duration::ZERO);
+    assert!(!options.ignore_unaskable_name_servers);
+    options.interval = WaitOptions::MIN_INTERVAL;
+    let result = inspector
+        .wait(
+            &name(ZONE),
+            &[Expectation::new(
+                question(CHALLENGE, RecordType::TXT),
+                Condition::Exact(Vec::new()),
+            )],
+            &options,
+        )
+        .await;
+    let Err(InspectorError::Timeout { report }) = result else {
+        panic!("expected a timeout, got {result:?}");
+    };
+    assert_eq!(report.rounds, 1);
+    assert_eq!(report.unaskable_ignored, 0);
+    assert_eq!(report.servers.len(), 2);
+}
+
+#[tokio::test]
+async fn ignoring_unaskable_servers_does_not_change_a_static_list() {
+    // Every entry of a static list is asked: a server that does not answer still blocks.
+    let mock = authoritative().await;
+    mock.add(CHALLENGE, TYPE_TXT, 60, Data::txt(&[b"v"]));
+    let silent = silent_socket().await;
+    let inspector = Inspector::new(static_config(
+        &[mock.addr(), silent.local_addr().unwrap()],
+        Duration::from_millis(300),
+    ))
+    .unwrap();
+    let mut options = WaitOptions::new(Duration::ZERO);
+    options.ignore_unaskable_name_servers = true;
+    let result = inspector
+        .wait(
+            &name(ZONE),
+            &[Expectation::new(
+                question(CHALLENGE, RecordType::TXT),
+                Condition::Present(vec![txt("v")]),
+            )],
+            &options,
+        )
+        .await;
+    let Err(InspectorError::Timeout { report }) = result else {
+        panic!("expected a timeout, got {result:?}");
+    };
+    assert_eq!(report.unaskable_ignored, 0);
+    let rows: Vec<(bool, Answer)> = report
+        .servers
+        .iter()
+        .map(|s| (s.satisfied, s.answers[0].clone()))
+        .collect();
+    assert!(rows[0].0, "{rows:?}");
+    assert_eq!(rows[1], (false, Answer::Timeout));
+
+    // With the silent server gone the same options are satisfied, nothing left out.
+    let inspector = static_inspector(&[mock.addr()]);
+    let report = inspector
+        .wait(
+            &name(ZONE),
+            &[Expectation::new(
+                question(CHALLENGE, RecordType::TXT),
+                Condition::Present(vec![txt("v")]),
+            )],
+            &options,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.unaskable_ignored, 0);
+}
+
 #[tokio::test]
 async fn discovery_moves_on_to_the_next_resolver_and_is_bounded_in_time() {
     let silent = silent_socket().await;
