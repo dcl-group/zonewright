@@ -49,6 +49,9 @@ mod values;
 #[allow(dead_code)]
 mod redact;
 
+#[cfg(feature = "__http")]
+mod http;
+
 // TEMPORARY (core phase): nothing uses these modules until the transport and the clients land.
 #[cfg(feature = "__crypto")]
 #[allow(dead_code)]

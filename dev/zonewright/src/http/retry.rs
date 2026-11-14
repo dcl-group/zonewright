@@ -1,0 +1,506 @@
+//! Sending a request: attempts, retries, rate limits, the status mapping, the size cap and the
+//! `tracing` event of every attempt (design sections 5.3, 5.4 and 5.6).
+//!
+//! - At most [`MAX_ATTEMPTS`] attempts per request, counting the first.
+//! - An idempotent request is retried after a connection or timeout error and after a 5xx
+//!   answer. Back-off before attempt `n + 1` is `500 ms × n` plus a random 0–25 %.
+//! - A request that is not idempotent is sent once; whatever goes wrong becomes the error.
+//! - 429: the wait comes from `Retry-After` (seconds or an HTTP date) or `RateLimit-Reset`. An
+//!   idempotent request with attempts left sleeps for a wait of at most [`MAX_INLINE_WAIT`] and
+//!   retries, or uses the back-off when no wait is given; otherwise `Error::RateLimited`.
+//! - 401 to a request made with a token from a [`TokenSource`]: the token's generation is
+//!   invalidated. An idempotent request with attempts left gets a new token and is repeated once;
+//!   the repeat counts toward the attempts, and a 401 for a token fetched during the call is
+//!   `Error::Auth`. Otherwise `Error::Transient`: the caller's repeat of the operation obtains a
+//!   new token.
+//! - 401 otherwise `Auth`, 403 `Forbidden`, 3xx `Rejected` (redirects are not followed), 5xx
+//!   `Transient`; every other status goes back to the client.
+//! - Refusals by the URL policy at send time (`loopback_only`, no CA certificates) are never
+//!   retried and contact nothing.
+//!
+//! One `DEBUG` event per attempt, target `zonewright::http`, with the fields `provider`,
+//! `method`, `path` (no query string), `status` (absent when there was no answer), `attempt`
+//! and `elapsed_ms`. Nothing else: no header, no body, no query, no detail text.
+
+use std::future::Future;
+use std::time::Duration;
+
+use bytes::Bytes;
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
+use secrecy::ExposeSecret;
+use tokio::time::Instant;
+
+use crate::error::Error;
+use crate::redact::Detail;
+
+use super::Http;
+use super::request::{AuthMode, BODY_LIMIT, BODY_TOO_LARGE, Request, Response, TokenAuth};
+use super::tls::NO_CA_CERTIFICATES;
+use super::token::{Lease, Token, TokenSource};
+use super::url::is_loopback_literal;
+
+/// Most attempts per request, counting the first.
+pub(crate) const MAX_ATTEMPTS: u32 = 3;
+
+/// Longest rate-limit wait the transport sleeps through itself; a longer one is returned as
+/// `Error::RateLimited`.
+pub(crate) const MAX_INLINE_WAIT: Duration = Duration::from_secs(30);
+
+/// `Target` of the transport's `tracing` events.
+const TARGET: &str = "zonewright::http";
+
+/// A cached-token credential for one call.
+struct TokenUse<'a, F> {
+    source: &'a TokenSource,
+    auth: &'a TokenAuth,
+    fetch: &'a F,
+}
+
+/// The fetch type of a call without a token; never called.
+type NoFetch = fn() -> std::future::Ready<Result<Token, Error>>;
+
+/// Why an attempt produced no usable answer.
+enum Failure {
+    /// No answer, or an answer cut off: connection refused or broken, timeout. Retryable for
+    /// an idempotent request. The text is a constant; the status is that of an answer whose
+    /// body was cut off.
+    Network(&'static str, Option<u16>),
+    /// The answer's body is over [`BODY_LIMIT`].
+    TooLarge { status: u16 },
+    /// The request could not be built (a header value the client set is unusable).
+    Build,
+}
+
+impl Failure {
+    fn from_reqwest(e: &reqwest::Error, status: Option<u16>) -> Failure {
+        // Only the classification of a `reqwest` error is used, never its text: it can contain
+        // the URL with its query string.
+        if e.is_builder() {
+            Failure::Build
+        } else if e.is_timeout() {
+            Failure::Network("the request to the provider timed out", status)
+        } else if e.is_connect() {
+            Failure::Network("could not connect to the provider", status)
+        } else if e.is_body() || e.is_decode() {
+            Failure::Network(
+                "the connection broke while the provider's answer was read",
+                status,
+            )
+        } else {
+            Failure::Network("the request to the provider failed", status)
+        }
+    }
+}
+
+impl Http {
+    /// Sends `request` with the client's static credential (if any) under the rules of the
+    /// module documentation.
+    pub(crate) async fn send(&self, request: &Request) -> Result<Response, Error> {
+        self.run::<NoFetch, _>(request, None).await
+    }
+
+    /// Sends `request` with a token from `tokens`, sent as `auth` says. `fetch` obtains a new
+    /// token when there is none or it is due; it runs inside this call's future (see
+    /// [`TokenSource`]). Every token used is registered with the scrubber.
+    pub(crate) async fn send_with_token<F, Fut>(
+        &self,
+        request: &Request,
+        tokens: &TokenSource,
+        auth: &TokenAuth,
+        fetch: F,
+    ) -> Result<Response, Error>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Token, Error>>,
+    {
+        let token = TokenUse {
+            source: tokens,
+            auth,
+            fetch: &fetch,
+        };
+        self.run(request, Some(token)).await
+    }
+
+    async fn run<F, Fut>(
+        &self,
+        request: &Request,
+        token: Option<TokenUse<'_, F>>,
+    ) -> Result<Response, Error>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Token, Error>>,
+    {
+        self.preflight(request)?;
+        let mut lease: Option<Lease> = None;
+        let mut refreshed = false;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let token_header = match &token {
+                Some(token) => {
+                    let current = match lease.take() {
+                        Some(current) => current,
+                        None => token.source.get(|| (token.fetch)()).await?,
+                    };
+                    self.scrubber.remember(current.token.expose_secret());
+                    let header = token.auth.header(current.token.expose_secret())?;
+                    lease = Some(current);
+                    Some(header)
+                }
+                None => None,
+            };
+
+            if let Some(gate) = &self.gate {
+                gate.wait().await;
+            }
+            let started = Instant::now();
+            let result = self.attempt(request, token_header, attempt).await;
+            let status = match &result {
+                Ok(response) => Some(response.status),
+                Err(Failure::TooLarge { status }) => Some(*status),
+                Err(Failure::Network(_, status)) => *status,
+                Err(Failure::Build) => None,
+            };
+            self.trace(request, status, attempt, started.elapsed());
+            let retry_left = request.idempotent && attempt < MAX_ATTEMPTS;
+
+            let response = match result {
+                Ok(response) => response,
+                Err(Failure::TooLarge { .. }) => return Err(protocol(BODY_TOO_LARGE)),
+                Err(Failure::Build) => {
+                    return Err(Error::InvalidInput {
+                        detail: Detail::constant("the HTTP request could not be built"),
+                    });
+                }
+                Err(Failure::Network(text, _)) => {
+                    if retry_left {
+                        tokio::time::sleep(backoff(attempt)).await;
+                        continue;
+                    }
+                    return Err(Error::Transient {
+                        detail: Detail::constant(text),
+                    });
+                }
+            };
+
+            let status = response.status;
+            if request.keep.contains(&status) {
+                return Ok(response);
+            }
+            match status {
+                300..=399 => {
+                    return Err(Error::Rejected {
+                        status: Some(status),
+                        detail: Detail::constant(
+                            "the provider answered with a redirect, which is not followed",
+                        ),
+                    });
+                }
+                401 => {
+                    let (Some(token), Some(used)) = (&token, lease.take()) else {
+                        return Err(Error::Auth {
+                            detail: self.body_detail(&response),
+                        });
+                    };
+                    token.source.invalidate(used.generation).await;
+                    if used.fresh || refreshed {
+                        return Err(Error::Auth {
+                            detail: self.body_detail(&response),
+                        });
+                    }
+                    if !retry_left {
+                        return Err(Error::Transient {
+                            detail: Detail::constant(
+                                "the provider rejected the cached token; repeating the operation obtains a new one",
+                            ),
+                        });
+                    }
+                    refreshed = true;
+                }
+                403 => {
+                    return Err(Error::Forbidden {
+                        detail: self.body_detail(&response),
+                    });
+                }
+                429 => {
+                    let wait = rate_wait(&response.headers, jiff::Timestamp::now());
+                    match wait {
+                        None if retry_left => tokio::time::sleep(backoff(attempt)).await,
+                        Some(wait) if retry_left && wait <= MAX_INLINE_WAIT => {
+                            tokio::time::sleep(wait).await;
+                        }
+                        _ => return Err(Error::RateLimited { retry_after: wait }),
+                    }
+                }
+                500..=599 => {
+                    if retry_left {
+                        tokio::time::sleep(backoff(attempt)).await;
+                        continue;
+                    }
+                    let message = self.body_detail(&response);
+                    return Err(Error::Transient {
+                        detail: self.scrubber.detail(&format!("status {status}: {message}")),
+                    });
+                }
+                _ => return Ok(response),
+            }
+        }
+    }
+
+    /// Checks made before any connection: the URL policy (https, or http on a loopback literal),
+    /// `loopback_only`, and the absence of CA certificates for an https URL. None is retried.
+    fn preflight(&self, request: &Request) -> Result<(), Error> {
+        let url = &request.url;
+        let loopback = is_loopback_literal(url);
+        let allowed = match url.scheme() {
+            "https" => true,
+            "http" => loopback,
+            _ => false,
+        };
+        if !allowed {
+            return Err(config(
+                "the request URL must use https; http is accepted only for a loopback IP literal",
+            ));
+        }
+        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+            return Err(config(
+                "the request URL must not contain user info or a fragment",
+            ));
+        }
+        if self.transport.shared.loopback_only && !loopback {
+            return Err(config(
+                "the request URL is not a loopback IP literal, and the context allows loopback addresses only",
+            ));
+        }
+        if url.scheme() == "https" && self.transport.shared.trust.no_ca_certificates() {
+            return Err(config(NO_CA_CERTIFICATES));
+        }
+        Ok(())
+    }
+
+    /// One HTTP exchange: build the request, send it, read the answer under the size cap.
+    async fn attempt(
+        &self,
+        request: &Request,
+        token: Option<(HeaderName, HeaderValue)>,
+        attempt: u32,
+    ) -> Result<Response, Failure> {
+        let mut outgoing = reqwest::Request::new(request.method.clone(), request.url.clone());
+        let headers = outgoing.headers_mut();
+        let accept = HeaderValue::from_str(request.accept).map_err(|_| Failure::Build)?;
+        headers.insert(ACCEPT, accept);
+        if request.auth == AuthMode::Client
+            && let Some((name, value)) = &self.auth
+        {
+            headers.insert(name.clone(), value.clone());
+        }
+        if let Some((name, value)) = token {
+            headers.insert(name, value);
+        }
+        for (name, value) in &request.headers {
+            headers.append(name.clone(), value.clone());
+        }
+        if let Some((content_type, body)) = &request.body {
+            let content_type = HeaderValue::from_str(content_type).map_err(|_| Failure::Build)?;
+            headers.insert(CONTENT_TYPE, content_type);
+            *outgoing.body_mut() = Some(reqwest::Body::from(body.clone()));
+        }
+        let answer = self
+            .transport
+            .client
+            .execute(outgoing)
+            .await
+            .map_err(|e| Failure::from_reqwest(&e, None))?;
+        let status = answer.status().as_u16();
+        let headers = answer.headers().clone();
+        let body = read_body(answer, status).await?;
+        Ok(Response {
+            status,
+            headers,
+            body,
+            attempt,
+        })
+    }
+
+    /// The `tracing` event of one attempt.
+    fn trace(&self, request: &Request, status: Option<u16>, attempt: u32, elapsed: Duration) {
+        let provider = self.provider.as_str();
+        let method = request.method.as_str();
+        let path = request.path();
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        match status {
+            Some(status) => tracing::debug!(
+                target: TARGET,
+                provider,
+                method,
+                path,
+                status,
+                attempt,
+                elapsed_ms,
+                "provider request"
+            ),
+            None => tracing::debug!(
+                target: TARGET,
+                provider,
+                method,
+                path,
+                attempt,
+                elapsed_ms,
+                "provider request"
+            ),
+        }
+    }
+}
+
+/// Reads the body of `answer`, at most [`BODY_LIMIT`] bytes. A `Content-Length` over the limit
+/// fails before anything is read; a body without one is read chunk by chunk and fails as soon
+/// as the limit is passed.
+async fn read_body(mut answer: reqwest::Response, status: u16) -> Result<Bytes, Failure> {
+    let limit = u64::try_from(BODY_LIMIT).unwrap_or(u64::MAX);
+    let declared = answer.content_length();
+    if declared.is_some_and(|len| len > limit) {
+        return Err(Failure::TooLarge { status });
+    }
+    let capacity = declared.map_or(0, |len| usize::try_from(len).unwrap_or(0));
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = answer
+        .chunk()
+        .await
+        .map_err(|e| Failure::from_reqwest(&e, Some(status)))?
+    {
+        if body.len().saturating_add(chunk.len()) > BODY_LIMIT {
+            return Err(Failure::TooLarge { status });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+/// The back-off before attempt `attempt + 1`: `500 ms × attempt` plus a random 0–25 %.
+pub(crate) fn backoff(attempt: u32) -> Duration {
+    let base = 500u64.saturating_mul(u64::from(attempt));
+    Duration::from_millis(base.saturating_add(fastrand::u64(0..=base / 4)))
+}
+
+/// Values of `RateLimit-Reset` above this are Unix times (Hetzner), below it delta-seconds
+/// (the IETF RateLimit header draft).
+const UNIX_TIME_THRESHOLD: u64 = 1_000_000_000;
+
+/// The wait a rate-limit answer asks for, counted from `now`: `Retry-After` as delta-seconds or
+/// an HTTP date, else `RateLimit-Reset` as delta-seconds or a Unix time. A time in the past is a
+/// wait of zero. `None` when no usable header is present.
+pub(crate) fn rate_wait(headers: &HeaderMap, now: jiff::Timestamp) -> Option<Duration> {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+    };
+    let until =
+        |at: jiff::Timestamp| Duration::try_from(at.duration_since(now)).unwrap_or_default();
+    if let Some(value) = header(RETRY_AFTER.as_str()) {
+        if value.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(seconds) = value.parse::<u64>()
+        {
+            return Some(Duration::from_secs(seconds));
+        }
+        // RFC 9110 section 10.2.3: delay-seconds or an HTTP-date; the IMF-fixdate form of an
+        // HTTP-date is an RFC 2822 date with "GMT".
+        if let Ok(at) = jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(value) {
+            return Some(until(at));
+        }
+    }
+    let reset = header("ratelimit-reset")?.parse::<u64>().ok()?;
+    if reset > UNIX_TIME_THRESHOLD {
+        let at = jiff::Timestamp::from_second(i64::try_from(reset).ok()?).ok()?;
+        Some(until(at))
+    } else {
+        Some(Duration::from_secs(reset))
+    }
+}
+
+fn config(text: &'static str) -> Error {
+    Error::Config {
+        detail: Detail::constant(text),
+    }
+}
+
+fn protocol(text: &'static str) -> Error {
+    Error::Protocol {
+        detail: Detail::constant(text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn rate_wait_reads_seconds_dates_and_resets() {
+        let now: jiff::Timestamp = "2026-11-06T08:49:00Z".parse().unwrap();
+        assert_eq!(rate_wait(&headers(&[]), now), None);
+        assert_eq!(
+            rate_wait(&headers(&[("retry-after", " 7 ")]), now),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            rate_wait(
+                &headers(&[("retry-after", "Fri, 06 Nov 2026 08:49:37 GMT")]),
+                now
+            ),
+            Some(Duration::from_secs(37))
+        );
+        // A date in the past is no wait.
+        assert_eq!(
+            rate_wait(
+                &headers(&[("retry-after", "Fri, 06 Nov 2026 08:48:00 GMT")]),
+                now
+            ),
+            Some(Duration::ZERO)
+        );
+        // Unusable Retry-After: fall back to RateLimit-Reset.
+        assert_eq!(
+            rate_wait(
+                &headers(&[("retry-after", "soon"), ("ratelimit-reset", "12")]),
+                now
+            ),
+            Some(Duration::from_secs(12))
+        );
+        let reset = (now.as_second() + 100).to_string();
+        assert_eq!(
+            rate_wait(&headers(&[("ratelimit-reset", &reset)]), now),
+            Some(Duration::from_secs(100))
+        );
+        assert_eq!(rate_wait(&headers(&[("retry-after", "-1")]), now), None);
+        // The obsolete RFC 850 date form is not read; without a reset header there is no wait.
+        assert_eq!(
+            rate_wait(
+                &headers(&[("retry-after", "Friday, 06-Nov-26 08:49:37 GMT")]),
+                now
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn backoff_grows_with_jitter_of_a_quarter() {
+        for attempt in 1..=2u32 {
+            let base = Duration::from_millis(500 * u64::from(attempt));
+            for _ in 0..200 {
+                let wait = backoff(attempt);
+                assert!(wait >= base && wait <= base + base / 4, "{wait:?}");
+            }
+        }
+    }
+}

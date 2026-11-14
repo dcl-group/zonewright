@@ -27,9 +27,9 @@ struct Inner {
     options: ContextOptions,
     /// Per-name locks of all mutating operations (design section 3.3).
     locks: NameLocks,
-    // HTTP TRANSPORT (core phase): the transport adds its client here, behind `__http`, as
-    // `http: crate::http::Transport`, built in `Context::new` from `options`, together with a
-    // `pub(crate)` accessor below. Nothing else in this file needs to change for it.
+    /// The HTTP client of every HTTP provider client (design section 5.1).
+    #[cfg(feature = "__http")]
+    http: crate::http::Transport,
     /// Process-local memory of the acme-dns client (design section 11.3).
     #[cfg(feature = "acme_dns")]
     acme_dns: crate::providers::acme_dns::State,
@@ -51,14 +51,23 @@ impl fmt::Debug for Context {
 }
 
 impl Context {
-    /// Builds the shared state. Fails with [`Error::Config`] when an option is invalid.
+    /// Builds the shared state. Fails with [`Error::Config`] when an option is invalid,
+    /// including an entry of [`ContextOptions::extra_root_certificates`] that is not a
+    /// DER-encoded certificate (checked in builds with an HTTP provider, the only ones that use
+    /// it).
+    ///
+    /// Builds no connection and needs no `tokio` runtime. No process-wide TLS crypto provider is
+    /// installed or consulted.
     pub fn new(options: ContextOptions) -> Result<Context, Error> {
         options.validate()?;
-        // HTTP TRANSPORT (core phase): build the HTTP client from `options` here.
+        #[cfg(feature = "__http")]
+        let http = crate::http::Transport::new(&options)?;
         Ok(Context {
             inner: Arc::new(Inner {
                 options,
                 locks: NameLocks::new(),
+                #[cfg(feature = "__http")]
+                http,
                 #[cfg(feature = "acme_dns")]
                 acme_dns: crate::providers::acme_dns::State::default(),
                 #[cfg(feature = "nicru")]
@@ -74,6 +83,12 @@ impl Context {
     #[allow(dead_code)]
     pub(crate) fn options(&self) -> &ContextOptions {
         &self.inner.options
+    }
+
+    /// The HTTP client, shared by every HTTP provider client of this context.
+    #[cfg(feature = "__http")]
+    pub(crate) fn http(&self) -> &crate::http::Transport {
+        &self.inner.http
     }
 
     /// The per-name locks. A client passes them to the TXT value layer, or takes a lock itself

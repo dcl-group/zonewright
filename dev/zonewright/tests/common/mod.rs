@@ -3,6 +3,8 @@
 // Each test crate includes this module and uses a different part of it.
 #![allow(dead_code)]
 
+pub mod echo;
+
 use secrecy::SecretString;
 use zonewright::{AnyProvider, Context, ContextOptions, DomainName, Error, ProviderId};
 
