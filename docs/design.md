@@ -2710,8 +2710,13 @@ Behavior that the design fixes because the generic sections cannot:
   `Error::InvalidInput`, before any request.
 - `beget`. A write happens only after a complete read whose answer names the requested name. A name
   that holds records of other types is refused (`Error::Rejected`) for both add and remove, because
-  it is not established that a TXT write leaves them alone. Credentials go in the POST body, never
-  in the query string.
+  a write that omits them deletes them: a report in lego's issue tracker (issue 2774, 2025-12-30)
+  quotes the provider's support saying that all existing A, MX and TXT records of the name must be
+  sent "in their entirety, otherwise the rest will be deleted", and the write spelling of A and MX
+  records is not documented. The client therefore writes TXT only and only at names that hold
+  nothing but TXT. An outside writer's A or MX record added between the client's read and its write
+  is lost; this is part of open point 14. Credentials go in the POST body, never in the query
+  string.
 - `cloud_ru`. More than one TXT record for a name is `Error::Protocol`. A record marked read-only is
   `Error::Rejected`. A missing list in a listing answer is `Error::Protocol`, never an empty result.
 - `hetzner`. Only zones in primary mode are usable; a secondary zone is reported by `check` as not
@@ -2728,8 +2733,8 @@ Behavior that the design fixes because the generic sections cannot:
   staged changes needs a commit by hand.
 - `regru`. `check` calls the API's no-operation request, which the documentation describes as
   requiring valid credentials, on every call; `credentials_verified` is always true.
-- `beget`. With an empty zone list `check` has no request that tests the credentials;
-  `credentials_verified` is false.
+- `beget`. `check` calls the domain listing, which like every method of the API requires the login
+  and password; `credentials_verified` is true also with an empty zone list.
 - `rfc2136`. DNS over TCP to the configured `server` (an IP literal or a host name, with an optional
   port, default 53).
   - Timeouts: `ContextOptions::connect_timeout` covers name resolution and the TCP connect;
