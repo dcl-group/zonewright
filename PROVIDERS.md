@@ -35,6 +35,7 @@ None yet.
 | Yandex 360    | `yandex_360`    | TXT values |                                                                                                  |
 | Timeweb Cloud | `timeweb_cloud` | TXT values |                                                                                                  |
 | Cloud.ru      | `cloud_ru`      | TXT values |                                                                                                  |
+| Hetzner       | `hetzner`       | TXT values |                                                                                                  |
 
 ## Planned
 
@@ -42,7 +43,6 @@ None yet.
 | -------- | ---------- | ------------------------------------------------------------------ |
 | acme-dns | `acme_dns` | TXT values only: the acme-dns API offers nothing else.             |
 | Beget    | `beget`    |                                                                    |
-| Hetzner  | `hetzner`  |                                                                    |
 | nic.ru   | `nicru`    |                                                                    |
 | reg.ru   | `regru`    | An earlier version of this client was proven against the live API. |
 

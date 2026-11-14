@@ -4,9 +4,9 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements. Until the client is ported,
-//! every operation flag is false, `record_types` is empty and `txt_values` is `NotOffered`; the
-//! provider's developer switches them on together with the client code that implements them.
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and
+//! the TXT value operations on plain values. The record-level operations are not written yet, so
+//! their flags are false and `record_types` is empty.
 
 use std::time::Duration;
 
@@ -44,11 +44,11 @@ const FIELDS: &[ConfigField] = &[
         required: false,
         kind: FieldKind::Integer {
             min: 60,
-            max: 86400,
+            max: 2_147_483_647,
         },
         default: Some("60"),
         label: "Record TTL, s",
-        help: "TTL of a new rrset, in seconds.",
+        help: "TTL of a new rrset, in seconds; at least 60. An existing rrset keeps its TTL.",
         advanced: true,
     },
     ConfigField {
@@ -78,22 +78,27 @@ const FIELDS: &[ConfigField] = &[
 
 /// What this version of the crate implements for Hetzner.
 const CAPABILITIES: Capabilities = Capabilities {
-    list_zones: false,
+    list_zones: true,
     list_rrsets: false,
     get_rrset: false,
     set_rrset: false,
     delete_rrset: false,
-    add_txt_value: false,
-    remove_txt_value: false,
+    add_txt_value: true,
+    remove_txt_value: true,
     record_types: TypeSet::Listed(&[]),
     read_only_types: &[],
+    // The reference says only that a TXT value "has to be quoted"; how the API treats spaces,
+    // quotes, backslashes and non-ASCII bytes inside the quotes is not established (design
+    // section 4.4).
     txt_plain_only: true,
-    txt_values: ValueGuarantee::NotOffered,
+    // The API adds and removes values of an rrset by value (design section 3.5).
+    txt_values: ValueGuarantee::PerValue,
     preconditions: Preconditions::ReadThenWrite,
     atomic_rrset_write: false,
+    // Source: the reference, Zone RRSets, `ttl`: 60 to 2147483647 seconds, one per rrset.
     ttl: TtlSupport::PerRrset {
         min: 60,
-        max: 86_400,
+        max: 2_147_483_647,
     },
     provider_default_ttl: false,
     asynchronous: true,

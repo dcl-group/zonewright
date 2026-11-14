@@ -29,3 +29,5 @@ All notable changes to this crate are recorded in this file. The format follows
 - Yandex 360 client (`yandex_360`): connection check, zone listing, TXT value operations.
 - Timeweb Cloud client (`timeweb_cloud`): connection check, zone listing, TXT value operations.
 - Cloud.ru client (`cloud_ru`): connection check, zone listing, TXT value operations.
+- Hetzner client (`hetzner`): connection check, zone listing, TXT value operations through
+  value-level rrset actions.
