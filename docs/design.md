@@ -3231,19 +3231,20 @@ Added after review:
     supplies them through `ContextOptions`.
 11. **Strict settings.** An application that stores its own keys next to the provider's settings
     must strip them before calling the crate. The alternative, ignoring unknown keys, hides typos.
-12. **Timeweb Cloud** uses endpoints its own API description marks as deprecated, because the newer
-    ones have no listing and were reported to reject challenge names. It stays as ported; a live
-    check decides when to move.
+12. **Timeweb Cloud: decided by the maintainer on 2026-11-14 — the v2 endpoints only.** The v1
+    endpoints, which the provider's API description marks as deprecated, are not used: lego's issue
+    tracker (issue 3119, 2026-05-22) shows the v1 create refusing `_acme-challenge` names with
+    `bad_subdomain_name` while v2 accepted them.
 13. **Typed views for more record types** (SSHFP, SOA) exist as canonical forms only. Typed structs
     are added on request.
-14. **Hard rule 2 against writers outside the process.** At Selectel v2, Beget and Cloud.ru the API
-    offers neither a per-value call nor a conditional write, so a TXT value operation cannot rule
-    out overwriting a value that another process, or a person in the control panel, adds between the
-    client's read and its write. Inside one process the per-name lock closes the gap; outside it
-    nothing can. The capability `txt_values == ReadThenWrite` states this. The question for the
-    maintainer is whether that reading of hard rule 2 ("guaranteed within a process, best effort
-    beyond it where the API gives no means") is acceptable, or whether these three providers need a
-    restriction such as writing only below a dedicated label.
+14. **Hard rule 2 against writers outside the process: accepted by the maintainer on 2026-11-14.**
+    At Selectel v2, Beget and Cloud.ru the API offers neither a per-value call nor a conditional
+    write, so a TXT value operation cannot rule out overwriting a value that another process, or a
+    person in the control panel, adds between the client's read and its write; at Beget the same
+    holds for an A or MX record added at the name in that window. Inside one process the per-name
+    lock closes the gap; outside it nothing can. The capability `txt_values == ReadThenWrite` states
+    this. The accepted reading of hard rule 2 is: guaranteed within a process, best effort beyond it
+    where the API gives no means.
 15. **No proxy support.** The HTTP client ignores proxy environment variables on purpose (section
     5.1). A deployment that can reach providers only through a proxy cannot use the crate until an
     explicit `ContextOptions` proxy setting is added; say if that is needed.
