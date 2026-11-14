@@ -41,3 +41,6 @@ All notable changes to this crate are recorded in this file. The format follows
 - Propagation inspector (feature `inspector`): name-server discovery, queries for any record type at
   each authoritative server or through recursive resolvers, waiting for a value to be present, for
   an exact set or for absence, with a report per name server.
+- Record-level operations (`list_rrsets`, `get_rrset`, `set_rrset`, `delete_rrset` with
+  preconditions) for Selectel v2: A, AAAA, ALIAS, CAA, CNAME, MX, NS, SRV, SSHFP and TXT; SOA is
+  read only.
