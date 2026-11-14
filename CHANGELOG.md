@@ -46,6 +46,8 @@ All notable changes to this crate are recorded in this file. The format follows
   read only.
 - Record-level operations for DigitalOcean: A, AAAA, CAA, CNAME, MX, NS, SRV and TXT; SOA is read
   only.
+- Record-level operations for Cloudflare: A, AAAA, CAA, CNAME, MX, NS, PTR, SRV, TLSA and TXT.
+  Record attributes the model does not carry (proxy status, comment, tags) are kept.
 
 ### Changed
 
