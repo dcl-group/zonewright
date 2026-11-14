@@ -86,6 +86,8 @@ pub mod echo;
 mod fault;
 mod log;
 
+pub mod dns;
+
 pub mod acme_dns;
 pub mod beget;
 pub mod cloud_ru;

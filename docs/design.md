@@ -2349,7 +2349,28 @@ error.
 | Message size                                | 4096 octets UDP, 65535 TCP                 |
 | Cached zones                                | 256                                        |
 
-### 8.9 Tracing and testing
+### 8.9 Decisions made in the implementation
+
+Points this section left open, as implemented:
+
+- An NXDOMAIN answer that carries a CNAME for the asked name is reported as a CNAME answer, not as
+  absence (RFC 6604): the name exists. `Absent` and an empty exact set therefore never hold for it.
+- An error answer without a question section is accepted when its ID matches the query; otherwise a
+  FORMERR answer to an EDNS query could never trigger the retry without EDNS.
+- A UDP reply that cannot be decoded or exceeds the size bound is a failed query when it carries the
+  query's ID and is ignored otherwise. A TCP reply that does not match the query, and a failed TCP
+  retry after a truncated UDP answer, are failed queries.
+- The address filter also refuses `0.0.0.0/8` and `240.0.0.0/4`.
+- The wait timeout counts from the first round of queries, after discovery; discovery has its own
+  deadline.
+- Refused as invalid input: jitter above 50 percent, expected values that have no wire form for the
+  question's type, pseudo-types and meta-types, more than 1,024 questions in one round. Refused as
+  configuration errors: zero timeouts, `max_servers` of zero, more than 16 resolvers, recursive
+  discovery without resolvers, an empty static list.
+- The values of an answer are deduplicated and sorted; a TTL with the high bit set is read as zero
+  (RFC 2181 section 8); identical questions are asked once per round.
+
+### 8.10 Tracing and testing
 
 Events: target `zonewright::inspector`, `DEBUG` per query with server address, record type, answer
 kind and duration; no record values and no names beyond the zone.
@@ -2398,7 +2419,9 @@ all-providers = [
     "acme_dns", "beget", "cloud_ru", "cloudflare", "digitalocean", "hetzner", "nicru", "regru",
     "rfc2136", "route53", "selectel_v2", "timeweb_cloud", "vk_cloud", "yandex_360", "yandex_cloud",
 ]
-inspector = ["dep:hickory-proto", "dep:futures-util", "dep:fastrand", "tokio/net", "tokio/io-util"]
+inspector = [
+    "dep:hickory-proto", "dep:futures-util", "dep:fastrand", "dep:tracing", "tokio/net", "tokio/io-util",
+]
 
 acme_dns = ["__http"]
 beget = ["__http"]
@@ -2408,7 +2431,7 @@ digitalocean = ["__http"]
 hetzner = ["__http"]
 nicru = ["__http", "__xml"]
 regru = ["__http"]
-rfc2136 = ["__crypto", "dep:fastrand", "tokio/net", "tokio/io-util"]
+rfc2136 = ["__crypto", "dep:fastrand", "dep:serde_json", "dep:tracing", "tokio/net", "tokio/io-util"]
 route53 = ["__http", "__crypto", "__xml"]
 selectel_v2 = ["__http"]
 timeweb_cloud = ["__http"]
@@ -2418,7 +2441,7 @@ yandex_cloud = ["__http", "__crypto"]
 
 __http = [
     "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:rustls-pki-types",
-    "dep:bytes", "dep:jiff", "dep:fastrand",
+    "dep:bytes", "dep:jiff", "dep:fastrand", "dep:serde_json", "dep:tracing",
 ]
 __crypto = ["dep:aws-lc-rs"]
 __xml = ["dep:roxmltree"]
@@ -2428,9 +2451,10 @@ __xml = ["dep:roxmltree"]
 
 Names, the record model with normalization and the typed records, `Ttl`, errors, `ProviderId`,
 metadata and capabilities of all fifteen providers, the `Provider` trait, `AnyProvider` (with no
-variants), `Context` (locks only), and `dns01`. Dependencies of that build: `serde`, `serde_json`,
-`secrecy`, `zeroize`, `thiserror`, `tracing`, `idna`, `base64`, `tokio` with `sync` and `time`. No
-TLS stack, no C compilation.
+variants), `Context` (locks only), and `dns01`. Dependencies of that build: `serde`, `secrecy`,
+`zeroize`, `thiserror`, `idna`, `base64`, `tokio` with `sync` and `time`; `serde_json` and `tracing`
+come with the first HTTP provider, `rfc2136` or (`tracing` only) the inspector. No TLS stack, no C
+compilation.
 
 An application that only needs the inspector enables `inspector` and gets `hickory-proto` and
 UDP/TCP sockets on top of that, still without a TLS stack.
@@ -2446,16 +2470,16 @@ Versions are the latest stable releases on 2026-11-14.
 ```toml
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
 secrecy = { version = "0.10.3", features = ["serde"] }
 zeroize = { version = "1.9.1", features = ["derive"] }
 thiserror = "2.0.21"
-tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 idna = "1.1.0"
 base64 = "0.23.1"
 tokio = { version = "1.54.1", features = ["sync", "time"] }
 
-# __http
+# __http (serde_json and tracing also serve rfc2136; tracing also serves the inspector)
+serde_json = { version = "1.0.154", optional = true }
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"], optional = true }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
 rustls-platform-verifier = { version = "0.7.1", optional = true }
@@ -2516,7 +2540,8 @@ Why each is there, and what is deliberately absent:
 The mock crate (`publish = false`) depends on `axum` 0.8.9 with `default-features = false` and the
 features `http1`, `tokio`, `json`, `query`, `form`; `tokio`; `serde`; `serde_json`; `aws-lc-rs` (its
 own verification of SigV4, TSIG and PS256, independent of the crate under test); `base64`;
-`roxmltree`; `fastrand`. It does not depend on `zonewright`.
+`roxmltree`; `hickory-proto` with `std` only (the DNS server for the inspector tests). It does not
+depend on `zonewright`.
 
 `cargo deny` (`dev/deny.toml`): `ring`, `openssl`, `openssl-sys` and `native-tls` are banned;
 `[graph] all-features = true`; wildcard versions denied; licenses allowed: MIT, Apache-2.0, ISC,
@@ -2854,11 +2879,11 @@ For every client, in its own test file:
 Once for the crate: a compile-time test that no client type and no credentials type implements
 `Display` or `Serialize`; unit tests of the scrubber (every spelling, every decoded dialect, the
 truncated tail, run-time tokens per slot, its `Debug`); the transport's secret tests over every
-dialect and every credential position (bearer, custom header, basic, form body, JSON body, query),
-which also require the message to be kept, with the canaries cut out in place, wherever the echo
-uses a spelling the scrubber knows exactly; a test that a redirect is not followed and that the
-address it points to receives no connection, with and without a client certificate; a source scan
-for `bearer_auth` and `basic_auth`.
+dialect and every credential position (bearer, custom header, form body, JSON body, query), which
+also require the message to be kept, with the canaries cut out in place, wherever the echo uses a
+spelling the scrubber knows exactly; a test that a redirect is not followed and that the address it
+points to receives no connection, with and without a client certificate; a source scan for
+`bearer_auth` and `basic_auth`.
 
 ### 12.3 Invariant tests
 

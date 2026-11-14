@@ -1958,6 +1958,7 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "base64",
+ "hickory-proto",
  "roxmltree",
  "serde",
  "serde_json",

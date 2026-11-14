@@ -38,3 +38,6 @@ All notable changes to this crate are recorded in this file. The format follows
   removal.
 - Beget client (`beget`): connection check, zone listing, TXT value operations at names that hold
   only TXT records.
+- Propagation inspector (feature `inspector`): name-server discovery, queries for any record type at
+  each authoritative server or through recursive resolvers, waiting for a value to be present, for
+  an exact set or for absence, with a report per name server.

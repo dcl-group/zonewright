@@ -28,6 +28,8 @@
 //! Every provider client needs a `tokio` runtime.
 
 pub mod dns01;
+#[cfg(feature = "inspector")]
+pub mod inspector;
 pub mod name;
 pub mod providers;
 pub mod record;
