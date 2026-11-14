@@ -60,6 +60,10 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
             r#"{"base_url":"http://127.0.0.1:9/v2"}"#,
             r#"{"api_token":"test-only-token"}"#,
         ),
+        ProviderId::VkCloud => (
+            r#"{"project_id":"b5b7ffd4ef0547e5b222f44555df0000","username":"dns@example.test","identity_url":"http://127.0.0.1:9/identity/v3","dns_url":"http://127.0.0.1:9/public-dns/v2/dns"}"#,
+            r#"{"password":"test-only-password"}"#,
+        ),
         ProviderId::AcmeDns
         | ProviderId::Beget
         | ProviderId::CloudRu
@@ -68,7 +72,6 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
         | ProviderId::Regru
         | ProviderId::Rfc2136
         | ProviderId::TimewebCloud
-        | ProviderId::VkCloud
         | ProviderId::Yandex360 => ("{}", "{}"),
         _ => panic!("no sample configuration for {id}"),
     }

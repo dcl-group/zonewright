@@ -23,3 +23,4 @@ All notable changes to this crate are recorded in this file. The format follows
 - Route 53 client (`route53`): connection check, zone listing, TXT value operations with conditional
   change batches.
 - DigitalOcean client (`digitalocean`): connection check, zone listing, TXT value operations.
+- VK Cloud client (`vk_cloud`): connection check, zone listing, TXT value operations.

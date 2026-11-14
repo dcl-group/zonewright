@@ -30,6 +30,7 @@ None yet.
 | Yandex Cloud | `yandex_cloud` | TXT values | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
 | Route 53     | `route53`      | TXT values |                                                                                                  |
 | DigitalOcean | `digitalocean` | TXT values |                                                                                                  |
+| VK Cloud     | `vk_cloud`     | TXT values |                                                                                                  |
 
 ## Planned
 
@@ -43,7 +44,6 @@ None yet.
 | reg.ru        | `regru`         | An earlier version of this client was proven against the live API. |
 | RFC 2136      | `rfc2136`       | Dynamic update has no operation that lists the records of a zone.  |
 | Timeweb Cloud | `timeweb_cloud` |                                                                    |
-| VK Cloud      | `vk_cloud`      |                                                                    |
 | Yandex 360    | `yandex_360`    |                                                                    |
 
 "An earlier version was proven" does not make the client verified here: it is verified again once it
