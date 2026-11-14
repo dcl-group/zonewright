@@ -22,7 +22,7 @@ use zonewright_mock::axum::extract::State;
 use zonewright_mock::axum::http::StatusCode;
 use zonewright_mock::axum::response::IntoResponse;
 use zonewright_mock::axum::routing;
-use zonewright_mock::echo::{self as mock_echo, Echo, Spelling};
+use zonewright_mock::echo::{Echo, Spelling};
 use zonewright_mock::{Fault, MockServer};
 
 use crate::context::ContextOptions;
@@ -31,8 +31,8 @@ use crate::error::{Error, ErrorKind};
 use super::keystone::{Keystone, X_AUTH_TOKEN};
 use super::request::{BODY_LIMIT, Request, TokenAuth};
 use super::testing::echo::{
-    CANARIES, CANARY_KEY, CANARY_PASSWORD, CANARY_TOKEN, CANARY_USER, LogCapture, REDACTED,
-    assert_clean,
+    CANARIES, CANARY_KEY, CANARY_PASSWORD, CANARY_TOKEN, CANARY_USER, Dialect, LogCapture,
+    REDACTED, WITHHELD, assert_clean, dialects,
 };
 use super::testing::{self, SilentServer, TlsServer};
 use super::tls::{self, Trust};
@@ -68,6 +68,17 @@ fn post(server: &MockServer, path: &str) -> Request {
 
 fn default_http() -> Http {
     testing::http(&testing::context(testing::options()), |b| b)
+}
+
+/// The endpoint of a mock server, as a client would parse it from its settings.
+fn endpoint_of(server: &MockServer) -> Endpoint {
+    Endpoint::parse_with("base_url", &server.base_url(), true).unwrap()
+}
+
+/// A handle whose declared endpoint is `server`, configured further by `configure`.
+fn http_on(server: &MockServer, configure: impl FnOnce(HttpBuilder) -> HttpBuilder) -> Http {
+    let ctx = testing::context(testing::options());
+    testing::http(&ctx, |b| configure(b.endpoint(&endpoint_of(server))))
 }
 
 fn kind<T: std::fmt::Debug>(result: Result<T, Error>) -> ErrorKind {
@@ -163,12 +174,38 @@ async fn https_fails_without_the_extra_root() {
     let (leaf, key) = testing::server_cert(&issuer);
     let server = TlsServer::start(vec![leaf], key);
     let http = default_http();
-    // Sent once, so that the failure is the handshake's, not a retry count.
-    let request = Request::new(Method::POST, url(&server.url()));
-    let e = http.send(&request).await.unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::Transient, "{e}");
-    assert!(server.connections.load(Ordering::SeqCst) >= 1);
+    // Idempotent, yet a refused certificate is not retried: the next attempt would be refused
+    // the same way.
+    let started = Instant::now();
+    let e = http
+        .send(&Request::get(url(&server.url())))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Config, "{e}");
+    assert!(!e.is_retryable());
+    assert!(e.to_string().contains("certificate"), "{e}");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
     assert_eq!(server.answered.load(Ordering::SeqCst), 0);
+    assert!(started.elapsed() < Duration::from_millis(400));
+}
+
+#[tokio::test]
+async fn a_server_certificate_for_another_name_is_refused_without_retry() {
+    let (ca, issuer) = testing::ca();
+    // A certificate for 127.0.0.1, reached as [::1]: the name does not match.
+    let (leaf, key) = testing::server_cert(&issuer);
+    let server = TlsServer::start_on("[::1]:0", vec![leaf], key);
+    let ctx = testing::context(ContextOptions {
+        extra_root_certificates: vec![ca.der().to_vec()],
+        ..testing::options()
+    });
+    let http = testing::http(&ctx, |b| b);
+    let e = http
+        .send(&Request::get(url(&server.url())))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Config, "{e}");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -231,16 +268,18 @@ async fn user_agent_accept_and_content_type_are_sent() {
 #[tokio::test]
 async fn redirects_are_not_followed_with_or_without_a_client_certificate() {
     let (_, _, cert_pem, key_pem) = testing::client_cert();
-    let ctx = testing::context(testing::options());
-    let plain = testing::http(&ctx, |b| b.bearer("api_token", CANARY_TOKEN));
-    let with_cert = testing::http(&ctx, |b| {
-        b.bearer("api_token", CANARY_TOKEN)
-            .client_identity(&cert_pem, &key_pem)
-    });
-    for http in [&plain, &with_cert] {
+    for with_cert in [false, true] {
         for status in [301, 302, 303, 307, 308] {
             let target = ok_server().await;
             let server = ok_server().await;
+            let http = http_on(&server, |b| {
+                let b = b.bearer("api_token", CANARY_TOKEN);
+                if with_cert {
+                    b.client_identity(&cert_pem, &key_pem)
+                } else {
+                    b
+                }
+            });
             server.faults().push(
                 Fault::any()
                     .always()
@@ -756,7 +795,7 @@ fn api_requests(server: &MockServer) -> Vec<zonewright_mock::LoggedRequest> {
 #[tokio::test]
 async fn a_rejected_cached_token_is_refreshed_once() {
     let (server, issued) = token_server().await;
-    let http = default_http();
+    let http = http_on(&server, |b| b);
     let tokens = TokenSource::new(None);
     // Warm the cache.
     token_call(&http, &tokens, &server, get(&server, "/api"))
@@ -782,7 +821,7 @@ async fn a_rejected_cached_token_is_refreshed_once() {
 #[tokio::test]
 async fn the_token_refresh_counts_toward_the_bound() {
     let (server, issued) = token_server().await;
-    let http = default_http();
+    let http = http_on(&server, |b| b);
     let tokens = TokenSource::new(None);
     token_call(&http, &tokens, &server, get(&server, "/api"))
         .await
@@ -803,7 +842,7 @@ async fn the_token_refresh_counts_toward_the_bound() {
 #[tokio::test]
 async fn a_rejected_new_token_is_auth() {
     let (server, issued) = token_server().await;
-    let http = default_http();
+    let http = http_on(&server, |b| b);
     let tokens = TokenSource::new(None);
     // Cold cache: the token fetched during the call is rejected.
     server
@@ -834,7 +873,7 @@ async fn a_rejected_new_token_is_auth() {
 #[tokio::test]
 async fn a_rejected_cached_token_on_a_non_idempotent_request_is_transient() {
     let (server, issued) = token_server().await;
-    let http = default_http();
+    let http = http_on(&server, |b| b);
     let tokens = TokenSource::new(None);
     token_call(&http, &tokens, &server, get(&server, "/api"))
         .await
@@ -857,7 +896,7 @@ async fn a_rejected_cached_token_on_a_non_idempotent_request_is_transient() {
 #[tokio::test]
 async fn token_fetch_failures_are_returned() {
     let (server, _) = token_server().await;
-    let http = default_http();
+    let http = http_on(&server, |b| b);
     let tokens = TokenSource::new(None);
     server.faults().push(Fault::path("/token").status(401));
     let e = token_call(&http, &tokens, &server, get(&server, "/api"))
@@ -913,8 +952,11 @@ async fn keystone_exchanges_the_password_for_a_scoped_token() {
         .fallback(|| async { (StatusCode::OK, "{}") });
     let server = MockServer::start(router).await;
     let ctx = testing::context(testing::options());
-    let http = testing::http(&ctx, |b| b.secret(CANARY_PASSWORD));
     let identity = Endpoint::parse("auth_url", &server.url("/identity/v3/"), &ctx).unwrap();
+    let api = Endpoint::parse("dns_url", &server.url("/dns"), &ctx).unwrap();
+    let http = testing::http(&ctx, |b| {
+        b.secret(CANARY_PASSWORD).endpoint(&identity).endpoint(&api)
+    });
     let keystone = Keystone::new(
         &identity,
         "user-1",
@@ -986,10 +1028,190 @@ async fn keystone_failures() {
     }
 }
 
+// --- credentials and endpoints ---
+
+#[tokio::test]
+async fn anonymous_requests_carry_no_credential() {
+    let server = ok_server().await;
+    let http = http_on(&server, |b| b.bearer("api_token", CANARY_TOKEN));
+    http.send(&get(&server, "/with")).await.unwrap();
+    http.send(&get(&server, "/without").anonymous())
+        .await
+        .unwrap();
+    let with = server.log().matching(None, "/with");
+    let without = server.log().matching(None, "/without");
+    assert!(
+        with[0]
+            .header("authorization")
+            .unwrap()
+            .starts_with("Bearer ")
+    );
+    assert!(without[0].header("authorization").is_none());
+}
+
+#[tokio::test]
+async fn credentials_go_only_to_declared_endpoints() {
+    let own = ok_server().await;
+    let other = ok_server().await;
+    let http = http_on(&own, |b| b.bearer("api_token", CANARY_TOKEN));
+    assert_eq!(http.send(&get(&own, "/x")).await.unwrap().status(), 200);
+    for request in [get(&other, "/x"), get(&other, "/x").anonymous()] {
+        let e = http.send(&request).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Config, "{e}");
+        assert!(!e.is_retryable());
+    }
+    // Same host, another port: another origin.
+    assert_eq!(other.connections(), 0);
+    assert!(other.log().is_empty());
+
+    // A client certificate counts as a credential too.
+    let (_, _, cert_pem, key_pem) = testing::client_cert();
+    let http = http_on(&own, |b| b.client_identity(&cert_pem, &key_pem));
+    assert_eq!(kind(http.send(&get(&other, "/x")).await), ErrorKind::Config);
+    assert_eq!(other.connections(), 0);
+
+    // Credentials without a declared endpoint are refused at construction.
+    let ctx = testing::context(testing::options());
+    let e = Http::builder(&ctx, crate::id::ProviderId::Cloudflare)
+        .bearer("api_token", CANARY_TOKEN)
+        .build()
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Config);
+    let e = Http::builder(&ctx, crate::id::ProviderId::Cloudflare)
+        .client_identity(&cert_pem, &key_pem)
+        .build()
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Config);
+
+    // A cached token is not sent, and not even fetched, without a declared endpoint.
+    let (server, issued) = token_server().await;
+    let anonymous = default_http();
+    let tokens = TokenSource::new(None);
+    let e = token_call(&anonymous, &tokens, &server, get(&server, "/api"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Config);
+    assert_eq!(issued.load(Ordering::SeqCst), 0);
+    assert!(server.log().is_empty());
+}
+
+// --- rate-limit extremes, stalled bodies, rejected tokens ---
+
+#[tokio::test]
+async fn a_zero_or_past_wait_still_backs_off() {
+    let http = default_http();
+    let past = (jiff::Timestamp::now().as_second() - 100).to_string();
+    for fault in [
+        Fault::any().times(2).rate_limited("0"),
+        Fault::any().times(2).rate_limited(&http_date_in(-60)),
+        Fault::any()
+            .times(2)
+            .status(429)
+            .header("ratelimit-reset", &past),
+    ] {
+        let server = ok_server().await;
+        server.faults().push(fault);
+        let started = Instant::now();
+        assert_eq!(http.send(&get(&server, "/x")).await.unwrap().status(), 200);
+        assert_eq!(server.log().len(), 3);
+        // 500 ms and 1000 ms of back-off at least.
+        assert!(started.elapsed() >= Duration::from_millis(1500));
+    }
+}
+
+#[tokio::test]
+async fn huge_waits_are_reported_clamped() {
+    let http = default_http();
+    let far = (jiff::Timestamp::now().as_second() + 10 * 365 * 86_400).to_string();
+    for fault in [
+        Fault::any().always().rate_limited("18446744073709551615"),
+        Fault::any()
+            .always()
+            .rate_limited("99999999999999999999999"),
+        Fault::any()
+            .always()
+            .status(429)
+            .header("ratelimit-reset", &far),
+    ] {
+        let server = ok_server().await;
+        server.faults().push(fault);
+        let e = http.send(&get(&server, "/x")).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::RateLimited);
+        let wait = e.retry_after();
+        // A number too large to parse is no wait at all: the back-off applies.
+        assert!(
+            wait.is_none() || wait == Some(Duration::from_secs(24 * 3600)),
+            "{wait:?}"
+        );
+        if let Some(wait) = wait {
+            // A caller can add it to an instant.
+            let _ = std::time::Instant::now() + wait;
+        }
+    }
+    let server = ok_server().await;
+    server
+        .faults()
+        .push(Fault::any().rate_limited("18446744073709551615"));
+    let e = http.send(&get(&server, "/x")).await.unwrap_err();
+    assert_eq!(e.retry_after(), Some(Duration::from_secs(24 * 3600)));
+    assert_eq!(server.log().len(), 1);
+}
+
+#[tokio::test]
+async fn a_body_that_stalls_or_trickles_hits_the_request_timeout() {
+    let http = short_timeout_http();
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n";
+    // Ten bytes, then nothing.
+    let server = ok_server().await;
+    server
+        .faults()
+        .push(stalled(head.to_owned(), b"{\"partial\"".to_vec()));
+    let started = Instant::now();
+    let e = http.send(&post(&server, "/x")).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e}");
+    assert!(e.to_string().contains("timed out"), "{e}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    // One byte every 100 ms: each read makes progress, the whole request does not finish.
+    let server = ok_server().await;
+    let mut chunks = vec![(Duration::ZERO, Bytes::from_static(head.as_bytes()))];
+    chunks.extend((0..100).map(|_| (Duration::from_millis(100), Bytes::from_static(b" "))));
+    server.faults().push(Fault::any().raw(chunks));
+    let started = Instant::now();
+    let e = http.send(&post(&server, "/x")).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn a_rejected_token_with_an_oversized_answer_is_not_kept() {
+    let (server, issued) = token_server().await;
+    let http = http_on(&server, |b| b);
+    let tokens = TokenSource::new(None);
+    token_call(&http, &tokens, &server, get(&server, "/api"))
+        .await
+        .unwrap();
+    server
+        .faults()
+        .push(Fault::path("/api").oversized_body(401, BODY_LIMIT + 1));
+    let e = token_call(&http, &tokens, &server, get(&server, "/api"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol);
+    token_call(&http, &tokens, &server, get(&server, "/api"))
+        .await
+        .unwrap();
+    assert_eq!(issued.load(Ordering::SeqCst), 2);
+    let api = api_requests(&server);
+    assert_eq!(
+        api.last().unwrap().header("authorization"),
+        Some("Bearer tok-2")
+    );
+}
+
 // --- secrets ---
 
 /// One position in which a client sends a credential.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Position {
     Bearer,
     Header,
@@ -1009,10 +1231,11 @@ const POSITIONS: [Position; 6] = [
 ];
 
 /// A handle that carries the canaries in `position`, with every canary registered as the
-/// client's credentials would be.
-fn canary_http(ctx: &crate::context::Context, position: Position) -> Http {
+/// client's credentials would be, and `server` as its endpoint.
+fn canary_http(ctx: &crate::context::Context, server: &MockServer, position: Position) -> Http {
     testing::http(ctx, |b| {
         let b = b
+            .endpoint(&endpoint_of(server))
             .secret(CANARY_TOKEN)
             .secret(CANARY_PASSWORD)
             .secret(CANARY_KEY)
@@ -1038,18 +1261,15 @@ fn canary_request(server: &MockServer, position: Position) -> Request {
         Position::Json => request
             .json(&serde_json::json!({ "user": CANARY_USER, "password": CANARY_PASSWORD }))
             .unwrap(),
-        Position::Query => {
-            let endpoint = Endpoint::parse_with("base_url", &server.base_url(), true).unwrap();
-            Request::new(
-                Method::POST,
-                endpoint
-                    .url()
-                    .path("/a")
-                    .query("key", CANARY_KEY)
-                    .build()
-                    .unwrap(),
-            )
-        }
+        Position::Query => Request::new(
+            Method::POST,
+            endpoint_of(server)
+                .url()
+                .path("/a")
+                .query("key", CANARY_KEY)
+                .build()
+                .unwrap(),
+        ),
         Position::Bearer | Position::Header | Position::Basic => request,
     }
 }
@@ -1063,96 +1283,93 @@ async fn error_of(http: &Http, request: &Request) -> Error {
     }
 }
 
-fn renderers() -> Vec<(&'static str, mock_echo::Render)> {
-    vec![
-        ("json", mock_echo::json()),
-        ("json_ascii", mock_echo::json_ascii()),
+/// Whether the canaries must be cut out in place, the rest of the message kept: the echo
+/// repeats them in a spelling the scrubber knows exactly, after the transport decoded what the
+/// body format encodes (a JSON message field, the string values of other JSON). Elsewhere the
+/// message may be withheld as a whole; it must never leak.
+fn precise(position: Position, dialect: &Dialect) -> bool {
+    match (dialect.spelling, dialect.name) {
         (
-            "xml",
-            mock_echo::xml("<Error><Message>{text}</Message></Error>"),
-        ),
-        ("text", mock_echo::text()),
-    ]
+            Spelling::Verbatim,
+            "json" | "json_ascii" | "json_go" | "json_dotnet" | "json_unicode" | "json_unknown_key"
+            | "text",
+        ) => true,
+        // XML-escaped or PHP-escaped JSON-escaped text is not a spelling of the scrubber.
+        (Spelling::Verbatim, "xml" | "json_ascii_with_notice") => position != Position::Json,
+        // A JSON body form-encoded is not either; every other position is, encoded once more.
+        (Spelling::FormPlus | Spelling::FormPercent, "json" | "text") => position != Position::Json,
+        _ => false,
+    }
 }
 
 #[tokio::test]
 async fn secrets_never_reach_errors() {
     let ctx = testing::context(testing::options());
-    for spelling in [
-        Spelling::Verbatim,
-        Spelling::FormPlus,
-        Spelling::FormPercent,
-    ] {
-        for (render_name, render) in renderers() {
-            for status in [400, 401, 403, 429, 500] {
-                let echo = Echo::new(status)
-                    .spelling(spelling)
-                    .render(render.clone())
-                    .start()
-                    .await;
-                for position in POSITIONS {
-                    let http = canary_http(&ctx, position);
-                    let request = canary_request(&echo, position);
-                    let e = error_of(&http, &request).await;
-                    let what = format!("{position:?} {spelling:?} {render_name} {status}");
-                    for text in [e.to_string(), format!("{e:?}"), format!("{http:?}")] {
-                        assert_clean(&what, &text, &CANARIES);
-                    }
-                    if status != 429 {
-                        // The echo reached the error path: the test is not vacuous.
-                        assert!(e.to_string().contains(REDACTED), "{what}: {e}");
-                    }
+    let mut precise_cases = 0;
+    for dialect in dialects() {
+        for status in [400, 401, 403, 429, 500] {
+            let echo = dialect.echo(status).start().await;
+            for position in POSITIONS {
+                let http = canary_http(&ctx, &echo, position);
+                let request = canary_request(&echo, position);
+                let e = error_of(&http, &request).await;
+                let what = format!(
+                    "{position:?} {} {:?} {status}",
+                    dialect.name, dialect.spelling
+                );
+                for text in [e.to_string(), format!("{e:?}"), format!("{http:?}")] {
+                    assert_clean(&what, &text, &CANARIES);
                 }
-                assert_eq!(echo.api_requests(), POSITIONS.len());
+                if status == 429 {
+                    continue;
+                }
+                // The echo reached the error path: the test is not vacuous.
+                assert!(e.to_string().contains(REDACTED), "{what}: {e}");
+                if precise(position, &dialect) {
+                    precise_cases += 1;
+                    assert!(!e.to_string().contains(WITHHELD), "{what}: {e}");
+                }
             }
+            assert_eq!(echo.api_requests(), POSITIONS.len());
         }
     }
+    assert!(precise_cases > 100, "{precise_cases}");
 }
 
 #[tokio::test]
 async fn tokens_obtained_at_run_time_never_reach_errors() {
     let ctx = testing::context(testing::options());
-    for spelling in [
-        Spelling::Verbatim,
-        Spelling::FormPlus,
-        Spelling::FormPercent,
-    ] {
-        for (render_name, render) in renderers() {
-            for status in [400, 401, 500] {
-                let echo = Echo::new(status)
-                    .spelling(spelling)
-                    .render(render.clone())
-                    .start()
-                    .await;
-                let http = canary_http(&ctx, Position::Form);
-                let tokens = TokenSource::new(None);
-                let token_url = echo.token_url();
-                let fetch = || async {
-                    let request = Request::new(Method::POST, url(&token_url))
-                        .idempotent()
-                        .anonymous()
-                        .form(&[("password", CANARY_PASSWORD)]);
-                    let response = http.send(&request).await?;
-                    let answer: TokenAnswer = response.json("token answer")?;
-                    Ok(Token::new(SecretString::from(answer.access_token), None))
-                };
-                // Sent once, so that a 500 is not retried with back-off.
-                let request = post(&echo, "/a");
-                let e = match http
-                    .send_with_token(&request, &tokens, &TokenAuth::BEARER, fetch)
-                    .await
-                {
-                    Ok(response) => http.reject(&response),
-                    Err(e) => e,
-                };
-                let what = format!("{spelling:?} {render_name} {status}");
-                let secrets = [CANARY_PASSWORD, echo.issued_token()];
-                for text in [e.to_string(), format!("{e:?}")] {
-                    assert_clean(&what, &text, &secrets);
-                }
-                assert!(e.to_string().contains(REDACTED), "{what}: {e}");
-                assert!(echo.token_requests() >= 1 && echo.api_requests() >= 1);
+    for dialect in dialects() {
+        for status in [400, 401, 500] {
+            let echo = dialect.echo(status).start().await;
+            let http = canary_http(&ctx, &echo, Position::Form);
+            let tokens = TokenSource::new(None);
+            let token_url = echo.token_url();
+            let fetch = || async {
+                let request = Request::new(Method::POST, url(&token_url))
+                    .idempotent()
+                    .anonymous()
+                    .form(&[("password", CANARY_PASSWORD)]);
+                let response = http.send(&request).await?;
+                let answer: TokenAnswer = response.json("token answer")?;
+                Ok(Token::new(SecretString::from(answer.access_token), None))
+            };
+            // Sent once, so that a 500 is not retried with back-off.
+            let request = post(&echo, "/a");
+            let e = match http
+                .send_with_token(&request, &tokens, &TokenAuth::BEARER, fetch)
+                .await
+            {
+                Ok(response) => http.reject(&response),
+                Err(e) => e,
+            };
+            let what = format!("{} {:?} {status}", dialect.name, dialect.spelling);
+            let secrets = [CANARY_PASSWORD, echo.issued_token()];
+            for text in [e.to_string(), format!("{e:?}")] {
+                assert_clean(&what, &text, &secrets);
             }
+            assert!(e.to_string().contains(REDACTED), "{what}: {e}");
+            assert!(echo.token_requests() >= 1 && echo.api_requests() >= 1);
         }
     }
 }
@@ -1160,31 +1377,32 @@ async fn tokens_obtained_at_run_time_never_reach_errors() {
 #[tokio::test]
 async fn keystone_password_and_token_never_reach_errors() {
     let ctx = testing::context(testing::options());
-    for status in [400, 401, 500] {
-        let echo = Echo::new(status).start().await;
-        let http = testing::http(&ctx, |b| b.secret(CANARY_PASSWORD).secret(CANARY_USER));
-        let identity = Endpoint::parse("auth_url", &echo.url("/v3"), &ctx).unwrap();
-        let keystone = Keystone::new(
-            &identity,
-            CANARY_USER,
-            "domain",
-            "project",
-            &SecretString::from(CANARY_PASSWORD),
-        )
-        .unwrap();
-        let e = keystone.fetch(&http).await.unwrap_err();
-        for text in [e.to_string(), format!("{e:?}"), format!("{keystone:?}")] {
-            assert_clean(
-                &format!("keystone {status}"),
-                &text,
-                &[CANARY_PASSWORD, CANARY_USER],
-            );
+    // 400, 401 and 403, each answered at once: the exchange is idempotent, and a 5xx would be
+    // retried with back-off for every dialect. The 5xx path is the same transport code.
+    for dialect in dialects() {
+        for status in [400, 401, 403] {
+            let echo = dialect.echo(status).start().await;
+            let http = testing::http(&ctx, |b| b.secret(CANARY_PASSWORD).secret(CANARY_USER));
+            let identity = Endpoint::parse("auth_url", &echo.url("/v3"), &ctx).unwrap();
+            let keystone = Keystone::new(
+                &identity,
+                CANARY_USER,
+                "domain",
+                "project",
+                &SecretString::from(CANARY_PASSWORD),
+            )
+            .unwrap();
+            let e = keystone.fetch(&http).await.unwrap_err();
+            let what = format!("keystone {} {:?} {status}", dialect.name, dialect.spelling);
+            for text in [e.to_string(), format!("{e:?}"), format!("{keystone:?}")] {
+                assert_clean(&what, &text, &[CANARY_PASSWORD, CANARY_USER]);
+            }
+            assert!(e.to_string().contains(REDACTED), "{what}: {e}");
         }
-        assert!(e.to_string().contains(REDACTED), "{e}");
     }
 }
 
-/// Field names the transport's events may carry.
+/// Field names the transport's request events may carry.
 const EVENT_FIELDS: [&str; 7] = [
     "message",
     "provider",
@@ -1197,19 +1415,21 @@ const EVENT_FIELDS: [&str; 7] = [
 
 #[tokio::test]
 async fn nothing_secret_reaches_tracing() {
-    let (capture, _guard) = LogCapture::install();
+    // The context is built before the capture: on a host without CA certificates it logs a
+    // warning of its own, which belongs to no request.
     let ctx = testing::context(testing::options());
+    let (capture, _guard) = LogCapture::install();
     // Success, 401 and 500, with the canaries in every position.
     for status in [200, 401, 500] {
         let echo = Echo::new(status).start().await;
         for position in POSITIONS {
-            let http = canary_http(&ctx, position);
+            let http = canary_http(&ctx, &echo, position);
             let _ = error_of(&http, &canary_request(&echo, position)).await;
         }
     }
     // A token obtained at run time, then a 401 for it and a 500.
     let echo = Echo::new(200).start().await;
-    let http = canary_http(&ctx, Position::Form);
+    let http = canary_http(&ctx, &echo, Position::Form);
     let tokens = TokenSource::new(None);
     let token_url = echo.token_url();
     let fetch = || async {
@@ -1220,8 +1440,7 @@ async fn nothing_secret_reaches_tracing() {
         let answer: TokenAnswer = http.send(&request).await?.json("token answer")?;
         Ok(Token::new(SecretString::from(answer.access_token), None))
     };
-    let query = Endpoint::parse_with("base_url", &echo.base_url(), true)
-        .unwrap()
+    let query = endpoint_of(&echo)
         .url()
         .path("/q")
         .query("filter", CANARY_KEY)
@@ -1252,22 +1471,38 @@ async fn nothing_secret_reaches_tracing() {
         .iter()
         .filter(|e| e.target == "zonewright::http")
         .collect();
-    assert!(ours.len() >= 3 * POSITIONS.len() + 3, "{}", capture.text());
+    let requests: Vec<_> = ours
+        .iter()
+        .filter(|e| e.field("message") == Some("provider request"))
+        .collect();
+    assert!(
+        requests.len() >= 3 * POSITIONS.len() + 3,
+        "{}",
+        capture.text()
+    );
     for event in &ours {
-        assert_eq!(event.level, tracing::Level::DEBUG);
-        assert!(!event.span);
-        for name in event.names() {
-            assert!(
-                EVENT_FIELDS.contains(&name),
-                "unexpected field {name}: {event}"
-            );
+        assert!(!event.span, "{event}");
+        if event.field("message") == Some("provider request") {
+            assert_eq!(event.level, tracing::Level::DEBUG);
+            for name in event.names() {
+                assert!(
+                    EVENT_FIELDS.contains(&name),
+                    "unexpected field {name}: {event}"
+                );
+            }
+            let path = event.field("path").unwrap();
+            assert!(path.starts_with('/') && !path.contains('?'), "{event}");
+            assert!(event.field("method").is_some() && event.field("elapsed_ms").is_some());
+        } else {
+            // Operator warnings carry no request data.
+            assert_eq!(event.level, tracing::Level::WARN, "{event}");
+            for name in event.names() {
+                assert!(["message", "lifetime_s"].contains(&name), "{event}");
+            }
         }
-        let path = event.field("path").unwrap();
-        assert!(path.starts_with('/') && !path.contains('?'), "{event}");
-        assert!(event.field("method").is_some() && event.field("elapsed_ms").is_some());
     }
-    assert!(ours.iter().any(|e| e.field("status") == Some("401")));
-    assert!(ours.iter().any(|e| e.field("status") == Some("500")));
+    assert!(requests.iter().any(|e| e.field("status") == Some("401")));
+    assert!(requests.iter().any(|e| e.field("status") == Some("500")));
     // Nothing captured from any target carries a secret, an issued token or a query string.
     let text = capture.text();
     assert_clean(

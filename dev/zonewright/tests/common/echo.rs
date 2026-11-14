@@ -3,6 +3,10 @@
 //!
 //! Used by the provider test files through `common`, and by the transport's unit tests, which
 //! include this file by path. It therefore uses nothing from `zonewright` and works on text.
+//!
+//! The base of every `<id>_secret_echo` test: run the client against an echo server for each of
+//! [`dialects`], with the [`CANARIES`] as credentials, and pass every error text, `Debug`
+//! output and `ZoneCheck::detail` to [`assert_clean`].
 
 use std::fmt::{self, Write as _};
 use std::sync::{Arc, Mutex};
@@ -13,25 +17,102 @@ use tracing::subscriber::DefaultGuard;
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;
+use zonewright_mock::echo::{self as echo_mock, Echo, Render, Spelling};
 
-/// A canary API token. Every canary contains `@`, a space, `/` and `+`, so that every encoding
-/// changes it.
-pub const CANARY_TOKEN: &str = "cAnaryT0ken @ p/q+r";
+/// A canary API token. Every canary contains `@`, a space, `/`, `+`, both quotes,
+/// `& < > \ ~ * =`, each next to letters, so that every encoding and escaping changes it and
+/// any fragment of an encoded canary is distinctive. The canaries sent in headers (this one and
+/// [`CANARY_KEY`]) contain no newline, which a header cannot carry; the others do.
+pub const CANARY_TOKEN: &str = "cAnaryT0ken \"Qa' &Rb<Sc>Td\\Ue~Vf*Wg=Xh @ p/q+r";
 
-/// A canary password, with non-ASCII letters as well.
-pub const CANARY_PASSWORD: &str = "cAnaryPa55 w@rd/x+y ключ";
+/// A canary password, with a newline and non-ASCII letters as well.
+pub const CANARY_PASSWORD: &str = "cAnaryPa55 \"Ka' &Lb<Mc>Nd\\Oe~Pf*Qg=Rh\nSi w@rd/x+y ключ";
 
 /// A canary API key.
-pub const CANARY_KEY: &str = "cAnaryK3y+z/w @v";
+pub const CANARY_KEY: &str = "cAnaryK3y \"Za' &Yb<Xc>Wd\\Ve~Uf*Tg=Sh +z/w @v";
 
 /// A canary user name or account identifier that arrives in the credentials object.
-pub const CANARY_USER: &str = "cAnaryUs3r @dept/a+b";
+pub const CANARY_USER: &str = "cAnaryUs3r \"Ga' &Hb<Ic>Jd\\Ke~Lf*Mg=Nh\nOi @dept/a+b";
 
 /// Every canary above.
 pub const CANARIES: [&str; 4] = [CANARY_TOKEN, CANARY_PASSWORD, CANARY_KEY, CANARY_USER];
 
 /// The marker a scrubbed secret leaves.
 pub const REDACTED: &str = "[redacted]";
+
+/// The start of the text of an error whose message was withheld as a whole because it quoted a
+/// credential in a spelling that cannot be removed in place.
+pub const WITHHELD: &str = "[redacted] (the provider's message was withheld";
+
+/// One way an echo server spells and renders the request it repeats.
+#[derive(Clone)]
+pub struct Dialect {
+    /// A short name for messages.
+    pub name: &'static str,
+    /// How the echoed text is spelled.
+    pub spelling: Spelling,
+    /// How the answer is rendered.
+    pub render: Render,
+}
+
+impl Dialect {
+    /// An echo server answering `status` in this dialect, not started yet.
+    pub fn echo(&self, status: u16) -> Echo {
+        Echo::new(status)
+            .spelling(self.spelling)
+            .render(self.render.clone())
+    }
+}
+
+/// XML template of the XML dialects.
+const XML_TEMPLATE: &str = "<Error><Code>Echo</Code><Message>{text}</Message></Error>";
+
+/// Every dialect of the secret tests: each renderer with the text verbatim, and each
+/// non-verbatim spelling inside JSON and plain text.
+pub fn dialects() -> Vec<Dialect> {
+    let renderers: Vec<(&'static str, Render)> = vec![
+        ("json", echo_mock::json()),
+        ("json_ascii", echo_mock::json_ascii()),
+        (
+            "json_ascii_with_notice",
+            echo_mock::json_ascii_with_notice(),
+        ),
+        ("json_go", echo_mock::json_go()),
+        ("json_dotnet", echo_mock::json_dotnet()),
+        ("json_unicode", echo_mock::json_unicode()),
+        ("json_in_json", echo_mock::json_in_json()),
+        ("json_unknown_key", echo_mock::json_unknown_key()),
+        ("form_json", echo_mock::form_json()),
+        ("xml", echo_mock::xml(XML_TEMPLATE)),
+        ("xml_numeric", echo_mock::xml_numeric(XML_TEMPLATE)),
+        ("xml_minimal", echo_mock::xml_minimal(XML_TEMPLATE)),
+        ("text", echo_mock::text()),
+    ];
+    let mut out: Vec<Dialect> = renderers
+        .into_iter()
+        .map(|(name, render)| Dialect {
+            name,
+            spelling: Spelling::Verbatim,
+            render,
+        })
+        .collect();
+    for spelling in Spelling::ALL {
+        if spelling == Spelling::Verbatim {
+            continue;
+        }
+        out.push(Dialect {
+            name: "json",
+            spelling,
+            render: echo_mock::json(),
+        });
+        out.push(Dialect {
+            name: "text",
+            spelling,
+            render: echo_mock::text(),
+        });
+    }
+    out
+}
 
 /// Length of the fragments of a spelling that must not occur either.
 const FRAGMENT: usize = 8;
@@ -53,9 +134,11 @@ pub fn form_encode(s: &str, space: &str) -> String {
     out
 }
 
-/// Every spelling in which an API can echo `secret`: verbatim; form-urlencoded with `+` and with
-/// `%20` for a space; the inside of a JSON string; JSON with `\/` and `\uXXXX` escapes; XML
-/// escaped. Written independently of the crate's scrubber.
+/// Every spelling in which an API can echo `secret`: verbatim; form-urlencoded with `+`, with
+/// `%20` and with lowercase hex; the percent-encodings of Python, JavaScript, RFC 3986 and Go;
+/// form-encoded JSON; the inside of a JSON string as `serde_json`, PHP, Go and .NET write it, with
+/// `\uXXXX` and a plain `/`, and nested in a second JSON string; XML with named entities, numeric
+/// references, and `&` and `<` only. Written independently of the crate's scrubber.
 pub fn spellings(secret: &str) -> Vec<String> {
     let json = serde_json::to_string(secret).expect("a string serializes");
     let json = json[1..json.len() - 1].to_owned();
@@ -78,13 +161,79 @@ pub fn spellings(secret: &str) -> Vec<String> {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;");
+    let percent = |safe: &[u8], space: &str, lower: bool| {
+        let mut out = String::new();
+        for b in secret.bytes() {
+            if b.is_ascii_alphanumeric() || safe.contains(&b) {
+                out.push(char::from(b));
+            } else if b == b' ' {
+                out.push_str(space);
+            } else if lower {
+                let _ = write!(out, "%{b:02x}");
+            } else {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+        out
+    };
+    let unit_escape = |escape: &dyn Fn(char) -> bool, upper: bool| {
+        let mut out = String::new();
+        for c in json.chars() {
+            if escape(c) {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    if upper {
+                        let _ = write!(out, "\\u{unit:04X}");
+                    } else {
+                        let _ = write!(out, "\\u{unit:04x}");
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    // Go escapes `< > &`; .NET also `' +` and every non-ASCII character (uppercase hex), and
+    // `"` as `\u0022` instead of `\"`.
+    let go = unit_escape(&|c| matches!(c, '<' | '>' | '&'), false);
+    let dotnet = unit_escape(
+        &|c| matches!(c, '\'' | '+' | '&' | '<' | '>') || !c.is_ascii(),
+        true,
+    )
+    .replace("\\\"", "\\u0022");
+    let unicode = unit_escape(&|c| !c.is_ascii(), false);
+    let json_in_json = {
+        let twice = serde_json::to_string(&json).expect("a string serializes");
+        twice[1..twice.len() - 1].to_owned()
+    };
+    let numeric = secret
+        .replace('&', "&#38;")
+        .replace('<', "&#60;")
+        .replace('>', "&#x3E;")
+        .replace('"', "&#34;")
+        .replace('\'', "&#39;")
+        .replace('/', "&#x2F;");
+    let minimal = secret.replace('&', "&amp;").replace('<', "&lt;");
     let mut out = vec![
         secret.to_owned(),
         form_encode(secret, "+"),
         form_encode(secret, "%20"),
-        json,
+        percent(b"*-._", "+", true),
+        percent(b"_.-~/", "%20", false),
+        percent(b"-_.!~*'()", "%20", false),
+        percent(b"-._~", "%20", false),
+        percent(b"-_.~", "+", false),
+        form_encode(&json, "+"),
+        json.clone(),
         php,
+        go,
+        dotnet,
+        unicode,
+        json_in_json,
         xml,
+        numeric,
+        minimal,
     ];
     out.sort();
     out.dedup();

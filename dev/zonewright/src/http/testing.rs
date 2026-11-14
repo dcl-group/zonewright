@@ -105,6 +105,15 @@ pub(crate) struct TlsServer {
 
 impl TlsServer {
     pub(crate) fn start(chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Self {
+        TlsServer::start_on("127.0.0.1:0", chain, key)
+    }
+
+    /// [`TlsServer::start`] on the address `bind`.
+    pub(crate) fn start_on(
+        bind: &str,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Self {
         let mut config = ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))
@@ -115,7 +124,7 @@ impl TlsServer {
         .unwrap();
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let config = Arc::new(config);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = TcpListener::bind(bind).unwrap();
         let server = TlsServer {
             addr: listener.local_addr().unwrap(),
             connections: Arc::default(),
@@ -139,7 +148,10 @@ impl TlsServer {
     }
 
     pub(crate) fn url(&self) -> String {
-        format!("https://{}/tls", self.addr)
+        match self.addr {
+            SocketAddr::V4(addr) => format!("https://{addr}/tls"),
+            SocketAddr::V6(addr) => format!("https://[{}]:{}/tls", addr.ip(), addr.port()),
+        }
     }
 }
 

@@ -2,8 +2,13 @@
 //!
 //! Clients cache the provider's identifier for a zone name for the life of the client. A cached
 //! identifier goes stale when the zone is deleted and created again. A "not found" answer to a
-//! request that used a cached identifier evicts the entry; the operation then resolves the zone
+//! request that used a cached identifier evicts the entry; the read then resolves the zone
 //! afresh once and repeats, before it concludes anything.
+//!
+//! Only reads are repeated. [`ZoneCache::read_zone`] runs the client's read phase and returns
+//! the identifier it ended with; the client performs its write afterwards, outside the cache,
+//! so a write can never run twice. A write answered "not found" evicts the entry with
+//! [`ZoneCache::evict`] and fails; the caller's repeat of the operation starts with a read.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -23,7 +28,7 @@ pub(crate) struct ZoneId {
     pub(crate) fresh: bool,
 }
 
-/// What an operation made of its answer.
+/// What a read made of its answer.
 #[derive(Debug)]
 pub(crate) enum Attempt<T> {
     /// A result the identifier does not put in doubt.
@@ -70,17 +75,21 @@ impl ZoneCache {
         }
     }
 
-    /// Runs `op` with the identifier of `zone`: the cached one, or one from `resolve` (which is
-    /// then cached). When `op` reports [`Attempt::Stale`] for a cached identifier, the entry is
-    /// evicted, the zone is resolved afresh, and `op` runs once more with the fresh identifier.
-    /// [`Attempt::Stale`] for a fresh identifier is `Error::ZoneNotFound`, and the entry is
-    /// evicted. `resolve` returns `Error::ZoneNotFound` itself when the zone does not exist.
-    pub(crate) async fn with_zone<T, R, RFut, O, OFut>(
+    /// Runs the read phase `read` with the identifier of `zone`: the cached one, or one from
+    /// `resolve` (which is then cached). When `read` reports [`Attempt::Stale`] for a cached
+    /// identifier, the entry is evicted, the zone is resolved afresh, and `read` runs once more
+    /// with the fresh identifier. [`Attempt::Stale`] for a fresh identifier is
+    /// `Error::ZoneNotFound`, and the entry is evicted. `resolve` returns `Error::ZoneNotFound`
+    /// itself when the zone does not exist.
+    ///
+    /// `read` may run twice, so it must not change anything at the provider. The identifier it
+    /// ended with is returned with its value, for the write that follows.
+    pub(crate) async fn read_zone<T, R, RFut, O, OFut>(
         &self,
         zone: &DomainName,
         resolve: R,
-        mut op: O,
-    ) -> Result<T, Error>
+        mut read: O,
+    ) -> Result<(ZoneId, T), Error>
     where
         R: Fn() -> RFut,
         RFut: Future<Output = Result<String, Error>>,
@@ -92,20 +101,18 @@ impl ZoneCache {
             None => self.resolve(zone, &resolve).await?,
         };
         let was_fresh = first.fresh;
-        let used = first.id.clone();
-        match op(first).await? {
-            Attempt::Done(value) => return Ok(value),
-            Attempt::Stale => self.evict(zone, &used),
+        match read(first.clone()).await? {
+            Attempt::Done(value) => return Ok((first, value)),
+            Attempt::Stale => self.evict(zone, &first.id),
         }
         if was_fresh {
             return Err(Error::zone_not_found(zone.clone()));
         }
         let again = self.resolve(zone, &resolve).await?;
-        let used = again.id.clone();
-        match op(again).await? {
-            Attempt::Done(value) => Ok(value),
+        match read(again.clone()).await? {
+            Attempt::Done(value) => Ok((again, value)),
             Attempt::Stale => {
-                self.evict(zone, &used);
+                self.evict(zone, &again.id);
                 Err(Error::zone_not_found(zone.clone()))
             }
         }
@@ -138,8 +145,8 @@ mod tests {
         let cache = ZoneCache::new();
         let resolves = AtomicU32::new(0);
         for expect_fresh in [true, false, false] {
-            let fresh = cache
-                .with_zone(
+            let (used, fresh) = cache
+                .read_zone(
                     &zone(),
                     || async {
                         resolves.fetch_add(1, Ordering::SeqCst);
@@ -153,6 +160,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(fresh, expect_fresh);
+            assert_eq!(used.fresh, expect_fresh);
         }
         assert_eq!(resolves.load(Ordering::SeqCst), 1);
     }
@@ -164,8 +172,8 @@ mod tests {
         cache.insert(&zone(), "old");
         let resolves = AtomicU32::new(0);
         let ops = AtomicU32::new(0);
-        let out = cache
-            .with_zone(
+        let (used, out) = cache
+            .read_zone(
                 &zone(),
                 || async {
                     resolves.fetch_add(1, Ordering::SeqCst);
@@ -191,6 +199,7 @@ mod tests {
                 fresh: true
             }
         );
+        assert_eq!(used, out);
         assert_eq!(resolves.load(Ordering::SeqCst), 1);
         assert_eq!(ops.load(Ordering::SeqCst), 2);
         assert_eq!(cache.get(&zone()).as_deref(), Some("new"));
@@ -201,7 +210,7 @@ mod tests {
         let cache = ZoneCache::new();
         let ops = AtomicU32::new(0);
         let e = cache
-            .with_zone(
+            .read_zone(
                 &zone(),
                 || async { Ok("id".to_owned()) },
                 |_| {
@@ -219,7 +228,7 @@ mod tests {
         cache.insert(&zone(), "old");
         ops.store(0, Ordering::SeqCst);
         let e = cache
-            .with_zone(
+            .read_zone(
                 &zone(),
                 || async { Ok("id".to_owned()) },
                 |_| {
@@ -238,7 +247,7 @@ mod tests {
     async fn resolve_failures_and_errors_pass_through() {
         let cache = ZoneCache::new();
         let e = cache
-            .with_zone(
+            .read_zone(
                 &zone(),
                 || async { Err(Error::zone_not_found(zone())) },
                 |_| async { Ok(Attempt::Done(())) },
@@ -248,7 +257,7 @@ mod tests {
         assert_eq!(e.kind(), ErrorKind::ZoneNotFound);
         cache.insert(&zone(), "id");
         let e = cache
-            .with_zone(
+            .read_zone(
                 &zone(),
                 || async { Ok("id".to_owned()) },
                 |_| async { Err::<Attempt<()>, _>(Error::transient("down")) },

@@ -10,8 +10,8 @@
 //! those cases is that request bodies and headers never enter error text at all; the scrubber
 //! covers what the provider sends back.
 
-use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use zeroize::Zeroizing;
@@ -22,9 +22,17 @@ pub(crate) const DETAIL_MAX_BYTES: usize = 512;
 /// Marker that takes the place of a removed secret.
 pub(crate) const REDACTED: &str = "[redacted]";
 
-/// How many secrets registered at run time (tokens, signed assertions) a [`Scrubber`] keeps:
-/// enough for the current and the previous token while one replaces the other.
-const RUNTIME_SECRETS: usize = 4;
+/// The whole text of a [`Detail`] whose source quoted a credential in a spelling the scrubber
+/// cannot replace in place (see [`Scrubber`]).
+pub(crate) const WITHHELD: &str = "[redacted] (the provider's message was withheld: it quoted a credential in an encoding that cannot be removed in place)";
+
+/// Rounds of decoding applied to a text before the scrubber concludes it holds no secret.
+const DECODE_ROUNDS: usize = 3;
+
+/// Longest prefix of a scrubbed text that is decoded and searched again: what the [`Detail`]
+/// shows, plus room for the longest needle in the widest encoding met (12 bytes per byte), at
+/// most 64 KiB.
+const DECODE_WINDOW_MAX: usize = 64 * 1024;
 
 /// Bounded text taken from a provider's answer or composed by the client.
 ///
@@ -96,30 +104,67 @@ fn bound(text: &str) -> (String, bool) {
     (out, false)
 }
 
+/// Identifies one source of secrets obtained at run time, such as one token cache or one signer
+/// of assertions. The scrubber keeps the current and the previous secret of every slot, so that
+/// a client with several token sources never loses the coverage of a live token.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SecretSlot(u64);
+
+impl SecretSlot {
+    /// A slot no other slot in the process equals.
+    pub(crate) fn new() -> SecretSlot {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        SecretSlot(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// Removes the secrets of one client from text taken from a provider's answer.
 ///
 /// Created in the client's constructor from every field of its credentials; every token the client
-/// obtains at run time and every signed assertion it sends is added with
-/// [`Scrubber::remember`]. The run-time list keeps the [`RUNTIME_SECRETS`] most recent entries.
+/// obtains at run time and every signed assertion it sends is added with [`Scrubber::remember`]
+/// under the [`SecretSlot`] of its source, which keeps that source's current and previous secret.
 ///
-/// For each secret the scrubber searches for the spellings in which an API can echo it:
+/// Matching works in two ways.
 ///
-/// - verbatim;
-/// - `application/x-www-form-urlencoded` (WHATWG serializer), with `+` and with `%20` for a space;
-/// - as the inside of a JSON string;
-/// - JSON with `\/` and lowercase `\uXXXX` escapes for non-ASCII characters (the PHP
-///   `json_encode` default);
-/// - XML-escaped;
-/// - and, for the truncation rule only in effect, each of these with its unsafe characters
-///   replaced by spaces, the way [`Detail`] cleans them.
+/// 1. Encoded needles, replaced in place. For each secret the scrubber searches for the spellings
+///    in which an API most often echoes it:
+///    - verbatim;
+///    - `application/x-www-form-urlencoded` (WHATWG serializer), with `+` and with `%20` for a
+///      space;
+///    - RFC 3986 percent-encoding (unreserved characters kept, uppercase hex), the encoding of
+///      the crate's own URL builder;
+///    - as the inside of a JSON string;
+///    - JSON with `\/` and lowercase `\uXXXX` escapes for non-ASCII characters (the PHP
+///      `json_encode` default);
+///    - XML-escaped;
+///    - and, for the truncation rule only in effect, each of these with its unsafe characters
+///      replaced by spaces, the way [`Detail`] cleans them.
 ///
-/// Every occurrence of any spelling, including overlapping ones, is replaced by `[redacted]`;
-/// overlapping or adjacent occurrences become one marker. Empty secrets are ignored.
+///    Every occurrence of any spelling, including overlapping ones, is replaced by `[redacted]`;
+///    overlapping or adjacent occurrences become one marker. Empty secrets are ignored.
+/// 2. A decoded haystack, for every other dialect (lowercase percent-hex, other percent-encoding
+///    safe sets, numeric XML character references, partial escaping, uppercase or extra JSON
+///    `\u` escapes, JSON inside JSON, form-encoded JSON). After the replacement above, the text
+///    is decoded — percent-decoding of any hex case with and without `+` for a space, XML entity
+///    decoding (the five named entities, decimal and hexadecimal references), JSON string
+///    unescaping — in every combination, up to three rounds deep. If any needle appears in any
+///    decoded layer, the secret cannot be cut out in place, and the whole [`Detail`] becomes the
+///    constant [`WITHHELD`] text. Only the part of the text that can reach the `Detail` is
+///    decoded: its first 512 bytes plus 12 bytes for every byte of the longest needle, at most
+///    64 KiB. The work is therefore bounded by 84 decoded layers of at most 64 KiB, each
+///    searched for every needle.
 ///
 /// The needles are held in zeroizing memory, and `Debug` prints none of them.
 pub(crate) struct Scrubber {
     fixed: Vec<Zeroizing<String>>,
-    runtime: Mutex<VecDeque<RuntimeSecret>>,
+    runtime: Mutex<Vec<SlotEntry>>,
+}
+
+/// The secrets of one [`SecretSlot`].
+struct SlotEntry {
+    slot: u64,
+    current: RuntimeSecret,
+    previous: Option<RuntimeSecret>,
 }
 
 /// A secret registered at run time with its spellings.
@@ -141,47 +186,66 @@ impl Scrubber {
         sort_longest_first(&mut fixed);
         Scrubber {
             fixed,
-            runtime: Mutex::new(VecDeque::new()),
+            runtime: Mutex::new(Vec::new()),
         }
     }
 
-    /// Registers a secret obtained at run time: a token or a signed assertion. Only the
-    /// [`RUNTIME_SECRETS`] most recent ones are kept; registering a secret that is already known
-    /// makes it the most recent.
-    pub(crate) fn remember(&self, secret: &str) {
-        let spellings = spellings(secret);
-        if spellings.is_empty() {
+    /// Registers a secret obtained at run time (a token, a signed assertion) as the current
+    /// secret of `slot`; the slot's previous current secret stays registered as its previous
+    /// one, and the one before is forgotten. Registering the slot's current secret again costs a
+    /// comparison and changes nothing.
+    pub(crate) fn remember(&self, slot: &SecretSlot, secret: &str) {
+        if secret.is_empty() {
             return;
         }
-        let entry = RuntimeSecret {
-            secret: Zeroizing::new(secret.to_owned()),
-            spellings,
-        };
         // A panic while the lock was held cannot leave the list half-updated in a way that
         // matters here: every state of it is a valid list of secrets.
         let mut runtime = self.runtime.lock().unwrap_or_else(PoisonError::into_inner);
-        runtime.retain(|known| known.secret.as_str() != secret);
-        runtime.push_back(entry);
-        while runtime.len() > RUNTIME_SECRETS {
-            runtime.pop_front();
+        let index = runtime.iter().position(|entry| entry.slot == slot.0);
+        if let Some(entry) = index.and_then(|i| runtime.get(i))
+            && entry.current.secret.as_str() == secret
+        {
+            return;
+        }
+        let fresh = RuntimeSecret {
+            secret: Zeroizing::new(secret.to_owned()),
+            spellings: spellings(secret),
+        };
+        match index.and_then(|i| runtime.get_mut(i)) {
+            Some(entry) => {
+                let old = std::mem::replace(&mut entry.current, fresh);
+                entry.previous = Some(old);
+            }
+            None => runtime.push(SlotEntry {
+                slot: slot.0,
+                current: fresh,
+                previous: None,
+            }),
         }
     }
 
     /// The text with every registered secret replaced, not bounded. For bodies that are parsed
-    /// after scrubbing.
+    /// after scrubbing; only encoded needles are replaced here. The text taken from the parsed
+    /// body then goes through [`Scrubber::detail`], which applies the decoded check as well.
     pub(crate) fn scrub(&self, text: &str) -> String {
         self.with_needles(|needles| redact(text, needles))
     }
 
     /// A [`Detail`] from text taken from a provider's answer.
     ///
-    /// Order: scrub, then replace unsafe characters by spaces, then truncate to 512 bytes on a
-    /// character boundary. When the text was cut, a trailing fragment that is a prefix of any
-    /// registered spelling is removed as well, so that the head of a secret cut by the limit is
-    /// not exposed.
+    /// Order: replace encoded needles; if a needle remains in a decoded layer of the part of the
+    /// text that can reach the `Detail`, return [`WITHHELD`]; otherwise replace unsafe characters
+    /// by spaces, then truncate to 512 bytes on a character boundary. When the text was cut, a
+    /// trailing fragment that is a prefix of any registered spelling is removed as well, so that
+    /// the head of a secret cut by the limit is not exposed.
     pub(crate) fn detail(&self, text: &str) -> Detail {
         self.with_needles(|needles| {
             let scrubbed = redact(text, needles);
+            let longest = needles.iter().map(|n| n.len()).max().unwrap_or(0);
+            let window = window(&scrubbed, longest);
+            if hidden_in_decoded(window, needles) {
+                return Detail::constant(WITHHELD);
+            }
             let (mut out, truncated) = bound(&scrubbed);
             if truncated {
                 strip_cut_prefix(&mut out, needles);
@@ -196,11 +260,245 @@ impl Scrubber {
         let needles: Vec<&str> = self
             .fixed
             .iter()
-            .chain(runtime.iter().flat_map(|entry| entry.spellings.iter()))
+            .chain(runtime.iter().flat_map(|entry| {
+                entry
+                    .current
+                    .spellings
+                    .iter()
+                    .chain(entry.previous.iter().flat_map(|p| p.spellings.iter()))
+            }))
             .map(|needle| needle.as_str())
             .collect();
         f(&needles)
     }
+}
+
+/// The prefix of `text` that is decoded: [`DETAIL_MAX_BYTES`] plus 12 bytes per byte of the
+/// longest needle, at most [`DECODE_WINDOW_MAX`], on a character boundary.
+fn window(text: &str, longest_needle: usize) -> &str {
+    let want = DETAIL_MAX_BYTES
+        .saturating_add(longest_needle.saturating_mul(12))
+        .min(DECODE_WINDOW_MAX);
+    if text.len() <= want {
+        return text;
+    }
+    let mut end = want;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or("")
+}
+
+/// The decoders of the decoded check.
+const DECODERS: &[fn(&str) -> Option<String>] = &[
+    percent_decode_plus,
+    percent_decode_keep_plus,
+    entity_decode,
+    json_unescape,
+];
+
+/// True when some needle occurs in a layer obtained from `text` by up to [`DECODE_ROUNDS`]
+/// rounds of the [`DECODERS`] in every combination.
+fn hidden_in_decoded(text: &str, needles: &[&str]) -> bool {
+    if needles.is_empty() {
+        return false;
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let mut frontier: Vec<String> = vec![text.to_owned()];
+    for _ in 0..DECODE_ROUNDS {
+        let mut next = Vec::new();
+        for layer in &frontier {
+            for decode in DECODERS.iter() {
+                let Some(decoded) = decode(layer) else {
+                    continue;
+                };
+                if seen.contains(&decoded) {
+                    continue;
+                }
+                if needles.iter().any(|n| !n.is_empty() && decoded.contains(n)) {
+                    return true;
+                }
+                seen.push(decoded.clone());
+                next.push(decoded);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    false
+}
+
+/// The value of an ASCII hexadecimal digit, either case.
+fn hex_value(b: u8) -> Option<u8> {
+    char::from(b)
+        .to_digit(16)
+        .and_then(|d| u8::try_from(d).ok())
+}
+
+/// Percent-decoding with `%XX` in either hex case; `+` becomes a space when `plus` is set.
+/// Malformed escapes stay as they are; bytes that are not UTF-8 are replaced. `None` when
+/// nothing changes.
+fn percent_decode(s: &str, plus: bool) -> Option<String> {
+    if !s.contains('%') && !(plus && s.contains('+')) {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'%' => {
+                let hi = bytes.get(i + 1).copied().and_then(hex_value);
+                let lo = bytes.get(i + 2).copied().and_then(hex_value);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push(hi << 4 | lo);
+                    i += 3;
+                    continue;
+                }
+                out.push(b);
+            }
+            b'+' if plus => out.push(b' '),
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    let decoded = String::from_utf8_lossy(&out).into_owned();
+    (decoded != s).then_some(decoded)
+}
+
+fn percent_decode_plus(s: &str) -> Option<String> {
+    percent_decode(s, true)
+}
+
+fn percent_decode_keep_plus(s: &str) -> Option<String> {
+    percent_decode(s, false)
+}
+
+/// XML entity decoding: `&amp; &lt; &gt; &quot; &apos;`, `&#NNN;` and `&#xHHH;` (either case).
+/// Anything else stays as it is. `None` when nothing changes.
+fn entity_decode(s: &str) -> Option<String> {
+    if !s.contains('&') {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(rest.get(..pos).unwrap_or(""));
+        let tail = rest.get(pos..).unwrap_or("");
+        let entity = tail
+            .get(1..)
+            .and_then(|t| t.find(';').filter(|&end| end <= 10).map(|end| (t, end)));
+        let decoded = entity.and_then(|(t, end)| {
+            let name = t.get(..end)?;
+            let c = match name {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                _ => {
+                    let number = name.strip_prefix('#')?;
+                    let value = match number.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                        None => number.parse::<u32>().ok()?,
+                    };
+                    char::from_u32(value)?
+                }
+            };
+            Some((c, end + 2))
+        });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = tail.get(len..).unwrap_or("");
+            }
+            None => {
+                out.push('&');
+                rest = tail.get(1..).unwrap_or("");
+            }
+        }
+    }
+    out.push_str(rest);
+    (out != s).then_some(out)
+}
+
+/// Four hexadecimal digits of either case at the start of `s`.
+fn hex4(s: &str) -> Option<u32> {
+    let digits = s.get(..4)?;
+    if digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        u32::from_str_radix(digits, 16).ok()
+    } else {
+        None
+    }
+}
+
+/// JSON string unescaping: `\" \\ \/ \b \f \n \r \t` and `\uXXXX` in either hex case,
+/// surrogate pairs joined, a lone surrogate replaced. Unknown escapes stay as they are. `None`
+/// when nothing changes.
+fn json_unescape(s: &str) -> Option<String> {
+    if !s.contains('\\') {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let rest = s.get(i + 1..).unwrap_or("");
+        let simple = match rest.chars().next() {
+            Some('"') => Some('"'),
+            Some('\\') => Some('\\'),
+            Some('/') => Some('/'),
+            Some('b') => Some('\u{08}'),
+            Some('f') => Some('\u{0c}'),
+            Some('n') => Some('\n'),
+            Some('r') => Some('\r'),
+            Some('t') => Some('\t'),
+            _ => None,
+        };
+        if let Some(c) = simple {
+            out.push(c);
+            chars.next();
+            continue;
+        }
+        let unit = rest.strip_prefix('u').and_then(hex4);
+        match unit {
+            Some(high @ 0xD800..=0xDBFF) => {
+                let low = rest
+                    .get(5..)
+                    .and_then(|r| r.strip_prefix("\\u"))
+                    .and_then(hex4)
+                    .filter(|low| (0xDC00..=0xDFFF).contains(low));
+                match low {
+                    Some(low) => {
+                        let code = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+                        out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                        for _ in 0..11 {
+                            chars.next();
+                        }
+                    }
+                    None => {
+                        out.push('\u{FFFD}');
+                        for _ in 0..5 {
+                            chars.next();
+                        }
+                    }
+                }
+            }
+            Some(unit) => {
+                out.push(char::from_u32(unit).unwrap_or('\u{FFFD}'));
+                for _ in 0..5 {
+                    chars.next();
+                }
+            }
+            None => out.push('\\'),
+        }
+    }
+    (out != s).then_some(out)
 }
 
 /// Every spelling of `secret` the scrubber searches for, longest first, without duplicates.
@@ -213,6 +511,7 @@ fn spellings(secret: &str) -> Vec<Zeroizing<String>> {
         Zeroizing::new(secret.to_owned()),
         form_urlencode(secret, "+"),
         form_urlencode(secret, "%20"),
+        percent_rfc3986(secret),
         php_json_inner(&json),
         xml_escape(secret),
         json,
@@ -258,6 +557,24 @@ fn form_urlencode(s: &str, space: &str) -> Zeroizing<String> {
             b'*' | b'-' | b'.' | b'_' => out.push(char::from(b)),
             b if b.is_ascii_alphanumeric() => out.push(char::from(b)),
             b' ' => out.push_str(space),
+            b => {
+                out.push('%');
+                push_hex_digit(&mut out, b >> 4, true);
+                push_hex_digit(&mut out, b, true);
+            }
+        }
+    }
+    out
+}
+
+/// RFC 3986 percent-encoding: the unreserved characters (`A-Z a-z 0-9 - . _ ~`) as they are,
+/// every other byte as `%XX` (uppercase), a space as `%20`.
+fn percent_rfc3986(s: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(s.len().saturating_mul(3)));
+    for b in s.bytes() {
+        match b {
+            b'-' | b'.' | b'_' | b'~' => out.push(char::from(b)),
+            b if b.is_ascii_alphanumeric() => out.push(char::from(b)),
             b => {
                 out.push('%');
                 push_hex_digit(&mut out, b >> 4, true);
@@ -582,7 +899,7 @@ mod tests {
         let scrubber = Scrubber::new(["", ""]);
         assert_eq!(scrubber.scrub("text"), "text");
         assert_eq!(scrubber.detail("").as_str(), "");
-        scrubber.remember("");
+        scrubber.remember(&SecretSlot::new(), "");
         assert_eq!(scrubber.scrub("text"), "text");
     }
 
@@ -669,30 +986,129 @@ mod tests {
     }
 
     #[test]
-    fn runtime_secrets_are_scrubbed_and_the_oldest_forgotten() {
+    fn runtime_secrets_are_kept_per_slot_current_and_previous() {
         let scrubber = Scrubber::new(["pw-1"]);
-        scrubber.remember("tok-aaaa");
+        let tokens = SecretSlot::new();
+        let other = SecretSlot::new();
+        scrubber.remember(&tokens, "tok-aaaa");
         assert_eq!(scrubber.scrub("a tok-aaaa pw-1"), "a [redacted] [redacted]");
-        for token in ["tok-bbbb", "tok-cccc", "tok-dddd"] {
-            scrubber.remember(token);
+        // Any number of other slots does not evict this slot's secrets.
+        for i in 0..20 {
+            scrubber.remember(&SecretSlot::new(), &format!("other-{i:02}"));
         }
-        // Registering a known secret again makes it the most recent instead of a duplicate.
-        scrubber.remember("tok-aaaa");
-        scrubber.remember("tok-eeee");
+        scrubber.remember(&other, "jwt-1111");
+        assert_eq!(scrubber.scrub("tok-aaaa"), REDACTED);
+        // Current and previous are kept; the one before is forgotten.
+        scrubber.remember(&tokens, "tok-bbbb");
+        assert_eq!(scrubber.scrub("tok-aaaa tok-bbbb"), "[redacted] [redacted]");
+        scrubber.remember(&tokens, "tok-cccc");
         assert_eq!(
-            scrubber.scrub("tok-aaaa tok-bbbb tok-cccc tok-dddd tok-eeee"),
-            "[redacted] tok-bbbb [redacted] [redacted] [redacted]"
+            scrubber.scrub("tok-aaaa tok-bbbb tok-cccc"),
+            "tok-aaaa [redacted] [redacted]"
+        );
+        // Registering the current secret again changes nothing.
+        scrubber.remember(&tokens, "tok-cccc");
+        assert_eq!(scrubber.scrub("tok-bbbb tok-cccc"), "[redacted] [redacted]");
+        // The other slots are untouched.
+        assert_eq!(
+            scrubber.scrub("jwt-1111 other-00 other-19"),
+            "[redacted] [redacted] [redacted]"
         );
         // Run-time secrets are found in every spelling too.
-        scrubber.remember("a b/c");
+        scrubber.remember(&other, "a b/c");
         assert_eq!(scrubber.scrub("x a+b%2Fc y"), "x [redacted] y");
         assert_eq!(scrubber.scrub("pw-1"), REDACTED);
     }
 
     #[test]
+    fn rfc3986_spelling_keeps_tilde_and_encodes_star() {
+        let scrubber = Scrubber::new(["k~e*y v"]);
+        assert_eq!(
+            scrubber.detail("q=k~e%2Ay%20v&x").as_str(),
+            "q=[redacted]&x"
+        );
+        assert_eq!(scrubber.detail("q=k%7Ee*y+v&x").as_str(), "q=[redacted]&x");
+    }
+
+    /// Dialects no encoded needle covers: the detail is withheld as a whole.
+    #[test]
+    fn secrets_in_other_dialects_withhold_the_detail() {
+        let secret = "p\"a'ss &w<o>rd/x+y~z*=ключ";
+        let scrubber = Scrubber::new([secret]);
+        let json = serde_json::to_string(secret).unwrap();
+        let dialects = [
+            // Lowercase percent-hex.
+            "p%22a%27ss%20%26w%3co%3erd%2fx%2by%7ez%2a%3d%d0%ba%d0%bb%d1%8e%d1%87".to_owned(),
+            // Python `quote`: `/` kept.
+            "p%22a%27ss%20%26w%3Co%3Erd/x%2By~z%2A%3D%D0%BA%D0%BB%D1%8E%D1%87".to_owned(),
+            // `encodeURIComponent`: `~ * '` kept.
+            "p%22a'ss%20%26w%3Co%3Erd%2Fx%2By~z*%3D%D0%BA%D0%BB%D1%8E%D1%87".to_owned(),
+            // XML numeric references.
+            "p&#34;a&#39;ss &#x26;w&#60;o&#x3E;rd&#x2F;x+y~z*=ключ".to_owned(),
+            // Text-node escaping of `&` and `<` only.
+            "p\"a'ss &amp;w&lt;o>rd/x+y~z*=ключ".to_owned(),
+            // .NET-style JSON: uppercase `\u`, `+ & < > ' "` escaped.
+            "p\\u0022a\\u0027ss \\u0026w\\u003Co\\u003Erd/x\\u002By~z*=\\u043A\\u043B\\u044E\\u0447".to_owned(),
+            // JSON inside JSON.
+            serde_json::to_string(&json).unwrap(),
+            // Form-encoded JSON.
+            form_urlencode(&json, "+").to_string(),
+        ];
+        for text in dialects {
+            let detail = scrubber.detail(&format!("error: {text} end"));
+            assert_eq!(detail.as_str(), WITHHELD, "{text}");
+        }
+        // A text without the secret is left alone, escapes and all.
+        let clean = "error: a%2fb &#39;c&#39; \\u0041 end";
+        assert_eq!(scrubber.detail(clean).as_str(), clean);
+    }
+
+    #[test]
+    fn the_decoded_check_covers_what_reaches_the_detail() {
+        let secret = "SECRET/token+1";
+        let scrubber = Scrubber::new([secret]);
+        // Straddling the cut, lowercase hex.
+        let encoded = "SECRET%2ftoken%2b1";
+        let text = format!("{}{encoded} tail", "x".repeat(DETAIL_MAX_BYTES - 6));
+        assert_eq!(scrubber.detail(&text).as_str(), WITHHELD);
+        // Far beyond what the detail shows: no effect.
+        let text = format!("{}{encoded}", "x".repeat(DECODE_WINDOW_MAX));
+        assert_eq!(
+            scrubber.detail(&text).as_str(),
+            "x".repeat(DETAIL_MAX_BYTES)
+        );
+        // A secret replaced in place does not trigger the withholding.
+        assert_eq!(
+            scrubber.detail("a SECRET/token+1 b").as_str(),
+            "a [redacted] b"
+        );
+    }
+
+    #[test]
+    fn decoders() {
+        assert_eq!(
+            percent_decode_plus("a+b%2fc%2F%zz%").as_deref(),
+            Some("a b/c/%zz%")
+        );
+        assert_eq!(percent_decode_keep_plus("a+b%41").as_deref(), Some("a+bA"));
+        assert_eq!(percent_decode_plus("plain"), None);
+        assert_eq!(percent_decode_keep_plus("%ff").as_deref(), Some("\u{FFFD}"));
+        assert_eq!(
+            entity_decode("&amp;&lt;&gt;&quot;&apos;&#39;&#x2F;&#X2f;&nbsp;&#;&").as_deref(),
+            Some("&<>\"''//&nbsp;&#;&")
+        );
+        assert_eq!(entity_decode("&#99999999999;"), None);
+        assert_eq!(
+            json_unescape(r#"\"\\\/\b\f\n\r\t\u0041\u00e9\uD83D\uDE00\ud800x\q\u12"#).as_deref(),
+            Some("\"\\/\u{8}\u{c}\n\r\tAé\u{1F600}\u{FFFD}x\\q\\u12")
+        );
+        assert_eq!(json_unescape("plain"), None);
+    }
+
+    #[test]
     fn debug_prints_no_secret() {
         let scrubber = Scrubber::new([SECRET, "fixed-canary"]);
-        scrubber.remember("runtime-canary");
+        scrubber.remember(&SecretSlot::new(), "runtime-canary");
         let debug = format!("{scrubber:?} {scrubber:#?}");
         assert_eq!(format!("{scrubber:?}"), "Scrubber { .. }");
         for canary in ["fixed-canary", "runtime-canary", "ключ", "p@ss"] {

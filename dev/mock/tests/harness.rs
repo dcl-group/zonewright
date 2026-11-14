@@ -649,6 +649,83 @@ async fn echo_renderers_and_spellings() {
     );
 }
 
+#[test]
+fn echo_spellings_follow_their_libraries() {
+    let text = "a b/c+d~e*f'g&\u{e9}";
+    let expect = [
+        (Spelling::Verbatim, "a b/c+d~e*f'g&\u{e9}"),
+        (Spelling::FormPlus, "a+b%2Fc%2Bd%7Ee*f%27g%26%C3%A9"),
+        (Spelling::FormPercent, "a%20b%2Fc%2Bd%7Ee*f%27g%26%C3%A9"),
+        (Spelling::FormLower, "a+b%2fc%2bd%7ee*f%27g%26%c3%a9"),
+        (Spelling::PercentPython, "a%20b/c%2Bd~e%2Af%27g%26%C3%A9"),
+        (
+            Spelling::PercentUriComponent,
+            "a%20b%2Fc%2Bd~e*f'g%26%C3%A9",
+        ),
+        (Spelling::PercentRfc3986, "a%20b%2Fc%2Bd~e%2Af%27g%26%C3%A9"),
+        (Spelling::QueryGo, "a+b%2Fc%2Bd~e%2Af%27g%26%C3%A9"),
+    ];
+    assert_eq!(expect.len(), Spelling::ALL.len());
+    for (spelling, expected) in expect {
+        assert_eq!(spelling.apply(text), expected, "{spelling:?}");
+    }
+}
+
+#[tokio::test]
+async fn echo_json_and_xml_dialects() {
+    let template = "<E><M>{text}</M></E>";
+    let echo = Echo::new(400)
+        .render_under("/go", echo::json_go())
+        .render_under("/dotnet", echo::json_dotnet())
+        .render_under("/unicode", echo::json_unicode())
+        .render_under("/nested", echo::json_in_json())
+        .render_under("/unknown", echo::json_unknown_key())
+        .render_under("/formjson", echo::form_json())
+        .render_under("/numeric", echo::xml_numeric(template))
+        .render_under("/minimal", echo::xml_minimal(template))
+        .render_under("/notice", echo::json_ascii_with_notice())
+        .start()
+        .await;
+    let body = "q\"'+&<>/\u{e9}";
+    let get = |path: &'static str| {
+        let addr = echo.addr();
+        async move {
+            send_raw(addr, &request("POST", path, &[], body))
+                .await
+                .body_str()
+        }
+    };
+    let go = get("/go").await;
+    assert!(go.contains(r#"q\"'+\u0026\u003c\u003e/é"#), "{go}");
+    let dotnet = get("/dotnet").await;
+    assert!(
+        dotnet.contains(r"q\u0022\u0027\u002B\u0026\u003C\u003E/\u00E9"),
+        "{dotnet}"
+    );
+    let unicode = get("/unicode").await;
+    assert!(unicode.contains(r#"q\"'+&<>/\u00e9"#), "{unicode}");
+    let nested = get("/nested").await;
+    let v: serde_json::Value = serde_json::from_str(&nested).unwrap();
+    let inner: serde_json::Value = serde_json::from_str(v["message"].as_str().unwrap()).unwrap();
+    assert!(inner["message"].as_str().unwrap().contains(body));
+    let unknown = get("/unknown").await;
+    let v: serde_json::Value = serde_json::from_str(&unknown).unwrap();
+    assert!(v["msg"].as_str().unwrap().contains(body));
+    assert!(v.get("message").is_none());
+    let form = get("/formjson").await;
+    assert!(form.contains("q%5C%22%27%2B%26%3C%3E%2F%C3%A9"), "{form}");
+    let numeric = get("/numeric").await;
+    assert!(
+        numeric.contains("q&#34;&#39;+&#38;&#60;&#x3E;&#x2F;\u{e9}"),
+        "{numeric}"
+    );
+    let notice = get("/notice").await;
+    assert!(notice.starts_with("PHP Notice"), "{notice}");
+    assert!(notice.contains(r#"q\"'+&<>\/\u00e9"#), "{notice}");
+    let minimal = get("/minimal").await;
+    assert!(minimal.contains("q\"'+&amp;&lt;>/\u{e9}"), "{minimal}");
+}
+
 #[tokio::test]
 async fn echo_has_fault_injection() {
     let echo = EchoServer::start(400).await;

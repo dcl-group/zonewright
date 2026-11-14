@@ -15,6 +15,7 @@
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
+use super::hmac::hmac_sha256_into;
 use super::{KeyError, hex_lower, hmac_sha256, push_hex_byte, sha256};
 
 /// The signing algorithm's identifier.
@@ -134,10 +135,16 @@ pub(crate) fn authorization(
     let mut k_secret = Zeroizing::new(String::with_capacity(4 + secret.len()));
     k_secret.push_str("AWS4");
     k_secret.push_str(secret);
-    let k_date = Zeroizing::new(hmac_sha256(k_secret.as_bytes(), date.as_bytes()));
-    let k_region = Zeroizing::new(hmac_sha256(k_date.as_ref(), scope.region.as_bytes()));
-    let k_service = Zeroizing::new(hmac_sha256(k_region.as_ref(), scope.service.as_bytes()));
-    let k_signing = Zeroizing::new(hmac_sha256(k_service.as_ref(), b"aws4_request"));
+    // Every derived key is written straight into a zeroizing buffer, never returned by value.
+    let mut k_date = Zeroizing::new([0u8; 32]);
+    hmac_sha256_into(k_secret.as_bytes(), date.as_bytes(), &mut k_date);
+    let mut k_region = Zeroizing::new([0u8; 32]);
+    hmac_sha256_into(k_date.as_ref(), scope.region.as_bytes(), &mut k_region);
+    let mut k_service = Zeroizing::new([0u8; 32]);
+    hmac_sha256_into(k_region.as_ref(), scope.service.as_bytes(), &mut k_service);
+    let mut k_signing = Zeroizing::new([0u8; 32]);
+    hmac_sha256_into(k_service.as_ref(), b"aws4_request", &mut k_signing);
+    // The signature is public: it is sent in the Authorization header.
     let signature = hex_lower(&hmac_sha256(k_signing.as_ref(), string_to_sign.as_bytes()));
 
     let parts = [

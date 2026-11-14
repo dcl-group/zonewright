@@ -135,8 +135,8 @@ impl Keystone {
         Ok(Keystone { url, body })
     }
 
-    /// Exchanges the password for a token. The token is registered with `http`'s scrubber as
-    /// soon as it is read.
+    /// Exchanges the password for a token. The transport registers the token with `http`'s
+    /// scrubber when [`Http::send_with_token`] first uses it; until then it appears in no error.
     ///
     /// Answers: 200 or 201 with `X-Subject-Token` is the token, its lifetime from
     /// `token.expires_at` (none stated when absent or unreadable, which the token cache treats
@@ -166,7 +166,6 @@ impl Keystone {
                     "the identity service answered without an X-Subject-Token header",
                 ),
             })?;
-        http.remember(token);
         let lifetime = response
             .json::<TokenAnswer>("the identity service's token answer is not in the expected form")
             .ok()

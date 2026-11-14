@@ -1638,6 +1638,17 @@ numbers and tokens only; a URL returned by the provider is never requested.
   re-sends the same memory and it is wiped when the last reference drops.
 - Form encoding (WHATWG `application/x-www-form-urlencoded`) and percent-encoding of path segments
   and query values are small private functions with tests, not dependency features.
+- Credentials go only to the client's own endpoints. A client declares every endpoint it uses (API,
+  identity or token service) when it builds its transport handle; a request to any other origin
+  (scheme, host, port) is refused with `Error::Config` before a connection is made. A client with a
+  static credential or a client certificate cannot be built without a declared endpoint, and a
+  request with a cached token is refused when none is declared.
+- A TLS client key is held in a buffer that is wiped when the transport handle is built; `rustls`
+  receives a copy, parses it with `aws-lc-rs` and drops that copy without wiping it.
+- Limit, stated plainly: the response side is not covered by these buffers. An issued token arrives
+  in an answer's headers (`X-Subject-Token`) or body; the transport reads bodies into a buffer that
+  is wiped when dropped (allocated once when the length is declared), but the HTTP stack's own read
+  buffers and the `HeaderMap` of the answer are ordinary memory that is not wiped.
 
 ### 5.3 Retries
 
@@ -1654,19 +1665,27 @@ overwritten (section 3.4).
   Back-off before attempt `n + 1` is `500 ms × n` plus a random 0–25 %.
 - A non-idempotent request is sent once. Whatever goes wrong becomes the operation's error;
   repeating the operation is safe because it starts with a read (section 3.2).
-- 429 and other rate-limit answers: the wait is taken from `Retry-After` (seconds or an HTTP date)
-  or a provider-specific header (`RateLimit-Reset`). For an idempotent request with attempts left
-  and a wait of at most 30 s, the transport sleeps and retries; without a header it uses the
-  back-off. Otherwise the result is `Error::RateLimited { retry_after }`.
-- A request that fails because a redirect was refused, or because `loopback_only` blocked it, is
-  never retried.
+- 429 and other rate-limit answers: the wait is taken from `Retry-After` (delay-seconds or an HTTP
+  date in the IMF-fixdate form; the obsolete RFC 850 and asctime forms are not read) or
+  `RateLimit-Reset` (a value above 10⁹ is a Unix time, as Hetzner sends it, a smaller one
+  delay-seconds). For an idempotent request with attempts left and a wait of at most 30 s, the
+  transport sleeps for the wait or the back-off, whichever is longer, and retries, so a wait of zero
+  or a time in the past does not produce three requests in a few milliseconds; without a header it
+  uses the back-off. Otherwise the result is `Error::RateLimited { retry_after }`, with the wait
+  clamped to 24 hours so that a caller can add it to an `Instant`.
+- A request that fails because a redirect was refused, because `loopback_only` or the endpoint
+  binding of section 5.2 blocked it, or because a TLS certificate was refused (the server's, or the
+  client certificate by the server) is never retried. A refused certificate is `Error::Config`: the
+  next attempt would be refused the same way. It is recognized by the type of the `rustls` error in
+  the error's source chain, never by its text.
 - A 401 answer to a request made with a cached token (section 5.7) follows the same rule. For an
   idempotent request with attempts left, the transport discards the token, obtains a new one and
   repeats the request; the repeat counts toward the three attempts, and a 401 for the new token is
-  `Error::Auth`. For a non-idempotent request it discards the token and returns `Error::Transient`
-  ("token rejected"); the caller's repeat of the operation starts with a read, which obtains the new
-  token. Tokens are renewed well before they expire, so this path is for revoked tokens, not for
-  normal expiry.
+  `Error::Auth`; so is a 401 for a token fetched during the same call. For a non-idempotent request,
+  or when no attempt is left, it discards the token and returns `Error::Transient` ("token
+  rejected"); the caller's repeat of the operation starts with a read, which obtains the new token.
+  The token is discarded also when the 401 answer is over the size limit. Tokens are renewed well
+  before they expire, so this path is for revoked tokens, not for normal expiry.
 - A delete by identifier that is repeated and answered "not found" is a success (section 3.5).
 
 ### 5.4 Responses
@@ -1694,24 +1713,43 @@ overwritten (section 3.4).
 Each client owns a `Scrubber` (private), created in its constructor from every secret the client
 holds. It is the only way to make a `Detail` from dynamic text.
 
-- Registered at construction: every field of the credentials. Registered at run time: every token
-  the client obtains (Keystone, IAM, OAuth) and every signed assertion it sends (JWT). The run-time
-  list keeps the four most recent entries, enough for the current and the previous token.
-- For each secret the scrubber searches for the spellings in which an API can echo it: verbatim;
-  form-urlencoded with `+` and with `%20` for a space; as the inside of a JSON string; JSON with
-  `\/` and lowercase `\uXXXX` escapes for non-ASCII characters; XML-escaped. Each occurrence is
-  replaced by `[redacted]`. Longer spellings are tried first. Empty secrets are ignored.
-- Order: scrub, then replace control characters by spaces, then truncate to 512 bytes on a character
-  boundary. Because truncation could otherwise expose the head of a secret cut by the limit, a
-  trailing fragment that is a prefix of any registered spelling is removed as well.
+- Registered at construction: every field of the credentials, each also in its form-encoded and
+  percent-encoded forms, so that a value the client sent encoded and the API echoes encoded once
+  more is replaced in place. Private key material (a TLS client key, a signing key) is not
+  registered: it is never sent, so no API can echo it, and a multi-line PEM document makes needles
+  that match nothing. Registered at run time: every token the client obtains (Keystone, IAM, OAuth)
+  and every signed assertion it sends (JWT), each under the slot of its source (a token cache, a
+  signer). A slot keeps its current and its previous secret, so a client with several token sources
+  never loses the coverage of a live token. The transport registers each token it sends; registering
+  the slot's current token again costs a comparison.
+- Encoded needles, replaced in place: for each secret, the spellings in which an API most often
+  echoes it — verbatim; form-urlencoded with `+` and with `%20` for a space; RFC 3986
+  percent-encoding (the crate's own URL encoding); as the inside of a JSON string; JSON with `\/`
+  and lowercase `\uXXXX` escapes for non-ASCII characters; XML-escaped. Each occurrence is replaced
+  by `[redacted]`. Longer spellings are tried first. Empty secrets are ignored.
+- A decoded haystack, for every other dialect: lowercase percent-hex, other percent-encoding safe
+  sets (Python, JavaScript, Go), numeric XML character references, escaping of `&` and `<` only,
+  uppercase or additional JSON `\u` escapes (Go, .NET), JSON inside JSON, form-encoded JSON. After
+  the replacement above, the text is decoded — percent-decoding of either hex case with and without
+  `+` for a space, XML entity decoding (named, decimal, hexadecimal), JSON string unescaping — in
+  every combination, up to three rounds deep (at most 84 layers). If any needle appears in a decoded
+  layer, the whole `Detail` is replaced by a constant text that starts with `[redacted]`. Only the
+  part of the text that can reach the `Detail` is decoded: its first 512 bytes plus 12 bytes per
+  byte of the longest needle, at most 64 KiB, which bounds the work.
+- Text from a JSON body: the client's message field where the body has a known shape; otherwise the
+  decoded string values of the JSON document, never its raw text.
+- Order: replace encoded needles, check the decoded layers, then replace control characters by
+  spaces, then truncate to 512 bytes on a character boundary. Because truncation could otherwise
+  expose the head of a secret cut by the limit, a trailing fragment that is a prefix of any
+  registered spelling is removed as well.
 - Texts with special handling: Route 53 authentication errors can quote the canonical request, so
   only the first sentence of the message is used, and the scrubber runs over the whole body before
   parsing.
 - The scrubber holds its needles in zeroizing memory and has a `Debug` that prints nothing.
-- Limit, stated plainly: redaction is by substring. A secret echoed in a transformation not listed
-  above (base64, a hash, a partial value) is not recognized. The defense for those cases is that
-  request bodies and headers never enter error text at all; the scrubber covers what the provider
-  sends back.
+- Limit, stated plainly: redaction is by substring, on the text and its decoded layers. A secret
+  echoed in a transformation not listed above (base64, a hash, a partial value, more than three
+  layers of encoding) is not recognized. The defense for those cases is that request bodies and
+  headers never enter error text at all; the scrubber covers what the provider sends back.
 
 The same rules apply to `ZoneCheck::detail`.
 
@@ -1736,24 +1774,30 @@ canary credentials, and asserts that the log is not empty and contains none of t
 
 - `TokenSource`: caches a token obtained by an exchange (Keystone password, IAM JWT, OAuth password
   grant, access-key exchange). The fetch returns the token and its lifetime. The token is renewed
-  ahead of time: at the expiry minus `max(10 min, 5 % of the lifetime)`, optionally capped by a
-  maximum age (50 min for Yandex Cloud); a token without a stated expiry is assumed to live 1 h.
-  Expiry timestamps are parsed with the private `jiff` dependency and turned into
-  `tokio::time::Instant` deadlines immediately. Single flight: the fetch runs inside the first
-  caller's future while it holds the source's async lock, and the others wait for the lock. If that
-  future is dropped mid-fetch, the lock is released with nothing stored and the next waiter fetches;
-  there is no detached task and no state that a cancelled fetch can leave half-written. Every token
-  has a generation number, and a 401 invalidates only the generation the failed request used, so a
-  late 401 for an old token does not discard a fresh one. What happens to the request after a 401 is
-  the retry rule of section 5.3.
+  ahead of time: at the expiry minus `max(10 min, 5 % of the lifetime)`, but at most half the
+  lifetime, optionally capped by a maximum age (50 min for Yandex Cloud); a token without a stated
+  expiry is assumed to live 1 h. A short-lived token is therefore still cached for half its life; a
+  lifetime under two minutes (a system clock that runs ahead makes a stated expiry look close) is
+  logged as one `WARN` event per token, with the lifetime and nothing else. Expiry timestamps are
+  parsed with the private `jiff` dependency and turned into `tokio::time::Instant` deadlines
+  immediately. Single flight: the fetch runs inside the first caller's future while it holds the
+  source's async lock, and the others wait for the lock. If that future is dropped mid-fetch, the
+  lock is released with nothing stored and the next waiter fetches; there is no detached task and no
+  state that a cancelled fetch can leave half-written. Every token has a generation number, and a
+  401 invalidates only the generation the failed request used, so a late 401 for an old token does
+  not discard a fresh one. What happens to the request after a 401 is the retry rule of section 5.3.
 - `Keystone`: the OpenStack Identity v3 password exchange with project scope, shared by Selectel v2
-  and VK Cloud.
+  and VK Cloud. The request body, which carries the password, is built once into a zeroizing buffer;
+  `400` and `401` are `Error::Auth`.
 - `RateGate`: at most one request per configured interval per client, for providers with
   undocumented limits (reg.ru 1000 ms, Beget 1000 ms, nic.ru 500 ms; `min_request_interval_ms`).
 - `Poller`: the bounded polling of section 3.7.
 - `Pager`: page loops for the cursor styles in use (page number with total pages, next-page number,
   offset with total, offset with next offset, page token), each with a hard page limit.
-- `ZoneCache`: section 3.8.
+- `ZoneCache`: section 3.8. Only the read phase is repeated after a stale identifier: the cache runs
+  the client's read and returns the identifier it ended with, and the client performs its write
+  afterwards, outside the cache, so a write never runs twice. A write answered "not found" evicts
+  the entry and fails; the repeat of the operation starts with a read.
 - XML reading (Route 53, nic.ru) uses `roxmltree`; XML writing is string building with one escaping
   function.
 
@@ -2741,13 +2785,20 @@ For every client, in its own test file:
 - `<id>_secret_echo`. The echo server answers every request with the chosen status and a body that
   repeats the request's body and its authentication headers inside the fields a client reads error
   text from (JSON or XML as the client expects); token endpoints hand out a canary token and the
-  server then echoes that too. The credentials are canaries containing `@`, a space, `/` and `+`, so
-  that every encoding changes them. The test runs `check` and a write, requires the write to fail,
-  and asserts on the `Display` and `Debug` of every error, on every `ZoneCheck::detail`, and on the
-  client's `Debug`: no canary in any spelling, no form-encoded fragment, no JWT; and the write's
-  error does contain `[redacted]`, which proves the echo reached the error path and the test is not
-  vacuous. It also asserts that the API endpoint, and for token clients the token endpoint, were
-  actually reached. Every secret field of the credentials is covered.
+  server then echoes that too. The credentials are canaries containing `@`, a space, `/`, `+`, both
+  quotes, `& < > \ ~ * =`, non-ASCII letters and (where a header does not carry them) a newline, so
+  that every encoding and escaping changes them. The test runs for every dialect of the shared
+  support in `tests/common/echo.rs`: each renderer of the echo server (JSON as `serde_json`, PHP, Go
+  and .NET escape it, with `\uXXXX` and a plain `/`, PHP JSON after a notice line, JSON inside JSON,
+  JSON under a key no client reads, form-encoded JSON, XML with named entities, numeric references
+  or minimal escaping, plain text) with the text verbatim, and each spelling (form-encoding with
+  `+`, `%20` or lowercase hex; the percent-encodings of Python, JavaScript, RFC 3986 and Go) inside
+  JSON and plain text. It runs `check` and a write, requires the write to fail, and asserts on the
+  `Display` and `Debug` of every error, on every `ZoneCheck::detail`, and on the client's `Debug`:
+  no canary in any of those spellings, no fragment of one, no JWT; and the write's error does
+  contain `[redacted]`, which proves the echo reached the error path and the test is not vacuous. It
+  also asserts that the API endpoint, and for token clients the token endpoint, were actually
+  reached. Every secret field of the credentials is covered.
 - RFC 2136 has no HTTP echo. Its equivalent asserts that the TSIG secret, in base64 and in hex, does
   not occur in any error or `Debug` output across the error paths of its mock.
 - `<id>_no_secret_in_logs`. A `tracing` subscriber at `TRACE` captures everything while the client
@@ -2755,10 +2806,13 @@ For every client, in its own test file:
   of the canaries or issued tokens.
 
 Once for the crate: a compile-time test that no client type and no credentials type implements
-`Display` or `Serialize`; unit tests of the scrubber (every spelling, the truncated tail, run-time
-tokens, its `Debug`); a test that a redirect is not followed and that the address it points to
-receives no connection, with and without a client certificate; a source scan for `bearer_auth` and
-`basic_auth`.
+`Display` or `Serialize`; unit tests of the scrubber (every spelling, every decoded dialect, the
+truncated tail, run-time tokens per slot, its `Debug`); the transport's secret tests over every
+dialect and every credential position (bearer, custom header, basic, form body, JSON body, query),
+which also require the message to be kept, with the canaries cut out in place, wherever the echo
+uses a spelling the scrubber knows exactly; a test that a redirect is not followed and that the
+address it points to receives no connection, with and without a client certificate; a source scan
+for `bearer_auth` and `basic_auth`.
 
 ### 12.3 Invariant tests
 

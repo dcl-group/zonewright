@@ -15,6 +15,8 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
+use zeroize::Zeroize as _;
+
 use crate::error::Error;
 use crate::redact::Detail;
 
@@ -183,6 +185,12 @@ pub(crate) struct ClientIdentity {
     key: PrivateKeyDer<'static>,
 }
 
+impl Drop for ClientIdentity {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
 impl std::fmt::Debug for ClientIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientIdentity")
@@ -228,17 +236,20 @@ pub(crate) fn client_config(
         })?
         .dangerous()
         .with_custom_certificate_verifier(trust.verifier.clone());
-    let mut config =
-        match identity {
-            None => builder.with_no_client_auth(),
-            Some(ClientIdentity { chain, key }) => builder
-                .with_client_auth_cert(chain, key)
-                .map_err(|_| Error::Config {
-                    detail: Detail::constant(
-                        "the client certificate and its key cannot be used together for TLS",
-                    ),
-                })?,
-        };
+    let mut config = match identity {
+        None => builder.with_no_client_auth(),
+        // rustls takes the key by value, parses it with aws-lc-rs and drops the DER without
+        // wiping it; `PrivateKeyDer` has no wiping `Drop`. It gets a copy, and the copy this
+        // crate holds is wiped when `identity` drops at the end of this function. The parsed
+        // key then lives in aws-lc-rs memory for the life of the client.
+        Some(identity) => builder
+            .with_client_auth_cert(identity.chain.clone(), identity.key.clone_key())
+            .map_err(|_| Error::Config {
+                detail: Detail::constant(
+                    "the client certificate and its key cannot be used together for TLS",
+                ),
+            })?,
+    };
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }

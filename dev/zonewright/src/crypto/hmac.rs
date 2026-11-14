@@ -20,6 +20,16 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     to_array(tag.as_ref())
 }
 
+/// HMAC-SHA-256 written into `out`, for a key-derivation chain whose intermediate keys live in
+/// zeroizing buffers the caller owns (SigV4). The backend's tag value is a stack temporary that
+/// is not wiped; it is overwritten by later stack use. Nothing else holds a copy.
+pub(crate) fn hmac_sha256_into(key: &[u8], data: &[u8], out: &mut [u8; 32]) {
+    let tag = backend::sign(&backend::Key::new(backend::HMAC_SHA256, key), data);
+    for (dst, src) in out.iter_mut().zip(tag.as_ref()) {
+        *dst = *src;
+    }
+}
+
 /// HMAC-SHA-512.
 pub(crate) fn hmac_sha512(key: &[u8], data: &[u8]) -> [u8; 64] {
     let tag = backend::sign(&backend::Key::new(backend::HMAC_SHA512, key), data);
@@ -129,6 +139,9 @@ mod tests {
     fn rfc4231_vectors() {
         for case in rfc4231() {
             let tag256 = hmac_sha256(&case.key, &case.data);
+            let mut into = [0u8; 32];
+            hmac_sha256_into(&case.key, &case.data, &mut into);
+            assert_eq!(into, tag256, "{} into", case.name);
             let tag512 = hmac_sha512(&case.key, &case.data);
             assert_eq!(
                 hex_lower(&tag256),

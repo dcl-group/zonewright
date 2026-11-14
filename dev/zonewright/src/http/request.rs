@@ -325,6 +325,34 @@ pub(crate) fn default_message(body: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Longest text [`json_strings`] collects.
+const JSON_STRINGS_MAX: usize = 64 * 1024;
+
+/// The string values of a JSON body, decoded and joined with `; `, at most 64 KiB; arrays in
+/// order, object members in key order (`serde_json` keeps maps sorted). `None` when the body is not JSON or holds no non-empty string.
+pub(crate) fn json_strings(body: &[u8]) -> Option<String> {
+    fn walk(value: &serde_json::Value, out: &mut String) {
+        if out.len() >= JSON_STRINGS_MAX {
+            return;
+        }
+        match value {
+            serde_json::Value::String(text) if !text.is_empty() => {
+                if !out.is_empty() {
+                    out.push_str("; ");
+                }
+                out.push_str(text);
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
+            serde_json::Value::Object(map) => map.values().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let mut out = String::new();
+    walk(&value, &mut out);
+    (!out.is_empty()).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +412,14 @@ mod tests {
         ] {
             assert_eq!(default_message(body).as_deref(), expected, "{body}");
         }
+    }
+
+    #[test]
+    fn json_strings_are_decoded_leaves_in_order() {
+        let body = br#"{"msg":"a\u002Bb","n":1,"list":["c",{"d":"e\u0022"}],"empty":""}"#;
+        assert_eq!(json_strings(body).as_deref(), Some("c; e\"; a+b"));
+        assert_eq!(json_strings(b"not json"), None);
+        assert_eq!(json_strings(b"{\"n\":1}"), None);
     }
 
     #[test]

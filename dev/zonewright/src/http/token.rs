@@ -1,8 +1,10 @@
 //! A cache for a token obtained by an exchange (design section 5.7).
 //!
-//! The token is renewed ahead of time, at the expiry minus `max(10 min, 5 % of the lifetime)`,
-//! optionally capped by a maximum age; a token without a stated lifetime is assumed to live one
-//! hour. Single flight: the fetch runs inside the first caller's future while it holds the
+//! The token is renewed ahead of time, at the expiry minus `max(10 min, 5 % of the lifetime)`
+//! but at most half the lifetime, optionally capped by a maximum age; a token without a stated
+//! lifetime is assumed to live one hour. A token whose lifetime is under two minutes (a clock
+//! that runs ahead makes a stated expiry look close) is still cached for half of it, and one
+//! `WARN` event says so, without the token or the answer. Single flight: the fetch runs inside the first caller's future while it holds the
 //! source's async lock, and the others wait for the lock. If that future is dropped mid-fetch,
 //! the lock is released with nothing stored and the next waiter fetches; there is no detached
 //! task and no state a cancelled fetch can leave half-written. Every token has a generation
@@ -21,9 +23,13 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::error::Error;
+use crate::redact::SecretSlot;
 
 /// Lifetime assumed for a token whose answer states none.
 pub(crate) const DEFAULT_LIFETIME: Duration = Duration::from_secs(60 * 60);
+
+/// Lifetimes below this are implausibly short and logged.
+const SHORT_LIFETIME: Duration = Duration::from_secs(2 * 60);
 
 /// Smallest renewal margin before the expiry.
 const MIN_MARGIN: Duration = Duration::from_secs(10 * 60);
@@ -92,6 +98,7 @@ pub(crate) struct TokenSource {
     slot: Mutex<Option<Cached>>,
     generations: AtomicU64,
     max_age: Option<Duration>,
+    secrets: SecretSlot,
 }
 
 impl std::fmt::Debug for TokenSource {
@@ -110,6 +117,7 @@ impl TokenSource {
             slot: Mutex::new(None),
             generations: AtomicU64::new(0),
             max_age,
+            secrets: SecretSlot::new(),
         }
     }
 
@@ -133,11 +141,19 @@ impl TokenSource {
         }
         // Dropping this future here releases the lock and leaves the slot as it was.
         let Token { secret, lifetime } = fetch().await?;
+        let lifetime = lifetime.unwrap_or(DEFAULT_LIFETIME);
+        if lifetime < SHORT_LIFETIME {
+            tracing::warn!(
+                target: "zonewright::http",
+                lifetime_s = lifetime.as_secs(),
+                "the provider issued a token with an implausibly short lifetime; is the system clock right?"
+            );
+        }
         let now = Instant::now();
         let generation = self.generations.fetch_add(1, Ordering::Relaxed) + 1;
         *slot = Some(Cached {
             token: secret.clone(),
-            refresh_at: now + self.renew_after(lifetime.unwrap_or(DEFAULT_LIFETIME)),
+            refresh_at: now + self.renew_after(lifetime),
             generation,
         });
         Ok(Lease {
@@ -145,6 +161,12 @@ impl TokenSource {
             generation,
             fresh: true,
         })
+    }
+
+    /// The scrubber slot of this source's tokens: the transport registers each token it uses
+    /// here, so the current and the previous token of every source stay registered.
+    pub(crate) fn secret_slot(&self) -> &SecretSlot {
+        &self.secrets
     }
 
     /// Discards the cached token if it is still of `generation`.
@@ -158,7 +180,7 @@ impl TokenSource {
     /// How long after it was obtained a token of `lifetime` is renewed.
     fn renew_after(&self, lifetime: Duration) -> Duration {
         let lifetime = lifetime.min(MAX_LIFETIME);
-        let margin = MIN_MARGIN.max(lifetime / 20);
+        let margin = MIN_MARGIN.max(lifetime / 20).min(lifetime / 2);
         let after = lifetime.saturating_sub(margin);
         match self.max_age {
             Some(max) => after.min(max),
@@ -255,10 +277,22 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(source.get(|| counting(&count, None)).await.unwrap().fresh);
 
-        // A lifetime shorter than the margin: used once, renewed on the next call.
+        // Ten minutes: the margin is at most half the lifetime, so renewal after five.
+        let source = TokenSource::new(None);
+        let ten = Some(Duration::from_secs(600));
+        source.get(|| counting(&count, ten)).await.unwrap();
+        tokio::time::advance(Duration::from_secs(5 * 60 - 1)).await;
+        assert!(!source.get(|| counting(&count, ten)).await.unwrap().fresh);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(source.get(|| counting(&count, ten)).await.unwrap().fresh);
+
+        // An implausibly short lifetime is still cached for half of it.
         let source = TokenSource::new(None);
         let short = Some(Duration::from_secs(60));
         source.get(|| counting(&count, short)).await.unwrap();
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(!source.get(|| counting(&count, short)).await.unwrap().fresh);
+        tokio::time::advance(Duration::from_secs(2)).await;
         assert!(source.get(|| counting(&count, short)).await.unwrap().fresh);
     }
 
@@ -333,6 +367,30 @@ mod tests {
         assert!(!third.fresh);
         assert_eq!(third.generation, second.generation);
         assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_implausibly_short_lifetime_is_logged_without_the_token() {
+        let (capture, _guard) = crate::http::testing::echo::LogCapture::install();
+        let source = TokenSource::new(None);
+        let short = Some(Duration::from_secs(30));
+        source
+            .get(|| async { Ok(token("tok-short-canary", short)) })
+            .await
+            .unwrap();
+        let normal = TokenSource::new(None);
+        normal
+            .get(|| async { Ok(token("tok-normal-canary", None)) })
+            .await
+            .unwrap();
+        let warnings: Vec<_> = capture
+            .entries()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN)
+            .collect();
+        assert_eq!(warnings.len(), 1, "{}", capture.text());
+        assert_eq!(warnings[0].field("lifetime_s"), Some("30"));
+        assert!(!capture.text().contains("canary"), "{}", capture.text());
     }
 
     #[test]

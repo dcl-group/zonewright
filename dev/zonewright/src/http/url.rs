@@ -109,9 +109,38 @@ impl Endpoint {
         }
     }
 
+    /// The origin of the endpoint, for [`HttpBuilder::endpoint`](super::HttpBuilder::endpoint).
+    pub(crate) fn origin(&self) -> Origin {
+        Origin::of(&self.base)
+    }
+
     /// The endpoint itself as a URL, for a setting that names one resource (a token URL).
     pub(crate) fn as_url(&self) -> &Url {
         &self.base
+    }
+}
+
+/// The origin of a URL: scheme, host and port (the scheme's default when none is given).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Origin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
+impl Origin {
+    /// The origin of `url`.
+    pub(crate) fn of(url: &Url) -> Origin {
+        Origin {
+            scheme: url.scheme().to_owned(),
+            host: url.host_str().unwrap_or("").to_ascii_lowercase(),
+            port: url.port_or_known_default(),
+        }
+    }
+
+    /// True when `url` has this origin.
+    pub(crate) fn matches(&self, url: &Url) -> bool {
+        *self == Origin::of(url)
     }
 }
 

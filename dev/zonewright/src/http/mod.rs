@@ -16,10 +16,11 @@
 //! A typical bearer-token JSON call:
 //!
 //! ```text
+//! let api = Endpoint::parse("base_url", &config.base_url, ctx)?;
 //! let http = Http::builder(ctx, ProviderId::Cloudflare)
+//!     .endpoint(&api)
 //!     .bearer("api_token", credentials.api_token.expose_secret())
 //!     .build()?;
-//! let api = Endpoint::parse("base_url", &config.base_url, ctx)?;
 //! let url = api.url().path("/zones").query("name", zone.as_str()).build()?;
 //! let response = http.send(&Request::get(url)).await?;
 //! if !response.is_success() {
@@ -56,7 +57,7 @@ pub(crate) use keystone::Keystone;
 pub(crate) use poll::{PollStep, Poller, poll_interval};
 pub(crate) use request::{Request, Response, TokenAuth};
 pub(crate) use token::{Token, TokenSource, lifetime_until};
-pub(crate) use url::{Endpoint, path_id};
+pub(crate) use url::{Endpoint, Origin, path_id};
 pub(crate) use zone_cache::{Attempt, ZoneCache, ZoneId};
 
 use std::fmt;
@@ -70,7 +71,7 @@ use zeroize::Zeroizing;
 use crate::context::{Context, ContextOptions};
 use crate::error::Error;
 use crate::id::ProviderId;
-use crate::redact::{Detail, Scrubber};
+use crate::redact::{Detail, Scrubber, SecretSlot};
 
 use request::MessageFn;
 use tls::{ClientIdentity, Trust};
@@ -200,6 +201,10 @@ pub(crate) struct Http {
     auth: Option<(HeaderName, HeaderValue)>,
     gate: Option<RateGate>,
     message: MessageFn,
+    /// The origins of the client's endpoints: the only hosts its requests may go to.
+    origins: Vec<Origin>,
+    /// True when the transport presents a client certificate.
+    identity: bool,
 }
 
 impl fmt::Debug for Http {
@@ -227,9 +232,12 @@ impl Http {
         &self.scrubber
     }
 
-    /// Registers a secret obtained at run time (a token, a signed assertion) with the scrubber.
-    pub(crate) fn remember(&self, secret: &str) {
-        self.scrubber.remember(secret);
+    /// Registers a secret obtained at run time as the current secret of `slot` (see
+    /// [`SecretSlot`]). Tokens used through [`Http::send_with_token`] are registered by the
+    /// transport under their [`TokenSource`]'s slot; a client that signs assertions (a JWT)
+    /// registers each one under a slot of its own.
+    pub(crate) fn remember(&self, slot: &SecretSlot, secret: &str) {
+        self.scrubber.remember(slot, secret);
     }
 
     /// A [`Detail`] from text taken from a provider's answer, with every secret of the client
@@ -238,11 +246,15 @@ impl Http {
         self.scrubber.detail(text)
     }
 
-    /// A [`Detail`] from a response body: the provider's error message where the body has a
-    /// known shape, otherwise the start of the body; scrubbed; `status N` when empty.
+    /// A [`Detail`] from a response body, scrubbed: the provider's error message where the
+    /// body has a known shape; for any other JSON body, its string values
+    /// decoded (never the raw JSON text, whose escapes the scrubber may not know); otherwise the
+    /// start of the body. `status N` when empty.
     pub(crate) fn body_detail(&self, response: &Response) -> Detail {
         let text = response.text();
-        let message = (self.message)(&text).unwrap_or_else(|| text.into_owned());
+        let message = (self.message)(&text)
+            .or_else(|| request::json_strings(response.body()))
+            .unwrap_or_else(|| text.into_owned());
         if message.trim().is_empty() {
             self.scrubber
                 .detail(&format!("status {}", response.status()))
@@ -272,6 +284,7 @@ pub(crate) struct HttpBuilder {
     gate: Option<Duration>,
     identity: Option<ClientIdentity>,
     message: MessageFn,
+    origins: Vec<Origin>,
     error: Option<Error>,
 }
 
@@ -285,19 +298,22 @@ impl HttpBuilder {
             gate: None,
             identity: None,
             message: request::default_message,
+            origins: Vec::new(),
             error: None,
         }
     }
 
     /// Registers a secret with the client's scrubber: every field of the credentials, whether
-    /// or not it is sent in a header. Besides the secret itself, its form-encoded spellings are
-    /// registered as secrets of their own, so that an API that echoes an already form-encoded
-    /// value (a form body, a query) encoded once more is recognized too.
+    /// or not it is sent in a header. Besides the secret itself, its form-encoded and
+    /// percent-encoded spellings are registered as secrets of their own, so that an API that
+    /// echoes an already encoded value (a form body, a query) encoded once more is replaced in
+    /// place too.
     pub(crate) fn secret(mut self, secret: &str) -> HttpBuilder {
         if !secret.is_empty() {
             self.secrets.push(Zeroizing::new(secret.to_owned()));
             self.secrets.push(encode::form_component(secret, "+"));
             self.secrets.push(encode::form_component(secret, "%20"));
+            self.secrets.push(Zeroizing::new(encode::percent(secret)));
         }
         self
     }
@@ -342,6 +358,20 @@ impl HttpBuilder {
         self.secret(user).secret(password).secret(&encoded)
     }
 
+    /// Declares an endpoint of the client: the API, the identity or token service. Requests
+    /// may go only to the origins (scheme, host, port) of declared endpoints; a request to any
+    /// other origin is refused before it is sent, so that no credential reaches a host the
+    /// client was not configured with. A client with a static credential or a client
+    /// certificate must declare at least one endpoint; a request with a cached token is refused
+    /// when none is declared.
+    pub(crate) fn endpoint(mut self, endpoint: &Endpoint) -> HttpBuilder {
+        let origin = endpoint.origin();
+        if !self.origins.contains(&origin) {
+            self.origins.push(origin);
+        }
+        self
+    }
+
     /// Spaces requests by `interval` ([`RateGate`]).
     pub(crate) fn pacing(mut self, interval: Duration) -> HttpBuilder {
         self.gate = Some(interval);
@@ -349,13 +379,18 @@ impl HttpBuilder {
     }
 
     /// Presents a TLS client certificate: the client gets its own `reqwest` client with
-    /// otherwise identical options. The key is registered as a secret.
+    /// otherwise identical options.
+    ///
+    /// The key is not registered with the scrubber: private key material (PEM or DER) is
+    /// never sent to a provider — TLS uses it to sign only — so no API can echo it, and a
+    /// multi-line PEM document makes needles that match nothing an API returns. The same holds
+    /// for a key a client uses to sign assertions; the signed assertions are registered instead.
     pub(crate) fn client_identity(mut self, cert_pem: &str, key_pem: &str) -> HttpBuilder {
         match ClientIdentity::from_pem(cert_pem, key_pem) {
             Ok(identity) => self.identity = Some(identity),
             Err(e) => self.fail(e),
         }
-        self.secret(key_pem)
+        self
     }
 
     /// Extracts error messages with `message` instead of the default extractor.
@@ -369,6 +404,14 @@ impl HttpBuilder {
         if let Some(e) = self.error {
             return Err(e);
         }
+        let identity = self.identity.is_some();
+        if (identity || self.auth.is_some()) && self.origins.is_empty() {
+            return Err(Error::Config {
+                detail: Detail::constant(
+                    "a client with credentials must declare the endpoints they may be sent to",
+                ),
+            });
+        }
         let transport = match self.identity {
             Some(identity) => self.transport.with_identity(identity)?,
             None => self.transport,
@@ -380,6 +423,8 @@ impl HttpBuilder {
             auth: self.auth,
             gate: self.gate.map(RateGate::new),
             message: self.message,
+            origins: self.origins,
+            identity,
         })
     }
 

@@ -29,6 +29,7 @@ use bytes::Bytes;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
 use secrecy::ExposeSecret;
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 use crate::error::Error;
 use crate::redact::Detail;
@@ -45,6 +46,10 @@ pub(crate) const MAX_ATTEMPTS: u32 = 3;
 /// Longest rate-limit wait the transport sleeps through itself; a longer one is returned as
 /// `Error::RateLimited`.
 pub(crate) const MAX_INLINE_WAIT: Duration = Duration::from_secs(30);
+
+/// Longest wait reported in `Error::RateLimited`: a provider's header could state any number,
+/// and a caller adding it to an `Instant` must not overflow.
+pub(crate) const MAX_REPORTED_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// `Target` of the transport's `tracing` events.
 const TARGET: &str = "zonewright::http";
@@ -69,6 +74,8 @@ enum Failure {
     TooLarge { status: u16 },
     /// The request could not be built (a header value the client set is unusable).
     Build,
+    /// TLS certificate verification failed, on either side. Repeating it gives the same answer.
+    Certificate,
 }
 
 impl Failure {
@@ -77,6 +84,8 @@ impl Failure {
         // the URL with its query string.
         if e.is_builder() {
             Failure::Build
+        } else if certificate_failure(e) {
+            Failure::Certificate
         } else if e.is_timeout() {
             Failure::Network("the request to the provider timed out", status)
         } else if e.is_connect() {
@@ -90,6 +99,50 @@ impl Failure {
             Failure::Network("the request to the provider failed", status)
         }
     }
+}
+
+/// True when the source chain of `e` holds a `rustls` certificate failure: the server's
+/// certificate was refused, or the server refused the client certificate. Only the types are
+/// inspected, never a message.
+fn certificate_failure(e: &reqwest::Error) -> bool {
+    use rustls::AlertDescription as Alert;
+    let is_certificate = |tls: &rustls::Error| match tls {
+        rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented => true,
+        rustls::Error::General(text) => text == super::tls::NO_CA_CERTIFICATES,
+        rustls::Error::AlertReceived(alert) => matches!(
+            alert,
+            Alert::BadCertificate
+                | Alert::UnsupportedCertificate
+                | Alert::CertificateRevoked
+                | Alert::CertificateExpired
+                | Alert::CertificateUnknown
+                | Alert::UnknownCA
+                | Alert::CertificateRequired
+                | Alert::AccessDenied
+        ),
+        _ => false,
+    };
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    let mut depth = 0;
+    while let Some(current) = next {
+        depth += 1;
+        if depth > 32 {
+            return false;
+        }
+        if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+            return is_certificate(tls);
+        }
+        // An I/O error hides the error it wraps from `source()`; follow it with `get_ref`.
+        // `tokio-rustls` wraps the `rustls` error in an I/O error, and the connector wraps
+        // that in another.
+        next = match current.downcast_ref::<std::io::Error>() {
+            Some(io) => io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => current.source(),
+        };
+    }
+    false
 }
 
 impl Http {
@@ -130,7 +183,7 @@ impl Http {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<Token, Error>>,
     {
-        self.preflight(request)?;
+        self.preflight(request, token.is_some())?;
         let mut lease: Option<Lease> = None;
         let mut refreshed = false;
         let mut attempt: u32 = 0;
@@ -142,7 +195,9 @@ impl Http {
                         Some(current) => current,
                         None => token.source.get(|| (token.fetch)()).await?,
                     };
-                    self.scrubber.remember(current.token.expose_secret());
+                    // A comparison when the token is already the slot's current one.
+                    self.scrubber
+                        .remember(token.source.secret_slot(), current.token.expose_secret());
                     let header = token.auth.header(current.token.expose_secret())?;
                     lease = Some(current);
                     Some(header)
@@ -159,14 +214,29 @@ impl Http {
                 Ok(response) => Some(response.status),
                 Err(Failure::TooLarge { status }) => Some(*status),
                 Err(Failure::Network(_, status)) => *status,
-                Err(Failure::Build) => None,
+                Err(Failure::Certificate | Failure::Build) => None,
             };
             self.trace(request, status, attempt, started.elapsed());
             let retry_left = request.idempotent && attempt < MAX_ATTEMPTS;
 
             let response = match result {
                 Ok(response) => response,
-                Err(Failure::TooLarge { .. }) => return Err(protocol(BODY_TOO_LARGE)),
+                Err(Failure::TooLarge { status }) => {
+                    // A rejected token is discarded even when the answer cannot be read.
+                    if status == 401
+                        && let (Some(token), Some(used)) = (&token, lease.take())
+                    {
+                        token.source.invalidate(used.generation).await;
+                    }
+                    return Err(protocol(BODY_TOO_LARGE));
+                }
+                Err(Failure::Certificate) => {
+                    return Err(Error::Config {
+                        detail: Detail::constant(
+                            "the provider's TLS certificate, or the client certificate, was not accepted",
+                        ),
+                    });
+                }
                 Err(Failure::Build) => {
                     return Err(Error::InvalidInput {
                         detail: Detail::constant("the HTTP request could not be built"),
@@ -223,12 +293,15 @@ impl Http {
                     });
                 }
                 429 => {
-                    let wait = rate_wait(&response.headers, jiff::Timestamp::now());
+                    let wait = rate_wait(&response.headers, jiff::Timestamp::now())
+                        .map(|wait| wait.min(MAX_REPORTED_WAIT));
                     match wait {
-                        None if retry_left => tokio::time::sleep(backoff(attempt)).await,
+                        // A zero or past wait still backs off, so that a provider answering
+                        // `Retry-After: 0` does not get three requests in a few milliseconds.
                         Some(wait) if retry_left && wait <= MAX_INLINE_WAIT => {
-                            tokio::time::sleep(wait).await;
+                            tokio::time::sleep(wait.max(backoff(attempt))).await;
                         }
+                        None if retry_left => tokio::time::sleep(backoff(attempt)).await,
                         _ => return Err(Error::RateLimited { retry_after: wait }),
                     }
                 }
@@ -249,7 +322,7 @@ impl Http {
 
     /// Checks made before any connection: the URL policy (https, or http on a loopback literal),
     /// `loopback_only`, and the absence of CA certificates for an https URL. None is retried.
-    fn preflight(&self, request: &Request) -> Result<(), Error> {
+    fn preflight(&self, request: &Request, with_token: bool) -> Result<(), Error> {
         let url = &request.url;
         let loopback = is_loopback_literal(url);
         let allowed = match url.scheme() {
@@ -270,6 +343,18 @@ impl Http {
         if self.transport.shared.loopback_only && !loopback {
             return Err(config(
                 "the request URL is not a loopback IP literal, and the context allows loopback addresses only",
+            ));
+        }
+        // Credentials go only to the client's own endpoints: its static header, a cached token,
+        // its client certificate, and anything else once the client has declared endpoints.
+        let credentialed = with_token
+            || self.identity
+            || (request.auth == AuthMode::Client && self.auth.is_some());
+        if (credentialed || !self.origins.is_empty())
+            && !self.origins.iter().any(|origin| origin.matches(url))
+        {
+            return Err(config(
+                "the request URL is not on one of the endpoints the client was configured with",
             ));
         }
         if url.scheme() == "https" && self.transport.shared.trust.no_ca_certificates() {
@@ -362,7 +447,10 @@ async fn read_body(mut answer: reqwest::Response, status: u16) -> Result<Bytes, 
         return Err(Failure::TooLarge { status });
     }
     let capacity = declared.map_or(0, |len| usize::try_from(len).unwrap_or(0));
-    let mut body = Vec::with_capacity(capacity);
+    // Answers can carry issued tokens. The buffer is wiped when the last reference drops; it is
+    // allocated once when the length is declared, while a body without a declared length may
+    // leave unwiped copies behind when the buffer grows.
+    let mut body = Zeroizing::new(Vec::with_capacity(capacity));
     while let Some(chunk) = answer
         .chunk()
         .await
@@ -373,7 +461,7 @@ async fn read_body(mut answer: reqwest::Response, status: u16) -> Result<Bytes, 
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(Bytes::from(body))
+    Ok(super::encode::wiped(body))
 }
 
 /// The back-off before attempt `attempt + 1`: `500 ms × attempt` plus a random 0–25 %.
