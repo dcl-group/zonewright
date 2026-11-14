@@ -386,6 +386,25 @@ impl Control {
         id
     }
 
+    /// Stages the deletion of the TXT records of `name` (relative) holding `value`, as an edit
+    /// whose answer was lost would; the zone then has changes.
+    pub fn stage_txt_deletion(&self, name: &str, value: &str) {
+        let name = name.to_lowercase();
+        let mut inner = lock(&self.state);
+        let zones: Vec<u64> = inner
+            .staged
+            .iter()
+            .filter(|r| r.name == name && r.rtype == "TXT" && r.value() == value)
+            .map(|r| r.zone_id)
+            .collect();
+        inner
+            .staged
+            .retain(|r| !(r.name == name && r.rtype == "TXT" && r.value() == value));
+        for z in inner.zones.iter_mut().filter(|z| zones.contains(&z.id)) {
+            z.has_changes = true;
+        }
+    }
+
     /// The staged records of `name` (relative, `@` for the apex) and `rtype`.
     pub fn staged(&self, name: &str, rtype: &str) -> Vec<Record> {
         let inner = lock(&self.state);

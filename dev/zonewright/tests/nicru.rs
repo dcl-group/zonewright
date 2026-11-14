@@ -315,11 +315,6 @@ async fn nicru_secret_echo() {
         // The edits are echoed.
         for status in [400, 403, 422, 500] {
             for write in [Write::Add, Write::Remove] {
-                // A 5xx to a delete by identifier is repeated by the transport, with back-off:
-                // it adds time and no coverage.
-                if status == 500 && matches!(write, Write::Remove) {
-                    continue;
-                }
                 let label = tag(&format!("edit {write:?}"), status);
                 let ours = matches!(write, Write::Remove);
                 let echo = dialect
@@ -340,9 +335,14 @@ async fn nicru_secret_echo() {
             }
         }
 
-        // The commit is echoed.
-        for status in [400, 403] {
-            for write in [Write::Add, Write::Remove] {
+        // The commit is echoed. It carries no credential but the token, whose spellings the
+        // rounds above cover; every renderer once keeps the commit back-off from dominating
+        // the test's time.
+        if dialect.spelling != echo_mock::Spelling::Verbatim {
+            continue;
+        }
+        for status in [400] {
+            for write in [Write::Add] {
                 let label = tag(&format!("commit {write:?}"), status);
                 let ours = matches!(write, Write::Remove);
                 let echo = dialect
@@ -703,23 +703,42 @@ async fn nicru_writes_are_sent_once() {
     assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
     assert_eq!(puts(&mock), 5);
 
-    // A deletion by identifier is idempotent: a 502, a rate limit and a 401 are repeated.
-    for (i, fault) in [
-        Fault::on("DELETE", RECORD).status(502),
-        Fault::on("DELETE", RECORD).rate_limited("1"),
-        Fault::on("DELETE", RECORD).status(401),
+    // Staging a deletion is sent once too: the API documents no answer for a record that is
+    // already deleted, so a repeat could not be read.
+    for (i, (fault, kind)) in [
+        (
+            Fault::on("DELETE", RECORD).status(502),
+            ErrorKind::Transient,
+        ),
+        (
+            Fault::on("DELETE", RECORD).rate_limited("1"),
+            ErrorKind::RateLimited,
+        ),
+        (
+            Fault::on("DELETE", RECORD).status(401),
+            ErrorKind::Transient,
+        ),
+        (
+            Fault::on("DELETE", RECORD)
+                .respond(200, fail_body("4097", "Access token expired or not found")),
+            ErrorKind::Transient,
+        ),
     ]
     .into_iter()
     .enumerate()
     {
         mock.faults().push(fault);
-        assert_eq!(
-            remove(&client, "AAA").await.unwrap(),
-            RemoveOutcome::RrsetDeleted
-        );
-        assert_eq!(deletes(&mock), 2 * (i + 1));
-        add(&client, "AAA").await.unwrap();
+        let e = remove(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), kind, "{e:?}");
+        assert_eq!(deletes(&mock), i + 1, "{e:?}");
+        assert_eq!(mock.control().published_txt(REL), ["AAA"]);
     }
+    assert_eq!(
+        remove(&client, "AAA").await.unwrap(),
+        RemoveOutcome::RrsetDeleted
+    );
+    assert_eq!(deletes(&mock), 5);
+    add(&client, "AAA").await.unwrap();
 
     // A commit that keeps failing is sent three times, once per attempt, and the operation is
     // `Transient`; the staged change waits for the next operation.
@@ -940,6 +959,168 @@ async fn nicru_stale_mark_does_not_cover_foreign_changes() {
     assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
     assert_eq!(commits(&mock), 0);
     assert!(control.published_txt("foreign-edit").is_empty());
+}
+
+/// A refused edit clears the mark at once, without looking at the zone: when someone else
+/// stages an edit while the refused request is answered, neither the failed operation nor the
+/// next one commits it; the next one refuses the zone. Covers a staging and a deletion, each
+/// refused with a `fail` answer and with an HTTP refusal.
+#[tokio::test]
+async fn nicru_refused_edit_clears_the_mark() {
+    for (method, path, fault_status) in [
+        ("PUT", RECORDS, None),
+        ("PUT", RECORDS, Some(429)),
+        ("DELETE", RECORD, None),
+        ("DELETE", RECORD, Some(403)),
+    ] {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        if method == "DELETE" {
+            add(&client, "AAA").await.unwrap();
+        }
+        let before = commits(&mock);
+        let hook = control.clone();
+        // Another writer stages an edit while the refused request is in flight.
+        let fault = Fault::on(method, path).run(move || {
+            hook.stage_record("example.org", "foreign-edit", "TXT", "pending", None);
+        });
+        let fault = match fault_status {
+            None => fault.respond(200, fail_body("4004", "refused")),
+            Some(429) => fault.rate_limited("1"),
+            Some(status) => fault.status(status),
+        };
+        mock.faults().push(fault);
+        let result = if method == "PUT" {
+            add(&client, "AAA").await.map(drop)
+        } else {
+            remove(&client, "AAA").await.map(drop)
+        };
+        let label = format!("{method} {fault_status:?}");
+        assert!(result.is_err(), "{label}");
+        assert_eq!(commits(&mock), before, "{label}");
+        let e = add(&client, "BBB").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{label}: {e:?}");
+        assert_eq!(commits(&mock), before, "{label}");
+        assert!(control.published_txt("foreign-edit").is_empty(), "{label}");
+    }
+}
+
+/// An edit whose outcome is unknown (a 502, or an answer the client cannot read) is settled
+/// at once by listing the zone again: staged changes there are this edit and are committed;
+/// a clean zone clears the mark, so a later foreign edit is refused.
+#[tokio::test]
+async fn nicru_unknown_edit_outcome_is_settled() {
+    // Applied, answer lost: the staging is committed by the failed operation itself.
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let hook = control.clone();
+    mock.faults().push(
+        Fault::on("PUT", RECORDS)
+            .run(move || {
+                hook.stage_record("example.org", REL, "TXT", "AAA", Some("30"));
+            })
+            .status(502),
+    );
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(control.published_txt(REL), ["AAA"]);
+    assert!(!control.has_changes("example.org"));
+    assert_eq!(
+        add(&client, "AAA").await.unwrap(),
+        AddOutcome::AlreadyPresent
+    );
+
+    // The same for a deletion.
+    let hook = control.clone();
+    mock.faults().push(
+        Fault::on("DELETE", RECORD)
+            .run(move || hook.stage_txt_deletion(REL, "AAA"))
+            .status(502),
+    );
+    let e = remove(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert!(control.published_txt(REL).is_empty());
+    assert!(!control.has_changes("example.org"));
+    assert_eq!(
+        remove(&client, "AAA").await.unwrap(),
+        RemoveOutcome::NotPresent
+    );
+
+    // Not applied: the clean zone clears the mark, and a foreign edit staged afterwards is
+    // refused. An answer with status `success` and an HTTP error status is unreadable, and
+    // takes the same path.
+    for fault in [
+        Fault::on("PUT", RECORDS).status(502),
+        Fault::on("PUT", RECORDS).respond(400, "<response><status>success</status></response>"),
+    ] {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        mock.faults().push(fault);
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert!(
+            matches!(e.kind(), ErrorKind::Transient | ErrorKind::Protocol),
+            "{e:?}"
+        );
+        control.stage_record("example.org", "foreign-edit", "TXT", "pending", None);
+        let e = add(&client, "BBB").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+        assert_eq!(commits(&mock), 0);
+        assert!(control.published_txt("foreign-edit").is_empty());
+    }
+}
+
+/// A successful commit clears the mark: a foreign edit staged after a completed operation is
+/// refused by the next one, with no clean read in between.
+#[tokio::test]
+async fn nicru_successful_commit_clears_the_mark() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
+    control.stage_record("example.org", "foreign-edit", "TXT", "pending", None);
+    let e = add(&client, "BBB").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(commits(&mock), 1);
+    assert!(control.published_txt("foreign-edit").is_empty());
+}
+
+/// A zone whose staged-change flag is missing or not `true` or `false` is an unexpected
+/// answer, never "nothing staged".
+#[tokio::test]
+async fn nicru_has_changes_must_be_stated() {
+    let (mock, client) = setup().await;
+    for flag in ["", " has-changes=\"yes\""] {
+        let body = format!(
+            "<response><status>success</status><data><zone name=\"example.org\" \
+             service=\"zwservice\" has-primary=\"true\"{flag}/></data></response>"
+        );
+        mock.faults()
+            .push(Fault::on("GET", ZONES).respond(200, body.clone()));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{flag}: {e:?}");
+        mock.faults()
+            .push(Fault::on("GET", ZONES).respond(200, body));
+        let e = client.check(&[zone()]).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{flag}: {e:?}");
+    }
+    assert_eq!(writes(&mock), 0);
+}
+
+/// The commit attempts of one operation are spaced: three failing attempts take at least the
+/// two pauses (200 ms and 400 ms).
+#[tokio::test]
+async fn nicru_commit_attempts_are_spaced() {
+    let (mock, client) = setup().await;
+    mock.faults()
+        .push(Fault::on("POST", COMMIT).times(3).status(503));
+    let start = Instant::now();
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert!(
+        start.elapsed() >= Duration::from_millis(600),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(commits(&mock), 3);
 }
 
 // ---- Tokens ------------------------------------------------------------------------------------

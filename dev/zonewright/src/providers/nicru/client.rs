@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::PoisonError;
+use std::time::Duration;
 
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -25,7 +26,12 @@ use super::config::{self, NicruConfig, NicruCredentials};
 use super::txt::{FOREIGN_CHANGES, Op};
 
 /// How many times a commit is tried before the operation gives up (design section 11.3).
-const COMMIT_ATTEMPTS: usize = 3;
+const COMMIT_ATTEMPTS: u32 = 3;
+
+/// Pause before commit attempt `n + 1`: `n` times this. The design fixes the number of
+/// attempts, not their spacing; the pause is the client's own, shorter than the transport's
+/// back-off because the commit is repeated by the operation, not by the transport.
+const COMMIT_BACKOFF: Duration = Duration::from_millis(200);
 
 /// Why a zone of a Secondary service cannot be used.
 // Source: "API of DNS hosting" section 3.2.2 (`has-primary="false"` – Secondary service) and
@@ -155,7 +161,10 @@ impl Nicru {
     /// the next operation in the zone commits the staged changes.
     pub(super) async fn commit_own(&self, zone: &DomainName, service: &str) -> Result<(), Error> {
         let mut last = None;
-        for _ in 0..COMMIT_ATTEMPTS {
+        for attempt in 0..COMMIT_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(COMMIT_BACKOFF * attempt).await;
+            }
             match self.api.commit(service, zone).await {
                 Ok(()) => {
                     self.unmark(zone);
@@ -171,6 +180,44 @@ impl Nicru {
                  in the zone commits them ({cause})"
             )),
         })
+    }
+
+    /// After an edit failed, still under the zone lock: makes sure the mark of `zone` stays only
+    /// while the zone holds staged changes of this process (design section 11.3, points b and
+    /// c). Returns `Ok(true)` when the edit turned out to be staged and is now committed.
+    ///
+    /// - An edit that was certainly not applied stages nothing: the mark is cleared at once,
+    ///   without looking at the zone, so that a foreign edit staged meanwhile is not committed.
+    /// - Otherwise the zone is listed again. Without staged changes, nothing of ours is
+    ///   pending and the mark is cleared. With staged changes, they are taken to be this edit
+    ///   and committed: when this operation read the zone under the zone lock it had no staged
+    ///   changes (or only ours, which it committed first), every edit of this process in the
+    ///   zone happens under that lock, and earlier edits of this operation were each committed
+    ///   before the next one. A writer outside the process that stages an edit between this
+    ///   operation's read and this commit is not detected; that window is the same as the one
+    ///   between a successful edit and its commit, which no API call can close.
+    /// - If the zone cannot be listed again, the mark stays: the next operation then commits a
+    ///   staged edit of ours, or clears the mark on a clean zone.
+    pub(super) async fn settle_failed_edit(
+        &self,
+        zone: &DomainName,
+        service: &str,
+        refused: bool,
+    ) -> Result<bool, Error> {
+        if refused {
+            self.unmark(zone);
+            return Ok(false);
+        }
+        let zones = self.api.zones().await?;
+        let Lookup::Found(found) = lookup(zones, zone) else {
+            return Ok(false);
+        };
+        if !found.has_changes {
+            self.unmark(zone);
+            return Ok(false);
+        }
+        self.commit_own(zone, service).await?;
+        Ok(true)
     }
 
     /// The zone to write to, looked up afresh. A missing zone is `Error::ZoneNotFound`; a zone

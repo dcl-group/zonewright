@@ -39,7 +39,7 @@ use reqwest::{Method, Url};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
 use crate::http::encode::{self, xml_escape};
 use crate::http::{Endpoint, Http, Request, Response, Token, TokenAuth, TokenSource};
 use crate::name::DomainName;
@@ -109,6 +109,23 @@ enum Answer {
     Success(String),
     /// Error `4097`: the token was not accepted.
     TokenRejected,
+}
+
+/// The failure of an edit (staging a record or the deletion of one).
+#[derive(Debug)]
+pub(super) struct EditError {
+    /// The operation's error.
+    pub(super) error: Error,
+    /// The edit was certainly not applied: it was refused by the answer to its one request,
+    /// or never sent. False whenever it may have been applied: no answer, a 5xx, an answer the
+    /// client cannot read.
+    pub(super) refused: bool,
+}
+
+impl EditError {
+    fn new(error: Error, refused: bool) -> EditError {
+        EditError { error, refused }
+    }
 }
 
 /// The client's handle on the API: the transport, the endpoints and the token.
@@ -198,35 +215,77 @@ impl Api {
         idempotent: bool,
         empty_ok: bool,
     ) -> Result<String, Error> {
+        self.call_edit(build, idempotent, empty_ok)
+            .await
+            .map_err(|e| e.error)
+    }
+
+    /// [`Api::call`], with the error saying whether the request was certainly not applied. That
+    /// is known only for a request that is sent once (`idempotent` false): a repeated request
+    /// may have been applied by an attempt whose answer was lost.
+    async fn call_edit(
+        &self,
+        build: impl Fn() -> Result<Request, Error>,
+        idempotent: bool,
+        empty_ok: bool,
+    ) -> Result<String, EditError> {
         let mut renewed = false;
         loop {
-            let request = build()?;
-            let response = self
+            let request = build().map_err(|e| EditError::new(e, true))?;
+            let response = match self
                 .http
                 .send_with_token(&request, &self.tokens, &TokenAuth::BEARER, || self.fetch())
-                .await?;
-            match self.answer(&response, empty_ok)? {
-                Answer::Success(text) => return Ok(text),
-                Answer::TokenRejected => {
+                .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    // A request sent once and answered with one of these was refused by that
+                    // answer (design sections 5.3 and 5.4: 401 for a fresh token, 403, 429, a
+                    // 3xx) or never sent (a request that could not be built). The transport's
+                    // `Transient` covers both a 5xx and a rejected cached token, so it counts
+                    // as an unknown outcome.
+                    let refused = !idempotent
+                        && matches!(
+                            e.kind(),
+                            ErrorKind::Auth
+                                | ErrorKind::Forbidden
+                                | ErrorKind::RateLimited
+                                | ErrorKind::Rejected
+                                | ErrorKind::InvalidInput
+                        );
+                    return Err(EditError::new(e, refused));
+                }
+            };
+            match self.answer(&response, empty_ok) {
+                Ok(Answer::Success(text)) => return Ok(text),
+                Ok(Answer::TokenRejected) => {
                     // Discards exactly the token this request carried; one that another call
                     // has fetched meanwhile is kept.
                     self.tokens.discard_rejected(&response).await;
                     if renewed {
-                        return Err(Error::Auth {
+                        let error = Error::Auth {
                             detail: Detail::constant(
                                 "the provider rejected a newly issued token (error 4097)",
                             ),
-                        });
+                        };
+                        return Err(EditError::new(error, !idempotent));
                     }
                     if !idempotent {
-                        return Err(Error::Transient {
+                        let error = Error::Transient {
                             detail: Detail::constant(
                                 "the provider rejected the cached token (error 4097); repeating \
                                  the operation obtains a new one",
                             ),
-                        });
+                        };
+                        return Err(EditError::new(error, true));
                     }
                     renewed = true;
+                }
+                Err(e) => {
+                    // A `fail` answer, or another refusal, is certain; an answer the client
+                    // cannot read says nothing about the outcome.
+                    let refused = !idempotent && e.kind() != ErrorKind::Protocol;
+                    return Err(EditError::new(e, refused));
                 }
             }
         }
@@ -256,6 +315,11 @@ impl Api {
             return Err(self.http.reject(response));
         };
         if status == "success" {
+            if !success {
+                return Err(protocol(
+                    "the provider answered status success with an HTTP error status",
+                ));
+            }
             return Ok(Answer::Success(text.into_owned()));
         }
         let (code, message) = parsed
@@ -299,10 +363,21 @@ impl Api {
                 else {
                     return Err(protocol("a listed zone has no name or no service"));
                 };
+                // Whether the zone has staged changes decides between refusing, committing
+                // and going on, so anything but the two documented values is unexpected.
+                let has_changes = match node.attribute("has-changes") {
+                    Some("true") => true,
+                    Some("false") => false,
+                    _ => {
+                        return Err(protocol(
+                            "a listed zone does not say whether it has staged changes",
+                        ));
+                    }
+                };
                 Ok(Zone {
                     name: DomainName::parse(name.trim()).ok(),
                     service: service.trim().to_owned(),
-                    has_changes: node.attribute("has-changes") == Some("true"),
+                    has_changes,
                     // Assumption (not documented): a zone without the attribute is treated as
                     // one of a DNS-master service; its record calls would then fail.
                     primary: node.attribute("has-primary") != Some("false"),
@@ -391,10 +466,13 @@ impl Api {
         owner: &str,
         value: &str,
         ttl: Option<u32>,
-    ) -> Result<(), Error> {
-        let url = self.zone_url(service, zone, "/records").build()?;
+    ) -> Result<(), EditError> {
+        let url = self
+            .zone_url(service, zone, "/records")
+            .build()
+            .map_err(|e| EditError::new(e, true))?;
         let body = Bytes::from(add_request(owner, value, ttl));
-        self.call(
+        self.call_edit(
             || {
                 Ok(Request::new(Method::PUT, url.clone())
                     .accept(TEXT_XML)
@@ -407,8 +485,12 @@ impl Api {
         Ok(())
     }
 
-    /// Stages the deletion of one record by its identifier. Idempotent: deleting the same
-    /// record twice leaves the same state (design section 5.3).
+    /// Stages the deletion of one record by its identifier. Sent once, although a deletion by
+    /// identifier is idempotent (design section 5.3 allows a repeat, it does not require one):
+    /// the API documents no answer for a record that is already deleted, so a repeat after a
+    /// lost answer could not tell "deleted by the first attempt" from a refusal. A failed
+    /// deletion whose outcome is unknown is settled by the caller from the zone's staged
+    /// changes instead.
     // Source: Docs 4.5.3 ("If the request is successful, HTTP code 200 will be returned in the
     // response", no body shown); lego internal/client.go:137-151 and
     // internal/fixtures/record_DELETE.xml (a `success` answer).
@@ -417,15 +499,15 @@ impl Api {
         service: &str,
         zone: &DomainName,
         id: &str,
-    ) -> Result<(), Error> {
-        let url = self.zone_url(service, zone, "/records").id(id).build()?;
-        self.call(
-            || {
-                Ok(Request::new(Method::DELETE, url.clone())
-                    .idempotent()
-                    .accept(TEXT_XML))
-            },
-            true,
+    ) -> Result<(), EditError> {
+        let url = self
+            .zone_url(service, zone, "/records")
+            .id(id)
+            .build()
+            .map_err(|e| EditError::new(e, true))?;
+        self.call_edit(
+            || Ok(Request::new(Method::DELETE, url.clone()).accept(TEXT_XML)),
+            false,
             true,
         )
         .await?;

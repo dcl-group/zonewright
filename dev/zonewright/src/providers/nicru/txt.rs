@@ -27,7 +27,10 @@
 //! - read: `GET /zones` (staged changes of the zone, its service), then `GET …/records`, exact
 //!   name match;
 //! - create: mark, `PUT …/records` (sent once), commit;
-//! - delete: mark, `DELETE …/records/{id}` (idempotent), commit.
+//! - delete: mark, `DELETE …/records/{id}` (sent once), commit;
+//! - a failed edit clears the mark at once when it was certainly refused, and otherwise lists
+//!   the zone again: no staged changes clears the mark, staged changes are this edit and are
+//!   committed (`Nicru::settle_failed_edit`).
 //!
 //! TXT dialect (design sections 4.4 and 11.2): read `Raw`, write `Raw`. The API carries each
 //! character string as the text of a `string` element; only plain values are written.
@@ -188,11 +191,23 @@ impl PerRecord for Op<'_> {
         // Recorded before the edit is sent (design section 3.2), so that an edit whose answer
         // is lost is recognized as ours.
         self.client.mark(zone);
-        self.client
+        match self
+            .client
             .api
             .add_txt(&service, zone, owner, &text, ttl)
-            .await?;
-        self.client.commit_own(zone, &service).await
+            .await
+        {
+            Ok(()) => self.client.commit_own(zone, &service).await,
+            Err(failed) => {
+                // Even when the staging turns out to have happened and is committed now, the
+                // operation reports the edit's error: the repeat reads the zone and reports
+                // what is there.
+                self.client
+                    .settle_failed_edit(zone, &service, failed.refused)
+                    .await?;
+                Err(failed.error)
+            }
+        }
     }
 
     async fn delete(
@@ -203,10 +218,21 @@ impl PerRecord for Op<'_> {
     ) -> Result<(), Error> {
         let service = self.service()?;
         self.client.mark(zone);
-        self.client
+        match self
+            .client
             .api
             .delete_record(&service, zone, &record.handle)
-            .await?;
-        self.client.commit_own(zone, &service).await
+            .await
+        {
+            Ok(()) => self.client.commit_own(zone, &service).await,
+            Err(failed) => {
+                // Even when the deletion turns out to have been staged and is committed now,
+                // the operation reports the edit's error; its repeat reads the zone.
+                self.client
+                    .settle_failed_edit(zone, &service, failed.refused)
+                    .await?;
+                Err(failed.error)
+            }
+        }
     }
 }
