@@ -89,7 +89,8 @@ impl RecordData {
     #[cfg(any(
         feature = "selectel_v2",
         feature = "digitalocean",
-        feature = "cloudflare"
+        feature = "cloudflare",
+        feature = "yandex_cloud"
     ))]
     pub(crate) fn from_provider(
         rtype: RecordType,
@@ -514,7 +515,8 @@ fn parse_generic(tokens: &[Token<'_>]) -> Result<Vec<u8>, RecordError> {
 #[cfg(any(
     feature = "selectel_v2",
     feature = "digitalocean",
-    feature = "cloudflare"
+    feature = "cloudflare",
+    feature = "yandex_cloud"
 ))]
 mod tests {
     use super::RecordData;

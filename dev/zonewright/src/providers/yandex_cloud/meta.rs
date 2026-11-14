@@ -4,15 +4,16 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and
-//! the TXT value operations on plain values. The record-level operations are not written yet, so
-//! their flags are false and `record_types` is empty.
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones`, the
+//! record-level operations for the types whose data form a source establishes (the client's
+//! `records.rs` gives the sources), and the TXT value operations on plain values.
 
 use crate::id::ProviderId;
 use crate::meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
     ValueGuarantee,
 };
+use crate::record::RecordType;
 
 /// The metadata of Yandex Cloud.
 pub(crate) static META: ProviderMeta = ProviderMeta {
@@ -117,18 +118,36 @@ const FIELDS: &[ConfigField] = &[
 /// What this version of the crate implements for Yandex Cloud.
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: true,
-    list_rrsets: false,
-    get_rrset: false,
-    set_rrset: false,
-    delete_rrset: false,
+    list_rrsets: true,
+    get_rrset: true,
+    set_rrset: true,
+    delete_rrset: true,
     add_txt_value: true,
     remove_txt_value: true,
-    record_types: TypeSet::Listed(&[]),
-    read_only_types: &[],
+    // The types of the Cloud DNS record types page (design section 11.2). TLSA is not accepted
+    // by the API.
+    record_types: TypeSet::Listed(&[
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::ANAME,
+        RecordType::CAA,
+        RecordType::CNAME,
+        RecordType::HTTPS,
+        RecordType::MX,
+        RecordType::NS,
+        RecordType::PTR,
+        RecordType::SOA,
+        RecordType::SRV,
+        RecordType::SVCB,
+        RecordType::TXT,
+    ]),
+    // Created with the zone (design section 3.4; the client's `records.rs`).
+    read_only_types: &[RecordType::SOA],
     // The encoding of values with spaces, quotes, backslashes or non-ASCII bytes is not
     // established for this API (design section 4.4).
     txt_plain_only: true,
-    // Every write carries the old set in the strict call's deletions (design section 3.5).
+    // Every write carries the old set in the strict call's deletions (design sections 3.4 and
+    // 3.5).
     txt_values: ValueGuarantee::Conditional,
     preconditions: Preconditions::Atomic,
     // One `updateRecordSets` call replaces the record set (design section 11.1).

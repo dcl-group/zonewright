@@ -24,7 +24,8 @@ pub use rrset::RrSet;
 #[cfg(any(
     feature = "selectel_v2",
     feature = "digitalocean",
-    feature = "cloudflare"
+    feature = "cloudflare",
+    feature = "yandex_cloud"
 ))]
 pub(crate) use rrset::singleton;
 pub use rtype::RecordType;

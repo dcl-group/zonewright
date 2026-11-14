@@ -48,6 +48,8 @@ All notable changes to this crate are recorded in this file. The format follows
   only.
 - Record-level operations for Cloudflare: A, AAAA, CAA, CNAME, MX, NS, PTR, SRV, TLSA and TXT.
   Record attributes the model does not carry (proxy status, comment, tags) are kept.
+- Record-level operations for Yandex Cloud: A, AAAA, ANAME, CAA, CNAME, HTTPS, MX, NS, PTR, SRV,
+  SVCB and TXT with provider-checked preconditions; SOA is read only.
 
 ### Changed
 

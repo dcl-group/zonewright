@@ -9,8 +9,9 @@
 //!   `iat`, `exp` with `exp - iat <= 3600`), the exchange `POST /iam/v1/tokens` with
 //!   `{"jwt": ...}`, and the token lifetime of at most 12 hours.
 //! - [IamToken.create]: the answer `200` with `iamToken` and `expiresAt` (RFC 3339).
-//! - [DnsZone.list], [DnsZone.get], [DnsZone.getRecordSet], [DnsZone.updateRecordSets]: paths,
-//!   parameters, the `RecordSet` and `Operation` shapes and their limits.
+//! - [DnsZone.list], [DnsZone.get], [DnsZone.getRecordSet], [DnsZone.listRecordSets],
+//!   [DnsZone.updateRecordSets]: paths, parameters, the `RecordSet` and `Operation` shapes and
+//!   their limits.
 //! - [Operation]: `GET /operations/{id}`; `done`, and `error` or `response`.
 //! - [Errors]: the error body `{code, message, details}` and the mapping of gRPC codes to HTTP
 //!   statuses (`NOT_FOUND` 404, `ALREADY_EXISTS` 409, `INVALID_ARGUMENT` and
@@ -20,23 +21,25 @@
 //!
 //! Endpoints used:
 //!
-//! | Call               | Request                                                     | Success          |
-//! | ------------------ | ----------------------------------------------------------- | ---------------- |
-//! | IAM token          | `POST {iam_url}` `{"jwt"}`                                  | 200, token       |
-//! | list zones         | `GET {dns_url}/zones?folderId&pageSize&pageToken`           | 200, page        |
-//! | get zone           | `GET {dns_url}/zones/{zone}`                                | 200, zone        |
-//! | get record set     | `GET {dns_url}/zones/{zone}:getRecordSet?name&type`         | 200, record set  |
-//! | update record sets | `POST {dns_url}/zones/{zone}:updateRecordSets`              | 200, operation   |
-//! | get operation      | `GET {operation_url}/{operation}`                           | 200, operation   |
+//! | Call               | Request                                                        | Success         |
+//! | ------------------ | -------------------------------------------------------------- | --------------- |
+//! | IAM token          | `POST {iam_url}` `{"jwt"}`                                     | 200, token      |
+//! | list zones         | `GET {dns_url}/zones?folderId&pageSize&pageToken`              | 200, page       |
+//! | get zone           | `GET {dns_url}/zones/{zone}`                                   | 200, zone       |
+//! | get record set     | `GET {dns_url}/zones/{zone}:getRecordSet?name&type`            | 200, record set |
+//! | list record sets   | `GET {dns_url}/zones/{zone}:listRecordSets?pageSize&pageToken` | 200, page       |
+//! | update record sets | `POST {dns_url}/zones/{zone}:updateRecordSets`                 | 200, operation  |
+//! | get operation      | `GET {operation_url}/{operation}`                              | 200, operation  |
 //!
-//! Record-level operations, when they are added, put `listRecordSets` next to `record_set` and
-//! reuse [`Api::update_record_sets`] for every change.
+//! The TXT value operations and the record-level operations share every call; only the listing
+//! of a whole zone is the record level's alone.
 //!
 //! [IAM token for a service account]: https://yandex.cloud/en/docs/iam/operations/iam-token/create-for-sa
 //! [IamToken.create]: https://yandex.cloud/en/docs/iam/api-ref/IamToken/create
 //! [DnsZone.list]: https://yandex.cloud/en/docs/dns/api-ref/DnsZone/list
 //! [DnsZone.get]: https://yandex.cloud/en/docs/dns/api-ref/DnsZone/get
 //! [DnsZone.getRecordSet]: https://yandex.cloud/en/docs/dns/api-ref/DnsZone/getRecordSet
+//! [DnsZone.listRecordSets]: https://yandex.cloud/en/docs/dns/api-ref/DnsZone/listRecordSets
 //! [DnsZone.updateRecordSets]: https://yandex.cloud/en/docs/dns/api-ref/DnsZone/updateRecordSets
 //! [Operation]: https://yandex.cloud/en/docs/api-design-guide/concepts/operation
 //! [Errors]: https://yandex.cloud/en/docs/api-design-guide/concepts/errors
@@ -63,8 +66,8 @@ use crate::http::{
 use crate::name::DomainName;
 use crate::redact::{Detail, SecretSlot};
 
-/// Page size of the zone listing: the documented maximum.
-// Source: DnsZone.list, `pageSize` ("The maximum value is 1000").
+/// Page size of the zone and record set listings: the documented maximum.
+// Source: DnsZone.list and DnsZone.listRecordSets, `pageSize` ("The maximum value is 1000").
 const PAGE_SIZE: &str = "1000";
 
 /// Lifetime of a signed JWT: the documented maximum.
@@ -118,6 +121,19 @@ impl Zone {
 struct ZonePage {
     #[serde(default)]
     dns_zones: Vec<Zone>,
+    #[serde(default)]
+    next_page_token: Option<String>,
+}
+
+/// One page of `DnsZone.listRecordSets`. The record sets are kept as JSON objects; the record
+/// layer interprets them.
+// Source: DnsZone.listRecordSets, `ListRecordSetsResponse`: `recordSets` and `nextPageToken`.
+// Proto3 JSON may omit an empty list and an empty token, so both are optional here.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordSetPage {
+    #[serde(default)]
+    record_sets: Vec<Value>,
     #[serde(default)]
     next_page_token: Option<String>,
 }
@@ -453,6 +469,54 @@ impl Api {
             });
         }
         Ok(Found::Set(set))
+    }
+
+    /// Every record set of zone `zone_id`, all pages, as the JSON objects the API returned; `None`
+    /// for a `404` (the zone is not known under this identifier). A listing is complete or it
+    /// fails.
+    // Source: DnsZone.listRecordSets (`pageSize`, at most 1000; `pageToken`; `nextPageToken` while
+    // more results exist). The `filter` parameter is not used: the whole zone is listed. A `404`
+    // for a zone that does not exist follows the error mapping (`NOT_FOUND`); the caller treats
+    // it as a possibly stale zone identifier and resolves the zone again (design section 3.8).
+    pub(super) async fn record_sets(&self, zone_id: &str) -> Result<Option<Vec<Value>>, Error> {
+        let missing = std::sync::atomic::AtomicBool::new(false);
+        let sets = pager::collect(None::<String>, |token| {
+            let missing = &missing;
+            async move {
+                let mut url = self
+                    .dns
+                    .url()
+                    .path("/zones")
+                    .id(zone_id)
+                    .path(":listRecordSets")
+                    .query("pageSize", PAGE_SIZE);
+                if let Some(token) = &token {
+                    url = url.query("pageToken", token);
+                }
+                let response = self.send(&Request::get(url.build()?)).await?;
+                if response.status() == 404 {
+                    missing.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Page {
+                        items: Vec::new(),
+                        next: None,
+                    });
+                }
+                if !response.is_success() {
+                    return Err(self.refusal(&response));
+                }
+                let page: RecordSetPage = response
+                    .json("the provider's record set listing is not in the expected form")?;
+                Ok(Page {
+                    items: page.record_sets,
+                    next: pager::next_token(page.next_page_token).map(Some),
+                })
+            }
+        })
+        .await?;
+        if missing.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        Ok(Some(sets))
     }
 
     /// The strict change: deletes `deletions`, each of which must match the record set at the

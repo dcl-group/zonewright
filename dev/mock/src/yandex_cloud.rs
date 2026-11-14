@@ -11,7 +11,8 @@
 //!   pair generated at run time ([`test_key`]); it shares no code with the client.
 //! - DNS: `DnsZone.list` (`folderId` required, at most 50 characters; `pageSize` at most 1000;
 //!   `pageToken`; `{dnsZones, nextPageToken}`), `DnsZone.get`, `DnsZone.getRecordSet` (`name`
-//!   and `type` required, `type` at most 10 characters), `DnsZone.updateRecordSets` (at most 1000
+//!   and `type` required, `type` at most 10 characters), `DnsZone.listRecordSets` (`pageSize` at
+//!   most 1000, `pageToken`; `{recordSets, nextPageToken}`), `DnsZone.updateRecordSets` (at most 1000
 //!   deletions and 1000 additions; "Returns error when: Deleted record is not found; Found record
 //!   with matched type and name but different TTL, value, or description; Attempted to add record
 //!   with existing name and type"; deletions first; `200` with an `Operation`). A `RecordSet` has
@@ -24,6 +25,18 @@
 //!   403, `UNAUTHENTICATED` 401).
 //! - Proto3 JSON (<https://protobuf.dev/programming-guides/json/>): an int64 is a string on
 //!   output and a string or a number on input; empty lists and empty tokens are omitted.
+//! - Record data (<https://yandex.cloud/en/docs/dns/concepts/resource-record>): the types A,
+//!   AAAA, ANAME, CAA, CNAME, HTTPS, MX, NS, PTR, SOA, SRV, SVCB and TXT, each in the form the
+//!   page describes; "Only ASCII characters are supported"; "Uppercase letters in domain names in
+//!   values aren't supported without quotation marks"; a `;` outside double quotes starts a
+//!   comment; a TXT character-string is at most 255 characters; CAA tags `issue`, `issuewild`,
+//!   `iodef`, `contactemail`, `contactphone` with the value in double quotes; SVCB and HTTPS
+//!   parameters `mandatory`, `alpn`, `no-default-alpn`, `port`, `ipv4hint`, `ipv6hint`,
+//!   `echconfig`, written unquoted as on the page; a CNAME "can't coexist with other records
+//!   under the same name". Data written by a client are checked against these forms; data put in
+//!   with [`Control::insert_rrset`] are not, so that a test can seed what the API might return,
+//!   and neither is an element of an addition that the deletion of the same set in the same
+//!   request carries (invented: the provider's own data written back unchanged).
 //!
 //! Answers this mock invents because the documentation is silent, each chosen so that a client
 //! cannot rely on a lenient reading. A test that depends on one of them proves only how the
@@ -44,7 +57,13 @@
 //!   configured one is `403` with code 7;
 //! - an operation reports `done: false` in the answer to `updateRecordSets` and `done: true` on
 //!   the first poll (configurable with [`Control::set_operation_polls`]);
-//! - zone and operation identifiers are lowercase letters and digits.
+//! - zone and operation identifiers are lowercase letters and digits;
+//! - data that break the rules of the record types page, a type the page does not list, and a
+//!   CNAME next to other data are refused with `400` and code 3 (`INVALID_ARGUMENT`);
+//! - `listRecordSets` returns the record sets in the order they were created, names absolute
+//!   (or, with [`Control::set_listing_names`], relative to the zone, `@` for the apex), and
+//!   refuses a `filter` (the client lists whole zones; a mock that ignored the filter would hide
+//!   a client that relied on it); its page token is an offset, and any other token is `400`.
 //!
 //! Error texts are invented.
 
@@ -160,6 +179,15 @@ pub enum StrictFailure {
     Http,
     /// The call is accepted; its operation finishes with the error.
     Operation,
+}
+
+/// How `listRecordSets` spells owner names (not documented; see the module).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListingNames {
+    /// Absolute, with the trailing dot.
+    Absolute,
+    /// Relative to the zone, `@` for the apex.
+    Relative,
 }
 
 /// The state the mock starts from.
@@ -296,6 +324,8 @@ struct Inner {
     fail_next_operation: Option<String>,
     strict_failure: StrictFailure,
     page_size: Option<usize>,
+    record_page_size: Option<usize>,
+    listing_names: ListingNames,
     next_id: u64,
 }
 
@@ -351,6 +381,8 @@ impl YandexCloudMock {
             fail_next_operation: None,
             strict_failure: StrictFailure::Http,
             page_size: None,
+            record_page_size: None,
+            listing_names: ListingNames::Absolute,
             next_id: 0,
         };
         for zone in &seed.zones {
@@ -566,6 +598,16 @@ impl Control {
     /// Page size of the zone listing, whatever the client asks for.
     pub fn set_page_size(&self, size: usize) {
         lock(&self.state).page_size = Some(size);
+    }
+
+    /// Page size of the record set listing, whatever the client asks for.
+    pub fn set_record_page_size(&self, size: usize) {
+        lock(&self.state).record_page_size = Some(size);
+    }
+
+    /// How the record set listing spells owner names.
+    pub fn set_listing_names(&self, names: ListingNames) {
+        lock(&self.state).listing_names = names;
     }
 }
 
@@ -789,8 +831,55 @@ async fn zone_get(
                 None => error(StatusCode::NOT_FOUND, 5, "RecordSet not found"),
             }
         }
+        "listRecordSets" => list_record_sets(&inner, &zone, &q),
         _ => error(StatusCode::NOT_FOUND, 5, "no such method"),
     }
+}
+
+fn list_record_sets(inner: &Inner, zone: &Zone, q: &HashMap<String, String>) -> Response {
+    if q.contains_key("filter") {
+        return invalid("this mock does not implement filter");
+    }
+    let asked = match q.get("pageSize").map(|s| s.parse::<usize>()) {
+        None => MAX_PAGE_SIZE,
+        Some(Ok(size)) if (1..=MAX_PAGE_SIZE).contains(&size) => size,
+        Some(_) => return invalid("pageSize must be 1 to 1000"),
+    };
+    let size = inner.record_page_size.unwrap_or(asked);
+    let offset = match q.get("pageToken").map(|s| s.parse::<usize>()) {
+        None => 0,
+        Some(Ok(offset)) => offset,
+        Some(Err(_)) => return invalid("invalid page token"),
+    };
+    let all: Vec<Value> = inner
+        .rrsets
+        .iter()
+        .filter(|r| r.zone_id == zone.id)
+        .map(|r| {
+            let mut set = r.to_json();
+            if inner.listing_names == ListingNames::Relative {
+                let relative = if r.name == zone.zone {
+                    "@".to_owned()
+                } else {
+                    r.name
+                        .strip_suffix(&format!(".{}", zone.zone))
+                        .unwrap_or(&r.name)
+                        .to_owned()
+                };
+                set["name"] = json!(relative);
+            }
+            set
+        })
+        .collect();
+    let page: Vec<Value> = all.iter().skip(offset).take(size).cloned().collect();
+    let mut out = json!({});
+    if !page.is_empty() {
+        out["recordSets"] = json!(page);
+    }
+    if offset + size < all.len() {
+        out["nextPageToken"] = json!((offset + size).to_string());
+    }
+    axum::Json(out).into_response()
 }
 
 /// `name` relative to `zone` (`@` for the apex) or absolute, as an absolute lowercase name;
@@ -899,6 +988,21 @@ async fn zone_post(
         (Ok(d), Ok(a)) => (d, a),
         (Err(response), _) | (_, Err(response)) => return response,
     };
+    // Data of an addition are checked against the documented forms, except an element that the
+    // deletion of the same set in this request carries: it is the provider's own data, written
+    // back.
+    for addition in &additions {
+        let kept: Vec<&String> = deletions
+            .iter()
+            .filter(|d| d.name == addition.name && d.rtype == addition.rtype)
+            .flat_map(|d| d.data.iter())
+            .collect();
+        for text in addition.data.iter().filter(|t| !kept.contains(t)) {
+            if let Err(message) = check_data(&addition.rtype, text) {
+                return invalid(&message);
+            }
+        }
+    }
     let mut next = inner.rrsets.clone();
     let mut failure: Option<(StatusCode, i64, &str)> = None;
     for deletion in &deletions {
@@ -932,6 +1036,14 @@ async fn zone_post(
             }) {
                 failure = Some((StatusCode::CONFLICT, 6, "record set already exists"));
                 break;
+            }
+            let cname_clash = next.iter().any(|r| {
+                r.zone_id == addition.zone_id
+                    && r.name == addition.name
+                    && (r.rtype == "CNAME") != (addition.rtype == "CNAME")
+            });
+            if cname_clash {
+                return invalid("a CNAME cannot coexist with other records under the same name");
             }
             next.push(addition.clone());
         }
@@ -970,6 +1082,118 @@ async fn zone_post(
     axum::Json(out).into_response()
 }
 
+/// Checks one data element of type `rtype` against the record types page (see the module).
+fn check_data(rtype: &str, text: &str) -> Result<(), String> {
+    let fail = |what: &str| Err(format!("{rtype} data: {what}"));
+    if !text.is_ascii() {
+        return fail("only ASCII characters are supported");
+    }
+    let fields: Vec<&str> = text.split(' ').collect();
+    if rtype != "TXT" && rtype != "CAA" && fields.iter().any(|f| f.is_empty()) {
+        return fail("fields are separated by one space");
+    }
+    let host = |name: &str| {
+        !name.is_empty()
+            && name != "."
+            && name.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'.' | b'-' | b'_' | b'*')
+            })
+            && !name.contains("..")
+    };
+    let target = |name: &str| name == "." || host(name);
+    let number = |field: &str| field.parse::<u16>().is_ok();
+    let ok = match (rtype, fields.as_slice()) {
+        ("A", [address]) => address.parse::<std::net::Ipv4Addr>().is_ok(),
+        ("AAAA", [address]) => address.parse::<std::net::Ipv6Addr>().is_ok(),
+        ("CNAME" | "ANAME" | "NS" | "PTR", [name]) => host(name),
+        ("MX", [preference, exchange]) => number(preference) && target(exchange),
+        ("SRV", [priority, weight, port, name]) => {
+            number(priority) && number(weight) && number(port) && target(name)
+        }
+        ("SOA", [mname, rname, rest @ ..]) => {
+            host(mname)
+                && host(rname)
+                && rest.len() == 5
+                && rest.iter().all(|f| f.parse::<u32>().is_ok())
+        }
+        ("CAA", [flag, tag, value @ ..]) => {
+            let value = value.join(" ");
+            flag.parse::<u8>().is_ok()
+                && [
+                    "issue",
+                    "issuewild",
+                    "iodef",
+                    "contactemail",
+                    "contactphone",
+                ]
+                .contains(tag)
+                && value.len() >= 2
+                && value.starts_with('"')
+                && value.ends_with('"')
+                && !value[1..value.len() - 1].contains('"')
+        }
+        ("SVCB" | "HTTPS", [priority, name, params @ ..]) => {
+            number(priority)
+                && target(name)
+                && params.iter().all(|param| {
+                    let (key, value) = param.split_once('=').unwrap_or((param, ""));
+                    !value.contains('"')
+                        && match key {
+                            "no-default-alpn" => value.is_empty(),
+                            "mandatory" | "alpn" | "port" | "ipv4hint" | "ipv6hint"
+                            | "echconfig" => !value.is_empty(),
+                            _ => false,
+                        }
+                })
+        }
+        ("TXT", _) => return check_txt(text).map_err(|what| format!("TXT data: {what}")),
+        ("A" | "AAAA" | "CNAME" | "ANAME" | "NS" | "PTR" | "MX" | "SRV" | "SOA" | "CAA", _)
+        | ("SVCB" | "HTTPS", _) => false,
+        _ => return fail("the record type is not supported"),
+    };
+    if ok {
+        Ok(())
+    } else {
+        fail("not in the documented form")
+    }
+}
+
+/// TXT: one unquoted string without spaces, quotes or `;`, or quoted strings of at most 255
+/// characters separated by spaces.
+fn check_txt(text: &str) -> Result<(), &'static str> {
+    if !text.starts_with('"') {
+        return if text.contains([' ', '"', ';']) {
+            Err("spaces, quotes and ';' need double quotes")
+        } else {
+            Ok(())
+        };
+    }
+    let mut rest = text;
+    while !rest.is_empty() {
+        let Some(inner) = rest.strip_prefix('"') else {
+            return Err("text outside double quotes");
+        };
+        let Some(end) = inner.find('"') else {
+            return Err("an unterminated quote");
+        };
+        if end > 255 {
+            return Err("a character-string is longer than 255 characters");
+        }
+        rest = &inner[end + 1..];
+        if let Some(next) = rest.strip_prefix(' ') {
+            rest = next;
+            if rest.is_empty() {
+                return Err("a trailing space");
+            }
+        } else if !rest.is_empty() {
+            return Err("strings are separated by spaces");
+        }
+    }
+    Ok(())
+}
+
 fn set_result(out: &mut Value, error: Option<&(i64, String)>) {
     match error {
         Some((code, message)) => {
@@ -1002,7 +1226,53 @@ async fn operation_get(
 
 #[cfg(test)]
 mod tests {
-    use super::{absolute, rfc3339};
+    use super::{absolute, check_data, rfc3339};
+
+    #[test]
+    fn data_follow_the_record_types_page() {
+        for (rtype, text) in [
+            ("A", "192.0.2.1"),
+            ("AAAA", "2001:db8::1"),
+            ("CNAME", "host.example.com."),
+            ("ANAME", "example.com.website.yandexcloud.net"),
+            ("MX", "10 mx-primary.example.com."),
+            ("SRV", "10 70 8080 host.example.com."),
+            ("SRV", "0 0 0 ."),
+            ("CAA", "0 issue \";\""),
+            ("CAA", "0 iodef \"mailto:security@example.com\""),
+            (
+                "SVCB",
+                "1 . alpn=h3,h3-29,h2 ipv4hint=10.0.0.1 ipv6hint=::1",
+            ),
+            ("HTTPS", "0 svc4.example.net."),
+            ("TXT", "\"v=spf1 ip4=192.0.2.0 -all\""),
+            ("TXT", "\"a\" \"b\""),
+            ("TXT", "plain"),
+            (
+                "SOA",
+                "ns1.yandexcloud.net. mx.cloud.yandex.net. 1 10800 900 604800 86400",
+            ),
+        ] {
+            assert_eq!(check_data(rtype, text), Ok(()), "{rtype} {text}");
+        }
+        for (rtype, text) in [
+            ("A", "192.0.2.256"),
+            ("CNAME", "Host.example.com."),
+            ("MX", "10  mx.example.com."),
+            ("CAA", "0 issuemail \"ca.example.net\""),
+            ("CAA", "0 issue ca.example.net"),
+            ("SVCB", "1 . alpn=\"h2\""),
+            ("SVCB", "1 . key65000=x"),
+            ("TXT", "two words"),
+            ("TXT", "\"a\"b"),
+            ("TLSA", "3 1 1 0a1b"),
+            ("A", "café"),
+        ] {
+            assert!(check_data(rtype, text).is_err(), "{rtype} {text}");
+        }
+        let long = format!("\"{}\"", "x".repeat(256));
+        assert!(check_data("TXT", &long).is_err());
+    }
 
     #[test]
     fn timestamps_are_rfc3339() {

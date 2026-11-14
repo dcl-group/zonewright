@@ -27,7 +27,7 @@ None yet.
 | ------------- | --------------- | --------------------- | ------------------------------------------------------------------------------------------------ |
 | Selectel v2   | `selectel_v2`   | TXT values, records   | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
 | Cloudflare    | `cloudflare`    | TXT values, records   |                                                                                                  |
-| Yandex Cloud  | `yandex_cloud`  | TXT values            | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
+| Yandex Cloud  | `yandex_cloud`  | TXT values, records   | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
 | Route 53      | `route53`       | TXT values            |                                                                                                  |
 | DigitalOcean  | `digitalocean`  | TXT values, records   |                                                                                                  |
 | VK Cloud      | `vk_cloud`      | TXT values            |                                                                                                  |

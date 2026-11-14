@@ -5,11 +5,12 @@
 //! `YandexCloudConfig` and credentials `YandexCloudCredentials` (holding an `AuthorizedKey`),
 //! is compiled with the cargo feature `yandex_cloud`.
 //!
-//! This version offers `check`, `list_zones` and the TXT value operations. The TXT value
-//! operations accept plain values only. They read the record set and write it back with the
-//! provider's strict call, which refuses the write if the set changed after the read, so a
-//! concurrent writer outside this process cannot lose its change (see
-//! [`ValueGuarantee::Conditional`](crate::ValueGuarantee::Conditional)).
+//! This version offers `check`, `list_zones`, the record-level operations and the TXT value
+//! operations. The TXT value operations accept plain values only. Every write reads the record
+//! set and writes it back with the provider's strict call, which refuses the write if the set
+//! changed after the read, so a concurrent writer outside this process cannot lose its change
+//! (see [`ValueGuarantee::Conditional`](crate::ValueGuarantee::Conditional) and
+//! [`Preconditions::Atomic`](crate::Preconditions::Atomic)).
 
 pub(crate) mod meta;
 
@@ -19,6 +20,10 @@ mod api;
 mod client;
 #[cfg(feature = "yandex_cloud")]
 mod config;
+#[cfg(feature = "yandex_cloud")]
+mod records;
+#[cfg(feature = "yandex_cloud")]
+mod rrset;
 #[cfg(feature = "yandex_cloud")]
 mod txt;
 

@@ -67,7 +67,8 @@ mod values;
 #[cfg(any(
     feature = "selectel_v2",
     feature = "digitalocean",
-    feature = "cloudflare"
+    feature = "cloudflare",
+    feature = "yandex_cloud"
 ))]
 mod rrsets;
 

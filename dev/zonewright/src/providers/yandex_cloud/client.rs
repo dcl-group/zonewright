@@ -13,10 +13,13 @@ use crate::http::{Http, ZoneCache, path_id, poll_interval};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
-use crate::values;
+use crate::{rrsets, values};
 
 use super::api::{self, Api, Endpoints};
 use super::config::{self, DEFAULT_POLL_MS, YandexCloudConfig, YandexCloudCredentials};
@@ -41,8 +44,9 @@ const NOT_CONFIGURED: &str = "the zone is not in zone_ids, and no folder_id is c
 /// native unit is the record set, addressed by name and type and changed with the provider's
 /// strict call, which refuses a write when the set changed after the client read it: a TXT
 /// value operation never overwrites another writer's change, inside this process or outside it
-/// (`ValueGuarantee::Conditional`). Writes complete through a provider-side operation that the
-/// client polls.
+/// (`ValueGuarantee::Conditional`), and a record-level write is conditional on the set it read
+/// (`Preconditions::Atomic`). Writes complete through a provider-side operation that the client
+/// polls.
 ///
 /// Zones are the public zones of the configured folder, or the zones whose IDs are configured.
 /// Zone identifiers are cached for the life of the client; a stale one is detected and resolved
@@ -259,6 +263,40 @@ impl Provider for YandexCloud {
             names.insert(name);
         }
         Ok(names.into_iter().map(ZoneInfo::new).collect())
+    }
+
+    /// Every record set of the zone, all pages. Record sets of types outside the record-level
+    /// type list are listed too; what the model cannot hold is in `skipped`.
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_whole_set(self, zone, name, rtype).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        rrsets::set_whole_set(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_whole_set(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(
