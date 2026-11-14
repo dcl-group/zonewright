@@ -17,32 +17,121 @@
 //! - lego `providers/dns/vkcloud` at commit `1da5445c` (`vkcloud.go`, `internal/client.go`,
 //!   `internal/types.go`; line numbers below refer to it).
 //!
-//! Endpoints used, all below the `dns_url`:
+//! Endpoints used, all below the `dns_url`. `{type}` is one of the per-type path segments of
+//! [`Kind`] (`a`, `aaaa`, `cname`, `mx`, `ns`, `srv`, `txt`); the OpenAPI documents the same four
+//! calls for each of them:
 //!
-//! | Call          | Request                        | Success                 |
-//! | ------------- | ------------------------------ | ----------------------- |
-//! | list zones    | `GET /`                        | 200, array of zones     |
-//! | list TXT      | `GET /{zone}/txt/`             | 200, array of records   |
-//! | create TXT    | `POST /{zone}/txt/`            | 201, the new record     |
-//! | delete TXT    | `DELETE /{zone}/txt/{record}`  | 204                     |
+//! | Call          | Request                          | Success                 |
+//! | ------------- | -------------------------------- | ----------------------- |
+//! | list zones    | `GET /`                          | 200, array of zones     |
+//! | list records  | `GET /{zone}/{type}/`            | 200, array of records   |
+//! | create record | `POST /{zone}/{type}/`           | 201, the new record     |
+//! | delete record | `DELETE /{zone}/{type}/{record}` | 204                     |
 //!
-//! Both listings return everything in one answer (no paging is documented), so they are
+//! The OpenAPI also documents `PUT /{zone}/{type}/{record}`. It is not used: its documented
+//! bodies carry no TTL, and those of A, AAAA and SRV carry only the name (see `records.rs`).
+//!
+//! The listings return everything in one answer (no paging is documented), so they are
 //! bounded by the transport's 4 MiB body limit alone; a larger answer fails, it is never
-//! returned in part. The OpenAPI documents `404` ("records not found") for both listings next
-//! to `200`; it does not say whether an empty listing is `200 []` or `404`, and for the TXT
-//! listing a `404` can also mean that the zone does not exist. [`Api::txt_records`] therefore
+//! returned in part. The OpenAPI documents `404` ("records not found") for every listing next
+//! to `200`; it does not say whether an empty listing is `200 []` or `404`, and for a record
+//! listing a `404` can also mean that the zone does not exist. [`Api::records`] therefore
 //! reports a `404` as such and leaves its meaning to the caller; [`Api::zones`] treats it as
 //! an error, since it cannot be told apart from a wrong `dns_url`.
 
 use std::fmt;
 
 use reqwest::Method;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::Error;
 use crate::http::keystone::X_AUTH_TOKEN;
 use crate::http::{Endpoint, Http, Keystone, Request, Response, TokenSource};
+use crate::record::RecordType;
 use crate::redact::Detail;
+
+/// A record type of the API: the types the OpenAPI documents, each on its own paths.
+// Source: the OpenAPI, the paths `/v2/dns/{DnsUuid}/{a,aaaa,cname,mx,ns,srv,txt}/` and
+// `/v2/dns/{DnsUuid}/{type}/{RecordUuid}`, each with `GET`, `POST` (list, create) and `GET`,
+// `PUT`, `DELETE` (one record). No other type and no listing of all types is documented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Kind {
+    /// `a`.
+    A,
+    /// `aaaa`.
+    Aaaa,
+    /// `cname`.
+    Cname,
+    /// `mx`.
+    Mx,
+    /// `ns`.
+    Ns,
+    /// `srv`.
+    Srv,
+    /// `txt`.
+    Txt,
+}
+
+impl Kind {
+    /// Every type of the API, in the order the zone listing reads them.
+    pub(super) const ALL: [Kind; 7] = [
+        Kind::A,
+        Kind::Aaaa,
+        Kind::Cname,
+        Kind::Mx,
+        Kind::Ns,
+        Kind::Srv,
+        Kind::Txt,
+    ];
+
+    /// The API type of `rtype`, if it has one.
+    pub(super) fn of(rtype: RecordType) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|kind| kind.rtype() == rtype)
+    }
+
+    /// The record type.
+    pub(super) fn rtype(self) -> RecordType {
+        match self {
+            Kind::A => RecordType::A,
+            Kind::Aaaa => RecordType::AAAA,
+            Kind::Cname => RecordType::CNAME,
+            Kind::Mx => RecordType::MX,
+            Kind::Ns => RecordType::NS,
+            Kind::Srv => RecordType::SRV,
+            Kind::Txt => RecordType::TXT,
+        }
+    }
+
+    /// The path of the type's collection below the zone, with the trailing slash the OpenAPI
+    /// paths have (lego internal/client.go:61, 76 for `txt`).
+    fn collection(self) -> &'static str {
+        match self {
+            Kind::A => "/a/",
+            Kind::Aaaa => "/aaaa/",
+            Kind::Cname => "/cname/",
+            Kind::Mx => "/mx/",
+            Kind::Ns => "/ns/",
+            Kind::Srv => "/srv/",
+            Kind::Txt => "/txt/",
+        }
+    }
+
+    /// The path below the zone that one record's identifier follows (lego
+    /// internal/client.go:87 for `txt`).
+    fn member(self) -> &'static str {
+        match self {
+            Kind::A => "/a",
+            Kind::Aaaa => "/aaaa",
+            Kind::Cname => "/cname",
+            Kind::Mx => "/mx",
+            Kind::Ns => "/ns",
+            Kind::Srv => "/srv",
+            Kind::Txt => "/txt",
+        }
+    }
+}
 
 /// A zone as `GET /` returns it; other fields are ignored.
 // Source: the OpenAPI, `Dns_Filter` (`zone`, `tenant`, `status` and the identifier, named
@@ -100,6 +189,84 @@ pub(super) struct NewTxt<'a> {
     pub(super) name: &'a str,
     /// The value, unquoted.
     pub(super) content: &'a str,
+    /// TTL in seconds.
+    pub(super) ttl: u32,
+}
+
+/// A record of any type as `GET /{zone}/{type}/` returns it; other fields are ignored. The
+/// identifier and the name are required: a record without them could be neither matched nor
+/// deleted, and a listing with one is not a complete read. The value fields are optional here;
+/// a record without its type's fields is read as non-canonical data (`records.rs`).
+// Source: the OpenAPI, `ARecord_Filter` (`uuid`, `name`, `dns`, `ipv4`, `ttl`),
+// `AaaaRecord_Filter` (`ipv6`), `CnameRecord_Filter`, `NsRecord_Filter` and `TxtRecord_Filter`
+// (`content`), `MxRecord_Filter` (`priority`, `content`), `SrvRecord_Filter` (`priority`,
+// `weight`, `port`, `host`). The numbers are integers there; they are taken as JSON values and
+// checked in `records.rs`. `AaaaRecord_Filter` declares its `ttl` with the string schema of
+// `name`, unlike every other type; a TTL is therefore read as a number or as a decimal string.
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct ApiRecord {
+    /// The record's identifier.
+    pub(super) uuid: String,
+    /// The name relative to the zone; `@` is the apex.
+    pub(super) name: String,
+    /// CNAME, MX, NS and TXT: the value.
+    #[serde(default)]
+    pub(super) content: Option<String>,
+    /// A: the address.
+    #[serde(default)]
+    pub(super) ipv4: Option<String>,
+    /// AAAA: the address.
+    #[serde(default)]
+    pub(super) ipv6: Option<String>,
+    /// SRV: the target host.
+    #[serde(default)]
+    pub(super) host: Option<String>,
+    /// MX and SRV: the priority.
+    #[serde(default)]
+    pub(super) priority: Option<Value>,
+    /// SRV: the weight.
+    #[serde(default)]
+    pub(super) weight: Option<Value>,
+    /// SRV: the port.
+    #[serde(default)]
+    pub(super) port: Option<Value>,
+    /// TTL in seconds.
+    #[serde(default)]
+    pub(super) ttl: Option<Value>,
+}
+
+/// The body of `POST /{zone}/{type}/`: the name, the type's value fields and the TTL. Fields a
+/// type does not have are left out.
+// Source: the OpenAPI, `ARecord_Create` (`name`, `ipv4`, `ttl` required), `AaaaRecord_Create`
+// (`name`, `ipv6`, `ttl`), `CnameRecord_Create`, `NsRecord_Create` and `TxtRecord_Create`
+// (`name`, `content`, `ttl`), `MxRecord_Create` (`name`, `content`, `priority`, `ttl`),
+// `SrvRecord_Create` (`name`, `priority`, `weight`, `port`, `host` required, `ttl` optional;
+// the client always sends one).
+#[derive(Debug, Serialize)]
+pub(super) struct NewRecord<'a> {
+    /// The name relative to the zone, `@` for the apex.
+    pub(super) name: &'a str,
+    /// CNAME, MX, NS and TXT: the value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) content: Option<&'a str>,
+    /// A: the address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ipv4: Option<&'a str>,
+    /// AAAA: the address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ipv6: Option<&'a str>,
+    /// MX and SRV: the priority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) priority: Option<u16>,
+    /// SRV: the weight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) weight: Option<u16>,
+    /// SRV: the port.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) port: Option<u16>,
+    /// SRV: the target host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) host: Option<&'a str>,
     /// TTL in seconds.
     pub(super) ttl: u32,
 }
@@ -194,7 +361,24 @@ impl Api {
     // `TxtRecord_Filter`, 404 "records not found"; lego internal/client.go:60-73
     // (`ListTXTRecords`, `JoinPath(zoneUUID, "txt", "/")`).
     pub(super) async fn txt_records(&self, zone_id: &str) -> Result<Option<Vec<TxtRecord>>, Error> {
-        let url = self.base.url().id(zone_id).path("/txt/").build()?;
+        self.records(zone_id, Kind::Txt).await
+    }
+
+    /// Every record of type `kind` in zone `zone_id`, or `None` for a `404`, which can mean an
+    /// empty listing or a zone that does not exist.
+    // Source: the OpenAPI, `GET /v2/dns/{DnsUuid}/{type}/` for each type: 200 with an array of
+    // the type's `…_Filter` schema; 400, 401, 404 "records not found".
+    pub(super) async fn records<T: DeserializeOwned>(
+        &self,
+        zone_id: &str,
+        kind: Kind,
+    ) -> Result<Option<Vec<T>>, Error> {
+        let url = self
+            .base
+            .url()
+            .id(zone_id)
+            .path(kind.collection())
+            .build()?;
         let response = self.send(&Request::get(url)).await?;
         if response.status() == 404 {
             return Ok(None);
@@ -203,7 +387,7 @@ impl Api {
             return Err(self.refusal(&response));
         }
         response
-            .json("the provider's TXT listing is not in the expected form")
+            .json("the provider's record listing is not in the expected form")
             .map(Some)
     }
 
@@ -217,7 +401,26 @@ impl Api {
         zone_id: &str,
         record: &NewTxt<'_>,
     ) -> Result<Written, Error> {
-        let url = self.base.url().id(zone_id).path("/txt/").build()?;
+        self.create(zone_id, Kind::Txt, record).await
+    }
+
+    /// Creates a record of type `kind`. Sent once: a create is not idempotent.
+    // Source: the OpenAPI, `POST /v2/dns/{DnsUuid}/{type}/` for each type: 201 with the record;
+    // 400 (validation), 401, 409 ("conflict of parameters, duplication or unavailability of the
+    // operation"). A 404 is not documented for the create; it is read as a zone that no longer
+    // exists, like the 404 of every other call on the zone.
+    pub(super) async fn create<B: Serialize>(
+        &self,
+        zone_id: &str,
+        kind: Kind,
+        record: &B,
+    ) -> Result<Written, Error> {
+        let url = self
+            .base
+            .url()
+            .id(zone_id)
+            .path(kind.collection())
+            .build()?;
         let response = self
             .send(&Request::new(Method::POST, url).json(record)?)
             .await?;
@@ -232,11 +435,24 @@ impl Api {
         zone_id: &str,
         record_id: &str,
     ) -> Result<Written, Error> {
+        self.delete(zone_id, Kind::Txt, record_id).await
+    }
+
+    /// Deletes one record of type `kind` by its identifier. Repeating it is safe, so the
+    /// transport may.
+    // Source: the OpenAPI, `DELETE /v2/dns/{DnsUuid}/{type}/{RecordUuid}` for each type: 204;
+    // 401, 404 ("record not found").
+    pub(super) async fn delete(
+        &self,
+        zone_id: &str,
+        kind: Kind,
+        record_id: &str,
+    ) -> Result<Written, Error> {
         let url = self
             .base
             .url()
             .id(zone_id)
-            .path("/txt")
+            .path(kind.member())
             .id(record_id)
             .build()?;
         let response = self
@@ -257,7 +473,7 @@ impl Api {
     /// transport already. The documented refusals are `Rejected`; anything else is an answer
     /// the client cannot interpret.
     // Source: the OpenAPI: 400 ("validation error of the request parameters") on the listings
-    // and the create, 409 on the create. No error body is documented, so the message is taken
+    // and the creates, 409 on the creates. No error body is documented, so the message is taken
     // by the transport's default extractor.
     fn refusal(&self, response: &Response) -> Error {
         match response.status() {

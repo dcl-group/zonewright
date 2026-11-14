@@ -219,12 +219,12 @@ fn txt_record(record: api::TxtRecord) -> TxtRecord<String> {
 }
 
 /// Whether the listed name `listed` is `name`, read relative to `zone`.
-fn is_name(listed: &str, zone: &DomainName, name: &DomainName) -> bool {
+pub(super) fn is_name(listed: &str, zone: &DomainName, name: &DomainName) -> bool {
     DomainName::from_relative(listed.trim(), zone).is_ok_and(|listed| &listed == name)
 }
 
 /// The name of a write: relative to the zone, `@` for the apex.
-fn relative_name<'a>(zone: &DomainName, name: &'a DomainName) -> Result<&'a str, Error> {
+pub(super) fn relative_name<'a>(zone: &DomainName, name: &'a DomainName) -> Result<&'a str, Error> {
     match name.relative_to(zone) {
         Some("") => Ok(APEX),
         Some(relative) => Ok(relative),
@@ -234,7 +234,7 @@ fn relative_name<'a>(zone: &DomainName, name: &'a DomainName) -> Result<&'a str,
 
 /// A write addressed a zone that no longer exists: it changed after the read, and nothing was
 /// written.
-fn vanished() -> Error {
+pub(super) fn vanished() -> Error {
     Error::Conflict {
         detail: Detail::constant("the zone was removed between the read and the write"),
     }

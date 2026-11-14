@@ -58,6 +58,8 @@ All notable changes to this crate are recorded in this file. The format follows
   protocol.
 - Record-level operations for Hetzner: A, AAAA, CNAME, MX, NS, PTR, SRV, TLSA and TXT; SOA is read
   only. A protected rrset is refused; record comments are kept.
+- Record-level operations for VK Cloud: A, AAAA, CNAME, MX, NS, SRV and TXT. A record is never
+  updated in place: the documented update cannot change a TTL.
 
 ### Changed
 

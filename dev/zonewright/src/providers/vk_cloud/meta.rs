@@ -4,15 +4,16 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and
-//! the TXT value operations on plain values. The record-level operations are not written yet, so
-//! their flags are false and `record_types` is empty.
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones`, the
+//! record-level operations for the seven types the provider's API documents, and the TXT value
+//! operations on plain values.
 
 use crate::id::ProviderId;
 use crate::meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
     ValueGuarantee,
 };
+use crate::record::RecordType;
 
 /// The metadata of VK Cloud.
 pub(crate) static META: ProviderMeta = ProviderMeta {
@@ -104,13 +105,23 @@ const FIELDS: &[ConfigField] = &[
 /// What this version of the crate implements for VK Cloud.
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: true,
-    list_rrsets: false,
-    get_rrset: false,
-    set_rrset: false,
-    delete_rrset: false,
+    list_rrsets: true,
+    get_rrset: true,
+    set_rrset: true,
+    delete_rrset: true,
     add_txt_value: true,
     remove_txt_value: true,
-    record_types: TypeSet::Listed(&[]),
+    // The types with documented paths and fields (the provider's OpenAPI description). The API
+    // has no SOA record (the zone carries the SOA fields) and no other type.
+    record_types: TypeSet::Listed(&[
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::CNAME,
+        RecordType::MX,
+        RecordType::NS,
+        RecordType::SRV,
+        RecordType::TXT,
+    ]),
     read_only_types: &[],
     // The encoding of values with spaces, quotes, backslashes or non-ASCII bytes is not
     // established for this API (design section 4.4).
@@ -118,11 +129,14 @@ const CAPABILITIES: Capabilities = Capabilities {
     // One record per value, created and deleted by identifier (design section 3.5).
     txt_values: ValueGuarantee::PerValue,
     preconditions: Preconditions::ReadThenWrite,
-    // Individual records with IDs: a replacement is several requests.
+    // Individual records with IDs: a replacement is several requests (creates, then deletes),
+    // and no request carries a condition on the rrset as read.
     atomic_rrset_write: false,
+    // The OpenAPI, `ttl`: 60 to 2147483648, on every record; the model's largest TTL is
+    // 2147483647. No documented call changes the TTL of an existing record.
     ttl: TtlSupport::PerRecord {
         min: 60,
-        max: 86_400,
+        max: 2_147_483_647,
     },
     provider_default_ttl: false,
     asynchronous: false,

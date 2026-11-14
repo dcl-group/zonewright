@@ -13,10 +13,13 @@ use crate::http::{Http, Keystone, ZoneCache, path_id};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
-use crate::values;
+use crate::{rrsets, values};
 
 use super::api::{Api, Zone};
 use super::config::{self, VkCloudConfig, VkCloudCredentials};
@@ -38,12 +41,19 @@ enum Lookup {
 /// The VK Cloud public DNS client.
 ///
 /// Authenticates with the OpenStack Keystone password exchange, scoped to one project, and
-/// sends the token in `X-Auth-Token`. The native unit is the individual TXT record: TXT value
-/// operations create one record per value and delete only the records that hold the value, by
-/// identifier, so a writer outside this process cannot lose a value to this client
-/// (`ValueGuarantee::PerValue`); a duplicate of a value is possible.
+/// sends the token in `X-Auth-Token`. The native unit is the individual record, on paths of its
+/// own for each type: TXT value operations create one record per value and delete only the
+/// records that hold the value, by identifier, so a writer outside this process cannot lose a
+/// value to this client (`ValueGuarantee::PerValue`); a duplicate of a value is possible.
 ///
-/// The API returns the zone listing and the TXT records of a zone in one answer each, without
+/// The record-level operations cover A, AAAA, CNAME, MX, NS, SRV and TXT. Replacing an rrset is
+/// several requests (creates, then deletes) and not atomic (`atomic_rrset_write` is false), and a
+/// writer outside this process that changes the rrset between the read and the writes is not
+/// detected (`Preconditions::ReadThenWrite`). The API cannot change the TTL of an existing
+/// record: a requested TTL that differs from that of a record which stays is
+/// `Error::InvalidInput`, and nothing is written.
+///
+/// The API returns the zone listing and the records of one type in one answer each, without
 /// paging, so a listing is bounded by the transport's 4 MiB body limit; a larger one fails.
 ///
 /// Zone identifiers are cached for the life of the client; a stale one is detected and
@@ -216,6 +226,39 @@ impl Provider for VkCloud {
             }
         }
         Ok(ids.into_keys().map(ZoneInfo::new).collect())
+    }
+
+    /// Every record of the zone, one listing per type, grouped into rrsets.
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_per_record(self, zone, name, rtype).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        rrsets::set_per_record(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_per_record(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(

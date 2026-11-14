@@ -16,8 +16,9 @@ use std::time::Duration;
 use secrecy::SecretString;
 use zonewright::providers::vk_cloud::{VkCloud, VkCloudConfig, VkCloudCredentials};
 use zonewright::{
-    AddOutcome, AnyProvider, Context, DomainName, Error, ErrorKind, Expect, Provider, ProviderId,
-    RecordType, RemoveOutcome, RrSet, Ttl, Txt,
+    AddOutcome, AnyProvider, Context, DeleteOutcome, DomainName, Error, ErrorKind, Expect,
+    Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, SetOutcome, SkipReason,
+    Ttl, Txt,
 };
 use zonewright_mock::Fault;
 use zonewright_mock::axum;
@@ -563,30 +564,39 @@ async fn vk_cloud_stale_zone_id() {
     assert_eq!(values(&mock), ["v2", "v3", "v4"]);
 }
 
-/// The record-level operations are not offered: `Unsupported`, and nothing is sent.
+/// Every operation is offered; the types the API does not document are not: CAA, TLSA, PTR, SOA
+/// and a type known only by its code are `UnsupportedRecordType` for every record-level
+/// operation, and nothing is sent.
 #[tokio::test]
 async fn vk_cloud_unsupported_operations_send_nothing() {
     let (mock, client) = setup().await;
-    let set = RrSet::new(name(), RecordType::TXT, None, [txt("v").to_data().unwrap()]).unwrap();
-    let errors = [
-        client.list_rrsets(&zone()).await.unwrap_err(),
-        client
-            .get_rrset(&zone(), &name(), RecordType::TXT)
-            .await
-            .unwrap_err(),
-        client
-            .set_rrset(&zone(), &set, Expect::Any)
-            .await
-            .unwrap_err(),
-        client
-            .delete_rrset(&zone(), &name(), RecordType::TXT, Expect::Any)
-            .await
-            .unwrap_err(),
-    ];
-    for e in errors {
-        assert_eq!(e.kind(), ErrorKind::Unsupported, "{e:?}");
+    for (rtype, text) in [
+        (RecordType::CAA, "0 issue \"ca.example.net\""),
+        (RecordType::TLSA, "3 1 1 0a1b"),
+        (RecordType::PTR, "host.example.net."),
+        (
+            RecordType::SOA,
+            "ns1.example.org. admin.example.org. 1 7200 3600 1209600 300",
+        ),
+        (RecordType::from_code(65_280), "\\# 0"),
+    ] {
+        let set = rr(NAME, rtype, None, &[text]);
+        let errors = [
+            client.get_rrset(&zone(), &name(), rtype).await.unwrap_err(),
+            client
+                .set_rrset(&zone(), &set, Expect::Any)
+                .await
+                .unwrap_err(),
+            client
+                .delete_rrset(&zone(), &name(), rtype, Expect::Any)
+                .await
+                .unwrap_err(),
+        ];
+        for e in errors {
+            assert_eq!(e.kind(), ErrorKind::UnsupportedRecordType, "{rtype}: {e:?}");
+        }
     }
-    assert!(mock.log().is_empty());
+    assert!(mock.log().is_empty(), "{:?}", mock.log().entries());
 }
 
 /// Retry behavior: a create is sent once whatever happens (a 502, a 429 and a 401 are the
@@ -779,7 +789,7 @@ async fn vk_cloud_ttl_policy() {
     assert_eq!(control.records_at(ZONE, "_acme-challenge.www")[0].ttl, 3600);
 
     let before = mock.log().len();
-    for secs in [30, 86_401] {
+    for secs in [30, 59] {
         let e = client
             .add_txt_value(
                 &zone(),
@@ -1640,38 +1650,1509 @@ fn vk_cloud_config_keys_match_metadata() {
     }
 }
 
-/// The capabilities say what the client does: the value operations, `list_zones`, nothing at
-/// record level, one record per value, a TTL per record.
+/// The capabilities say what the client does: every operation, the seven documented types, none
+/// read-only, one record per value, a TTL per record within the documented range.
 #[test]
 fn vk_cloud_capabilities_match_the_client() {
-    use zonewright::{Operation, TtlSupport, ValueGuarantee};
+    use zonewright::{Operation, Preconditions, TtlSupport, ValueGuarantee};
     let caps = &ProviderId::VkCloud.meta().capabilities;
     for op in [
         Operation::Check,
         Operation::ListZones,
         Operation::AddTxtValue,
         Operation::RemoveTxtValue,
-    ] {
-        assert!(caps.supports(op), "{op}");
-    }
-    for op in [
         Operation::ListRrsets,
         Operation::GetRrset,
         Operation::SetRrset,
         Operation::DeleteRrset,
     ] {
-        assert!(!caps.supports(op), "{op}");
+        assert!(caps.supports(op), "{op}");
     }
+    for rtype in [
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::CNAME,
+        RecordType::MX,
+        RecordType::NS,
+        RecordType::SRV,
+        RecordType::TXT,
+    ] {
+        assert!(caps.can_read(rtype) && caps.can_write(rtype), "{rtype}");
+    }
+    for rtype in [RecordType::SOA, RecordType::CAA, RecordType::TLSA] {
+        assert!(!caps.can_read(rtype), "{rtype}");
+    }
+    assert!(caps.read_only_types.is_empty());
     assert_eq!(caps.txt_values, ValueGuarantee::PerValue);
+    assert_eq!(caps.preconditions, Preconditions::ReadThenWrite);
     assert!(caps.txt_plain_only);
     assert!(!caps.atomic_rrset_write);
     assert!(matches!(
         caps.ttl,
         TtlSupport::PerRecord {
             min: 60,
-            max: 86_400
+            max: 2_147_483_647
         }
     ));
+}
+
+// ---- Record level (design sections 3.4, 3.6 and 12.3) ------------------------------------------
+
+/// Fault patterns of the record paths of every type. `*` matches an empty segment, so the
+/// member pattern is only used with `DELETE`.
+const COLLECTIONS: &str = "/public-dns/v2/dns/*/*/";
+const MEMBERS: &str = "/public-dns/v2/dns/*/*/*";
+
+/// A record value in canonical text.
+fn rdata(rtype: RecordType, text: &str) -> RecordData {
+    RecordData::parse(rtype, text).unwrap()
+}
+
+/// An rrset at `owner`.
+fn rr(owner: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrSet {
+    RrSet::new(
+        dn(owner),
+        rtype,
+        ttl.map(|t| Ttl::from_secs(t).unwrap()),
+        texts.iter().map(|t| rdata(rtype, t)),
+    )
+    .unwrap()
+}
+
+fn ttl(secs: u32) -> Option<Ttl> {
+    Some(Ttl::from_secs(secs).unwrap())
+}
+
+/// Number of record write requests of any type: creates and deletes.
+fn record_writes(mock: &VkCloudMock) -> usize {
+    let log = mock.log();
+    log.count(Some("POST"), COLLECTIONS)
+        + log.count(Some("DELETE"), MEMBERS)
+        + log.count(Some("PUT"), MEMBERS)
+}
+
+/// The values of the records of type `kind` at the relative name `rel`, as the mock stores them
+/// (the type's value fields joined by spaces), sorted.
+fn stored(mock: &VkCloudMock, kind: &str, rel: &str) -> Vec<String> {
+    let keys: &[&str] = match kind {
+        "a" => &["ipv4"],
+        "aaaa" => &["ipv6"],
+        "mx" => &["priority", "content"],
+        "srv" => &["priority", "weight", "port", "host"],
+        _ => &["content"],
+    };
+    let mut values: Vec<String> = mock
+        .control()
+        .records_of(ZONE, kind, rel)
+        .iter()
+        .map(|r| {
+            keys.iter()
+                .map(|k| r.field(k).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    values.sort();
+    values
+}
+
+/// Every supported type through set, get and list with canonical equality: the apex, an IDN
+/// name, a wildcard, a delegation, an SRV name, multi-value sets and a TXT value of a full
+/// character-string; then the fields the API stores, and a repeat that changes nothing.
+#[tokio::test]
+async fn vk_cloud_record_round_trips() {
+    let (mock, client) = setup().await;
+    let long = format!("\"{}\"", "x".repeat(255));
+    let sets = [
+        rr(
+            "example.org",
+            RecordType::A,
+            None,
+            &["192.0.2.1", "192.0.2.2"],
+        ),
+        rr(
+            "bücher.example.org",
+            RecordType::A,
+            Some(300),
+            &["192.0.2.3"],
+        ),
+        rr(
+            "*.example.org",
+            RecordType::AAAA,
+            None,
+            &["2001:db8::1", "2001:db8::2"],
+        ),
+        rr(
+            "www.example.org",
+            RecordType::CNAME,
+            None,
+            &["target.example.net."],
+        ),
+        rr(
+            "sub.example.org",
+            RecordType::NS,
+            Some(3600),
+            &["ns1.example.net.", "ns2.example.net."],
+        ),
+        rr(
+            "example.org",
+            RecordType::MX,
+            None,
+            &["10 mail.example.org.", "20 backup.example.net."],
+        ),
+        rr(
+            "_sip._tcp.example.org",
+            RecordType::SRV,
+            None,
+            &["1 5 5060 sip.example.org.", "2 0 5061 sip2.example.org."],
+        ),
+        rr("example.org", RecordType::TXT, None, &[&long, "\"v=1\""]),
+        rr(
+            "_acme-challenge.example.org",
+            RecordType::TXT,
+            Some(2_147_483_647),
+            &["\"abc-DEF_123\""],
+        ),
+    ];
+    for set in &sets {
+        let label = format!("{} {}", set.name(), set.rtype());
+        assert_eq!(
+            client
+                .set_rrset(&zone(), set, Expect::Absent)
+                .await
+                .unwrap(),
+            SetOutcome::Created,
+            "{label}"
+        );
+        // A set without a TTL gets the configured default.
+        let expected = set.clone().with_ttl(set.ttl().or(ttl(60)));
+        let got = client
+            .get_rrset(&zone(), set.name(), set.rtype())
+            .await
+            .unwrap();
+        assert_eq!(got.as_ref(), Some(&expected), "{label}");
+        assert!(got.unwrap().records().iter().all(RecordData::is_canonical));
+        let before = record_writes(&mock);
+        assert_eq!(
+            client.set_rrset(&zone(), set, Expect::Any).await.unwrap(),
+            SetOutcome::Unchanged,
+            "{label}"
+        );
+        assert_eq!(record_writes(&mock), before, "{label}");
+    }
+    let listing = client.list_rrsets(&zone()).await.unwrap();
+    assert!(listing.skipped.is_empty(), "{:?}", listing.skipped);
+    assert_eq!(listing.rrsets.len(), sets.len());
+    for set in &sets {
+        let expected = set.clone().with_ttl(set.ttl().or(ttl(60)));
+        assert!(listing.rrsets.contains(&expected), "{expected:?}");
+    }
+
+    // The names and fields the API stores.
+    assert_eq!(stored(&mock, "a", "@"), ["192.0.2.1", "192.0.2.2"]);
+    assert_eq!(stored(&mock, "a", "xn--bcher-kva"), ["192.0.2.3"]);
+    assert_eq!(stored(&mock, "aaaa", "*"), ["2001:db8::1", "2001:db8::2"]);
+    assert_eq!(stored(&mock, "cname", "www"), ["target.example.net"]);
+    assert_eq!(
+        stored(&mock, "ns", "sub"),
+        ["ns1.example.net", "ns2.example.net"]
+    );
+    assert_eq!(
+        stored(&mock, "mx", "@"),
+        ["10 mail.example.org", "20 backup.example.net"]
+    );
+    assert_eq!(
+        stored(&mock, "srv", "_sip._tcp"),
+        ["1 5 5060 sip.example.org", "2 0 5061 sip2.example.org"]
+    );
+    assert_eq!(
+        stored(&mock, "txt", "@"),
+        ["v=1".to_owned(), "x".repeat(255)]
+    );
+    let ttls: Vec<u64> = mock
+        .control()
+        .records_of(ZONE, "ns", "sub")
+        .iter()
+        .map(|r| r.ttl)
+        .collect();
+    assert_eq!(ttls, [3600, 3600]);
+
+    // A host name stated with its trailing dot by another writer reads as the same value.
+    mock.control().insert_record(
+        ZONE,
+        "mx",
+        "other",
+        serde_json::json!({"content": "Mail.Example.org.", "priority": 10}),
+        600,
+    );
+    let other = rr(
+        "other.example.org",
+        RecordType::MX,
+        None,
+        &["10 mail.example.org."],
+    );
+    assert_eq!(
+        client
+            .get_rrset(&zone(), &dn("other.example.org"), RecordType::MX)
+            .await
+            .unwrap(),
+        Some(other.clone().with_ttl(ttl(600)))
+    );
+    let before = record_writes(&mock);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &other, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Unchanged
+    );
+    assert_eq!(record_writes(&mock), before);
+}
+
+/// `Expect::Absent` on an existing set and `Expect::Matches` on a different or missing one are
+/// `PreconditionFailed` and write nothing; an expectation that holds lets the write through.
+#[tokio::test]
+async fn vk_cloud_failed_expectation_is_precondition_failed() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_record(
+        ZONE,
+        "a",
+        "www",
+        serde_json::json!({"ipv4": "192.0.2.1"}),
+        600,
+    );
+    let original = control.all_records();
+    let www = "www.example.org";
+    let wanted = rr(www, RecordType::A, None, &["192.0.2.7"]);
+    let other = rr(www, RecordType::A, None, &["192.0.2.2"]);
+    let more = rr(www, RecordType::A, None, &["192.0.2.1", "192.0.2.2"]);
+    let with_ttl = rr(www, RecordType::A, Some(300), &["192.0.2.1"]);
+    for expect in [
+        Expect::Absent,
+        Expect::Matches(&other),
+        Expect::Matches(&more),
+        Expect::Matches(&with_ttl),
+    ] {
+        let e = client
+            .set_rrset(&zone(), &wanted, expect)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{expect:?}: {e:?}");
+        assert!(!e.is_retryable());
+    }
+    for expect in [Expect::Matches(&other), Expect::Matches(&with_ttl)] {
+        let e = client
+            .delete_rrset(&zone(), &dn(www), RecordType::A, expect)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{expect:?}: {e:?}");
+    }
+    let txt = rr(www, RecordType::TXT, None, &["\"v\""]);
+    let e = client
+        .set_rrset(&zone(), &txt, Expect::Matches(&txt))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{e:?}");
+    let e = client
+        .delete_rrset(&zone(), &dn(www), RecordType::TXT, Expect::Matches(&txt))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{e:?}");
+    assert_eq!(record_writes(&mock), 0);
+    assert_eq!(control.all_records(), original);
+
+    // The expectation holds, with the TTL and without one.
+    let current = rr(www, RecordType::A, Some(600), &["192.0.2.1"]);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &wanted, Expect::Matches(&current))
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(stored(&mock, "a", "www"), ["192.0.2.7"]);
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Matches(&wanted))
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &wanted, Expect::Absent)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+}
+
+/// `Any` replaces whatever is there, touching only the records that change; an equal set is
+/// `Unchanged` without a write; a delete removes every record and a repeat is `NotPresent`.
+#[tokio::test]
+async fn vk_cloud_set_any_replaces_and_delete_converges() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = "www.example.org";
+    control.insert_record(
+        ZONE,
+        "a",
+        "www",
+        serde_json::json!({"ipv4": "192.0.2.1"}),
+        600,
+    );
+    control.insert_record(
+        ZONE,
+        "a",
+        "www",
+        serde_json::json!({"ipv4": "192.0.2.2"}),
+        600,
+    );
+    let kept = control.records_of(ZONE, "a", "www")[1].clone();
+    let replaced = rr(www, RecordType::A, None, &["192.0.2.2", "192.0.2.3"]);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &replaced, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(stored(&mock, "a", "www"), ["192.0.2.2", "192.0.2.3"]);
+    let log = mock.log();
+    assert_eq!(log.count(Some("POST"), COLLECTIONS), 1);
+    assert_eq!(log.count(Some("DELETE"), MEMBERS), 1);
+    // The record that stays is the same record, with its TTL; the new one joins with it.
+    let records = control.records_of(ZONE, "a", "www");
+    assert!(records.contains(&kept));
+    assert!(records.iter().all(|r| r.ttl == 600));
+
+    let before = record_writes(&mock);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &replaced, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Unchanged
+    );
+    assert_eq!(record_writes(&mock), before);
+
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(control.records_of(ZONE, "a", "www").is_empty());
+    let before = record_writes(&mock);
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::NotPresent
+    );
+    assert_eq!(record_writes(&mock), before);
+    assert_eq!(
+        client
+            .get_rrset(&zone(), &dn(www), RecordType::A)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// Refusals before any request: SOA is not a type of this API, the apex NS set is not writable,
+/// a TTL below 60 and an expectation about another name or type are `InvalidInput`, a name
+/// outside the zone is `NameOutsideZone`. The bounds themselves are accepted.
+#[tokio::test]
+async fn vk_cloud_record_refusals_send_nothing() {
+    let (mock, client) = setup().await;
+    let soa = rr(
+        "example.org",
+        RecordType::SOA,
+        None,
+        &["ns1.example.org. admin.example.org. 1 7200 3600 1209600 300"],
+    );
+    let e = client
+        .set_rrset(&zone(), &soa, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::UnsupportedRecordType, "{e:?}");
+
+    let apex_ns = rr("example.org", RecordType::NS, None, &["ns1.example.net."]);
+    let e = client
+        .set_rrset(&zone(), &apex_ns, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    let e = client
+        .delete_rrset(&zone(), &zone(), RecordType::NS, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+
+    for secs in [0, 59] {
+        let set = rr("www.example.org", RecordType::A, Some(secs), &["192.0.2.1"]);
+        let e = client
+            .set_rrset(&zone(), &set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{secs}: {e:?}");
+    }
+    let a = rr("www.example.org", RecordType::A, None, &["192.0.2.1"]);
+    let txt = rr("www.example.org", RecordType::TXT, None, &["\"v\""]);
+    let e = client
+        .set_rrset(&zone(), &a, Expect::Matches(&txt))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    let e = client
+        .delete_rrset(
+            &zone(),
+            &dn("www.example.org"),
+            RecordType::A,
+            Expect::Absent,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+
+    for (zone, owner) in [
+        ("example.org", "example.net"),
+        ("example.org", "badexample.org"),
+        ("a.example.org", "b.example.org"),
+    ] {
+        let set = rr(owner, RecordType::A, None, &["192.0.2.1"]);
+        let e = client
+            .set_rrset(&dn(zone), &set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NameOutsideZone, "{e:?}");
+        let e = client
+            .delete_rrset(&dn(zone), &dn(owner), RecordType::A, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NameOutsideZone, "{e:?}");
+        let e = client
+            .get_rrset(&dn(zone), &dn(owner), RecordType::A)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NameOutsideZone, "{e:?}");
+    }
+    assert!(mock.log().is_empty(), "{:?}", mock.log().entries());
+    assert_eq!(mock.control().tokens_issued(), 0);
+
+    // The bounds are accepted and stored.
+    for (owner, secs) in [("lo", 60), ("hi", 2_147_483_647)] {
+        let set = rr(
+            &format!("{owner}.example.org"),
+            RecordType::A,
+            Some(secs),
+            &["192.0.2.1"],
+        );
+        client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
+        assert_eq!(
+            mock.control().records_of(ZONE, "a", owner)[0].ttl,
+            u64::from(secs)
+        );
+    }
+}
+
+/// An SRV owner name is stated as service and protocol labels relative to the zone; a name that
+/// does not start with them is refused after the read and nothing is written. Labels to the right
+/// of them are sent as they are.
+#[tokio::test]
+async fn vk_cloud_srv_names_start_with_service_and_protocol() {
+    let (mock, client) = setup().await;
+    for owner in [
+        "example.org",
+        "sip.example.org",
+        "_sip.example.org",
+        "_sip.tcp.example.org",
+    ] {
+        let set = rr(owner, RecordType::SRV, None, &["1 1 5060 sip.example.org."]);
+        let e = client
+            .set_rrset(&zone(), &set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{owner}: {e:?}");
+    }
+    assert_eq!(record_writes(&mock), 0);
+    let deep = rr(
+        "_sip._udp.sub.example.org",
+        RecordType::SRV,
+        None,
+        &["1 1 5060 sip.example.org."],
+    );
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &deep, Expect::Absent)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    assert_eq!(
+        stored(&mock, "srv", "_sip._udp.sub"),
+        ["1 1 5060 sip.example.org"]
+    );
+}
+
+/// Values whose encoding at this API no source establishes are refused after the read and
+/// nothing is written; the same value already at the provider is kept as it is.
+#[tokio::test]
+async fn vk_cloud_values_without_an_encoding_are_refused() {
+    let (mock, client) = setup().await;
+    for set in [
+        rr("www.example.org", RecordType::TXT, None, &["\"two words\""]),
+        rr("www.example.org", RecordType::TXT, None, &["\"a\\\"b\""]),
+        rr("www.example.org", RecordType::MX, None, &["0 ."]),
+        rr("_s._tcp.example.org", RecordType::SRV, None, &["0 0 0 ."]),
+        rr(
+            "www.example.org",
+            RecordType::CNAME,
+            None,
+            &["a\\.b.example.net."],
+        ),
+    ] {
+        let e = client
+            .set_rrset(&zone(), &set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{set:?}: {e:?}");
+    }
+    assert_eq!(record_writes(&mock), 0);
+
+    // An SPF value with spaces written by someone else: listed, kept, and a value joins it.
+    mock.control()
+        .insert_txt(ZONE, "www", "v=spf1 mx -all", 300);
+    let read = client
+        .get_rrset(&zone(), &dn("www.example.org"), RecordType::TXT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.records()[0].as_str(), "\"v=spf1 mx -all\"");
+    let mut members = read.records().to_vec();
+    members.push(rdata(RecordType::TXT, "\"plain\""));
+    let both = RrSet::new(dn("www.example.org"), RecordType::TXT, None, members).unwrap();
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &both, Expect::Matches(&read))
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(stored(&mock, "txt", "www"), ["plain", "v=spf1 mx -all"]);
+}
+
+/// Per-record TTLs (design section 3.6): a set whose records disagree reads with the smallest; a
+/// value added without a TTL gets it and the others keep theirs. The API cannot change the TTL
+/// of a record that stays: such a request is `InvalidInput` and nothing is written, while a
+/// replacement of every record carries the requested TTL.
+#[tokio::test]
+async fn vk_cloud_record_ttls() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = "www.example.org";
+    control.insert_record(
+        ZONE,
+        "a",
+        "www",
+        serde_json::json!({"ipv4": "192.0.2.1"}),
+        600,
+    );
+    control.insert_record(
+        ZONE,
+        "a",
+        "www",
+        serde_json::json!({"ipv4": "192.0.2.2"}),
+        300,
+    );
+    let read = client
+        .get_rrset(&zone(), &dn(www), RecordType::A)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.ttl(), ttl(300));
+
+    let three = rr(
+        www,
+        RecordType::A,
+        None,
+        &["192.0.2.1", "192.0.2.2", "192.0.2.3"],
+    );
+    client
+        .set_rrset(&zone(), &three, Expect::Any)
+        .await
+        .unwrap();
+    let ttls = || {
+        let mut t: Vec<(String, u64)> = control
+            .records_of(ZONE, "a", "www")
+            .into_iter()
+            .map(|r| (r.field("ipv4").unwrap(), r.ttl))
+            .collect();
+        t.sort();
+        t
+    };
+    let mixed = [
+        ("192.0.2.1".to_owned(), 600),
+        ("192.0.2.2".to_owned(), 300),
+        ("192.0.2.3".to_owned(), 300),
+    ];
+    assert_eq!(ttls(), mixed);
+
+    // A TTL for records that stay: refused, nothing written, nothing changed.
+    mock.log().clear();
+    for set in [
+        three.clone().with_ttl(ttl(300)),
+        rr(www, RecordType::A, Some(900), &["192.0.2.1", "192.0.2.9"]),
+    ] {
+        let e = client
+            .set_rrset(&zone(), &set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    }
+    assert_eq!(record_writes(&mock), 0);
+    assert_eq!(ttls(), mixed);
+
+    // Every record replaced: the new ones carry the requested TTL.
+    let fresh = rr(www, RecordType::A, Some(900), &["192.0.2.8", "192.0.2.9"]);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &fresh, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(
+        ttls(),
+        [("192.0.2.8".to_owned(), 900), ("192.0.2.9".to_owned(), 900)]
+    );
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &fresh, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Unchanged
+    );
+}
+
+/// The listing reads every type, with the smallest TTL of each set; a name the model cannot hold
+/// and two CNAME records at one name are in `skipped`, an unparseable value is non-canonical
+/// data. The API lists by type, so a type outside the model cannot appear.
+#[tokio::test]
+async fn vk_cloud_listing_reports_skipped_sets() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let a = |rel: &str, ip: &str, ttl: u64| {
+        control.insert_record(ZONE, "a", rel, serde_json::json!({"ipv4": ip}), ttl);
+    };
+    a("www", "192.0.2.1", 600);
+    a("www", "192.0.2.2", 300);
+    a("odd", "not an address", 300);
+    a("bad name", "192.0.2.9", 300);
+    control.insert_record(
+        ZONE,
+        "ns",
+        "@",
+        serde_json::json!({"content": "ns1.mcs.mail.ru"}),
+        86400,
+    );
+    control.insert_record(
+        ZONE,
+        "ns",
+        "@",
+        serde_json::json!({"content": "ns2.mcs.mail.ru"}),
+        86400,
+    );
+    for target in ["a.example.net", "b.example.net"] {
+        control.insert_record(
+            ZONE,
+            "cname",
+            "two",
+            serde_json::json!({"content": target}),
+            300,
+        );
+    }
+    control.insert_record(
+        ZONE,
+        "mx",
+        "@",
+        serde_json::json!({"content": "mx.example.org"}),
+        300,
+    );
+    control.insert_txt(ZONE, "WWW", "v", 120);
+    let listing = client.list_rrsets(&zone()).await.unwrap();
+
+    let get = |owner: &str, rtype: RecordType| {
+        listing
+            .rrsets
+            .iter()
+            .find(|s| s.name() == &dn(owner) && s.rtype() == rtype)
+            .cloned()
+    };
+    assert_eq!(
+        get("www.example.org", RecordType::A),
+        Some(rr(
+            "www.example.org",
+            RecordType::A,
+            Some(300),
+            &["192.0.2.1", "192.0.2.2"]
+        ))
+    );
+    assert_eq!(
+        get("example.org", RecordType::NS),
+        Some(rr(
+            "example.org",
+            RecordType::NS,
+            Some(86400),
+            &["ns1.mcs.mail.ru.", "ns2.mcs.mail.ru."]
+        ))
+    );
+    let odd = get("odd.example.org", RecordType::A).unwrap();
+    assert!(!odd.records()[0].is_canonical());
+    assert_eq!(odd.records()[0].as_str(), "not an address");
+    // An MX record without its priority: kept as non-canonical data.
+    let mx = get("example.org", RecordType::MX).unwrap();
+    assert!(!mx.records()[0].is_canonical());
+    assert_eq!(
+        get("www.example.org", RecordType::TXT),
+        Some(rr(
+            "www.example.org",
+            RecordType::TXT,
+            Some(120),
+            &["\"v\""]
+        ))
+    );
+
+    let mut skipped: Vec<(String, String, SkipReason)> = listing
+        .skipped
+        .iter()
+        .map(|s| (s.name.to_string(), s.type_name.clone(), s.reason))
+        .collect();
+    skipped.sort_by_key(|s| format!("{s:?}"));
+    assert_eq!(
+        skipped,
+        [
+            (
+                "example.org.".to_owned(),
+                "A".to_owned(),
+                SkipReason::UnsupportedName
+            ),
+            (
+                "two.example.org.".to_owned(),
+                "CNAME".to_owned(),
+                SkipReason::NotPlainRecords
+            ),
+        ]
+    );
+    assert_eq!(listing.rrsets.len(), 5);
+
+    // One listing per type, and nothing else.
+    let gets: Vec<String> = mock
+        .log()
+        .matching(Some("GET"), COLLECTIONS)
+        .into_iter()
+        .map(|r| r.path)
+        .filter(|p| p != ZONES)
+        .collect();
+    let id = control.zone_id(ZONE);
+    let expected: Vec<String> = ["a", "aaaa", "cname", "mx", "ns", "srv", "txt"]
+        .iter()
+        .map(|k| format!("/public-dns/v2/dns/{id}/{k}/"))
+        .collect();
+    assert_eq!(gets, expected);
+}
+
+/// A listing or a read that does not have the documented shape is an error, never a shorter
+/// result, and nothing is written after a short read.
+#[tokio::test]
+async fn vk_cloud_truncated_rrset_listing_is_protocol() {
+    let (mock, client) = setup().await;
+    mock.control().insert_record(
+        ZONE,
+        "a",
+        "www",
+        serde_json::json!({"ipv4": "192.0.2.1"}),
+        60,
+    );
+    let a = "/public-dns/v2/dns/*/a/";
+    for body in [
+        r#"{"records":[]}"#,
+        r#"[{"uuid":"00000000-0000-4000-8000-0000000000aa","ipv4":"192.0.2.1"}]"#,
+        r#"[{"name":"www","ipv4":"192.0.2.1"}]"#,
+        r#"[{"uuid":"00000000-0000-4000-8000-0000000000aa","name":"www","ipv4":"192.0.2.1"}"#,
+        "null",
+    ] {
+        mock.faults().push(Fault::on("GET", a).respond(200, body));
+        let e = client.list_rrsets(&zone()).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{body}: {e:?}");
+        mock.faults().push(Fault::on("GET", a).respond(200, body));
+        let e = client
+            .get_rrset(&zone(), &dn("www.example.org"), RecordType::A)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{body}: {e:?}");
+        let set = rr("www.example.org", RecordType::A, None, &["192.0.2.2"]);
+        mock.faults().push(Fault::on("GET", a).respond(200, body));
+        let e = client
+            .set_rrset(&zone(), &set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{body}: {e:?}");
+        mock.faults().push(Fault::on("GET", a).respond(200, body));
+        let e = client
+            .delete_rrset(&zone(), &dn("www.example.org"), RecordType::A, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{body}: {e:?}");
+    }
+    // One failed type fails the whole listing.
+    mock.faults().push(
+        Fault::on("GET", "/public-dns/v2/dns/*/srv/")
+            .status(500)
+            .always(),
+    );
+    let e = client.list_rrsets(&zone()).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    mock.faults().clear();
+    assert_eq!(record_writes(&mock), 0);
+}
+
+/// Records at other names, other types at the same name and a name that only looks like ours are
+/// untouched by every operation.
+#[tokio::test]
+async fn vk_cloud_record_operations_touch_only_their_rrset() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_txt(ZONE, "www", "foreign", 300);
+    control.insert_record(
+        ZONE,
+        "aaaa",
+        "www",
+        serde_json::json!({"ipv6": "2001:db8::1"}),
+        300,
+    );
+    control.insert_record(
+        ZONE,
+        "a",
+        "x.www",
+        serde_json::json!({"ipv4": "192.0.2.1"}),
+        300,
+    );
+    control.insert_record(
+        ZONE,
+        "a",
+        "www.example.org",
+        serde_json::json!({"ipv4": "192.0.2.1"}),
+        300,
+    );
+    control.insert_record(
+        ZONE,
+        "cname",
+        "www2",
+        serde_json::json!({"content": "t.example.net"}),
+        300,
+    );
+    let others = control.all_records();
+
+    let www = "www.example.org";
+    let set = rr(www, RecordType::A, None, &["192.0.2.1"]);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &set, Expect::Absent)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    let set = rr(www, RecordType::A, None, &["192.0.2.5", "192.0.2.6"]);
+    client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(www), RecordType::CNAME, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::NotPresent
+    );
+    assert_eq!(control.all_records(), others);
+}
+
+/// A replacement creates the missing records before it deletes the surplus ones. A failure part
+/// way leaves a superset of the old values, never a subset, and a repeat sends only the rest.
+#[tokio::test]
+async fn vk_cloud_replacement_creates_before_it_deletes() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = "www.example.org";
+    control.insert_record(
+        ZONE,
+        "a",
+        "www",
+        serde_json::json!({"ipv4": "192.0.2.1"}),
+        300,
+    );
+    control.insert_record(
+        ZONE,
+        "a",
+        "www",
+        serde_json::json!({"ipv4": "192.0.2.2"}),
+        300,
+    );
+    let wanted = rr(www, RecordType::A, None, &["192.0.2.3", "192.0.2.4"]);
+
+    // The second create fails: the old values are all there, with the first new one.
+    mock.faults()
+        .push(Fault::on("POST", COLLECTIONS).skip(1).status(502));
+    let e = client
+        .set_rrset(&zone(), &wanted, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(
+        stored(&mock, "a", "www"),
+        ["192.0.2.1", "192.0.2.2", "192.0.2.3"]
+    );
+    assert_eq!(mock.log().count(Some("DELETE"), MEMBERS), 0);
+
+    // The first delete is refused: every wanted value is published, the old ones too.
+    mock.faults().push(Fault::on("DELETE", MEMBERS).status(403));
+    let e = client
+        .set_rrset(&zone(), &wanted, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Forbidden, "{e:?}");
+    assert_eq!(
+        stored(&mock, "a", "www"),
+        ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]
+    );
+
+    // The repeat converges, then nothing is left to do.
+    mock.log().clear();
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &wanted, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(stored(&mock, "a", "www"), ["192.0.2.3", "192.0.2.4"]);
+    assert_eq!(mock.log().count(Some("POST"), COLLECTIONS), 0);
+    assert_eq!(mock.log().count(Some("DELETE"), MEMBERS), 2);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &wanted, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Unchanged
+    );
+
+    // The order of the requests of one replacement.
+    mock.log().clear();
+    let next = rr(www, RecordType::A, None, &["192.0.2.5"]);
+    client.set_rrset(&zone(), &next, Expect::Any).await.unwrap();
+    let methods: Vec<String> = mock
+        .log()
+        .entries()
+        .into_iter()
+        .filter(|r| r.method != "GET")
+        .map(|r| r.method.to_string())
+        .collect();
+    assert_eq!(methods, ["POST", "DELETE", "DELETE"]);
+}
+
+/// A CNAME is replaced by a delete followed by a create (the API has no documented update of
+/// the value with its TTL), never by a second record next to the first; no `PUT` is sent.
+#[tokio::test]
+async fn vk_cloud_cname_is_replaced_by_delete_then_create() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_record(
+        ZONE,
+        "cname",
+        "www",
+        serde_json::json!({"content": "old.example.net"}),
+        300,
+    );
+    let new = rr(
+        "www.example.org",
+        RecordType::CNAME,
+        None,
+        &["new.example.net."],
+    );
+    assert_eq!(
+        client.set_rrset(&zone(), &new, Expect::Any).await.unwrap(),
+        SetOutcome::Replaced
+    );
+    let records = control.records_of(ZONE, "cname", "www");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].field("content").unwrap(), "new.example.net");
+    // The record's TTL as read is kept.
+    assert_eq!(records[0].ttl, 300);
+    let methods: Vec<String> = mock
+        .log()
+        .entries()
+        .into_iter()
+        .filter(|r| r.method != "GET" && r.path != TOKENS)
+        .map(|r| r.method.to_string())
+        .collect();
+    assert_eq!(methods, ["DELETE", "POST"]);
+}
+
+/// Two clients sharing a `Context` write one name at once, the first create delayed: the second
+/// reads after the first wrote, so its `Expect::Absent` fails.
+#[tokio::test]
+async fn vk_cloud_concurrent_record_writes_are_serialized() {
+    let mock = VkCloudMock::start(Seed::standard()).await;
+    let ctx = context();
+    let a = client_with(&mock, PASSWORD, &ctx);
+    let b = client_with(&mock, PASSWORD, &ctx);
+    mock.faults()
+        .push(Fault::on("POST", COLLECTIONS).delay(Duration::from_millis(300)));
+    let first = rr("www.example.org", RecordType::A, None, &["192.0.2.1"]);
+    let second = rr("www.example.org", RecordType::A, None, &["192.0.2.2"]);
+    let zone = zone();
+    let (ra, rb) = tokio::join!(
+        a.set_rrset(&zone, &first, Expect::Absent),
+        b.set_rrset(&zone, &second, Expect::Absent),
+    );
+    let mut kinds = [ra.map_err(|e| e.kind()), rb.map_err(|e| e.kind())];
+    kinds.sort_by_key(|r| format!("{r:?}"));
+    assert_eq!(
+        kinds,
+        [Err(ErrorKind::PreconditionFailed), Ok(SetOutcome::Created)]
+    );
+    assert_eq!(mock.control().records_of(ZONE, "a", "www").len(), 1);
+}
+
+/// Creates are sent once whatever the answer (502, 429, 401); the delete of one record by its
+/// identifier is repeated by the transport after a 502, a 429 and a 401.
+#[tokio::test]
+async fn vk_cloud_record_writes_are_sent_once() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = "www.example.org";
+    let set = rr(www, RecordType::MX, None, &["10 mail.example.org."]);
+    for (fault, kind) in [
+        (
+            Fault::on("POST", COLLECTIONS).status(502),
+            ErrorKind::Transient,
+        ),
+        (
+            Fault::on("POST", COLLECTIONS).rate_limited("1"),
+            ErrorKind::RateLimited,
+        ),
+        (
+            Fault::on("POST", COLLECTIONS).status(401),
+            ErrorKind::Transient,
+        ),
+    ] {
+        mock.log().clear();
+        mock.faults().push(fault);
+        let e = client
+            .set_rrset(&zone(), &set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), kind, "{e:?}");
+        assert_eq!(mock.log().count(Some("POST"), COLLECTIONS), 1);
+        assert!(control.all_records().is_empty());
+    }
+    assert_eq!(
+        client.set_rrset(&zone(), &set, Expect::Any).await.unwrap(),
+        SetOutcome::Created
+    );
+    for fault in [
+        Fault::on("DELETE", MEMBERS).status(502),
+        Fault::on("DELETE", MEMBERS).rate_limited("1"),
+        Fault::on("DELETE", MEMBERS).status(401),
+    ] {
+        mock.log().clear();
+        mock.faults().push(fault);
+        assert_eq!(
+            client
+                .delete_rrset(&zone(), &dn(www), RecordType::MX, Expect::Any)
+                .await
+                .unwrap(),
+            DeleteOutcome::Deleted
+        );
+        assert_eq!(mock.log().count(Some("DELETE"), MEMBERS), 2);
+        client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
+    }
+    assert_eq!(mock.log().count(Some("PUT"), MEMBERS), 0);
+}
+
+/// The record-level requests as the OpenAPI describes them: one listing of the type, the create
+/// with the relative name, the type's fields and the TTL, the delete by identifier on the type's
+/// path.
+#[tokio::test]
+async fn vk_cloud_record_request_shapes() {
+    let (mock, client) = setup().await;
+    let id = mock.control().zone_id(ZONE);
+    for (set, kind, body) in [
+        (
+            rr("example.org", RecordType::A, None, &["192.0.2.1"]),
+            "a",
+            serde_json::json!({"name": "@", "ipv4": "192.0.2.1", "ttl": 60}),
+        ),
+        (
+            rr(
+                "v6.example.org",
+                RecordType::AAAA,
+                Some(120),
+                &["2001:db8::1"],
+            ),
+            "aaaa",
+            serde_json::json!({"name": "v6", "ipv6": "2001:db8::1", "ttl": 120}),
+        ),
+        (
+            rr(
+                "www.example.org",
+                RecordType::CNAME,
+                None,
+                &["t.example.net."],
+            ),
+            "cname",
+            serde_json::json!({"name": "www", "content": "t.example.net", "ttl": 60}),
+        ),
+        (
+            rr(
+                "sub.example.org",
+                RecordType::NS,
+                None,
+                &["ns1.example.net."],
+            ),
+            "ns",
+            serde_json::json!({"name": "sub", "content": "ns1.example.net", "ttl": 60}),
+        ),
+        (
+            rr(
+                "example.org",
+                RecordType::MX,
+                None,
+                &["10 mail.example.org."],
+            ),
+            "mx",
+            serde_json::json!({
+                "name": "@", "content": "mail.example.org", "priority": 10, "ttl": 60
+            }),
+        ),
+        (
+            rr(
+                "_sip._udp.example.org",
+                RecordType::SRV,
+                None,
+                &["1 2 3 sip.example.org."],
+            ),
+            "srv",
+            serde_json::json!({
+                "name": "_sip._udp", "priority": 1, "weight": 2, "port": 3,
+                "host": "sip.example.org", "ttl": 60
+            }),
+        ),
+        (
+            rr("*.example.org", RecordType::TXT, None, &["\"v1\""]),
+            "txt",
+            serde_json::json!({"name": "*", "content": "v1", "ttl": 60}),
+        ),
+    ] {
+        mock.log().clear();
+        client
+            .set_rrset(&zone(), &set, Expect::Absent)
+            .await
+            .unwrap();
+        let entries = mock.log().entries();
+        let gets: Vec<&str> = entries
+            .iter()
+            .filter(|r| r.method == "GET" && r.path != ZONES)
+            .map(|r| r.path.as_str())
+            .collect();
+        let collection = format!("/public-dns/v2/dns/{id}/{kind}/");
+        // One listing of the type; a second one when the first, under the cached zone
+        // identifier, found nothing and the zone was looked up again.
+        assert!(!gets.is_empty() && gets.len() <= 2, "{kind}: {gets:?}");
+        assert!(gets.iter().all(|p| *p == collection), "{kind}: {gets:?}");
+        let post = mock
+            .log()
+            .matching(Some("POST"), COLLECTIONS)
+            .pop()
+            .unwrap();
+        assert_eq!(post.path, collection, "{kind}");
+        assert_eq!(post.body_json().unwrap(), body, "{kind}");
+
+        mock.log().clear();
+        client
+            .delete_rrset(&zone(), set.name(), set.rtype(), Expect::Any)
+            .await
+            .unwrap();
+        let uuid = post_uuid(&mock, kind);
+        assert!(uuid.is_none(), "{kind}: the record was not deleted");
+        let delete = mock.log().matching(Some("DELETE"), MEMBERS).pop().unwrap();
+        assert!(
+            delete.path.starts_with(&collection),
+            "{kind}: {}",
+            delete.path
+        );
+    }
+    assert_eq!(record_writes(&mock), 1);
+}
+
+/// The identifier of the one record of type `kind` the mock holds, if any.
+fn post_uuid(mock: &VkCloudMock, kind: &str) -> Option<String> {
+    mock.control()
+        .all_records()
+        .into_iter()
+        .find(|r| r.kind == kind)
+        .map(|r| r.uuid)
+}
+
+/// After the zone is recreated under a new identifier, the record-level operations look it up
+/// again: a read under the cached identifier that finds nothing is confirmed by a fresh lookup,
+/// and never reported as an absent rrset while the records are published.
+#[tokio::test]
+async fn vk_cloud_record_stale_zone_id() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = "www.example.org";
+    let set = rr(www, RecordType::A, None, &["192.0.2.1"]);
+    client
+        .set_rrset(&zone(), &set, Expect::Absent)
+        .await
+        .unwrap();
+    let expected = set.clone().with_ttl(ttl(60));
+
+    control.recreate_zone(ZONE);
+    assert_eq!(
+        client
+            .get_rrset(&zone(), &dn(www), RecordType::A)
+            .await
+            .unwrap(),
+        Some(expected.clone())
+    );
+    control.recreate_zone(ZONE);
+    let listing = client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(listing.rrsets, std::slice::from_ref(&expected));
+    control.recreate_zone(ZONE);
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Matches(&expected))
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(control.all_records().is_empty());
+
+    // An empty listing answered `200 []` under the cached identifier is confirmed the same way.
+    let mut seed = Seed::standard();
+    seed.empty_is_404 = false;
+    seed.unknown_zone_lists_empty = true;
+    let (mock, client) = setup_with(seed).await;
+    client
+        .set_rrset(&zone(), &set, Expect::Absent)
+        .await
+        .unwrap();
+    mock.control().recreate_zone(ZONE);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &set, Expect::Absent)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::PreconditionFailed
+    );
+}
+
+/// A delete answered 404 is a success only when a new read, under a freshly looked-up zone, no
+/// longer finds the value; with the zone recreated (and the record in it) the answer is a
+/// retryable `Conflict` and the repeat converges.
+#[tokio::test]
+async fn vk_cloud_record_delete_not_found_reads_again() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = "www.example.org";
+    let set = rr(www, RecordType::A, None, &["192.0.2.1"]);
+    client
+        .set_rrset(&zone(), &set, Expect::Absent)
+        .await
+        .unwrap();
+
+    let hook = control.clone();
+    mock.faults()
+        .push(Fault::on("DELETE", MEMBERS).run(move || {
+            hook.recreate_zone(ZONE);
+        }));
+    let e = client
+        .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+    assert!(e.is_retryable());
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+
+    // Deleted by someone else between the read and the delete: done.
+    client
+        .set_rrset(&zone(), &set, Expect::Absent)
+        .await
+        .unwrap();
+    let uuid = post_uuid(&mock, "a").unwrap();
+    let hook = control.clone();
+    mock.faults()
+        .push(Fault::on("DELETE", MEMBERS).run(move || hook.delete_record(&uuid)));
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(control.all_records().is_empty());
+}
+
+/// A create refused because another writer created the same record after the read is a
+/// retryable `Conflict` (found by a new read), and the repeat reports it unchanged; any other
+/// refusal is the error.
+#[tokio::test]
+async fn vk_cloud_refused_record_create_reads_again() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let set = rr("www.example.org", RecordType::A, None, &["192.0.2.1"]);
+    let hook = control.clone();
+    mock.faults()
+        .push(Fault::on("POST", COLLECTIONS).run(move || {
+            hook.insert_record(
+                ZONE,
+                "a",
+                "www",
+                serde_json::json!({"ipv4": "192.0.2.1"}),
+                60,
+            );
+        }));
+    let e = client
+        .set_rrset(&zone(), &set, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+    assert_eq!(
+        client.set_rrset(&zone(), &set, Expect::Any).await.unwrap(),
+        SetOutcome::Unchanged
+    );
+
+    mock.faults()
+        .push(Fault::on("POST", COLLECTIONS).status(400));
+    let other = rr("x.example.org", RecordType::A, None, &["192.0.2.2"]);
+    let e = client
+        .set_rrset(&zone(), &other, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(control.records_of(ZONE, "a", "x").len(), 0);
+}
+
+/// What the echo answers for each record-level request kind.
+#[derive(Clone, Copy, Debug)]
+enum RecordRequest {
+    /// A create: no A record at the name.
+    Create,
+    /// A delete: TXT records at the name.
+    Delete,
+    /// A record listing of the zone listing: the type listings are the echo.
+    List,
+}
+
+/// A renderer that answers the zone listing like the API and, unless `records_echo`, every
+/// record listing with TXT-shaped records at [`REL`] (a foreign value and `v1`); every other
+/// request gets `errors`.
+fn record_listings_then(errors: Render, records_echo: bool) -> Render {
+    let listings = listings_then(errors.clone(), true);
+    Arc::new(move |e: &Echoed| {
+        if e.method == Method::GET && (e.path.ends_with("/dns/") || !records_echo) {
+            return listings(e);
+        }
+        errors(e)
+    })
+}
+
+/// The record-level requests against an echo, for every dialect: the create, the delete and the
+/// per-type listing. No canary and no issued token in any error or `Debug`, and the error shows
+/// the redaction.
+#[tokio::test]
+async fn vk_cloud_secret_echo_record_level() {
+    let secrets = [CANARY_PASSWORD, DEFAULT_ISSUED_TOKEN];
+    for dialect in dialects() {
+        for (kind, statuses) in [
+            // A 401 to a create is not repeated and carries no echo (the token is renewed by
+            // the operation's repeat); the read and the token request cover the 401 body.
+            (RecordRequest::Create, [400, 403, 409, 500].as_slice()),
+            // A 5xx to a delete by identifier or a listing is repeated by the transport with
+            // back-off: it adds time and no coverage.
+            (RecordRequest::Delete, [400, 403, 409].as_slice()),
+            (RecordRequest::List, [400, 401, 403].as_slice()),
+        ] {
+            for &status in statuses {
+                let label = format!("{} {:?} {status} {kind:?}", dialect.name, dialect.spelling);
+                let echo = dialect
+                    .echo(status)
+                    .render_under(
+                        "/public-dns/v2/dns",
+                        record_listings_then(
+                            dialect.render.clone(),
+                            matches!(kind, RecordRequest::List),
+                        ),
+                    )
+                    .start()
+                    .await;
+                let client = echo_client(&echo, &echo.token_url());
+                let result = match kind {
+                    RecordRequest::Create => {
+                        let set = rr(NAME, RecordType::A, None, &["192.0.2.1"]);
+                        client
+                            .set_rrset(&zone(), &set, Expect::Any)
+                            .await
+                            .map(|o| format!("{o:?}"))
+                    }
+                    RecordRequest::Delete => client
+                        .delete_rrset(&zone(), &name(), RecordType::TXT, Expect::Any)
+                        .await
+                        .map(|o| format!("{o:?}")),
+                    RecordRequest::List => client
+                        .list_rrsets(&zone())
+                        .await
+                        .map(|l| format!("{} rrsets", l.rrsets.len())),
+                };
+                let text = match result {
+                    Ok(outcome) => panic!("{label}: the echo accepted the request: {outcome}"),
+                    Err(e) => format!("{e} | {e:?} | {client:?}"),
+                };
+                assert!(
+                    text.contains(REDACTED),
+                    "{label}: the echo did not reach the error: {text}"
+                );
+                assert_clean(&label, &text, &secrets);
+                let (method, path) = match kind {
+                    RecordRequest::Create => ("POST", COLLECTIONS),
+                    RecordRequest::Delete => ("DELETE", MEMBERS),
+                    RecordRequest::List => ("GET", "/public-dns/v2/dns/*/a/"),
+                };
+                assert!(
+                    echo.log().count(Some(method), path) >= 1,
+                    "{label}: the request did not reach the echo"
+                );
+            }
+        }
+    }
 }
 
 // ---- Live (design section 12.5; run only by the maintainer) ------------------------------------
@@ -1760,6 +3241,105 @@ async fn live_vk_cloud_add_and_remove() {
     let mut cleanup = Vec::new();
     for value in &values {
         if let Err(e) = client.remove_txt_value(&zone, &name, value).await {
+            cleanup.push(format!("{e}"));
+        }
+    }
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+    assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
+}
+
+/// Record-level round trip under a generated label in the zone the maintainer names: an A set
+/// and a TXT set are created, read, listed, replaced and deleted; afterwards every rrset at the
+/// generated names is deleted, also when the body failed. Nothing else is touched.
+#[tokio::test]
+#[ignore = "live API: run only by the maintainer"]
+async fn live_vk_cloud_record_round_trip() {
+    let settings = live_env("ZONEWRIGHT_LIVE_VK_CLOUD_SETTINGS");
+    let credentials = live_env("ZONEWRIGHT_LIVE_VK_CLOUD_CREDENTIALS");
+    let zone = dn(&live_env("ZONEWRIGHT_LIVE_VK_CLOUD_ZONE"));
+    let ctx = Context::new(zonewright::ContextOptions::default()).unwrap();
+    let client = Arc::new(
+        AnyProvider::from_json(
+            ProviderId::VkCloud,
+            &settings,
+            &SecretString::from(credentials),
+            &ctx,
+        )
+        .unwrap(),
+    );
+    let tag = random_u64();
+    let name = zone.prepend(&format!("zw-live-{tag:016x}")).unwrap();
+    let created = [
+        (name.clone(), RecordType::A),
+        (name.clone(), RecordType::TXT),
+    ];
+
+    let body = {
+        let (client, zone, name) = (client.clone(), zone.clone(), name.clone());
+        tokio::spawn(async move {
+            let set = |rtype: RecordType, ttl: Option<u32>, texts: &[&str]| {
+                RrSet::new(
+                    name.clone(),
+                    rtype,
+                    ttl.map(|t| Ttl::from_secs(t).unwrap()),
+                    texts.iter().map(|t| RecordData::parse(rtype, t).unwrap()),
+                )
+                .unwrap()
+            };
+            let a = set(RecordType::A, Some(300), &["192.0.2.1", "192.0.2.2"]);
+            let txt = set(RecordType::TXT, Some(300), &["\"zw-live\""]);
+            for wanted in [&a, &txt] {
+                assert_eq!(
+                    client
+                        .set_rrset(&zone, wanted, Expect::Absent)
+                        .await
+                        .unwrap(),
+                    SetOutcome::Created
+                );
+                assert_eq!(
+                    client
+                        .get_rrset(&zone, &name, wanted.rtype())
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    Some(wanted)
+                );
+                assert_eq!(
+                    client.set_rrset(&zone, wanted, Expect::Any).await.unwrap(),
+                    SetOutcome::Unchanged
+                );
+            }
+            let listing = client.list_rrsets(&zone).await.unwrap();
+            assert!(listing.rrsets.contains(&a), "{listing:?}");
+            assert!(listing.rrsets.contains(&txt), "{listing:?}");
+            let replaced = set(RecordType::A, None, &["192.0.2.2", "192.0.2.3"]);
+            assert_eq!(
+                client
+                    .set_rrset(&zone, &replaced, Expect::Matches(&a))
+                    .await
+                    .unwrap(),
+                SetOutcome::Replaced
+            );
+            for rtype in [RecordType::A, RecordType::TXT] {
+                assert_eq!(
+                    client
+                        .delete_rrset(&zone, &name, rtype, Expect::Any)
+                        .await
+                        .unwrap(),
+                    DeleteOutcome::Deleted
+                );
+                assert_eq!(client.get_rrset(&zone, &name, rtype).await.unwrap(), None);
+            }
+        })
+    };
+    let outcome = body.await;
+
+    // Cleanup: every rrset at the generated name, which only this test writes.
+    let mut cleanup = Vec::new();
+    for (name, rtype) in &created {
+        if let Err(e) = client.delete_rrset(&zone, name, *rtype, Expect::Any).await {
             cleanup.push(format!("{e}"));
         }
     }

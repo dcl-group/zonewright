@@ -70,6 +70,7 @@ mod values;
     feature = "cloudflare",
     feature = "yandex_cloud",
     feature = "hetzner",
+    feature = "vk_cloud",
     feature = "route53",
     feature = "rfc2136"
 ))]

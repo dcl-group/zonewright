@@ -6,12 +6,20 @@
 //!   <https://cloud.vk.ru/docs/ru/tools-for-using-services/api/api-spec/network-api/api-dns>
 //!   (`assets/public-dns-api.json`, "the OpenAPI" below): `GET /v2/dns/` answers `200` with an
 //!   array of zones (`zone` without the trailing dot, `tenant`, `status`, the identifier) or `404`
-//!   ("records not found"); `GET /v2/dns/{zone}/txt/` answers `200` with an array of
-//!   `{uuid, name, dns, content, ttl}` or `404`; `POST /v2/dns/{zone}/txt/` takes `name`,
-//!   `content` (at most 255 characters) and `ttl` (60 to 2147483648), all three required, and
-//!   answers `201` with the new record, `400` for a validation error, `409` for a duplicate;
-//!   `DELETE /v2/dns/{zone}/txt/{record}` answers `204`, or `404` when the record is not found;
-//!   a request without a valid token answers `401`.
+//!   ("records not found"); for each type `{type}` of `a`, `aaaa`, `cname`, `mx`, `ns`, `srv`
+//!   and `txt`, `GET /v2/dns/{zone}/{type}/` answers `200` with an array of
+//!   `{uuid, name, dns, ttl, <the type's fields>}` or `404`; `POST /v2/dns/{zone}/{type}/` takes
+//!   the type's `…_Create` fields and answers `201` with the new record, `400` for a validation
+//!   error, `409` for a duplicate; `DELETE /v2/dns/{zone}/{type}/{record}` answers `204`, or
+//!   `404` when the record is not found; a request without a valid token answers `401`. The
+//!   fields per type: A `name`, `ipv4`, `ttl`; AAAA `name`, `ipv6`, `ttl`; CNAME, NS and TXT
+//!   `name`, `content`, `ttl`; MX `name`, `content`, `priority`, `ttl`; SRV `name`, `priority`,
+//!   `weight`, `port`, `host` and an optional `ttl` (the OpenAPI's `required` lists). `ttl` is
+//!   60 to 2147483648; TXT content is at most 255 characters; the content of CNAME, MX and NS
+//!   "must consist of two or more subdomains", labels of at most 63 characters, and "cannot
+//!   start or end with a hyphen or a dot" (`content-cname`, `content-mx`, `content-ns`); the
+//!   SRV host "must consist of two or more subdomains" (the console documentation,
+//!   <https://cloud.vk.ru/docs/en/networks/dns/publicdns>).
 //! - lego `providers/dns/vkcloud` (`internal/types.go`): the zone identifier is listed as
 //!   `uuid`. The OpenAPI names it `DnsUuid`; [`Seed::zone_id_key`] picks either.
 //! - Keystone (the OpenStack Identity v3 API, as the provider's token documentation uses it):
@@ -27,15 +35,24 @@
 //! - a TXT listing or a create in a zone that does not exist answers `404` (documented for the
 //!   listing as "records not found" only, not documented for the create);
 //!   [`Seed::unknown_zone_lists_empty`] makes the listing answer `200 []` instead;
-//! - a create of a name and content that exists is the "duplication" of the documented `409`;
+//! - a create of a name and value that exists (same type, same fields) is the "duplication" of
+//!   the documented `409`;
+//! - a create with a field the type's `…_Create` schema does not have is refused with `400`
+//!   (the OpenAPI does not forbid extra fields; the mock refuses them so that a client sending
+//!   another type's field is noticed);
+//! - an SRV create without `ttl` stores 3600 (the OpenAPI makes it optional and names no
+//!   default);
+//! - `priority`, `weight` and `port` above 65535 are refused with `400` (the OpenAPI names no
+//!   range); an `ipv4` or `ipv6` that does not parse as an address is refused with `400`;
 //! - zones of another project are not listed, and requests into them answer `404`;
 //! - a record name ending in a dot is refused with `400` (names are relative to the zone);
 //! - error bodies are `{"error": {"code", "message"}}`; error texts are invented.
 //!
-//! One documented rule is deliberately not enforced: the OpenAPI describes record names and TXT
-//! content as "only digits, Latin letters, hyphen and dot", which would refuse every ACME
-//! challenge name (`_acme-challenge`) and many challenge values; lego's provider exists to write
-//! exactly those, so the description is taken as a copy of the zone-name rule.
+//! One documented rule is deliberately not enforced: the OpenAPI describes record names and the
+//! content of CNAME, MX, NS and TXT as "only digits, Latin letters, hyphen and dot", which would
+//! refuse every ACME challenge name (`_acme-challenge`), every wildcard and SRV name and many
+//! challenge values; lego's provider exists to write exactly those, so the description is taken
+//! as a copy of the zone-name rule.
 //!
 //! A test holds a [`VkCloudMock`]. It dereferences to the [`MockServer`], so the request log
 //! and the fault queue of the shared harness work as usual:
@@ -52,6 +69,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -63,7 +81,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::MockServer;
 
@@ -148,6 +166,46 @@ impl Seed {
 /// The project of the standard seed.
 pub const PROJECT: &str = "b5b7ffd4ef0547e5b222f44555df0000";
 
+/// The path segments of the record types the API documents.
+pub const KINDS: [&str; 7] = ["a", "aaaa", "cname", "mx", "ns", "srv", "txt"];
+
+/// A record of any type as the mock holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Record {
+    /// The record's identifier.
+    pub uuid: String,
+    /// The zone's identifier.
+    pub zone_id: String,
+    /// The type's path segment (`a`, `mx`, ...).
+    pub kind: String,
+    /// The name relative to the zone, `@` for the apex, as written.
+    pub name: String,
+    /// The type's value fields as written (`ipv4`, `content`, `priority`, ...).
+    pub fields: Map<String, Value>,
+    /// TTL in seconds.
+    pub ttl: u64,
+}
+
+impl Record {
+    /// A value field as text: strings as they are, numbers in decimal.
+    pub fn field(&self, key: &str) -> Option<String> {
+        match self.fields.get(key)? {
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        }
+    }
+
+    fn to_txt(&self) -> TxtRecord {
+        TxtRecord {
+            uuid: self.uuid.clone(),
+            zone_id: self.zone_id.clone(),
+            name: self.name.clone(),
+            content: self.field("content").unwrap_or_default(),
+            ttl: self.ttl,
+        }
+    }
+}
+
 /// A TXT record as the mock holds it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TxtRecord {
@@ -185,7 +243,7 @@ struct IssuedToken {
 struct Inner {
     seed: Seed,
     zones: Vec<Zone>,
-    records: Vec<TxtRecord>,
+    records: Vec<Record>,
     tokens: HashMap<String, IssuedToken>,
     issued: Vec<String>,
     next_id: u64,
@@ -253,12 +311,12 @@ impl VkCloudMock {
             .route("/identity/v3/auth/tokens", post(keystone))
             .route("/public-dns/v2/dns/", get(zones_list))
             .route(
-                "/public-dns/v2/dns/{zone}/txt/",
-                get(txt_list).post(txt_create),
+                "/public-dns/v2/dns/{zone}/{kind}/",
+                get(record_list).post(record_create),
             )
             .route(
-                "/public-dns/v2/dns/{zone}/txt/{record}",
-                get(txt_get).delete(txt_delete),
+                "/public-dns/v2/dns/{zone}/{kind}/{record}",
+                get(record_get).delete(record_delete),
             )
             .with_state(state.clone());
         Self {
@@ -343,17 +401,36 @@ impl Control {
 
     /// Every TXT record, in creation order.
     pub fn records(&self) -> Vec<TxtRecord> {
+        lock(&self.state)
+            .records
+            .iter()
+            .filter(|r| r.kind == "txt")
+            .map(Record::to_txt)
+            .collect()
+    }
+
+    /// Every record of every type, in creation order.
+    pub fn all_records(&self) -> Vec<Record> {
         lock(&self.state).records.clone()
     }
 
-    /// The TXT records of zone `zone` whose stored name is `name`.
-    pub fn records_at(&self, zone: &str, name: &str) -> Vec<TxtRecord> {
+    /// The records of type `kind` (`a`, `mx`, ...) of zone `zone` whose stored name is `name`,
+    /// in creation order.
+    pub fn records_of(&self, zone: &str, kind: &str, name: &str) -> Vec<Record> {
         let zone_id = self.zone_id(zone);
         lock(&self.state)
             .records
             .iter()
-            .filter(|r| r.zone_id == zone_id && r.name == name)
+            .filter(|r| r.zone_id == zone_id && r.kind == kind && r.name == name)
             .cloned()
+            .collect()
+    }
+
+    /// The TXT records of zone `zone` whose stored name is `name`.
+    pub fn records_at(&self, zone: &str, name: &str) -> Vec<TxtRecord> {
+        self.records_of(zone, "txt", name)
+            .iter()
+            .map(Record::to_txt)
             .collect()
     }
 
@@ -373,17 +450,41 @@ impl Control {
     ///
     /// If there is no such zone.
     pub fn insert_txt(&self, zone: &str, name: &str, content: &str, ttl: u64) -> String {
+        self.insert_record(zone, "txt", name, json!({ "content": content }), ttl)
+    }
+
+    /// Creates a record of type `kind` directly, as another writer would, without validation:
+    /// `name` and the value fields of the object `fields` are stored as given. Returns the
+    /// record's identifier.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such zone.
+    pub fn insert_record(
+        &self,
+        zone: &str,
+        kind: &str,
+        name: &str,
+        fields: Value,
+        ttl: u64,
+    ) -> String {
         let zone_id = self.zone_id(zone);
         let mut inner = lock(&self.state);
         let uuid = inner.new_id();
-        inner.records.push(TxtRecord {
+        inner.records.push(Record {
             uuid: uuid.clone(),
             zone_id,
+            kind: kind.to_owned(),
             name: name.to_owned(),
-            content: content.to_owned(),
+            fields: fields.as_object().cloned().unwrap_or_default(),
             ttl,
         });
         uuid
+    }
+
+    /// Deletes the record with identifier `uuid`, as another writer would.
+    pub fn delete_record(&self, uuid: &str) {
+        lock(&self.state).records.retain(|r| r.uuid != uuid);
     }
 
     /// Deletes the TXT records of zone `zone` whose stored name is `name`, as another writer
@@ -392,7 +493,7 @@ impl Control {
         let zone_id = self.zone_id(zone);
         lock(&self.state)
             .records
-            .retain(|r| !(r.zone_id == zone_id && r.name == name));
+            .retain(|r| !(r.zone_id == zone_id && r.kind == "txt" && r.name == name));
     }
 
     /// Revokes every token issued so far: requests with them answer `401`.
@@ -544,14 +645,19 @@ fn listing(state: &Shared, items: Vec<Value>) -> Response {
     axum::Json(Value::Array(items)).into_response()
 }
 
-fn record_json(record: &TxtRecord) -> Value {
-    json!({
+fn record_json(record: &Record) -> Value {
+    let mut value = json!({
         "uuid": record.uuid,
         "name": record.name,
         "dns": format!("/v2/dns/{}", record.zone_id),
-        "content": record.content,
         "ttl": record.ttl,
-    })
+    });
+    if let Some(object) = value.as_object_mut() {
+        for (key, field) in &record.fields {
+            object.insert(key.clone(), field.clone());
+        }
+    }
+    value
 }
 
 async fn zones_list(State(state): State<Shared>, headers: HeaderMap) -> Response {
@@ -586,13 +692,25 @@ async fn zones_list(State(state): State<Shared>, headers: HeaderMap) -> Response
     listing(&state, zones)
 }
 
-async fn txt_list(
+/// The type of a path segment, or the `404` answer.
+fn kind_of(kind: &str) -> Result<&'static str, Response> {
+    KINDS
+        .into_iter()
+        .find(|k| *k == kind)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "not found"))
+}
+
+async fn record_list(
     State(state): State<Shared>,
     headers: HeaderMap,
-    Path(zone_id): Path<String>,
+    Path((zone_id, kind)): Path<(String, String)>,
 ) -> Response {
     let project = match authorize(&state, &headers) {
         Ok(project) => project,
+        Err(response) => return response,
+    };
+    let kind = match kind_of(&kind) {
+        Ok(kind) => kind,
         Err(response) => return response,
     };
     if let Err(response) = own_zone(&state, &zone_id, &project) {
@@ -604,19 +722,23 @@ async fn txt_list(
     let records: Vec<Value> = lock(&state)
         .records
         .iter()
-        .filter(|r| r.zone_id == zone_id)
+        .filter(|r| r.zone_id == zone_id && r.kind == kind)
         .map(record_json)
         .collect();
     listing(&state, records)
 }
 
-async fn txt_get(
+async fn record_get(
     State(state): State<Shared>,
     headers: HeaderMap,
-    Path((zone_id, record_id)): Path<(String, String)>,
+    Path((zone_id, kind, record_id)): Path<(String, String, String)>,
 ) -> Response {
     let project = match authorize(&state, &headers) {
         Ok(project) => project,
+        Err(response) => return response,
+    };
+    let kind = match kind_of(&kind) {
+        Ok(kind) => kind,
         Err(response) => return response,
     };
     if let Err(response) = own_zone(&state, &zone_id, &project) {
@@ -625,7 +747,7 @@ async fn txt_get(
     let found = lock(&state)
         .records
         .iter()
-        .find(|r| r.zone_id == zone_id && r.uuid == record_id)
+        .find(|r| r.zone_id == zone_id && r.kind == kind && r.uuid == record_id)
         .map(record_json);
     match found {
         Some(record) => axum::Json(record).into_response(),
@@ -633,67 +755,132 @@ async fn txt_get(
     }
 }
 
-async fn txt_create(
+/// The value fields of a type's `…_Create` schema (`name` and `ttl` apart).
+fn value_fields(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "a" => &["ipv4"],
+        "aaaa" => &["ipv6"],
+        "mx" => &["content", "priority"],
+        "srv" => &["priority", "weight", "port", "host"],
+        _ => &["content"],
+    }
+}
+
+/// A host name of CNAME, MX or NS content, or an SRV host: at least two labels of 1 to 63
+/// characters, at most 255 characters, not starting or ending with a hyphen or a dot.
+fn valid_fqdn(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 255
+        && !text.starts_with(['-', '.'])
+        && !text.ends_with(['-', '.'])
+        && text.contains('.')
+        && text.split('.').all(|l| (1..=63).contains(&l.len()))
+}
+
+/// The validation of a create's value fields (the module documentation lists the rules).
+fn check_fields(
+    kind: &str,
+    request: &Map<String, Value>,
+) -> Result<Map<String, Value>, &'static str> {
+    let mut fields = Map::new();
+    for key in request.keys() {
+        if !matches!(key.as_str(), "name" | "ttl") && !value_fields(kind).contains(&key.as_str()) {
+            return Err("unknown field");
+        }
+    }
+    for key in value_fields(kind) {
+        let value = request.get(*key).ok_or("a required field is missing")?;
+        let valid = match *key {
+            "ipv4" => value
+                .as_str()
+                .is_some_and(|s| s.parse::<Ipv4Addr>().is_ok()),
+            "ipv6" => value
+                .as_str()
+                .is_some_and(|s| s.parse::<Ipv6Addr>().is_ok()),
+            "priority" | "weight" | "port" => value.as_u64().is_some_and(|n| n <= 65_535),
+            "host" => value.as_str().is_some_and(valid_fqdn),
+            _ if kind == "txt" => value
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && s.chars().count() <= MAX_CONTENT),
+            _ => value.as_str().is_some_and(valid_fqdn),
+        };
+        if !valid {
+            return Err("invalid field value");
+        }
+        fields.insert((*key).to_owned(), value.clone());
+    }
+    Ok(fields)
+}
+
+async fn record_create(
     State(state): State<Shared>,
     headers: HeaderMap,
-    Path(zone_id): Path<String>,
+    Path((zone_id, kind)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
     let project = match authorize(&state, &headers) {
         Ok(project) => project,
         Err(response) => return response,
     };
+    let kind = match kind_of(&kind) {
+        Ok(kind) => kind,
+        Err(response) => return response,
+    };
     if let Err(response) = own_zone(&state, &zone_id, &project) {
         return response;
     }
-    let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+    let Ok(Value::Object(request)) = serde_json::from_slice::<Value>(&body) else {
         return error(StatusCode::BAD_REQUEST, "malformed request body");
     };
-    let (Some(name), Some(content), Some(ttl)) = (
-        request["name"].as_str(),
-        request["content"].as_str(),
-        request["ttl"].as_u64(),
-    ) else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "name, content and ttl are required",
-        );
+    let Some(name) = request.get("name").and_then(Value::as_str) else {
+        return error(StatusCode::BAD_REQUEST, "name is required");
     };
     if name.is_empty() || name.ends_with('.') {
         return error(StatusCode::BAD_REQUEST, "invalid record name");
     }
-    if content.is_empty() || content.chars().count() > MAX_CONTENT {
-        return error(StatusCode::BAD_REQUEST, "invalid content");
-    }
-    if !(TTL_MIN..=TTL_MAX).contains(&ttl) {
-        return error(StatusCode::BAD_REQUEST, "invalid ttl");
-    }
+    let ttl = match (request.get("ttl"), kind) {
+        (None, "srv") => 3600,
+        (None, _) => return error(StatusCode::BAD_REQUEST, "ttl is required"),
+        (Some(ttl), _) => match ttl.as_u64() {
+            Some(ttl) if (TTL_MIN..=TTL_MAX).contains(&ttl) => ttl,
+            _ => return error(StatusCode::BAD_REQUEST, "invalid ttl"),
+        },
+    };
+    let fields = match check_fields(kind, &request) {
+        Ok(fields) => fields,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let mut inner = lock(&state);
     if inner
         .records
         .iter()
-        .any(|r| r.zone_id == zone_id && r.name == name && r.content == content)
+        .any(|r| r.zone_id == zone_id && r.kind == kind && r.name == name && r.fields == fields)
     {
         return error(StatusCode::CONFLICT, "duplicate record");
     }
-    let record = TxtRecord {
+    let record = Record {
         uuid: inner.new_id(),
         zone_id,
+        kind: kind.to_owned(),
         name: name.to_owned(),
-        content: content.to_owned(),
+        fields,
         ttl,
     };
     inner.records.push(record.clone());
     (StatusCode::CREATED, axum::Json(record_json(&record))).into_response()
 }
 
-async fn txt_delete(
+async fn record_delete(
     State(state): State<Shared>,
     headers: HeaderMap,
-    Path((zone_id, record_id)): Path<(String, String)>,
+    Path((zone_id, kind, record_id)): Path<(String, String, String)>,
 ) -> Response {
     let project = match authorize(&state, &headers) {
         Ok(project) => project,
+        Err(response) => return response,
+    };
+    let kind = match kind_of(&kind) {
+        Ok(kind) => kind,
         Err(response) => return response,
     };
     if let Err(response) = own_zone(&state, &zone_id, &project) {
@@ -703,7 +890,7 @@ async fn txt_delete(
     let before = inner.records.len();
     inner
         .records
-        .retain(|r| !(r.zone_id == zone_id && r.uuid == record_id));
+        .retain(|r| !(r.zone_id == zone_id && r.kind == kind && r.uuid == record_id));
     if inner.records.len() == before {
         return error(StatusCode::NOT_FOUND, "record not found");
     }
