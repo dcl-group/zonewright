@@ -902,6 +902,49 @@ async fn cloud_ru_operations_are_polled() {
     );
 }
 
+/// A write the provider accepted (2xx) whose operation cannot be read is `Transient`, not
+/// `Protocol`: the write may have happened, and a repeat converges.
+#[tokio::test]
+async fn cloud_ru_unreadable_operation_is_transient() {
+    let (mock, client) = setup().await;
+    // Not an operation at all; the create is not applied by the fault.
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).respond(200, "<html>accepted</html>"));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert!(e.is_retryable());
+    // An operation whose identifier cannot go into a URL.
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).respond(200, r#"{"id":"../../v1/x","done":false}"#));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
+}
+
+/// An operation `error` without a code: empty, it is `OK` (Proto3 JSON omits a zero); with a
+/// message, it is a refusal rather than a success.
+#[tokio::test]
+async fn cloud_ru_operation_error_without_code() {
+    let (mock, client) = setup().await;
+    mock.faults().push(Fault::on("GET", OPERATIONS).respond(
+        200,
+        r#"{"id":"00000000-0000-4000-8000-0000000000aa","done":true,"error":{}}"#,
+    ));
+    assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
+    mock.faults().push(Fault::on("GET", OPERATIONS).respond(
+        200,
+        r#"{"id":"00000000-0000-4000-8000-0000000000aa","done":true,"error":{"message":"quota exceeded"}}"#,
+    ));
+    let e = add(&client, "BBB").await.unwrap_err();
+    match e {
+        Error::Rejected { status, detail, .. } => {
+            assert_eq!(status, None);
+            assert_eq!(detail.as_str(), "quota exceeded");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// An operation still running after the last of the 60 polls is `Transient`.
 #[tokio::test]
 async fn cloud_ru_unfinished_operation_is_transient() {
@@ -935,18 +978,22 @@ async fn cloud_ru_delete_operation_not_found_reads_again() {
 
 // ---- Listings ----------------------------------------------------------------------------------
 
-/// A listing answer without its list, or with `null`, is `Protocol`, never "empty": no record is
-/// created over a record the client could not see.
+/// A listing page without its list field is an empty page: the OpenAPI marks the field optional
+/// and Proto3 JSON omits an empty repeated field. A list given as `null` or as another type is
+/// `Protocol`, never "empty". Either way no record is created over one the client could not see:
+/// an empty page read over an existing record leads to a refused create, a new read and
+/// `Conflict`.
 #[tokio::test]
 async fn cloud_ru_missing_list_is_protocol() {
     let (mock, client) = setup().await;
     mock.control().append_txt(NAME, "foreign");
     for (path, body) in [
         // The zones first: after a successful lookup the zone identifier is cached.
-        (ZONES, r#"{"nextPageToken":""}"#),
         (ZONES, r#"{"zones":null}"#),
-        (RECORDS, r#"{"nextPageToken":""}"#),
+        (ZONES, r#"{"zones":{}}"#),
+        (ZONES, r#"{"zones":[],"nextPageToken":7}"#),
         (RECORDS, r#"{"records":null}"#),
+        (RECORDS, r#"{"records":"none"}"#),
     ] {
         mock.faults()
             .push(Fault::on("GET", path).respond(200, body));
@@ -954,23 +1001,31 @@ async fn cloud_ru_missing_list_is_protocol() {
         assert_eq!(e.kind(), ErrorKind::Protocol, "{path} {body}: {e:?}");
     }
     assert_eq!(writes(&mock), 0);
+
+    // An omitted list is an empty page: no zone, or no record.
+    let other = DomainName::parse("example.net").unwrap();
+    mock.faults()
+        .push(Fault::on("GET", ZONES).respond(200, r#"{"nextPageToken":""}"#));
+    let e = client
+        .add_txt_value(&other, &dn("x.example.net"), &txt("AAA"), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::ZoneNotFound { .. }), "{e:?}");
+    // The read and the re-read see an empty zone; the create meets the existing record and is
+    // refused; the new read finds it.
+    mock.faults()
+        .push(Fault::on("GET", RECORDS).times(2).respond(200, "{}"));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
     assert_eq!(values(&mock), ["foreign"]);
+    assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Appended);
 }
 
-/// A listing whose pages end early is an error, never a shorter result: a later page without
-/// its list, or a page token that does not advance.
+/// A listing whose pages do not end is an error, never a shorter result: a page token that does
+/// not advance.
 #[tokio::test]
 async fn cloud_ru_truncated_listing_is_protocol() {
     let (mock, client) = setup().await;
-    mock.control().set_page_size_cap(1);
-    mock.control().insert_zone("example.net", PROJECT);
-    mock.faults().push(
-        Fault::on("GET", ZONES)
-            .skip(1)
-            .respond(200, r#"{"nextPageToken":""}"#),
-    );
-    let e = client.list_zones().await.unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
     mock.faults().push(
         Fault::on("GET", ZONES)
             .times(2)
@@ -978,7 +1033,60 @@ async fn cloud_ru_truncated_listing_is_protocol() {
     );
     let e = client.list_zones().await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    mock.faults().push(
+        Fault::on("GET", RECORDS)
+            .times(2)
+            .respond(200, r#"{"records":[],"nextPageToken":"pg-same"}"#),
+    );
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
     assert_eq!(writes(&mock), 0);
+}
+
+/// A record listing that holds a record of another zone, or one without `publicZoneId`, did
+/// not honor its filter: `Protocol`, nothing written.
+#[tokio::test]
+async fn cloud_ru_listing_of_another_zone_is_protocol() {
+    let (mock, client) = setup().await;
+    let zone_id = mock.control().zone_id(ZONE);
+    for zone_field in [json!("00000000-0000-4000-8000-0000000000ee"), Value::Null] {
+        let mut record = json!({
+            "id": "00000000-0000-4000-8000-0000000000aa",
+            "name": "_acme-challenge",
+            "type": "txt",
+            "values": ["AAA"],
+            "ttl": "60"
+        });
+        if !zone_field.is_null() {
+            record["publicZoneId"] = zone_field.clone();
+        }
+        let body = json!({"records": [record]}).to_string();
+        mock.faults()
+            .push(Fault::on("GET", RECORDS).respond(200, body.clone()));
+        let e = remove(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{zone_field}: {e:?}");
+        mock.faults()
+            .push(Fault::on("GET", RECORDS).respond(200, body));
+        let e = add(&client, "BBB").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{zone_field}: {e:?}");
+    }
+    assert_eq!(writes(&mock), 0);
+    // The same record in the right zone is read.
+    let body = json!({"records": [{
+        "id": "00000000-0000-4000-8000-0000000000aa",
+        "publicZoneId": zone_id,
+        "name": "_acme-challenge",
+        "type": "txt",
+        "values": ["AAA"],
+        "ttl": "60"
+    }]})
+    .to_string();
+    mock.faults()
+        .push(Fault::on("GET", RECORDS).respond(200, body));
+    assert_eq!(
+        add(&client, "AAA").await.unwrap(),
+        AddOutcome::AlreadyPresent
+    );
 }
 
 /// Every page of the record listing is read: the TXT record on the last page is found.
@@ -1019,21 +1127,16 @@ async fn cloud_ru_several_txt_records_are_protocol() {
 }
 
 /// Owner names are recognized in the relative form, as `@` for the zone itself, and in the
-/// absolute form; the client sends the relative form and `@`.
+/// absolute form with a trailing dot; the client sends the relative form and `@`. A name
+/// without a trailing dot that also reads as an absolute name inside the zone cannot be placed:
+/// when either reading is the requested name, the operation is `Protocol` and writes nothing,
+/// so a published value is never reported absent and no create goes to an occupied name.
 #[tokio::test]
 async fn cloud_ru_owner_names() {
     let (mock, client) = setup().await;
     let control = mock.control();
     control.insert_record(ZONE, NAME, "txt", 60, &["AAA"]);
     control.insert_record(ZONE, ZONE, "txt", 60, &["apex"]);
-    // A record whose relative name ends with the zone's text is another name.
-    control.insert_record(
-        ZONE,
-        "_acme-challenge.example.org.example.org",
-        "txt",
-        60,
-        &["BBB"],
-    );
     for style in [NameStyle::Relative, NameStyle::Absolute] {
         control.set_name_style(style);
         assert_eq!(
@@ -1049,12 +1152,35 @@ async fn cloud_ru_owner_names() {
             AddOutcome::AlreadyPresent,
             "{style:?}"
         );
-        assert_eq!(
-            remove(&client, "BBB").await.unwrap(),
-            RemoveOutcome::NotPresent
-        );
     }
+
+    // The API spells absolute names without the dot: `_acme-challenge.example.org`.
+    control.set_name_style(NameStyle::AbsoluteNoDot);
+    let e = remove(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    let e = add(&client, "BBB").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    let e = client
+        .add_txt_value(&zone(), &zone(), &txt("x"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
     assert_eq!(writes(&mock), 0);
+    assert_eq!(values(&mock), ["AAA"]);
+
+    // A relative name that ends with the zone's text is ambiguous in the same way.
+    control.set_name_style(NameStyle::Relative);
+    let deep = "_acme-challenge.example.org.example.org";
+    control.insert_record(ZONE, deep, "txt", 60, &["BBB"]);
+    let e = client
+        .remove_txt_value(&zone(), &dn(deep), &txt("BBB"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    let e = remove(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    assert_eq!(writes(&mock), 0);
+    control.delete_record(deep, "txt");
 
     let other = dn("_acme-challenge.www.example.org");
     client
@@ -1080,7 +1206,16 @@ async fn cloud_ru_owner_names() {
 #[tokio::test]
 async fn cloud_ru_wildcards() {
     let (mock, client) = setup().await;
-    let wildcard = r#"{"records":[{"id":"00000000-0000-4000-8000-0000000000aa","publicZoneId":"z","name":"_acme-challenge","type":"txt","values":["AAA"],"ttl":"60","wildcard":true}]}"#;
+    let wildcard = json!({"records": [{
+        "id": "00000000-0000-4000-8000-0000000000aa",
+        "publicZoneId": mock.control().zone_id(ZONE),
+        "name": "_acme-challenge",
+        "type": "txt",
+        "values": ["AAA"],
+        "ttl": "60",
+        "wildcard": true
+    }]})
+    .to_string();
     // The read, then the re-read.
     mock.faults()
         .push(Fault::on("GET", RECORDS).times(2).respond(200, wildcard));
@@ -1253,6 +1388,24 @@ async fn cloud_ru_zone_not_found() {
     let report = client.check(&[zone(), other_zone]).await.unwrap();
     assert!(report.credentials_verified);
     assert!(report.zones[0].found && !report.zones[1].found);
+    assert_eq!(writes(&mock), 0);
+}
+
+/// Two zones of the project with one name: the client cannot tell which holds the records, so
+/// every operation on the name is `Protocol`; `list_zones` lists the name but does not cache an
+/// identifier for it.
+#[tokio::test]
+async fn cloud_ru_several_zones_with_one_name_are_protocol() {
+    let (mock, client) = setup().await;
+    mock.control().insert_zone(ZONE, PROJECT);
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    let e = client.check(&[zone()]).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    let zones = client.list_zones().await.unwrap();
+    assert_eq!(zones.len(), 1);
+    let e = remove(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
     assert_eq!(writes(&mock), 0);
 }
 

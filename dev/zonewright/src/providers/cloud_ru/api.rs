@@ -45,9 +45,9 @@ use std::time::Duration;
 
 use reqwest::{Method, Url};
 use secrecy::{ExposeSecret as _, SecretString};
-use serde::de::{self, Deserializer};
+use serde::de::{self, DeserializeOwned, Deserializer};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::error::Error;
 use crate::http::pager::{self, Page};
@@ -106,26 +106,39 @@ impl Zone {
     }
 }
 
-/// One page of a listing: the list under `zones` or `records`, and `nextPageToken`.
-// Source: the OpenAPI, `v1ListPublicZonesSoleResponse` and `v1ListPublicRecordsSoleResponse`.
-// The list is read as optional so that its absence is reported (design section 11.3: a missing
-// list is `Error::Protocol`, never an empty result).
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ZonePage {
-    #[serde(default)]
-    zones: Option<Vec<Zone>>,
-    #[serde(default)]
-    next_page_token: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RecordPage {
-    #[serde(default)]
-    records: Option<Vec<Value>>,
-    #[serde(default)]
-    next_page_token: Option<String>,
+/// One page of a listing: the list under `key` (`zones` or `records`) and the next page token.
+///
+/// The list field is optional in the OpenAPI (`v1ListPublicZonesSoleResponse` and
+/// `v1ListPublicRecordsSoleResponse` mark nothing required), and Proto3 JSON omits a repeated
+/// field that is empty, so an absent list is an empty page. A list that is present but not an
+/// array (`null` included, which a Proto3 JSON printer never writes for a repeated field) is
+/// `Error::Protocol`, never an empty result; so is a next page token that is not a string.
+fn page_of<T: DeserializeOwned>(
+    response: &Response,
+    key: &str,
+) -> Result<Page<T, Option<String>>, Error> {
+    let protocol = || Error::Protocol {
+        detail: Detail::constant("the provider's listing is not in the expected form"),
+    };
+    let mut page: Map<String, Value> =
+        response.json("the provider's listing is not in the expected form")?;
+    let items = match page.remove(key) {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(|item| serde_json::from_value(item).map_err(|_| protocol()))
+            .collect::<Result<Vec<T>, Error>>()?,
+        Some(_) => return Err(protocol()),
+    };
+    let token = match page.remove("nextPageToken") {
+        None => None,
+        Some(Value::String(token)) => Some(token),
+        Some(_) => return Err(protocol()),
+    };
+    Ok(Page {
+        items,
+        next: pager::next_token(token).map(Some),
+    })
 }
 
 /// A record of a public zone, one per name and type, holding all values of that name and type.
@@ -409,12 +422,7 @@ impl Api {
             if !response.is_success() {
                 return Err(self.http.reject(&response));
             }
-            let page: ZonePage =
-                response.json("the provider's zone listing is not in the expected form")?;
-            Ok(Page {
-                items: page.zones.ok_or_else(missing_list)?,
-                next: pager::next_token(page.next_page_token).map(Some),
-            })
+            page_of(&response, "zones")
         })
         .await
     }
@@ -448,12 +456,7 @@ impl Api {
             if !response.is_success() {
                 return Err(self.http.reject(&response));
             }
-            let page: RecordPage =
-                response.json("the provider's record listing is not in the expected form")?;
-            Ok(Page {
-                items: page.records.ok_or_else(missing_list)?,
-                next: pager::next_token(page.next_page_token).map(Some),
-            })
+            page_of(&response, "records")
         })
         .await
     }
@@ -514,8 +517,9 @@ impl Api {
         if !response.is_success() {
             return Ok(Written::Refused(self.http.reject(response)));
         }
-        let operation: Operation =
-            response.json("the provider's operation is not in the expected form")?;
+        let operation: Operation = response
+            .json("the provider's operation is not in the expected form")
+            .map_err(|_| accepted_unreadable())?;
         self.finish(operation).await
     }
 
@@ -526,7 +530,9 @@ impl Api {
         if operation.done {
             return Ok(self.outcome(operation));
         }
-        let id = path_id(&operation.id)?.to_owned();
+        let id = path_id(&operation.id)
+            .map_err(|_| accepted_unreadable())?
+            .to_owned();
         self.poller
             .run(|| {
                 let id = id.clone();
@@ -553,17 +559,22 @@ impl Api {
         response.json("the provider's operation is not in the expected form")
     }
 
-    /// A finished operation: an `error` with a code other than `OK` (0) is a refusal with the
-    /// provider's message, or [`Written::NotFound`] for `NOT_FOUND`.
+    /// A finished operation: no `error`, or an `error` with code `OK` (0), is success; `NOT_FOUND`
+    /// is [`Written::NotFound`]; any other code is a refusal with the provider's message. An
+    /// `error` without a code is `OK` by Proto3 JSON (a zero is omitted) when it is empty, but a
+    /// refusal when it carries a message: success is not reported for an answer that describes an
+    /// error, and a refusal is safe to repeat (the repeat starts with a read).
     // Source: the OpenAPI, `dnsv1Operation.error` and `rpcStatus.code` (google.rpc.Code, where 0
-    // is OK).
+    // is OK); Proto3 JSON (default values are omitted).
     fn outcome(&self, operation: Operation) -> Written {
         let Some(status) = operation.error else {
             return Written::Done;
         };
-        match status.code.unwrap_or(0) {
-            0 => Written::Done,
-            CODE_NOT_FOUND => Written::NotFound,
+        let message = status.message.as_deref().is_some_and(|m| !m.is_empty());
+        match status.code {
+            Some(0) => Written::Done,
+            None if !message => Written::Done,
+            Some(CODE_NOT_FOUND) => Written::NotFound,
             _ => Written::Refused(Error::Rejected {
                 status: None,
                 detail: match status.message.filter(|m| !m.is_empty()) {
@@ -587,9 +598,13 @@ fn is_not_found(response: &Response) -> bool {
             == Some(CODE_NOT_FOUND)
 }
 
-fn missing_list() -> Error {
-    Error::Protocol {
-        detail: Detail::constant("the provider's listing answer has no list"),
+/// The provider accepted a write, but what it answered cannot be read: the write may have
+/// happened (design section 3.7).
+fn accepted_unreadable() -> Error {
+    Error::Transient {
+        detail: Detail::constant(
+            "the provider accepted the change, but its operation could not be read",
+        ),
     }
 }
 

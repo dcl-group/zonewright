@@ -30,8 +30,8 @@
 //!   `404` (code 5), a create of a name and type that exists `409` (code 6), a malformed request
 //!   `400` (code 3), and a write to a read-only record `400` (code 9);
 //! - the form of a record's `name`: the mock accepts the name relative to the zone, `@` for the
-//!   zone itself, or absolute with a trailing dot, and returns it relative (or absolute, with
-//!   [`Control::set_name_style`]);
+//!   zone itself, or absolute with a trailing dot, and returns it relative (or absolute with or
+//!   without the trailing dot, with [`Control::set_name_style`]);
 //! - an update replaces the description and the tags with the ones it carries (none when
 //!   absent), the values with the ones it carries (which are required), and the TTL when it
 //!   carries one;
@@ -152,6 +152,8 @@ pub enum NameStyle {
     Relative,
     /// Absolute, with the trailing dot.
     Absolute,
+    /// Absolute, without the trailing dot.
+    AbsoluteNoDot,
 }
 
 #[derive(Debug)]
@@ -688,6 +690,7 @@ async fn zones_list(
 fn name_text(record: &Record, zone: &Zone, style: NameStyle) -> String {
     match style {
         NameStyle::Absolute => record.owner.clone(),
+        NameStyle::AbsoluteNoDot => record.owner.trim_end_matches('.').to_owned(),
         NameStyle::Relative if record.owner == zone.domain => "@".to_owned(),
         NameStyle::Relative => record
             .owner

@@ -2764,7 +2764,13 @@ Behavior that the design fixes because the generic sections cannot:
   is lost; this is part of open point 14. Credentials go in the POST body, never in the query
   string.
 - `cloud_ru`. More than one TXT record for a name is `Error::Protocol`. A record marked read-only is
-  `Error::Rejected`. A missing list in a listing answer is `Error::Protocol`, never an empty result.
+  `Error::Rejected`. A list field absent from a listing page is an empty page (the provider's API
+  description does not mark it required, and Proto3 JSON omits empty repeated fields); a list given
+  as `null` or as a non-array, or a non-string page token, is `Error::Protocol`. A record name
+  without a trailing dot that can be read both as relative to the zone and as a full name inside it
+  is `Error::Protocol` when either reading is the requested name: the form the API uses is not
+  documented, and the client does not guess. Two zones with one name, and a listed record of another
+  zone, are `Error::Protocol`.
 - `hetzner`. Only zones in primary mode are usable; a secondary zone is reported by `check` as not
   found with a detail, and operations on it are `Error::Rejected`. Values are removed using exactly
   the text the API returned.

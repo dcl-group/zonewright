@@ -28,15 +28,25 @@
 //! A record marked read-only is `Error::Rejected` for any write (design section 11.3). Every
 //! write waits for its operation (design section 3.7).
 //!
-//! Owner names. The specification does not describe the form of `name`. The console takes the
+//! Owner names. The specification does not describe the form of `name` (`v1PublicRecordSole.name`
+//! is "Наименование записи публичной зоны", a string, nothing more). The console takes the
 //! subdomain relative to the zone and `@` for the zone itself (the provider's guide to creating
-//! a record). Assumption (not documented): the API uses the same form. The client sends that
-//! form and recognizes a record's owner in it and in the absolute form with a trailing dot; a
-//! form it does not recognize matches no requested name. Being wrong can make a create fail or
-//! create the record at a name the client then does not find; it cannot put a foreign value at
-//! risk, because a whole-set write carries every value of the record it read. Wildcard owner
-//! names are refused (`Error::InvalidInput`) before any request: the service expresses a
-//! wildcard through a flag whose interplay with `name` is not documented.
+//! a record). Assumption (not documented): the API uses the same form, and the client sends it.
+//! A record's owner is recognized in three spellings that cannot be confused: `@` (or nothing)
+//! for the zone, an absolute name with a trailing dot, and a relative name. A name without a
+//! trailing dot that also reads as an absolute name inside the zone (`_acme-challenge.example.org`
+//! in `example.org`) is ambiguous: it is the requested name as an absolute name, or another name
+//! as a relative one. When either reading is the requested name, the read fails with
+//! `Error::Protocol` instead of guessing, so that a published value is never reported absent and
+//! a create is never sent over a record the client could not place. (lego's client for this
+//! provider talks to the retired Cloud DNS API, not to Evolution DNS, and establishes nothing
+//! about this form.) Wildcard owner names are refused (`Error::InvalidInput`) before any
+//! request: the service expresses a wildcard through a flag whose interplay with `name` is not
+//! documented.
+//!
+//! Every listed record must belong to the zone the listing asked for (`publicZoneId`, required
+//! in `v1PublicRecordSole`); a record of another zone, or one without the field, is
+//! `Error::Protocol`: the listing did not honor its filter, and no write may follow it.
 //!
 //! TXT dialect (design sections 4.4 and 11.2): read `Auto`, write `Raw`. Plain values, the only
 //! ones the capabilities accept, are spelled the same in either.
@@ -223,15 +233,26 @@ impl CloudRu {
         let mut found = Vec::new();
         for item in listed {
             let text = |key: &str| item.get(key).and_then(serde_json::Value::as_str);
+            if text("publicZoneId") != Some(id.id.as_str()) {
+                return Err(Error::Protocol {
+                    detail: Detail::constant(
+                        "the provider's record listing holds a record of another zone",
+                    ),
+                });
+            }
             let is_txt = text("type").is_some_and(|t| t.eq_ignore_ascii_case(TXT));
             let wildcard = item
                 .get("wildcard")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let same_name = text("name")
-                .and_then(|n| owner_name(zone, n))
-                .is_some_and(|owner| &owner == name);
-            if is_txt && !wildcard && same_name {
+            if !is_txt || wildcard {
+                continue;
+            }
+            let same_name = match text("name") {
+                Some(owner) => is_owner(zone, name, owner)?,
+                None => false,
+            };
+            if same_name {
                 let record: Record = serde_json::from_value(item).map_err(|_| Error::Protocol {
                     detail: Detail::constant(
                         "the provider's TXT record is not in the expected form",
@@ -259,18 +280,30 @@ impl CloudRu {
     }
 }
 
-/// The owner name of a record from the API's `name`: `@` (or nothing) for the zone itself, an
-/// absolute name with a trailing dot, or a name relative to the zone. `None` when it is none of
-/// these.
-fn owner_name(zone: &DomainName, text: &str) -> Option<DomainName> {
+/// True when the API's `name` of a record in `zone` is `name`: `@` (or nothing) for the zone
+/// itself, an absolute name with a trailing dot, or a name relative to the zone. A name without
+/// a trailing dot that also reads as an absolute name inside the zone is ambiguous; when either
+/// reading is `name`, the answer is `Error::Protocol`.
+fn is_owner(zone: &DomainName, name: &DomainName, text: &str) -> Result<bool, Error> {
     let text = text.trim();
     if text.is_empty() || text == "@" {
-        return Some(zone.clone());
+        return Ok(zone == name);
     }
     if text.ends_with('.') {
-        DomainName::parse(text).ok()
-    } else {
-        DomainName::from_relative(text, zone).ok()
+        return Ok(DomainName::parse(text).is_ok_and(|owner| &owner == name));
+    }
+    let relative = DomainName::from_relative(text, zone).is_ok_and(|owner| &owner == name);
+    let absolute = DomainName::parse(text)
+        .ok()
+        .filter(|owner| owner.is_within(zone));
+    match absolute {
+        Some(owner) if relative || &owner == name => Err(Error::Protocol {
+            detail: Detail::constant(
+                "the provider returned a record name without a trailing dot that reads both as \
+                 a relative and as an absolute name; the record cannot be placed",
+            ),
+        }),
+        _ => Ok(relative),
     }
 }
 
@@ -341,7 +374,8 @@ fn vanished() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{owner_name, owner_text};
+    use super::{is_owner, owner_text};
+    use crate::error::ErrorKind;
     use crate::name::DomainName;
 
     fn dn(s: &str) -> DomainName {
@@ -357,17 +391,33 @@ mod tests {
             "_ACME-challenge",
             "_acme-challenge.example.org.",
         ] {
-            assert_eq!(owner_name(&zone, text), Some(name.clone()), "{text}");
+            assert!(is_owner(&zone, &name, text).unwrap(), "{text}");
+            assert!(!is_owner(&zone, &zone, text).unwrap(), "{text}");
         }
         for text in ["@", "", "example.org."] {
-            assert_eq!(owner_name(&zone, text), Some(zone.clone()), "{text}");
+            assert!(is_owner(&zone, &zone, text).unwrap(), "{text}");
+            assert!(!is_owner(&zone, &name, text).unwrap(), "{text}");
         }
-        // Without the trailing dot a name is relative, even if it ends with the zone's text.
-        assert_eq!(
-            owner_name(&zone, "_acme-challenge.example.org"),
-            Some(dn("_acme-challenge.example.org.example.org"))
-        );
-        assert_eq!(owner_name(&zone, "a..b"), None);
+        assert!(!is_owner(&zone, &name, "a..b").unwrap());
+        // Another name without a trailing dot, whichever way it is read.
+        assert!(!is_owner(&zone, &name, "www.example.org").unwrap());
+        assert!(!is_owner(&zone, &name, "www").unwrap());
+    }
+
+    #[test]
+    fn ambiguous_owner_names_are_protocol() {
+        let zone = dn("example.org");
+        let name = dn("_acme-challenge.example.org");
+        // The requested name as a dotless absolute name.
+        let e = is_owner(&zone, &name, "_acme-challenge.example.org").unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol);
+        // The zone's own name without a dot, for the apex.
+        let e = is_owner(&zone, &zone, "example.org").unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol);
+        // A relative name that also reads as an absolute name inside the zone.
+        let deep = dn("a.example.org.example.org");
+        let e = is_owner(&zone, &deep, "a.example.org").unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol);
     }
 
     #[test]

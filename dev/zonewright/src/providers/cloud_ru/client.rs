@@ -119,16 +119,19 @@ impl CloudRu {
     }
 
     /// Looks the zone up by name in the project's listing: there is no endpoint for one zone by
-    /// name, and the listing's filter is not used (see `Api::zones`).
+    /// name, and the listing's filter is not used (see `Api::zones`). Two zones of the project
+    /// with the name are `Error::Protocol`: the client cannot tell which one holds the records.
     async fn find_zone(&self, zone: &DomainName) -> Result<Lookup, Error> {
         let zones = self.api.zones(&self.config.project_id).await?;
-        let Some(found) = zones
+        let mut named = zones
             .iter()
-            .filter(|z| self.own(z))
-            .find(|z| z.name().as_ref() == Some(zone))
-        else {
+            .filter(|z| self.own(z) && z.name().as_ref() == Some(zone));
+        let Some(found) = named.next() else {
             return Ok(Lookup::Missing);
         };
+        if named.next().is_some() {
+            return Err(several_zones());
+        }
         if found.read_only {
             return Ok(Lookup::ReadOnly);
         }
@@ -164,6 +167,12 @@ impl CloudRu {
     }
 }
 
+fn several_zones() -> Error {
+    Error::Protocol {
+        detail: Detail::constant("the project has more than one public zone with this name"),
+    }
+}
+
 /// What a lookup by name found.
 enum Lookup {
     Found(String),
@@ -189,14 +198,24 @@ impl Provider for CloudRu {
 
     /// Every public zone of the configured project that is not read-only, all pages. The
     /// identifiers are cached.
+    ///
+    /// A name that two zones of the project carry is listed, but its identifier is not cached:
+    /// an operation on it looks it up and fails with `Error::Protocol`.
     async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
         let zones = self.api.zones(&self.config.project_id).await?;
+        let own: Vec<&Zone> = zones.iter().filter(|z| self.own(z)).collect();
         let mut names = BTreeSet::new();
-        for zone in zones.iter().filter(|z| self.own(z) && !z.read_only) {
+        for zone in own.iter().filter(|z| !z.read_only) {
             let (Some(name), Some(Ok(id))) = (zone.name(), zone.id.as_deref().map(path_id)) else {
                 continue;
             };
-            self.zones.insert(&name, id);
+            let carriers = own
+                .iter()
+                .filter(|z| z.name().as_ref() == Some(&name))
+                .count();
+            if carriers == 1 {
+                self.zones.insert(&name, id);
+            }
             names.insert(name);
         }
         Ok(names.into_iter().map(ZoneInfo::new).collect())
