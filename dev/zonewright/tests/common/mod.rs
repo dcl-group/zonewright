@@ -37,6 +37,25 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
             r#"{"base_url":"http://127.0.0.1:9/client/v4"}"#,
             r#"{"api_token":"test-only-token"}"#,
         ),
+        ProviderId::YandexCloud => {
+            // A valid configuration needs an RSA key that parses. No key is stored in the
+            // repository: the mock generates one per test process.
+            static CONFIG: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+            let (settings, credentials) = CONFIG.get_or_init(|| {
+                let seed = zonewright_mock::yandex_cloud::Seed::standard();
+                let key =
+                    seed.authorized_key(&zonewright_mock::yandex_cloud::test_key().private_pem);
+                (
+                    r#"{"folder_id":"b1gtestfolder000001","dns_url":"http://127.0.0.1:9/dns/v1","iam_url":"http://127.0.0.1:9/iam/v1/tokens","operation_url":"http://127.0.0.1:9/operations"}"#.to_owned(),
+                    serde_json::json!({ "authorized_key": key }).to_string(),
+                )
+            });
+            (settings.as_str(), credentials.as_str())
+        }
+        ProviderId::Route53 => (
+            r#"{"access_key_id":"AKIAZWTEST0000000001","base_url":"http://127.0.0.1:9"}"#,
+            r#"{"secret_access_key":"test-only-secret"}"#,
+        ),
         ProviderId::AcmeDns
         | ProviderId::Beget
         | ProviderId::CloudRu
@@ -45,11 +64,9 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
         | ProviderId::Nicru
         | ProviderId::Regru
         | ProviderId::Rfc2136
-        | ProviderId::Route53
         | ProviderId::TimewebCloud
         | ProviderId::VkCloud
-        | ProviderId::Yandex360
-        | ProviderId::YandexCloud => ("{}", "{}"),
+        | ProviderId::Yandex360 => ("{}", "{}"),
         _ => panic!("no sample configuration for {id}"),
     }
 }

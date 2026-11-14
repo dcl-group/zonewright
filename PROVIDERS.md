@@ -23,28 +23,28 @@ None yet.
 
 ## Implemented, not yet verified
 
-| Provider    | ID            | Levels     | Notes                                                                                            |
-| ----------- | ------------- | ---------- | ------------------------------------------------------------------------------------------------ |
-| Selectel v2 | `selectel_v2` | TXT values | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
-| Cloudflare  | `cloudflare`  | TXT values |                                                                                                  |
+| Provider     | ID             | Levels     | Notes                                                                                            |
+| ------------ | -------------- | ---------- | ------------------------------------------------------------------------------------------------ |
+| Selectel v2  | `selectel_v2`  | TXT values | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
+| Cloudflare   | `cloudflare`   | TXT values |                                                                                                  |
+| Yandex Cloud | `yandex_cloud` | TXT values | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
+| Route 53     | `route53`      | TXT values |                                                                                                  |
 
 ## Planned
 
-| Provider      | ID              | Notes                                                                                            |
-| ------------- | --------------- | ------------------------------------------------------------------------------------------------ |
-| acme-dns      | `acme_dns`      | TXT values only: the acme-dns API offers nothing else.                                           |
-| Beget         | `beget`         |                                                                                                  |
-| Cloud.ru      | `cloud_ru`      |                                                                                                  |
-| DigitalOcean  | `digitalocean`  |                                                                                                  |
-| Hetzner       | `hetzner`       |                                                                                                  |
-| nic.ru        | `nicru`         |                                                                                                  |
-| reg.ru        | `regru`         | An earlier version of this client was proven against the live API.                               |
-| RFC 2136      | `rfc2136`       | Dynamic update has no operation that lists the records of a zone.                                |
-| Route 53      | `route53`       |                                                                                                  |
-| Timeweb Cloud | `timeweb_cloud` |                                                                                                  |
-| VK Cloud      | `vk_cloud`      |                                                                                                  |
-| Yandex 360    | `yandex_360`    |                                                                                                  |
-| Yandex Cloud  | `yandex_cloud`  | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
+| Provider      | ID              | Notes                                                              |
+| ------------- | --------------- | ------------------------------------------------------------------ |
+| acme-dns      | `acme_dns`      | TXT values only: the acme-dns API offers nothing else.             |
+| Beget         | `beget`         |                                                                    |
+| Cloud.ru      | `cloud_ru`      |                                                                    |
+| DigitalOcean  | `digitalocean`  |                                                                    |
+| Hetzner       | `hetzner`       |                                                                    |
+| nic.ru        | `nicru`         |                                                                    |
+| reg.ru        | `regru`         | An earlier version of this client was proven against the live API. |
+| RFC 2136      | `rfc2136`       | Dynamic update has no operation that lists the records of a zone.  |
+| Timeweb Cloud | `timeweb_cloud` |                                                                    |
+| VK Cloud      | `vk_cloud`      |                                                                    |
+| Yandex 360    | `yandex_360`    |                                                                    |
 
 "An earlier version was proven" does not make the client verified here: it is verified again once it
 is implemented in this crate.

@@ -18,3 +18,7 @@ All notable changes to this crate are recorded in this file. The format follows
   process-wide crypto provider.
 - Selectel v2 client (`selectel_v2`): connection check, zone listing, TXT value operations.
 - Cloudflare client (`cloudflare`): connection check, zone listing, TXT value operations.
+- Yandex Cloud client (`yandex_cloud`): connection check, zone listing, TXT value operations with
+  conditional writes.
+- Route 53 client (`route53`): connection check, zone listing, TXT value operations with conditional
+  change batches.

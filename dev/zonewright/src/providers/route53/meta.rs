@@ -4,9 +4,9 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements. Until the client is ported,
-//! every operation flag is false, `record_types` is empty and `txt_values` is `NotOffered`; the
-//! provider's developer switches them on together with the client code that implements them.
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and
+//! the TXT value operations on plain values. The record-level operations are not written yet, so
+//! their flags are false and `record_types` is empty.
 
 use std::time::Duration;
 
@@ -105,17 +105,21 @@ const FIELDS: &[ConfigField] = &[
 
 /// What this version of the crate implements for Route 53.
 const CAPABILITIES: Capabilities = Capabilities {
-    list_zones: false,
+    list_zones: true,
     list_rrsets: false,
     get_rrset: false,
     set_rrset: false,
     delete_rrset: false,
-    add_txt_value: false,
-    remove_txt_value: false,
+    add_txt_value: true,
+    remove_txt_value: true,
     record_types: TypeSet::Listed(&[]),
     read_only_types: &[],
+    // Values outside printable ASCII are written by the API as octal escapes, unlike zone-file
+    // text; until that is mapped, only plain values are accepted (design section 4.4).
     txt_plain_only: true,
-    txt_values: ValueGuarantee::NotOffered,
+    // Every write repeats the old set as a DELETE in the same atomic change batch (design
+    // section 3.5).
+    txt_values: ValueGuarantee::Conditional,
     preconditions: Preconditions::Atomic,
     atomic_rrset_write: false,
     ttl: TtlSupport::PerRrset {
