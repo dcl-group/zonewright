@@ -88,7 +88,18 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
             r#"{"project_id":"0f1e2d3c-0000-4000-8000-000000000001","key_id":"zw-test-key-id","dns_url":"http://127.0.0.1:9","iam_url":"http://127.0.0.1:9/api/v1/auth/token"}"#,
             r#"{"secret":"test-only-secret"}"#,
         ),
-        ProviderId::AcmeDns | ProviderId::Beget | ProviderId::Nicru => ("{}", "{}"),
+        ProviderId::AcmeDns => (
+            r#"{"server_url":"http://127.0.0.1:9"}"#,
+            r#"{"registrations":"{\"username\":\"c36f50e8-4632-4000-8000-000000000001\",\"password\":\"htB9mR9DYgcu9bX_afHF62erXaH2TS7bg9KWtest\",\"subdomain\":\"8e5700ea-a4bf-4000-8000-000000000001\",\"fulldomain\":\"8e5700ea-a4bf-4000-8000-000000000001.auth.example.org\"}"}"#,
+        ),
+        ProviderId::Beget => (
+            r#"{"login":"zw-test-login","base_url":"http://127.0.0.1:9/api"}"#,
+            r#"{"password":"test-only-password"}"#,
+        ),
+        ProviderId::Nicru => (
+            r#"{"username":"123/NIC-REG","base_url":"http://127.0.0.1:9/dns-master","token_url":"http://127.0.0.1:9/oauth/token"}"#,
+            r#"{"password":"test-only-password","client_id":"test-only-client-id","client_secret":"test-only-secret"}"#,
+        ),
         _ => panic!("no sample configuration for {id}"),
     }
 }

@@ -31,3 +31,5 @@ All notable changes to this crate are recorded in this file. The format follows
 - Cloud.ru client (`cloud_ru`): connection check, zone listing, TXT value operations.
 - Hetzner client (`hetzner`): connection check, zone listing, TXT value operations through
   value-level rrset actions.
+- nic.ru client (`nicru`): connection check, zone listing, TXT value operations with a zone-wide
+  commit.

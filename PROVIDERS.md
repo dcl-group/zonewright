@@ -36,6 +36,7 @@ None yet.
 | Timeweb Cloud | `timeweb_cloud` | TXT values |                                                                                                  |
 | Cloud.ru      | `cloud_ru`      | TXT values |                                                                                                  |
 | Hetzner       | `hetzner`       | TXT values |                                                                                                  |
+| nic.ru        | `nicru`         | TXT values |                                                                                                  |
 
 ## Planned
 
@@ -43,7 +44,6 @@ None yet.
 | -------- | ---------- | ------------------------------------------------------------------ |
 | acme-dns | `acme_dns` | TXT values only: the acme-dns API offers nothing else.             |
 | Beget    | `beget`    |                                                                    |
-| nic.ru   | `nicru`    |                                                                    |
 | reg.ru   | `regru`    | An earlier version of this client was proven against the live API. |
 
 "An earlier version was proven" does not make the client verified here: it is verified again once it
