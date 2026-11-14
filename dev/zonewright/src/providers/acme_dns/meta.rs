@@ -4,9 +4,9 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements. Until the client is ported,
-//! every operation flag is false, `record_types` is empty and `txt_values` is `NotOffered`; the
-//! provider's developer switches them on together with the client code that implements them.
+//! Capabilities describe what this version of the crate implements: `check` and `add_txt_value`.
+//! The API has one operation, an update that stores a value in one of two rotating slots of a
+//! registration, so there is no removal, no zone listing and no record-level operation.
 
 use std::time::Duration;
 
@@ -52,19 +52,25 @@ const FIELDS: &[ConfigField] = &[
 
 /// What this version of the crate implements for acme-dns.
 const CAPABILITIES: Capabilities = Capabilities {
+    // The API has no read.
     list_zones: false,
     list_rrsets: false,
     get_rrset: false,
     set_rrset: false,
     delete_rrset: false,
-    add_txt_value: false,
+    add_txt_value: true,
+    // The API has no delete: the server keeps the two most recent values (design section 11.3).
     remove_txt_value: false,
     record_types: TypeSet::Listed(&[]),
     read_only_types: &[],
+    // The server accepts exactly 43 characters of the base64url alphabet, which are plain.
     txt_plain_only: true,
-    txt_values: ValueGuarantee::NotOffered,
+    // The server keeps two values per registration and drops the oldest.
+    txt_values: ValueGuarantee::Rotating,
+    // No meaning: there is no read and no record-level write (design section 11.1).
     preconditions: Preconditions::ReadThenWrite,
     atomic_rrset_write: false,
+    // The server serves every value with a TTL of its own choosing.
     ttl: TtlSupport::NotSettable,
     provider_default_ttl: true,
     asynchronous: false,

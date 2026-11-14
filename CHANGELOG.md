@@ -34,3 +34,5 @@ All notable changes to this crate are recorded in this file. The format follows
 - nic.ru client (`nicru`): connection check, zone listing, TXT value operations with a zone-wide
   commit.
 - reg.ru client (`regru`): connection check, TXT value operations; optional TLS client certificate.
+- acme-dns client (`acme_dns`): adds TXT values through registrations; the API has no read and no
+  removal.
