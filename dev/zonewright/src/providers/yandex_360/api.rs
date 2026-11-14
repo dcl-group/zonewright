@@ -491,6 +491,18 @@ fn page_query(url: UrlBuilder, page: u32, per_page: u32) -> UrlBuilder {
 /// delete it. So the client never guesses: a name that only one reading allows decides the form
 /// for the whole listing, and a name that both readings allow, in a listing that decides nothing,
 /// is refused or skipped.
+///
+/// Only the relative form can be proven. The full form cannot: every set of dotless names that
+/// a listing in the full form can state (each the zone or a name ending in `.` and the zone, no
+/// `@`), a listing in the relative form can state as well, since the documented create form
+/// writes `name: "www.example.org"` as a record at `www.example.org.example.org`. The one
+/// exception, a name whose relative reading is longer than a domain name can be, is placed at
+/// its full reading by `read_owner` already.
+// Source: List, record field `name`: "Полное доменное имя. Например `example.com`. Для
+// кириллических доменов (например `домен.рф`) используйте кодировку Punycode." ("full domain
+// name", the description of the `domain` path parameter word for word, with the example
+// `example`), page re-read on 2026-11-15; Create, request field `name`: "Имя записи." ("record
+// name", example `example`).
 // Assumption (not documented): one listing states every name in one form. Being wrong makes a
 // record at a lookalike name read as relative in a listing that also holds a relative name,
 // which is the documented create form; it never makes a name that only the full reading allows

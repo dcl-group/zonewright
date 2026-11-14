@@ -25,9 +25,9 @@ use crate::{rrsets, values};
 
 use super::api::{self, Api, Zone};
 use super::config::{self, NicruConfig, NicruCredentials};
-use super::records::RecordOp;
+use super::records::{RecordOp, STAGED_READ};
 use super::txt::{FOREIGN_CHANGES, Op};
-use super::{Pending, State};
+use super::{Mark, Pending, State};
 
 /// How many times a commit is tried before the operation gives up (design section 11.3). A
 /// rollback is tried as often.
@@ -47,6 +47,11 @@ const ZONE_SECONDARY: &str =
 /// Why a zone listed under several DNS-master services cannot be used.
 const ZONE_AMBIGUOUS: &str = "the zone is listed under more than one DNS-master service";
 
+/// Why a zone is refused whose staged changes may be this process's but cannot be shown to be.
+pub(super) const UNCONFIRMED_CHANGES: &str = "the zone has staged changes that this client \
+     cannot show to be its own: an earlier edit, commit or rollback of this process ended without \
+     a known outcome; nothing is read or changed until they are committed or rolled back by hand";
+
 /// A warning about a usable zone with staged changes of this process.
 const OWN_CHANGES: &str = "the zone has staged changes of this process that are not committed \
      yet; the next operation in the zone commits them or, if they belong to a record-level \
@@ -63,11 +68,15 @@ const OWN_CHANGES: &str = "the zone has staged changes of this process that are 
 /// Changes are staged until a commit, and a commit publishes every staged change of the zone,
 /// including changes staged by anyone else. The client therefore refuses a zone that has staged
 /// changes it did not make (`Error::Rejected`), holds a lock per zone in the [`Context`] for
-/// the whole read, edit and commit, and remembers in the context which zones hold its own
-/// staged changes, so that an operation interrupted before its commit is finished by the next
-/// one. That memory lives in the process: after a restart, a zone left with this process's
-/// staged changes has to be committed or rolled back by hand, in the provider's control panel
-/// or with its API.
+/// the whole read, edit and commit, and remembers in the context which zones may hold its own
+/// staged changes. When a commit or a rollback fails and a listing made right after it still
+/// shows staged changes, the next operation in the zone commits or rolls them back. When the
+/// outcome of an edit, a commit or a rollback stays unknown (the operation was dropped while the
+/// request was in flight, or the listing that should settle it failed too), the client cannot
+/// tell its staged changes from someone else's and refuses the zone while it has staged
+/// changes. Such a zone, and a zone left with this process's staged changes when the process
+/// ends, has to be committed or rolled back by hand, in the provider's control panel or with its
+/// API.
 ///
 /// The record-level operations stage every edit of one operation (records to create, the
 /// deletions of records to remove) and publish them with one commit, so the published rrset
@@ -141,9 +150,8 @@ impl Nicru {
         self.ctx.nicru()
     }
 
-    /// What this process has marked `zone` for: `None` when it holds no staged changes of
-    /// this process.
-    pub(super) fn pending(&self, zone: &DomainName) -> Option<Pending> {
+    /// The mark of `zone`: `None` when this process holds no staged changes there.
+    pub(super) fn mark_of(&self, zone: &DomainName) -> Option<Mark> {
         self.state()
             .staged
             .lock()
@@ -152,24 +160,41 @@ impl Nicru {
             .copied()
     }
 
-    /// True when this process has marked `zone` as holding its staged changes.
-    pub(super) fn is_marked(&self, zone: &DomainName) -> bool {
-        self.pending(zone).is_some()
-    }
-
-    /// Marks `zone` as holding staged changes of this process that make up a complete change,
-    /// to be committed by the next operation if this one does not.
+    /// Marks `zone` as possibly holding staged changes of this process that make up a complete
+    /// change, to be committed. Set before an edit is sent; unconfirmed.
     pub(super) fn mark(&self, zone: &DomainName) {
         self.mark_for(zone, Pending::Commit);
     }
 
-    /// Marks `zone` as holding staged changes of this process, to be treated as `pending`.
+    /// Marks `zone` as possibly holding staged changes of this process, to be treated as
+    /// `pending`. Set before every request that can change the zone's staged state, so the mark
+    /// is unconfirmed (see [`Mark`]).
     pub(super) fn mark_for(&self, zone: &DomainName, pending: Pending) {
         self.state()
             .staged
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(zone.clone(), pending);
+            .insert(
+                zone.clone(),
+                Mark {
+                    pending,
+                    confirmed: false,
+                },
+            );
+    }
+
+    /// Confirms the mark of `zone`: called only after a listing, made under the zone lock after
+    /// the last request that could change the staged state, showed staged changes.
+    fn confirm(&self, zone: &DomainName) {
+        if let Some(mark) = self
+            .state()
+            .staged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(zone)
+        {
+            mark.confirmed = true;
+        }
     }
 
     /// Clears the mark of `zone`.
@@ -181,34 +206,71 @@ impl Nicru {
             .remove(zone);
     }
 
-    /// Before an operation edits `zone`, under the zone lock: a zone without staged changes has
-    /// its mark cleared (nothing of ours can be pending there, and a stale mark must not later
-    /// make a foreign edit look like ours); staged changes this process did not make are
-    /// `Error::Rejected`; staged changes of this process left by an earlier operation are
-    /// committed or rolled back, as their mark says (design section 11.3, points b and c).
+    /// Before an operation reads or edits `zone`, under the zone lock, with `target` as the zone
+    /// lookup of this operation found it (design section 11.3, points b and c):
+    ///
+    /// - a zone without staged changes has its mark cleared: nothing of ours can be pending
+    ///   there, and a stale mark must not later make a foreign edit look like ours;
+    /// - staged changes without a mark are not this process's: `Error::Rejected`;
+    /// - staged changes with an unconfirmed mark cannot be shown to be this process's (an
+    ///   earlier edit, commit or rollback ended without a known outcome, and the listing that
+    ///   should have settled it failed): `Error::Rejected`, and the mark stays until a lookup
+    ///   finds the zone clean;
+    /// - staged changes with a confirmed mark are committed or rolled back, as the mark says.
+    ///
+    /// With `reading` set (`get_rrset`, `list_rrsets`), staged changes without a mark are
+    /// refused with the read's own message. An unconfirmed mark is never acted on, by a read or
+    /// a write.
     pub(super) async fn settle_leftovers(
         &self,
         zone: &DomainName,
         target: &Zone,
+        reading: bool,
     ) -> Result<(), Error> {
         if !target.has_changes {
             self.unmark(zone);
             return Ok(());
         }
-        match self.pending(zone) {
+        match self.mark_of(zone) {
+            None if reading => Err(rejected(STAGED_READ)),
             None => Err(rejected(FOREIGN_CHANGES)),
-            Some(Pending::Commit) => self.commit_own(zone, &target.service).await,
-            Some(Pending::Rollback) => self.rollback_own(zone, &target.service).await,
+            Some(mark) if !mark.confirmed => Err(rejected(UNCONFIRMED_CHANGES)),
+            Some(Mark {
+                pending: Pending::Commit,
+                ..
+            }) => self.commit_own(zone, &target.service).await,
+            Some(Mark {
+                pending: Pending::Rollback,
+                ..
+            }) => self.rollback_own(zone, &target.service).await,
+        }
+    }
+
+    /// After the last attempt of a commit or a rollback failed, still under the zone lock: the
+    /// zone is listed once more, since an attempt may have been applied with its answer lost.
+    /// Without staged changes the mark is cleared (nothing of ours is pending, and a foreign
+    /// edit staged later must not be taken for ours); with staged changes the mark is
+    /// confirmed; when the listing fails the mark stays unconfirmed, and later operations refuse
+    /// the zone while it has staged changes.
+    async fn relist_after_failure(&self, zone: &DomainName) {
+        if let Ok(zones) = self.api.zones().await
+            && let Lookup::Found(found) = lookup(zones, zone)
+        {
+            if found.has_changes {
+                self.confirm(zone);
+            } else {
+                self.unmark(zone);
+            }
         }
     }
 
     /// Commits `zone`, up to [`COMMIT_ATTEMPTS`] times, and clears its mark after a successful
-    /// commit. When every attempt fails, the result is `Error::Transient`, and the zone is
-    /// listed once more: an attempt may have been applied with its answer lost, so a zone
-    /// without staged changes has its mark cleared (nothing of ours is pending, and a foreign
-    /// edit staged later must not be committed as ours). With staged changes, or when the
-    /// listing fails, the mark stays and the next operation in the zone commits them.
+    /// commit. The mark is set to an unconfirmed `Commit` first. When every attempt fails, the
+    /// result is `Error::Transient`, and the zone is listed once more
+    /// ([`Nicru::relist_after_failure`]): a confirmed mark makes the next operation commit the
+    /// staged changes.
     pub(super) async fn commit_own(&self, zone: &DomainName, service: &str) -> Result<(), Error> {
+        self.mark_for(zone, Pending::Commit);
         let mut last = None;
         for attempt in 0..COMMIT_ATTEMPTS {
             if attempt > 0 {
@@ -222,26 +284,25 @@ impl Nicru {
                 Err(e) => last = Some(e),
             }
         }
-        if let Ok(zones) = self.api.zones().await
-            && let Lookup::Found(found) = lookup(zones, zone)
-            && !found.has_changes
-        {
-            self.unmark(zone);
-        }
+        self.relist_after_failure(zone).await;
         let cause = last.map(|e| e.to_string()).unwrap_or_default();
         Err(Error::Transient {
             detail: self.api.detail(&format!(
                 "the staged changes are not committed after three attempts; the next operation \
-                 in the zone commits them ({cause})"
+                 in the zone commits them if the zone still shows staged changes of this process \
+                 ({cause})"
             )),
         })
     }
 
     /// Rolls `zone` back, up to [`COMMIT_ATTEMPTS`] times, and clears its mark after a
-    /// successful rollback. When every attempt fails, the zone is marked for a rollback and the
-    /// result is `Error::Transient`: the next operation in the zone rolls the staged changes
-    /// back before it does anything else.
+    /// successful rollback. The mark is set to an unconfirmed `Rollback` first. When every
+    /// attempt fails, the result is `Error::Transient`, and the zone is listed once more
+    /// ([`Nicru::relist_after_failure`]): a rollback applied with its answer lost leaves a clean
+    /// zone, which loses its mark; a confirmed mark makes the next operation roll the staged
+    /// changes back before it does anything else.
     pub(super) async fn rollback_own(&self, zone: &DomainName, service: &str) -> Result<(), Error> {
+        self.mark_for(zone, Pending::Rollback);
         let mut last = None;
         for attempt in 0..COMMIT_ATTEMPTS {
             if attempt > 0 {
@@ -255,12 +316,13 @@ impl Nicru {
                 Err(e) => last = Some(e),
             }
         }
-        self.mark_for(zone, Pending::Rollback);
+        self.relist_after_failure(zone).await;
         let cause = last.map(|e| e.to_string()).unwrap_or_default();
         Err(Error::Transient {
             detail: self.api.detail(&format!(
                 "the staged changes of an unfinished operation are not rolled back after three \
-                 attempts; the next operation in the zone rolls them back ({cause})"
+                 attempts; the next operation in the zone rolls them back if the zone still \
+                 shows staged changes of this process ({cause})"
             )),
         })
     }
@@ -273,8 +335,8 @@ impl Nicru {
     /// had none but ours, which it settled first, and every edit of this process in the zone
     /// happens under the zone lock; a writer outside the process that stages an edit between
     /// this operation's read and the rollback loses that edit, the same window as the one
-    /// before a commit. If the zone cannot be listed again the mark stays, and the next
-    /// operation rolls back.
+    /// before a commit. If the zone cannot be listed again the mark stays unconfirmed, and
+    /// later operations refuse the zone while it has staged changes.
     pub(super) async fn discard_own(&self, zone: &DomainName, service: &str) -> Result<(), Error> {
         let zones = self.api.zones().await?;
         let Lookup::Found(found) = lookup(zones, zone) else {
@@ -288,8 +350,8 @@ impl Nicru {
     }
 
     /// After an edit failed, still under the zone lock: makes sure the mark of `zone` stays only
-    /// while the zone holds staged changes of this process (design section 11.3, points b and
-    /// c). Returns `Ok(true)` when the edit turned out to be staged and is now committed.
+    /// while the zone may hold staged changes of this process (design section 11.3, points b
+    /// and c). Returns `Ok(true)` when the edit turned out to be staged and is now committed.
     ///
     /// - An edit that was certainly not applied stages nothing: the mark is cleared at once,
     ///   without looking at the zone, so that a foreign edit staged meanwhile is not committed.
@@ -301,8 +363,8 @@ impl Nicru {
     ///   before the next one. A writer outside the process that stages an edit between this
     ///   operation's read and this commit is not detected; that window is the same as the one
     ///   between a successful edit and its commit, which no API call can close.
-    /// - If the zone cannot be listed again, the mark stays: the next operation then commits a
-    ///   staged edit of ours, or clears the mark on a clean zone.
+    /// - If the zone cannot be listed again, the mark stays unconfirmed: later operations clear
+    ///   it on a clean zone and refuse a zone with staged changes.
     pub(super) async fn settle_failed_edit(
         &self,
         zone: &DomainName,
@@ -341,10 +403,10 @@ impl Nicru {
     fn check_zone(&self, zones: &[Zone], zone: &DomainName) -> ZoneCheck {
         match lookup(zones.to_vec(), zone) {
             Lookup::Found(found) if found.has_changes => {
-                let detail = if self.is_marked(zone) {
-                    OWN_CHANGES
-                } else {
-                    FOREIGN_CHANGES
+                let detail = match self.mark_of(zone) {
+                    Some(mark) if mark.confirmed => OWN_CHANGES,
+                    Some(_) => UNCONFIRMED_CHANGES,
+                    None => FOREIGN_CHANGES,
                 };
                 ZoneCheck::new(zone.clone(), true, Some(Detail::constant(detail)))
             }

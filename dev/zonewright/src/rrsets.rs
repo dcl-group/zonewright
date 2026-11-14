@@ -1650,6 +1650,9 @@ mod tests {
         coexistence: bool,
         /// The plan hooks refuse any plan that creates a value.
         refuse_creates: bool,
+        /// The per-record plan hook refuses any plan that deletes a record, and logs the number
+        /// of deletes of every plan it is shown.
+        refuse_deletes: bool,
     }
 
     impl Store {
@@ -2046,6 +2049,16 @@ mod tests {
             let creates = steps.iter().any(|s| matches!(s, Step::Create { .. }));
             if store.refuse_creates && creates {
                 return Err(store.refusal());
+            }
+            let deletes = steps
+                .iter()
+                .filter(|s| matches!(s, Step::Delete(_)))
+                .count();
+            if store.refuse_deletes {
+                store.log.push(format!("plan with {deletes} deletes"));
+                if deletes > 0 {
+                    return Err(store.refusal());
+                }
             }
             Ok(())
         }
@@ -3388,6 +3401,38 @@ mod tests {
                 shape.label()
             );
         }
+    }
+
+    /// A per-record delete hands its plan, every enabled record, to the client before the first
+    /// delete: a refusal leaves every record in place.
+    #[tokio::test]
+    async fn per_record_delete_plan_is_checked_before_any_write() {
+        let fake = per_record(true);
+        store(&fake.0).insert(RecordType::A, "192.0.2.1", true, 600);
+        store(&fake.0).insert(RecordType::A, "192.0.2.2", true, 600);
+        store(&fake.0).insert(RecordType::A, "192.0.2.3", false, 600);
+        store(&fake.0).refuse_deletes = true;
+        let e = super::delete_per_record(&fake, &zone(), &name(), RecordType::A, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected);
+        assert_eq!(
+            store(&fake.0).writes_logged(),
+            ["plan with 2 deletes", "plan-refused"]
+        );
+        assert_eq!(store(&fake.0).texts(RecordType::A).len(), 3);
+        // Accepted, the plan is carried out: the enabled records go, the disabled one stays.
+        store(&fake.0).refuse_deletes = false;
+        assert_eq!(
+            super::delete_per_record(&fake, &zone(), &name(), RecordType::A, Expect::Any)
+                .await
+                .unwrap(),
+            DeleteOutcome::Deleted
+        );
+        assert_eq!(
+            store(&fake.0).texts(RecordType::A),
+            [("192.0.2.3".to_owned(), false, 600)]
+        );
     }
 
     /// The whole plan reaches the client before the first write: a refusal leaves everything

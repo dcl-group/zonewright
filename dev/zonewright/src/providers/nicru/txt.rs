@@ -11,13 +11,17 @@
 //!   commit, taken after the per-name lock (design section 3.3);
 //! - (b) a zone that has staged changes this process did not make is refused with
 //!   `Error::Rejected`, and nothing is committed;
-//! - (c) the zone is marked "has our staged changes" in the context before an edit is sent, and
-//!   the mark is cleared after a successful commit; a zone with staged changes and the mark is
-//!   committed before the operation goes on, which finishes an earlier operation that failed or
-//!   was dropped between its edit and its commit (or rolled back, when the mark was left by a
-//!   record-level operation that did not finish, see `records.rs`). A zone found without staged changes has its
-//!   mark cleared too: nothing of ours can be pending there, and a stale mark must not later
-//!   make a foreign edit look like ours;
+//! - (c) the zone is marked "may have our staged changes" in the context before an edit is
+//!   sent, and the mark is cleared after a successful commit. The mark is confirmed only when a
+//!   commit (or a rollback) failed and a listing made right after it still showed staged
+//!   changes (see `Mark`); a zone with staged changes and a confirmed mark is committed before
+//!   the operation goes on, which finishes an earlier operation whose commit failed (or rolled
+//!   back, when the mark was left by a record-level operation that did not finish, see
+//!   `records.rs`). A zone with staged changes and an unconfirmed mark (an operation dropped
+//!   while a request was in flight, or one whose settling listing failed) is refused like one
+//!   with foreign changes: whether the staged changes are ours is unknown. A zone found without
+//!   staged changes has its mark cleared, confirmed or not: nothing of ours can be pending
+//!   there, and a stale mark must not later make a foreign edit look like ours;
 //! - (d) the commit is tried up to three times; if all fail, `Error::Transient`.
 //!
 //! The value layer takes the per-name lock and then calls [`PerRecord::read`] and the writes of
@@ -144,7 +148,7 @@ impl PerRecord for Op<'_> {
         // Refuses foreign staged changes, and finishes (commits) or discards (rolls back) our
         // own from an earlier operation that failed or was dropped before its end (design
         // section 11.3, points b and c).
-        self.client.settle_leftovers(zone, &target).await?;
+        self.client.settle_leftovers(zone, &target, false).await?;
         *self.service.lock().unwrap_or_else(PoisonError::into_inner) = Some(target.service.clone());
         let records = self
             .client

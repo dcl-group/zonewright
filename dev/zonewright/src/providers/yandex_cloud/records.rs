@@ -29,37 +29,46 @@
 //!
 //! The API reference describes `data` only as "Data of the record set", 1 to 100 elements of 1 to
 //! 1024 characters (`RecordSet`, [listRecordSets]). The text form of each type is given by the
-//! Cloud DNS page on resource records ([record types], read 2026-11-14), which says that the
-//! service uses the master file format (a `;` outside double quotes starts a comment) and gives
-//! a description and examples for each type:
+//! Cloud DNS page on resource records ([record types], read 2026-11-15), which gives a
+//! description and examples for each type:
 //!
 //! | Type        | Form and examples on the record types page                                       |
 //! | ----------- | -------------------------------------------------------------------------------- |
 //! | A           | an IPv4 address: `192.0.2.1`                                                     |
 //! | AAAA        | an IPv6 address: `2001:db8::1`                                                   |
-//! | CNAME       | an FQDN with the trailing dot: `host.example.com.`                               |
+//! | CNAME       | "Alias for an FQDN": `host.example.com.`                                         |
 //! | ANAME       | like CNAME, may coexist with other types: `example.com.website.yandexcloud.net`  |
-//! | MX          | preference and exchange: `10 mx-primary.example.com.`                            |
+//! | MX          | preference and the exchange's FQDN: `10 mx-primary.example.com.`                 |
 //! | NS          | a name server: `ns1.example.com.`                                                |
 //! | PTR         | a name: `host1.example.com.`                                                     |
-//! | SRV         | priority, weight, port, target: `10 70 8080 host.example.com.`                   |
+//! | SRV         | priority, weight, port, target (an FQDN): `10 70 8080 host.example.com.`         |
 //! | CAA         | flag, tag, value in double quotes: `0 issue "ca.example.net"`                    |
 //! | SVCB, HTTPS | priority, target, parameters: `1 . alpn=h3,h3-29,h2 ipv4hint=10.0.0.1`           |
 //! | TXT         | text; spaces separate strings, so a value with spaces is quoted: `"v=spf1 … -all"` |
 //! | SOA         | created automatically: `ns1.yandexcloud.net. mx.cloud.yandex.net. 1 10800 …`      |
 //!
 //! These are the presentation formats of the types (RFC 1035 section 5), which is what the
-//! canonical text of design section 4.3 is. The page states the format of the whole: "The
-//! service uses MASTER FILES format." In that format (RFC 1035 section 5.1) a domain name
-//! without the trailing dot is relative to the origin, here the zone, and spaces separate
-//! character-strings. A value is therefore read with `RecordData::from_provider` with the zone as
-//! the origin (`www` inside a CNAME is `www.<zone>.`, never the absolute `www.`), and TXT with the
-//! `Auto` rule except that unquoted text with whitespace is read as presentation format, several
-//! strings (the page: "The space character serves as a separator. If an input string has spaces,
-//! it will be perceived as multiple strings."). Unquoted text without whitespace, which is what
-//! the TXT value operations write, reads back as itself. A value is written as its canonical
-//! text, names absolute with the trailing dot, with these limits, each checked by
-//! [`write_content`]:
+//! canonical text of design section 4.3 is.
+//!
+//! Names inside values. The page's examples for CNAME, MX, NS, PTR, SRV, SVCB, HTTPS and SOA
+//! spell names absolute with the trailing dot; the fields are described as an "FQDN". The page
+//! never says what a name without the trailing dot inside a value means, and never mentions `@`.
+//! Its ANAME section shows dotless names that are plainly absolute (`example.com.website.
+//! yandexcloud.net`, and `10 mx.example.com` for the zone `example.com.`); the sentence "The
+//! service uses MASTER FILES format", in which a dotless name would be relative to the zone,
+//! stands in the TXT section and speaks of `;`, quotes and spaces in TXT. So a value whose name
+//! lacks the trailing dot (one that reads differently relative to the zone than absolute), and
+//! `@`, are non-canonical data (design section 4.9): never read as relative, never read as
+//! absolute, never equal to a canonical value, so a `set_rrset` that asks for a canonical value
+//! replaces them rather than answering `Unchanged`, and a listing shows the provider's text.
+//!
+//! TXT is read by `txt::read_txt`, the rule the TXT value operations read by too: the TXT
+//! section's master-file statement ("The space character serves as a separator. If an input
+//! string has spaces, it will be perceived as multiple strings."), unquoted text with spaces
+//! being several strings. Data that rule leaves undecided are non-canonical.
+//!
+//! A value is written as its canonical text, names absolute with the trailing dot as in the
+//! page's examples, with these limits, each checked by [`write_content`]:
 //!
 //! - Escapes. No source says how the API treats a backslash escape. A value whose canonical text
 //!   needs one (a TXT or CAA value with `"`, `\` or a byte outside printable ASCII; a name with
@@ -77,16 +86,14 @@
 //!   digits, `-`, `.`, `_` and `/` only; other identifiers would need the quoted or escaped form,
 //!   which the page does not show. `ech` (the page names an older `echconfig`) and numbered keys
 //!   are not sent.
-//! - ANAME. The page's example (`example.com.website.yandexcloud.net`) has no trailing dot, which
-//!   in the master file format the page names would be relative to the zone; the client writes
-//!   the canonical name with the dot, the absolute form the page uses for CNAME, which ANAME
-//!   "works like", and reads a dotless name as relative, by the stated format.
+//! - ANAME. The page's example (`example.com.website.yandexcloud.net`) has no trailing dot; the
+//!   client writes the canonical name with the dot, the absolute form the page uses for CNAME,
+//!   to which ANAME "is similar", and reads a dotless name as non-canonical data, as above.
 //! - SOA is read only (design section 3.4); TLSA is not accepted by the API (it is not on the
 //!   page) and is not in `record_types`. A type the API lists that is outside `record_types` is
 //!   still listed, canonical where its text parses.
 //!
-//! Data elements the API returns are read by the same format. A value read this way that the
-//! caller asks for again is `Unchanged`, and the provider's text is left as it is; a write keeps
+//! A canonical value read from the API that the caller asks for again is `Unchanged`, and the provider's text is left as it is; a write keeps
 //! every element it does not change verbatim as it was read, and the strict condition protects the
 //! set.
 //!
@@ -107,41 +114,13 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
 use crate::provider::ZoneListing;
-use crate::record::{Caa, RecordData, RecordType, RrsetTtl, SvcParam, Svcb, Txt, TxtDialect};
+use crate::record::{Caa, RecordData, RecordType, RrsetTtl, SvcParam, Svcb, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{self, Current, Found, Listing, Member, RrsetBase, SetTtl, Stored, WholeSet};
 
 use super::client::YandexCloud;
 use super::rrset::{RecordSet, data_of, relative, ttl_of};
-use super::txt::MAX_DATA;
-
-/// How TXT data is read at record level: quoted text as presentation format, other text as the
-/// value (design section 11.2), except unquoted text with whitespace (see [`unquoted_strings`]).
-const TXT_READ: TxtDialect = TxtDialect::Auto;
-
-/// Unquoted TXT text with whitespace: several character-strings separated by the whitespace,
-/// whose value is their concatenation (the canonical TXT value joins its strings, design section
-/// 4.3). `None` for text this rule does not cover: quoted text, text without whitespace, and
-/// text with a character the master file format gives a meaning (`"`, `\`, `;`, `(`, `)`),
-/// which then stays non-canonical.
-// Source: https://yandex.cloud/en/docs/dns/concepts/resource-record, TXT ("The service uses
-// MASTER FILES format", "The space character serves as a separator. If an input string has
-// spaces, it will be perceived as multiple strings."), read 2026-11-14.
-fn unquoted_strings(content: &str) -> Option<RecordData> {
-    let text = content.trim();
-    if text.starts_with('"') || !text.contains(|c: char| c.is_ascii_whitespace()) {
-        return None;
-    }
-    if text.contains(['"', '\\', ';', '(', ')']) {
-        return Some(RecordData::non_canonical(text));
-    }
-    let joined: String = text.split_ascii_whitespace().collect();
-    Some(
-        Txt::new(joined)
-            .and_then(|value| value.to_data())
-            .unwrap_or_else(|_| RecordData::non_canonical(text)),
-    )
-}
+use super::txt::{MAX_DATA, read_txt};
 
 /// Longest data element.
 // Source: https://yandex.cloud/en/docs/dns/api-ref/DnsZone/listRecordSets (`data[]`: "The
@@ -158,17 +137,30 @@ const CAA_TAGS: &[&str] = &[
     "contactphone",
 ];
 
-/// A value as the API returned it, in the master file format with `zone` as the origin (see the
-/// module documentation).
-// Source: https://yandex.cloud/en/docs/dns/concepts/resource-record ("The service uses MASTER
-// FILES format"), read 2026-11-14; RFC 1035 section 5.1 (relative names and the origin).
+/// A value as the API returned it (see the module documentation): TXT by `txt::read_txt`; any
+/// other type by the strict parser, except that a value with a name that lacks the trailing dot
+/// (one that reads differently relative to `zone` than absolute), or with `@`, is non-canonical
+/// data.
+// Source: https://yandex.cloud/en/docs/dns/concepts/resource-record (read 2026-11-15): names in
+// the examples absolute with the trailing dot, fields described as "FQDN"; nothing on dotless
+// names or `@` inside values; the dotless ANAME section examples are absolute.
 pub(super) fn read_content(zone: &DomainName, rtype: RecordType, content: &str) -> RecordData {
-    if rtype == RecordType::TXT
-        && let Some(data) = unquoted_strings(content)
-    {
-        return data;
+    if rtype == RecordType::TXT {
+        return read_txt(content)
+            .and_then(|value| value.to_data().ok())
+            .unwrap_or_else(|| RecordData::non_canonical(content));
     }
-    RecordData::from_provider(rtype, content, Some(zone), TXT_READ)
+    let absolute = RecordData::from_provider(rtype, content, None, TxtDialect::Presentation);
+    // A dotless name (or `@`) is the only text the two readings take differently.
+    if absolute.is_canonical()
+        && RecordData::parse_relative(rtype, content, zone)
+            .ok()
+            .as_ref()
+            != Some(&absolute)
+    {
+        return RecordData::non_canonical(content);
+    }
+    absolute
 }
 
 /// The API's text for a value, or `None` when the client cannot send it (see the module

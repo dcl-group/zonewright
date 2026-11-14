@@ -1071,8 +1071,8 @@ async fn yandex_cloud_unfinished_operation_keeps_being_polled() {
     assert_eq!(writes(&mock), 1);
 }
 
-/// The TXT dialect: quoted character-strings are joined, unquoted text is read as it is, and
-/// data the dialect cannot decode is a foreign value written back unchanged.
+/// The TXT dialect: quoted character-strings are joined, and data the rule cannot decode is a
+/// foreign value written back unchanged (`yandex_cloud_txt_levels_agree` has every spelling).
 #[tokio::test]
 async fn yandex_cloud_txt_dialect() {
     let (mock, client) = setup().await;
@@ -2028,8 +2028,8 @@ async fn yandex_cloud_record_round_trips() {
 
 /// Values the API returns in another valid spelling read as canonical data and compare equal
 /// to the canonical form; writing the same set back is `Unchanged` and leaves the provider's
-/// text alone. (A name without the trailing dot is relative to the zone, not another spelling of
-/// an absolute name: `yandex_cloud_reads_values_in_master_file_format`.)
+/// text alone. (A name without the trailing dot, or `@`, inside a value is not another spelling:
+/// `yandex_cloud_dotless_names_inside_values_are_non_canonical`.)
 #[tokio::test]
 async fn yandex_cloud_reads_provider_spellings() {
     let (mock, client) = setup().await;
@@ -2038,9 +2038,10 @@ async fn yandex_cloud_reads_provider_spellings() {
         ("AAAA", "2001:0DB8:0000::0001", "2001:db8::1"),
         ("MX", "10 MAIL.Example.org.", "10 mail.example.org."),
         ("CNAME", "target.example.net.", "target.example.net."),
-        ("ANAME", "www", "www.example.org."),
-        ("NS", "@", "example.org."),
+        ("ANAME", "Site.Example.net.", "site.example.net."),
+        ("NS", "NS1.example.net.", "ns1.example.net."),
         ("TXT", "\"a\" \"b\"", "\"ab\""),
+        ("TXT", "a b", "\"ab\""),
         (
             "CAA",
             "0 ISSUE ca.example.net",
@@ -2080,8 +2081,8 @@ async fn yandex_cloud_reads_provider_spellings() {
         assert_eq!(writes(&mock), before);
         assert_eq!(stored(&mock, &name, &rtype.to_string()), [provider]);
     }
-    // An unquoted TXT value is the value itself (the `Auto` rule): what the TXT value
-    // operations write reads back as the same value at record level.
+    // An unquoted TXT string is the string itself: what the TXT value operations write reads
+    // back as the same value at record level.
     add(&client, "plain-value").await.unwrap();
     let read = client
         .get_rrset(&zone(), &name(), RecordType::TXT)
@@ -2091,58 +2092,290 @@ async fn yandex_cloud_reads_provider_spellings() {
     assert_eq!(read.records(), [txt("plain-value").to_data().unwrap()]);
 }
 
-/// The service "uses MASTER FILES format": a name without the trailing dot inside a value is
-/// relative to the zone, and unquoted text with spaces is several strings. Such a value never
-/// equals the absolute name or the single string of the same characters, so a `set_rrset` of
-/// those replaces it instead of answering `Unchanged`; get and list read alike.
+/// Names inside values: the record types page spells them absolute with the trailing dot and
+/// never says what a name without it, or `@`, inside a value means (its ANAME section shows
+/// dotless names that are absolute; its master-file sentence is in the TXT section). Such a
+/// value is non-canonical data, whether it looks relative or absolute: it equals neither the
+/// absolute nor the relative reading, so `Expect::Matches` with either reading fails and writes
+/// nothing, `Expect::Matches` with the value as read succeeds, a `set_rrset` of either reading
+/// replaces it (one write), and get and list report the provider's text. A name with the dot
+/// is canonical and compares equal.
 #[tokio::test]
-async fn yandex_cloud_reads_values_in_master_file_format() {
-    let (mock, client) = setup().await;
-    let control = mock.control();
-    for (rtype, provider, read_as, wanted) in [
+async fn yandex_cloud_dotless_names_inside_values_are_non_canonical() {
+    // Type, the provider's text, the absolute reading (none for `@`), the relative reading.
+    let cases: &[(&str, &str, Option<&str>, &str)] = &[
         (
             "CNAME",
             "mail.example.org",
+            Some("mail.example.org."),
             "mail.example.org.example.org.",
-            "mail.example.org.",
         ),
+        ("CNAME", "www", Some("www."), "www.example.org."),
+        ("CNAME", "@", None, "example.org."),
         (
             "MX",
-            "10 mx.example.net",
-            "10 mx.example.net.example.org.",
-            "10 mx.example.net.",
+            "10 mx.example.org",
+            Some("10 mx.example.org."),
+            "10 mx.example.org.example.org.",
+        ),
+        ("MX", "10 mail", Some("10 mail."), "10 mail.example.org."),
+        ("MX", "10 @", None, "10 example.org."),
+        (
+            "NS",
+            "ns1.example.net",
+            Some("ns1.example.net."),
+            "ns1.example.net.example.org.",
+        ),
+        ("NS", "ns1", Some("ns1."), "ns1.example.org."),
+        ("NS", "@", None, "example.org."),
+        (
+            "SRV",
+            "0 5 443 host.example.org",
+            Some("0 5 443 host.example.org."),
+            "0 5 443 host.example.org.example.org.",
         ),
         (
             "SRV",
             "0 5 443 host",
+            Some("0 5 443 host."),
             "0 5 443 host.example.org.",
-            "0 5 443 host.",
         ),
-        ("TXT", "v=spf1 -all", "\"v=spf1-all\"", "\"v=spf1 -all\""),
-    ] {
-        let name = format!("m{}.example.org", rtype.to_lowercase());
-        control.insert_rrset(ZONE, &name, rtype, "600", &[provider]);
+        ("SRV", "0 5 443 @", None, "0 5 443 example.org."),
+        (
+            "ANAME",
+            "example.org.website.yandexcloud.net",
+            Some("example.org.website.yandexcloud.net."),
+            "example.org.website.yandexcloud.net.example.org.",
+        ),
+        ("ANAME", "www", Some("www."), "www.example.org."),
+        ("ANAME", "@", None, "example.org."),
+    ];
+    let name = "m.sub.example.org";
+    for &(rtype, provider, absolute, relative) in cases {
+        let rtype_name = rtype;
         let rtype: RecordType = rtype.parse().unwrap();
-        let expected = rrset(&name, rtype, Some(600), &[read_as]);
-        let read = client.get_rrset(&zone(), &dn(&name), rtype).await.unwrap();
+        for reading in absolute.into_iter().chain([relative]) {
+            let (mock, client) = setup().await;
+            mock.control()
+                .insert_rrset(ZONE, name, rtype_name, "600", &[provider]);
+            let read = client
+                .get_rrset(&zone(), &dn(name), rtype)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.records().len(), 1, "{rtype} {provider}");
+            assert!(!read.records()[0].is_canonical(), "{rtype} {provider}");
+            assert_eq!(read.records()[0].as_str(), provider);
+            let listing = client.list_rrsets(&zone()).await.unwrap();
+            assert!(listing.rrsets.contains(&read), "{rtype} {provider}");
+            let wanted = rrset(name, rtype, None, &[reading]);
+            let as_read = rrset(name, rtype, Some(600), &[reading]);
+            let e = client
+                .set_rrset(&zone(), &wanted, Expect::Matches(&as_read))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                e.kind(),
+                ErrorKind::PreconditionFailed,
+                "{rtype} {provider} as {reading}"
+            );
+            assert_eq!(writes(&mock), 0, "{rtype} {provider} as {reading}");
+            assert_eq!(
+                client
+                    .set_rrset(&zone(), &wanted, Expect::Matches(&read))
+                    .await
+                    .unwrap(),
+                SetOutcome::Replaced,
+                "{rtype} {provider} as {reading}"
+            );
+            assert_eq!(writes(&mock), 1, "{rtype} {provider} as {reading}");
+            assert_eq!(stored(&mock, name, rtype_name), [reading]);
+        }
+    }
+    // With the trailing dot the name is canonical, absolute, and compares equal.
+    for (rtype, provider) in [
+        ("CNAME", "mail.example.org."),
+        ("MX", "10 mx.example.org."),
+        ("NS", "ns1.example.net."),
+        ("SRV", "0 5 443 host.example.org."),
+        ("ANAME", "example.org.website.yandexcloud.net."),
+    ] {
+        let (mock, client) = setup().await;
+        mock.control()
+            .insert_rrset(ZONE, name, rtype, "600", &[provider]);
+        let rtype: RecordType = rtype.parse().unwrap();
+        let expected = rrset(name, rtype, Some(600), &[provider]);
+        let read = client.get_rrset(&zone(), &dn(name), rtype).await.unwrap();
         assert_eq!(read.as_ref(), Some(&expected), "{rtype}");
-        let listing = client.list_rrsets(&zone()).await.unwrap();
-        assert!(listing.rrsets.contains(&expected), "{rtype}");
-        let before = writes(&mock);
         assert_eq!(
             client
-                .set_rrset(&zone(), &rrset(&name, rtype, None, &[wanted]), Expect::Any)
+                .set_rrset(
+                    &zone(),
+                    &rrset(name, rtype, None, &[provider]),
+                    Expect::Matches(&expected)
+                )
                 .await
                 .unwrap(),
-            SetOutcome::Replaced,
+            SetOutcome::Unchanged,
             "{rtype}"
         );
-        assert_eq!(writes(&mock), before + 1, "{rtype}");
+        assert_eq!(writes(&mock), 0, "{rtype}");
+    }
+}
+
+/// The data element the TXT value operations write for a plain value: the value unquoted, or
+/// in double quotes when it holds `;`, `(` or `)`.
+fn written(value: &str) -> String {
+    if value.contains([';', '(', ')']) {
+        format!("\"{value}\"")
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Both levels read stored TXT data by one rule: for each spelling, the TXT value operations
+/// take the record for a value of theirs exactly when `get_rrset` reports that value. Spellings
+/// the rule leaves undecided are non-canonical at record level, and the value operations put
+/// the value next to them and answer `NotPresent` to its removal, leaving them untouched.
+#[tokio::test]
+async fn yandex_cloud_txt_levels_agree() {
+    // Stored data, what `get_rrset` reports (`None`: non-canonical), the plain value probed.
+    let cases: &[(&str, Option<&str>, &str)] = &[
+        // One quoted string.
+        (r#""abc""#, Some(r#""abc""#), "abc"),
+        // Several quoted strings.
+        (r#""ab" "c""#, Some(r#""abc""#), "abc"),
+        // Unquoted, without spaces.
+        ("abc", Some(r#""abc""#), "abc"),
+        // Unquoted with spaces: several strings.
+        ("ab c", Some(r#""abc""#), "abc"),
+        ("v=spf1 -all", Some(r#""v=spf1-all""#), "v=spf1-all"),
+        // Mixed.
+        (r#""ab" c"#, Some(r#""abc""#), "abc"),
+        (r#"ab "c""#, Some(r#""abc""#), "abc"),
+        // Escapes.
+        (r#""a\059b""#, Some(r#""a;b""#), "a;b"),
+        (r"a\059b", Some(r#""a;b""#), "a;b"),
+        (r#""a\"b""#, Some(r#""a\"b""#), "ab"),
+        // Empty.
+        (r#""""#, Some(r#""""#), "x"),
+        // Undecided: a comment or a group outside quotes, strings not separated by
+        // whitespace, an unterminated quote.
+        ("a;b", None, "a;b"),
+        ("a(b)", None, "a(b)"),
+        (r#""a""b""#, None, "ab"),
+        (r#"a"b""#, None, "ab"),
+        (r#""a" b ""#, None, "ab"),
+    ];
+    for &(spelling, reported, probe) in cases {
+        let (mock, client) = setup().await;
+        mock.control()
+            .insert_rrset(ZONE, NAME, "TXT", "600", &[spelling]);
+        let read = client
+            .get_rrset(&zone(), &name(), RecordType::TXT)
+            .await
+            .unwrap()
+            .unwrap();
+        let record = read.records()[0].clone();
+        match reported {
+            Some(text) => assert_eq!(record, rd(RecordType::TXT, text), "{spelling}"),
+            None => {
+                assert!(!record.is_canonical(), "{spelling}");
+                assert_eq!(record.as_str(), spelling);
+            }
+        }
+        let value = txt(probe).to_data().unwrap();
+        if record == value {
+            assert_eq!(
+                add(&client, probe).await.unwrap(),
+                AddOutcome::AlreadyPresent,
+                "{spelling}"
+            );
+            assert_eq!(writes(&mock), 0, "{spelling}");
+            assert_eq!(
+                remove(&client, probe).await.unwrap(),
+                RemoveOutcome::RrsetDeleted,
+                "{spelling}"
+            );
+            assert!(data(&mock).is_empty(), "{spelling}");
+        } else {
+            assert_eq!(
+                remove(&client, probe).await.unwrap(),
+                RemoveOutcome::NotPresent,
+                "{spelling}"
+            );
+            assert_eq!(writes(&mock), 0, "{spelling}");
+            assert_eq!(
+                add(&client, probe).await.unwrap(),
+                AddOutcome::Appended,
+                "{spelling}"
+            );
+            assert_eq!(data(&mock), [spelling.to_owned(), written(probe)]);
+            let read = client
+                .get_rrset(&zone(), &name(), RecordType::TXT)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.records().len(), 2, "{spelling}");
+            assert!(read.records().contains(&record), "{spelling}");
+            assert!(read.records().contains(&value), "{spelling}");
+            assert_eq!(
+                remove(&client, probe).await.unwrap(),
+                RemoveOutcome::Removed,
+                "{spelling}"
+            );
+            assert_eq!(data(&mock), [spelling], "{spelling}");
+        }
+    }
+}
+
+/// What one level writes, the other reads back as the same value: a value added by the TXT
+/// value operations (unquoted, or quoted when it holds `;`, `(` or `)`) is that value at record
+/// level, and a `set_rrset` of it is `Unchanged`; a value written by `set_rrset` (quoted
+/// chunks) is found by the value operations and removed by them.
+#[tokio::test]
+async fn yandex_cloud_txt_round_trips_through_both_levels() {
+    let long = "z".repeat(255);
+    for probe in ["abc", "a;b", "a(b)", "v=DKIM1;k=rsa", long.as_str()] {
+        let value = txt(probe).to_data().unwrap();
+        // Value operation, then record level.
+        let (mock, client) = setup().await;
+        assert_eq!(add(&client, probe).await.unwrap(), AddOutcome::Created);
+        assert_eq!(data(&mock), [written(probe)]);
+        let read = client
+            .get_rrset(&zone(), &name(), RecordType::TXT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.records(), std::slice::from_ref(&value), "{probe}");
+        let set = RrSet::new(name(), RecordType::TXT, None, [value.clone()]).unwrap();
         assert_eq!(
-            stored(&mock, &name, &rtype.to_string()),
-            [wanted],
-            "{rtype}"
+            client.set_rrset(&zone(), &set, Expect::Any).await.unwrap(),
+            SetOutcome::Unchanged,
+            "{probe}"
         );
+        assert_eq!(writes(&mock), 1, "{probe}");
+        // Record level, then value operation.
+        let (mock, client) = setup().await;
+        assert_eq!(
+            client
+                .set_rrset(&zone(), &set, Expect::Absent)
+                .await
+                .unwrap(),
+            SetOutcome::Created
+        );
+        assert_eq!(
+            add(&client, probe).await.unwrap(),
+            AddOutcome::AlreadyPresent,
+            "{probe}"
+        );
+        assert_eq!(writes(&mock), 1, "{probe}");
+        assert_eq!(
+            remove(&client, probe).await.unwrap(),
+            RemoveOutcome::RrsetDeleted,
+            "{probe}"
+        );
+        assert!(data(&mock).is_empty(), "{probe}");
     }
 }
 
@@ -3220,8 +3453,9 @@ async fn live_yandex_cloud_add_and_remove() {
 /// A record-level round trip on names the test generates (`_zw-live-<random>-rr` and
 /// `-cn` below the zone the maintainer names): A with a TTL, TXT with spaces, a `;` and more
 /// than 255 characters, HTTPS with an unquoted `alpn`, and a CNAME whose target lies in the zone
-/// (written absolute with the trailing dot; the read-back shows how the API spells it, the open
-/// question of reading names inside values relative to the zone). Created with `Expect::Absent`,
+/// (written absolute with the trailing dot; the read-back shows how the API spells it: a
+/// spelling without the dot reads as non-canonical data and fails the comparison, which is
+/// what this probe is for). Created with `Expect::Absent`,
 /// read back, `Unchanged` when written again, listed, replaced under `Expect::Matches`; the
 /// sets are deleted afterwards, also when the body failed, and only while they hold nothing but
 /// what the test wrote.
@@ -3396,11 +3630,20 @@ async fn live_yandex_cloud_record_round_trip() {
             Err(e) => cleanup.push(format!("{e}")),
         }
     }
+    // The CNAME the test wrote, also when the API spells its target without the trailing dot
+    // (read as non-canonical data).
+    let our_cname = |record: &RecordData| {
+        cname_set.records().contains(record)
+            || (!record.is_canonical()
+                && RecordData::parse(RecordType::CNAME, record.as_str())
+                    .ok()
+                    .is_some_and(|data| cname_set.records().contains(&data)))
+    };
     match client
         .get_rrset(&zone, &cname_name, RecordType::CNAME)
         .await
     {
-        Ok(Some(current)) if current.same_records(&cname_set) => {
+        Ok(Some(current)) if current.records().iter().all(our_cname) => {
             if let Err(e) = client
                 .delete_rrset(
                     &zone,

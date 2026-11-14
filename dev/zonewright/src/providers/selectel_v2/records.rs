@@ -75,7 +75,7 @@ use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
 use crate::provider::ZoneListing;
-use crate::record::{RecordData, RecordType, RrsetTtl, TxtDialect};
+use crate::record::{RecordData, RecordType, RrsetTtl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{self, Current, Found, Listing, Member, RrsetBase, SetTtl, Stored, WholeSet};
 
@@ -86,25 +86,38 @@ use super::client::SelectelV2;
 // Source: the OpenAPI, `RRSetCreateForm` and `RRSetUpdateForm` (`records`: 1 to 100 items).
 pub(super) const MAX_RECORDS: usize = 100;
 
-/// How the TXT value operations read content: quoted text as presentation format, anything else
-/// as the value. The record level holds TXT to the stated quoted form ([`read_content`]).
-pub(super) const TXT_READ: TxtDialect = TxtDialect::Auto;
+/// The value of TXT content, the one rule both levels read TXT by: the record level here
+/// ([`read_content`]) and the TXT value operations (`txt.rs`). Content "wrapped in `\"`", one
+/// quoted string or several separated by whitespace, is read by the strict presentation parser
+/// (design section 4.4), several strings joined. Anything else is `None`: unquoted text, text
+/// mixing quoted and unquoted parts, an unterminated quote. No source says what such content
+/// means (one string or several; joined how), so the record level reports it as non-canonical
+/// data and the TXT value operations never take it for a value of theirs: an add puts the value
+/// next to it, a remove answers `NotPresent`.
+// Source: Terraform docs (module documentation): TXT "Any text wrapped in `\"`"; the OpenAPI
+// describes `content` only as "the content of the DNS record". Several quoted strings are what
+// the record level writes for a value longer than 255 octets (design section 11.2).
+pub(super) fn read_txt(content: &str) -> Option<Txt> {
+    if !content.trim_start().starts_with('"') {
+        return None;
+    }
+    TxtDialect::Presentation.read(content)
+}
 
 /// A value as the API returned it, held to the documented form (see the module documentation):
-/// unquoted TXT text, and a value with a name that lacks the trailing dot (one that reads
-/// differently relative to `zone` than absolute), are non-canonical data.
+/// TXT content by [`read_txt`], and a value with a name that lacks the trailing dot (one that
+/// reads differently relative to `zone` than absolute) is non-canonical data.
 // Source: Terraform docs (module documentation): CNAME, ALIAS and SRV targets and MX hosts
 // "with a dot at the end"; TXT "Any text wrapped in `\"`". Neither the Terraform docs nor
 // https://docs.selectel.ru/en/networks-services/dns/records/add-record/ (read 2026-11-14) say
 // what a name without the dot or unquoted text means.
 pub(super) fn read_content(zone: &DomainName, rtype: RecordType, content: &str) -> RecordData {
     if rtype == RecordType::TXT {
-        if !content.trim_start().starts_with('"') {
-            return RecordData::non_canonical(content);
-        }
-        return RecordData::from_provider(rtype, content, None, TxtDialect::Presentation);
+        return read_txt(content)
+            .and_then(|value| value.to_data().ok())
+            .unwrap_or_else(|| RecordData::non_canonical(content));
     }
-    let absolute = RecordData::from_provider(rtype, content, None, TXT_READ);
+    let absolute = RecordData::from_provider(rtype, content, None, TxtDialect::Presentation);
     // A dotless name (or `@`) is the only text the two readings take differently.
     if absolute.is_canonical()
         && RecordData::parse_relative(rtype, content, zone)

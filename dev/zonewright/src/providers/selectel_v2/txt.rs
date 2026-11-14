@@ -13,9 +13,13 @@
 //! - delete: an rrset cannot be written with no records (documented `records` range 1 to 100), so
 //!   the last value is removed by deleting the rrset.
 //!
-//! TXT dialect (design sections 4.4 and 11.2): read `Auto`, write `Presentation`. The API
-//! carries TXT content quoted (lego writes `fmt.Sprintf("%q", value)`; the provider's examples
-//! quote TXT), and plain values, the only ones the capabilities accept, need no escape.
+//! TXT dialect (design sections 4.4 and 11.2): read by `records::read_txt`, the rule the record
+//! level reads TXT by, so that both levels agree on what a record holds: quoted content is read
+//! as presentation format, and unquoted or mixed content, whose meaning no source gives, is never
+//! a value of ours (an add puts the value next to it, a remove leaves it). Write `Presentation`:
+//! the API carries TXT content quoted (lego writes `fmt.Sprintf("%q", value)`; the provider's
+//! examples quote TXT), and plain values, the only ones the capabilities accept, need no escape,
+//! so what is written reads back as the same value at both levels.
 //!
 //! Disabled records (design section 3.4): a disabled record is not published, so it never counts
 //! as holding a value (its decoded value is `None`) and is written back as it was; a value being
@@ -33,10 +37,7 @@ use crate::values::{Member, SetRead, SetState, TxtBase, TxtRecord, TxtSet, Whole
 
 use super::api::{Record, Rrset, TXT};
 use super::client::SelectelV2;
-use super::records::{MAX_RECORDS, TXT_READ};
-
-/// How TXT content is read: the rule the record level reads TXT content with.
-const READ: TxtDialect = TXT_READ;
+use super::records::{MAX_RECORDS, read_txt};
 
 /// How a value being added is written.
 const WRITE: TxtDialect = TxtDialect::Presentation;
@@ -143,7 +144,7 @@ fn decode(record: &Record) -> Option<Txt> {
     if record.disabled {
         None
     } else {
-        READ.read(&record.content)
+        read_txt(&record.content)
     }
 }
 
@@ -163,7 +164,7 @@ fn records(members: &[Member<'_, Record>]) -> Result<Vec<Record>, Error> {
         };
         let disabled_copy = records
             .iter_mut()
-            .find(|r| r.disabled && READ.read(&r.content).as_ref() == Some(*value));
+            .find(|r| r.disabled && read_txt(&r.content).as_ref() == Some(*value));
         match disabled_copy {
             Some(record) => record.disabled = false,
             None => records.push(Record {

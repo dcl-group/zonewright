@@ -11,8 +11,9 @@
 //! operation and keeps the protocol of the TXT value operations (design section 11.3):
 //!
 //! - its read takes the zone lock (after the name lock the layer holds) and keeps it until the
-//!   operation has ended, commit included; a zone with staged changes this process did not make
-//!   is `Error::Rejected`; staged changes of this process left by an earlier operation are
+//!   operation has ended, commit included; a zone with staged changes this process did not make,
+//!   or cannot show to be its own (an unconfirmed mark, see `Mark`), is `Error::Rejected`;
+//!   staged changes of this process left by an earlier operation under a confirmed mark are
 //!   committed or rolled back first, as their mark says;
 //! - before its first edit the zone is marked "staged changes of this process, to be rolled
 //!   back": an operation that fails or is dropped part-way leaves a mark that makes the next
@@ -24,7 +25,9 @@
 //!   same, since it says whether a replacement is one request;
 //! - after the layer has returned an error with edits possibly staged, the zone is listed again
 //!   and rolled back (Docs 4.2) if it has staged changes; an edit that was certainly refused
-//!   stages nothing and only clears the mark.
+//!   stages nothing and only clears the mark. A commit or rollback whose attempts all fail is
+//!   followed by one more listing: a clean zone loses its mark, staged changes confirm it, and a
+//!   failed listing leaves it unconfirmed.
 //!
 //! The commit and the rollback happen after the record layer has released the name lock, which
 //! `crate::rrsets` holds only inside its functions, but while the zone lock is still held: every
@@ -42,7 +45,8 @@
 //!
 //! `get_rrset` and `list_rrsets` take the zone lock too, so they never see this process's edits
 //! between staging and commit, and they first settle staged changes this process left behind
-//! (commit or rollback, as their mark says), as a write does. The documentation says neither
+//! under a confirmed mark (commit or rollback, as the mark says), as a write does; under an
+//! unconfirmed mark they refuse the zone, as a write does. The documentation says neither
 //! that the record listing shows the published records nor that it shows the staged ones
 //! ("resource records which are already created in the zone file", Docs 4.5.2). A zone with
 //! other staged changes, by `GET /zones` or by the `has-changes` attribute of the record listing
@@ -110,7 +114,7 @@ use crate::rrsets::{
 };
 
 use super::Pending;
-use super::api::{Content, EditError, Rr, Shape, TXT, Zone, shape};
+use super::api::{Content, EditError, Rr, Shape, TXT, shape};
 use super::client::{Nicru, rejected};
 use super::txt::FOREIGN_CHANGES;
 
@@ -125,7 +129,7 @@ const TXT_WRITE: TxtDialect = TxtDialect::Raw;
 const STRING_MAX: usize = 255;
 
 /// Why a zone with staged changes is not read.
-const STAGED_READ: &str = "the zone has staged changes that are not committed; its record \
+pub(super) const STAGED_READ: &str = "the zone has staged changes that are not committed; its record \
      listing could show them as if they were published, so it is not read until they are \
      committed or rolled back";
 
@@ -486,10 +490,11 @@ impl<'a> RecordOp<'a> {
 
     /// Ends a writing operation after the record layer returned `result`, still under the zone
     /// lock (module documentation). Every edit staged: commit, and a failed commit is the
-    /// result (`Error::Transient`; the zone stays marked for a commit, so the next operation
-    /// publishes this complete change). An error after edits that may have been staged: they
-    /// are rolled back; if that fails, its error is the result and the zone stays marked for a
-    /// rollback. Nothing staged: the result as it is.
+    /// result (`Error::Transient`; when a listing right after it still shows staged changes the
+    /// zone stays marked for a commit, confirmed, so the next operation publishes this complete
+    /// change). An error after edits that may have been staged: they are rolled back; if that
+    /// fails, its error is the result and the zone stays marked for a rollback (confirmed or
+    /// not, as for the commit). Nothing staged: the result as it is.
     pub(super) async fn finish<T>(
         &self,
         zone: &DomainName,
@@ -557,11 +562,9 @@ impl PerRecord for RecordOp<'_> {
     ) -> Result<RecordsRead<String, Neighbors>, Error> {
         self.lock_zone(zone).await;
         let target = self.client.resolve_zone(zone).await?;
-        if self.writing {
-            self.client.settle_leftovers(zone, &target).await?;
-        } else {
-            self.client.settle_before_read(zone, &target).await?;
-        }
+        self.client
+            .settle_leftovers(zone, &target, !self.writing)
+            .await?;
         *self.service.lock().unwrap_or_else(PoisonError::into_inner) = Some(target.service.clone());
         let listing = self.client.api.records(&target.service, zone).await?;
         if listing.has_changes == Some(true) {
@@ -717,24 +720,13 @@ fn shown(rtype: RecordType) -> bool {
 }
 
 impl Nicru {
-    /// Before a read of `zone`, under the zone lock: staged changes of this process left by an
-    /// earlier operation are committed or rolled back first, as their mark says, as a write
-    /// does; other staged changes are `Error::Rejected` (module documentation, "Reads"). A
-    /// zone without staged changes has its mark cleared.
-    async fn settle_before_read(&self, zone: &DomainName, target: &Zone) -> Result<(), Error> {
-        if target.has_changes && !self.is_marked(zone) {
-            return Err(rejected(STAGED_READ));
-        }
-        self.settle_leftovers(zone, target).await
-    }
-
     /// `list_rrsets`: every record of the zone, grouped by owner name and type, under the zone
     /// lock and only while the zone has no staged changes (module documentation).
     pub(super) async fn list_zone(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
         rrsets::check_list(&RecordOp::reading(self), zone)?;
         let _zone_guard = self.state().zone_locks.lock(zone).await;
         let target = self.resolve_zone(zone).await?;
-        self.settle_before_read(zone, &target).await?;
+        self.settle_leftovers(zone, &target, true).await?;
         let listing = self.api.records(&target.service, zone).await?;
         if listing.has_changes == Some(true) {
             return Err(rejected(STAGED_READ));

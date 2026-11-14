@@ -892,6 +892,176 @@ async fn timeweb_cloud_a_subdomain_listing_without_names_is_protocol() {
     }
 }
 
+/// A listing answer that holds `records`, all on one page.
+fn listing_body(records: &[serde_json::Value]) -> String {
+    serde_json::json!({"meta": {"total": records.len()}, "dns_records": records}).to_string()
+}
+
+/// A listed record with TTL 60.
+fn listed(id: u64, rtype: &str, subdomain: &str, value: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id, "type": rtype, "ttl": 60,
+        "data": {"subdomain": subdomain, "value": value}
+    })
+}
+
+/// Answers the listing of the zone with `zone` and the listing of [`NAME`] (a subdomain) with
+/// `name` until the faults are cleared.
+fn serve_listings(mock: &TimewebCloudMock, zone: &[serde_json::Value], name: &[serde_json::Value]) {
+    mock.control().insert_subdomain("example.org", NAME);
+    mock.faults().clear();
+    mock.faults().push(
+        Fault::on("GET", ZONE_LISTING)
+            .always()
+            .respond(200, listing_body(zone)),
+    );
+    mock.faults().push(
+        Fault::on("GET", NAME_LISTING)
+            .always()
+            .respond(200, listing_body(name)),
+    );
+}
+
+/// Every operation at [`NAME`], and the zone listing, fails with `Protocol` and writes nothing.
+async fn assert_every_operation_is_protocol(
+    mock: &TimewebCloudMock,
+    client: &TimewebCloud,
+    label: &str,
+) {
+    let kinds = [
+        add(client, "AAA").await.map(|_| ()),
+        remove(client, "AAA").await.map(|_| ()),
+        client
+            .get_rrset(&zone(), &name(), RecordType::TXT)
+            .await
+            .map(|_| ()),
+        client
+            .set_rrset(
+                &zone(),
+                &rr(NAME, RecordType::TXT, None, &["\"BBB\""]),
+                Expect::Any,
+            )
+            .await
+            .map(|_| ()),
+        client
+            .delete_rrset(&zone(), &name(), RecordType::TXT, Expect::Any)
+            .await
+            .map(|_| ()),
+        client.list_rrsets(&zone()).await.map(|_| ()),
+    ]
+    .map(|result| result.map_err(|e| e.kind()));
+    assert_eq!(kinds, [Err(ErrorKind::Protocol); 6], "{label}");
+    assert_eq!(record_writes(mock), 0);
+}
+
+/// One identifier at two names is refused, also when only the listings of different names
+/// disagree. The first case is what a listing of a subdomain that states names relative to
+/// that subdomain, rather than to the zone, looks like next to the zone's listing: the zone's
+/// listing places the record at `_acme-challenge._acme-challenge.example.org`, the listing of
+/// `_acme-challenge.example.org` states it as `_acme-challenge`.
+#[tokio::test]
+async fn timeweb_cloud_one_record_at_two_names_is_protocol() {
+    let (mock, client) = setup().await;
+    for zone_name in ["_acme-challenge._acme-challenge", "other"] {
+        serve_listings(
+            &mock,
+            &[listed(7, "TXT", zone_name, "AAA")],
+            &[listed(7, "TXT", "_acme-challenge", "AAA")],
+        );
+        assert_every_operation_is_protocol(&mock, &client, zone_name).await;
+    }
+    // The same record in both listings is one record.
+    serve_listings(
+        &mock,
+        &[listed(7, "TXT", "_acme-challenge", "AAA")],
+        &[listed(7, "TXT", "_acme-challenge", "AAA")],
+    );
+    assert_eq!(
+        add(&client, "AAA").await.unwrap(),
+        AddOutcome::AlreadyPresent
+    );
+    let read = client
+        .get_rrset(&zone(), &name(), RecordType::TXT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.records().len(), 1);
+    assert_eq!(record_writes(&mock), 0);
+}
+
+/// One identifier for two different records (another type, another value) is refused: the
+/// description does not say that identifiers are unique across types, and taking the second
+/// for a copy of the first would hide it from every read.
+#[tokio::test]
+async fn timeweb_cloud_one_identifier_for_two_records_is_protocol() {
+    let (mock, client) = setup().await;
+    for (zone_record, name_record) in [
+        (
+            listed(7, "A", "_acme-challenge", "192.0.2.1"),
+            listed(7, "TXT", "_acme-challenge", "AAA"),
+        ),
+        (
+            listed(7, "A", "_acme-challenge", "192.0.2.1"),
+            listed(7, "TXT", "_acme-challenge", "192.0.2.1"),
+        ),
+        (
+            listed(7, "TXT", "_acme-challenge", "OTHER"),
+            listed(7, "TXT", "_acme-challenge", "AAA"),
+        ),
+    ] {
+        serve_listings(
+            &mock,
+            std::slice::from_ref(&zone_record),
+            std::slice::from_ref(&name_record),
+        );
+        assert_every_operation_is_protocol(&mock, &client, "two listings").await;
+        // Both in the zone's listing alone.
+        serve_listings(&mock, &[zone_record, name_record], &[]);
+        assert_every_operation_is_protocol(&mock, &client, "one listing").await;
+    }
+}
+
+/// Listings of one operation that prove different forms are refused: the zone's listing states
+/// `www` (only relative to the zone), the listing of [`NAME`] states its record as the full name
+/// (its relative reading is not at or below [`NAME`]).
+#[tokio::test]
+async fn timeweb_cloud_two_forms_across_listings_are_protocol() {
+    let (mock, client) = setup().await;
+    serve_listings(
+        &mock,
+        &[listed(1, "A", "www", "192.0.2.1")],
+        &[listed(2, "TXT", NAME, "AAA")],
+    );
+    assert_every_operation_is_protocol(&mock, &client, "two forms").await;
+    // Each listing alone proves its form, and the record is read.
+    serve_listings(&mock, &[], &[listed(2, "TXT", NAME, "AAA")]);
+    assert_eq!(
+        add(&client, "AAA").await.unwrap(),
+        AddOutcome::AlreadyPresent
+    );
+    serve_listings(
+        &mock,
+        &[listed(1, "A", "www", "192.0.2.1")],
+        &[listed(2, "TXT", "_acme-challenge", "AAA")],
+    );
+    assert_eq!(
+        add(&client, "AAA").await.unwrap(),
+        AddOutcome::AlreadyPresent
+    );
+    assert_eq!(record_writes(&mock), 0);
+}
+
+/// The listing of a subdomain that holds a record that is not at or below it in any reading
+/// (`mail` in the listing of [`NAME`]) is refused, never read as a record elsewhere.
+#[tokio::test]
+async fn timeweb_cloud_a_subdomain_record_outside_it_is_protocol() {
+    let (mock, client) = setup().await;
+    for stated in ["mail", "mail.example.org"] {
+        serve_listings(&mock, &[], &[listed(7, "TXT", stated, "AAA")]);
+        assert_every_operation_is_protocol(&mock, &client, stated).await;
+    }
+}
+
 // ---- Requests, names and TTLs ------------------------------------------------------------------
 
 /// The requests as the documentation and lego describe them: the token in `Authorization`, the

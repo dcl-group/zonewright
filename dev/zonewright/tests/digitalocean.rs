@@ -2164,6 +2164,169 @@ async fn digitalocean_replacement_creates_before_it_deletes() {
     assert_eq!(methods, ["POST", "DELETE", "DELETE"]);
 }
 
+/// The write requests the mock received since the log was cleared, as `METHOD id` (`POST` for
+/// a create).
+fn record_requests(mock: &DigitalOceanMock) -> Vec<String> {
+    mock.log()
+        .entries()
+        .into_iter()
+        .filter(|r| r.method != "GET")
+        .map(|r| match r.path.rsplit_once("/records/") {
+            Some((_, id)) => format!("{} {id}", r.method),
+            None => r.method.to_string(),
+        })
+        .collect()
+}
+
+/// Several CNAME records at one name (a state the model cannot hold, which the API can show)
+/// are repaired by a write instead of refused: the surplus records are deleted first, so the
+/// number of published records only goes down, and the last one is changed in place. A record
+/// that already holds the requested value is the one kept, and a second copy of it is surplus
+/// too. A failure part way leaves fewer records, never more, and the repeat converges. A delete
+/// removes them all; an expectation they cannot meet fails before any write.
+#[tokio::test]
+async fn digitalocean_surplus_cname_records_are_repaired() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = "www.example.org";
+    let target = |t: &str| rr(www, RecordType::CNAME, None, &[t]);
+    let two = |a: &str, b: &str| {
+        for record in control.records_at(www, "CNAME") {
+            control.delete_record(record.id);
+        }
+        let first = control.insert_record("example.org", www, "CNAME", a, 300);
+        let second = control.insert_record("example.org", www, "CNAME", b, 300);
+        mock.log().clear();
+        (first, second)
+    };
+
+    // The read and the listing do not take them for an rrset.
+    two("a.example.net.", "b.example.net.");
+    let e = client
+        .get_rrset(&zone(), &dn(www), RecordType::CNAME)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+
+    // Neither expectation that names a set is met; nothing is written.
+    for expect in [
+        Expect::Absent,
+        Expect::Matches(&target("a.example.net.")),
+        Expect::Matches(&target("b.example.net.")),
+    ] {
+        let e = client
+            .set_rrset(&zone(), &target("c.example.net."), expect)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{e:?}");
+        if matches!(expect, Expect::Absent) {
+            // Not an expectation of a delete.
+            continue;
+        }
+        let e = client
+            .delete_rrset(&zone(), &dn(www), RecordType::CNAME, expect)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{e:?}");
+    }
+    assert_eq!(record_requests(&mock), Vec::<String>::new());
+
+    // A new value: the first record is deleted, then the last one is changed in place.
+    let (first, second) = two("a.example.net.", "b.example.net.");
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &target("c.example.net."), Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(
+        record_requests(&mock),
+        [format!("DELETE {first}"), format!("PATCH {second}")]
+    );
+    let records = control.records_at(www, "CNAME");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        (records[0].id, records[0].data.as_str()),
+        (second, "c.example.net.")
+    );
+
+    // A value one of them holds: that record stays, the other one goes.
+    for (a, b) in [
+        ("a.example.net.", "c.example.net."),
+        ("c.example.net.", "a.example.net."),
+    ] {
+        let (first, second) = two(a, b);
+        let (kept, surplus) = if a == "c.example.net." {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        assert_eq!(
+            client
+                .set_rrset(&zone(), &target("c.example.net."), Expect::Any)
+                .await
+                .unwrap(),
+            SetOutcome::Replaced
+        );
+        assert_eq!(record_requests(&mock), [format!("DELETE {surplus}")]);
+        let records = control.records_at(www, "CNAME");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, kept);
+    }
+
+    // Two copies of the requested value: the second is surplus.
+    let (first, second) = two("c.example.net.", "c.example.net.");
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &target("c.example.net."), Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(record_requests(&mock), [format!("DELETE {second}")]);
+    assert_eq!(control.records_at(www, "CNAME")[0].id, first);
+
+    // The update after the delete fails: one old record is left, never two new ones; the
+    // repeat changes it in place.
+    let (_, second) = two("a.example.net.", "b.example.net.");
+    mock.faults().push(Fault::on("PATCH", RECORD).status(502));
+    let e = client
+        .set_rrset(&zone(), &target("c.example.net."), Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(stored(&mock, www, "CNAME"), ["b.example.net."]);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &target("c.example.net."), Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    let records = control.records_at(www, "CNAME");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        (records[0].id, records[0].data.as_str()),
+        (second, "c.example.net.")
+    );
+
+    // A delete removes every one of them.
+    let (first, second) = two("a.example.net.", "b.example.net.");
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(www), RecordType::CNAME, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert_eq!(
+        record_requests(&mock),
+        [format!("DELETE {first}"), format!("DELETE {second}")]
+    );
+    assert!(control.records_at(www, "CNAME").is_empty());
+}
+
 /// A CNAME is replaced in place by one update, never by a second record next to the first; a
 /// record that went away before the update is `Conflict`, and the repeat creates it.
 #[tokio::test]

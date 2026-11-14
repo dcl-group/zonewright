@@ -810,6 +810,63 @@ mod tests {
         }
     }
 
+    /// A record of another type that may or may not be at the name (a dotless name that reads
+    /// both ways in a listing that does not decide the form) is data of an unknown type: the
+    /// read does not claim that the name holds no other data. The coexistence hooks are not
+    /// observable through the public API while the layer treats "unknown" and "none" alike, so
+    /// the read is asked directly.
+    #[tokio::test]
+    async fn an_ambiguous_record_of_another_type_is_unknown_data() {
+        use secrecy::SecretString;
+        use zonewright_mock::yandex_360::{NameForm as MockForm, ORG_ID, Seed, Yandex360Mock};
+
+        use crate::context::{Context, ContextOptions};
+        use crate::name::DomainName;
+        use crate::providers::yandex_360::{Yandex360, Yandex360Config, Yandex360Credentials};
+        use crate::rrsets::PerRecord;
+
+        let mock = Yandex360Mock::start(Seed::standard()).await;
+        let ctx = Context::new(ContextOptions {
+            loopback_only: true,
+            ..ContextOptions::default()
+        })
+        .unwrap();
+        let mut config = Yandex360Config::new(ORG_ID);
+        config.base_url = mock.base_url();
+        let credentials =
+            Yandex360Credentials::new(SecretString::from("test-only-token".to_owned()));
+        let client = Yandex360::new(config, credentials, &ctx).unwrap();
+        let zone = DomainName::parse("example.org").unwrap();
+        let www = DomainName::parse("www.example.org").unwrap();
+        let control = mock.control();
+        control.insert_fields(
+            "example.org",
+            "www",
+            "A",
+            serde_json::json!({"address": "192.0.2.1"}),
+            300,
+        );
+        let hooks = async |rtype: RecordType| {
+            let read = PerRecord::read(&client, &zone, &www, rtype).await.unwrap();
+            (
+                client.holds_cname(rtype, &read.context),
+                client.holds_other_data(rtype, &read.context),
+            )
+        };
+
+        // Full names without a dot and nothing else: `www.example.org` may be this name or
+        // `www.example.org.example.org`.
+        control.set_name_form(MockForm::Full);
+        assert_eq!(hooks(RecordType::CNAME).await, (Some(false), None));
+        // Names that only one reading allows: the A record is at this name.
+        control.set_name_form(MockForm::Absolute);
+        assert_eq!(hooks(RecordType::CNAME).await, (Some(false), Some(true)));
+        control.set_name_form(MockForm::Relative);
+        assert_eq!(hooks(RecordType::CNAME).await, (Some(false), Some(true)));
+        // Nothing of another type at the name.
+        assert_eq!(hooks(RecordType::A).await, (Some(false), Some(false)));
+    }
+
     #[test]
     fn values_without_an_established_encoding_are_not_sent() {
         for (rtype, text) in [

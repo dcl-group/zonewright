@@ -1106,11 +1106,14 @@ async fn nicru_own_uncommitted_change_is_committed_not_refused() {
     assert_eq!(control.published_txt(REL), ["BBB"]);
 }
 
-/// An operation dropped between its edit and its commit leaves the zone marked: the next
-/// operation in the same `Context` commits the edit (design section 3.2). A client of another
-/// `Context`, as after a restart, does not know the edit and refuses the zone.
+/// An operation dropped while its commit is in flight leaves the zone with an unconfirmed mark:
+/// whether the commit was applied is unknown, so the staged changes cannot be shown to be this
+/// process's. Every later operation refuses the zone, in this `Context` as in another one (as
+/// after a restart), and nothing is committed; once the staged changes are committed by hand,
+/// the next operation clears the mark and goes on, and a foreign edit staged after that is
+/// refused, not taken for ours.
 #[tokio::test]
-async fn nicru_dropped_operation_is_finished_by_the_next() {
+async fn nicru_dropped_operation_leaves_the_zone_refused() {
     let (mock, client) = setup().await;
     let control = mock.control();
     mock.faults().push(
@@ -1127,13 +1130,28 @@ async fn nicru_dropped_operation_is_finished_by_the_next() {
     let other = client_with(&mock, &context());
     let e = add(&other, "BBB").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert!(e.to_string().contains("cannot show"), "{e}");
+    let e = client.list_rrsets(&zone()).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    let report = client.check(&[zone()]).await.unwrap();
+    let detail = report.zones[0].detail.as_ref().unwrap();
+    assert!(detail.as_str().contains("cannot show"), "{detail}");
+    assert_eq!(commits(&mock), 1);
+    assert!(control.published_txt(REL).is_empty());
 
+    // Committed by hand: the zone is clean, the mark goes, the operation goes on.
+    control.commit("example.org");
     assert_eq!(
         add(&client, "AAA").await.unwrap(),
         AddOutcome::AlreadyPresent
     );
-    assert_eq!(control.published_txt(REL), ["AAA"]);
-    assert!(!control.has_changes("example.org"));
+    control.stage_record("example.org", "foreign-edit", "TXT", "pending", None);
+    let e = add(&client, "BBB").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(commits(&mock), 1);
+    assert!(control.published_txt("foreign-edit").is_empty());
 }
 
 /// A zone found without staged changes clears a stale mark: an edit that was refused, and so
@@ -2435,7 +2453,8 @@ async fn nicru_staged_changes_block_record_operations() {
 /// published set stays the old one, and a repeat converges with one commit. Covered: an unknown
 /// outcome of the second staging, a refused deletion after the stagings, a CNAME whose old
 /// record's deletion is staged when the new record is refused, and an operation dropped
-/// between two edits. An edit refused before anything was staged rolls nothing back.
+/// between two edits, which leaves the zone refused until it is rolled back by hand. An edit
+/// refused before anything was staged rolls nothing back.
 #[tokio::test]
 async fn nicru_failed_replacement_is_never_published() {
     let (mock, client) = setup().await;
@@ -2543,12 +2562,24 @@ async fn nicru_failed_replacement_is_never_published() {
     let _ = task.await;
     assert!(control.has_changes("example.org"));
     mock.faults().clear();
+    // The outcome of the second staging is unknown and no listing settled it: the next
+    // operation can tell the staged changes from someone else's no better than a stranger, so
+    // it refuses the zone and neither commits nor rolls back.
     let second = client_with(&mock, &ctx);
+    let e = second
+        .add_txt_value(&zone(), &name(), &txt("AAA"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!((commits(&mock), rollbacks(&mock)), (0, 0));
+    assert_eq!(published(&mock, "www", "A"), ["192.0.2.1"]);
+    // Rolled back by hand: the next operation goes on.
+    control.rollback("example.org");
     second
         .add_txt_value(&zone(), &name(), &txt("AAA"), None)
         .await
         .unwrap();
-    assert_eq!(rollbacks(&mock), 1);
+    assert_eq!(rollbacks(&mock), 0);
     assert_eq!(published(&mock, "www", "A"), ["192.0.2.1"]);
     assert_eq!(control.published_txt(REL), ["AAA"]);
     assert!(settled(&mock));
@@ -2734,6 +2765,225 @@ async fn nicru_unknown_first_edit_is_rolled_back() {
         SetOutcome::Created
     );
     assert_eq!(published(&mock, "www", "A"), ["192.0.2.1"]);
+}
+
+/// Critic 6, probe A: a staging answered 502 without being applied, and the listing that
+/// should settle it fails as well, leave an unconfirmed rollback mark on a clean zone. A foreign
+/// edit staged afterwards is never rolled back: reads and writes refuse the zone. Once the zone
+/// is clean again the mark goes, and a later foreign edit is refused as foreign.
+#[tokio::test]
+async fn nicru_unconfirmed_rollback_mark_is_not_acted_on() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = dn("www.example.org");
+    control.insert_record("example.org", "www", "A", "192.0.2.1", None);
+    mock.fail_creates_unapplied(1, 3);
+    let wanted = rr("www.example.org", RecordType::A, None, &["192.0.2.2"]);
+    let e = client
+        .set_rrset(&zone(), &wanted, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert!(!control.has_changes("example.org"));
+
+    control.stage_record("example.org", "foreign-edit", "A", "192.0.2.9", None);
+    let e = client
+        .get_rrset(&zone(), &www, RecordType::A)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    let e = client.list_rrsets(&zone()).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    let e = client
+        .set_rrset(&zone(), &wanted, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert!(e.to_string().contains("cannot show"), "{e}");
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    let report = client.check(&[zone()]).await.unwrap();
+    let detail = report.zones[0].detail.as_ref().unwrap();
+    assert!(detail.as_str().contains("cannot show"), "{detail}");
+    assert_eq!((commits(&mock), rollbacks(&mock)), (0, 0));
+    assert_eq!(control.staged("foreign-edit", "A").len(), 1);
+    assert_eq!(puts(&mock), 1);
+
+    // The other writer commits: the zone is clean, a read clears the mark.
+    control.commit("example.org");
+    assert_eq!(
+        client
+            .get_rrset(&zone(), &www, RecordType::A)
+            .await
+            .unwrap()
+            .unwrap()
+            .records()
+            .len(),
+        1
+    );
+    control.stage_record("example.org", "foreign-two", "A", "192.0.2.10", None);
+    let e = client
+        .get_rrset(&zone(), &www, RecordType::A)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    let report = client.check(&[zone()]).await.unwrap();
+    let detail = report.zones[0].detail.as_ref().unwrap();
+    assert!(detail.as_str().contains("did not make"), "{detail}");
+    assert_eq!((commits(&mock), rollbacks(&mock)), (0, 0));
+}
+
+/// Critic 6, probe B: every commit attempt is applied with its answer lost, and the listing
+/// after the last attempt fails as well, so the zone is clean but keeps an unconfirmed commit
+/// mark. Another writer then stages the deletion of a published TXT record: neither a read nor
+/// a write commits it. Covered for a TXT value operation and for a record-level write.
+#[tokio::test]
+async fn nicru_unconfirmed_commit_mark_is_not_acted_on() {
+    for record_level in [false, true] {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        control.insert_record("example.org", "other", "TXT", "keep", None);
+        mock.lose_commit_answers(3, 3);
+        let e = if record_level {
+            client
+                .set_rrset(
+                    &zone(),
+                    &rr("www.example.org", RecordType::A, None, &["192.0.2.1"]),
+                    Expect::Any,
+                )
+                .await
+                .unwrap_err()
+        } else {
+            add(&client, "AAA").await.unwrap_err()
+        };
+        assert_eq!(e.kind(), ErrorKind::Transient, "{record_level}: {e:?}");
+        assert_eq!(commits(&mock), 3, "{record_level}");
+        assert!(!control.has_changes("example.org"), "{record_level}");
+
+        control.stage_txt_deletion("other", "keep");
+        let e = client.list_rrsets(&zone()).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{record_level}: {e:?}");
+        let e = client
+            .get_rrset(&zone(), &dn("other.example.org"), RecordType::TXT)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{record_level}: {e:?}");
+        let e = add(&client, "BBB").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{record_level}: {e:?}");
+        let e = client
+            .delete_rrset(&zone(), &dn("www.example.org"), RecordType::A, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{record_level}: {e:?}");
+        assert_eq!((commits(&mock), rollbacks(&mock)), (3, 0), "{record_level}");
+        assert_eq!(control.published_txt("other"), ["keep"], "{record_level}");
+        assert!(control.has_changes("example.org"), "{record_level}");
+    }
+}
+
+/// A rollback applied with its answer lost, every attempt, leaves a clean zone: the listing
+/// after the last attempt clears the mark, so a foreign edit staged afterwards is refused, not
+/// rolled back. When that listing fails too, the mark stays unconfirmed and the foreign edit is
+/// refused as well.
+#[tokio::test]
+async fn nicru_lost_rollback_answer_clears_the_mark() {
+    for failing_listings in [0, 3] {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        let www = dn("www.example.org");
+        control.insert_record("example.org", "www", "A", "192.0.2.1", None);
+        mock.faults()
+            .push(Fault::on("DELETE", RECORD).respond(200, fail_body("4004", "refused")));
+        mock.lose_rollback_answers(3, failing_listings);
+        let wanted = rr("www.example.org", RecordType::A, None, &["192.0.2.2"]);
+        let e = client
+            .set_rrset(&zone(), &wanted, Expect::Any)
+            .await
+            .unwrap_err();
+        let label = format!("listings failing: {failing_listings}");
+        assert_eq!(e.kind(), ErrorKind::Transient, "{label}: {e:?}");
+        assert_eq!(rollbacks(&mock), 3, "{label}");
+        assert!(settled(&mock), "{label}");
+        assert_eq!(published(&mock, "www", "A"), ["192.0.2.1"], "{label}");
+
+        control.stage_record("example.org", "foreign-edit", "A", "192.0.2.9", None);
+        let e = client
+            .get_rrset(&zone(), &www, RecordType::A)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{label}: {e:?}");
+        let e = client
+            .set_rrset(&zone(), &wanted, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{label}: {e:?}");
+        let expected = if failing_listings == 0 {
+            "did not make"
+        } else {
+            "cannot show"
+        };
+        assert!(e.to_string().contains(expected), "{label}: {e}");
+        assert_eq!((commits(&mock), rollbacks(&mock)), (0, 3), "{label}");
+        assert_eq!(control.staged("foreign-edit", "A").len(), 1, "{label}");
+    }
+}
+
+/// Settling a confirmed mark unconfirms it before the first attempt: when the commit (or
+/// rollback) that settles it is applied with its answer lost and the listing after it fails, a
+/// foreign edit staged afterwards is refused, not committed (or rolled back) as ours.
+#[tokio::test]
+async fn nicru_settling_a_confirmed_mark_unconfirms_it_first() {
+    // A confirmed commit mark: every commit attempt fails, the listing after them succeeds.
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    mock.faults()
+        .push(Fault::on("POST", COMMIT).times(3).status(502));
+    assert!(add(&client, "AAA").await.unwrap_err().is_retryable());
+    assert!(control.has_changes("example.org"));
+    // The next operation settles it; its commits are applied with their answers lost.
+    mock.lose_commit_answers(3, 3);
+    let e = add(&client, "BBB").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(control.published_txt(REL), ["AAA"]);
+    control.stage_record("example.org", "foreign-edit", "TXT", "pending", None);
+    let e = add(&client, "BBB").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(commits(&mock), 6);
+    assert!(control.published_txt("foreign-edit").is_empty());
+
+    // A confirmed rollback mark: a refused deletion, every rollback attempt fails, the listing
+    // after them succeeds.
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = dn("www.example.org");
+    control.insert_record("example.org", "www", "A", "192.0.2.1", None);
+    mock.faults()
+        .push(Fault::on("DELETE", RECORD).respond(200, fail_body("4004", "refused")));
+    mock.faults()
+        .push(Fault::on("POST", ROLLBACK).times(3).status(502));
+    let wanted = rr("www.example.org", RecordType::A, None, &["192.0.2.2"]);
+    let e = client
+        .set_rrset(&zone(), &wanted, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert!(control.has_changes("example.org"));
+    // A read settles it; its rollbacks are applied with their answers lost.
+    mock.lose_rollback_answers(3, 3);
+    let e = client
+        .get_rrset(&zone(), &www, RecordType::A)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert!(settled(&mock));
+    control.stage_record("example.org", "foreign-edit", "A", "192.0.2.9", None);
+    let e = client
+        .get_rrset(&zone(), &www, RecordType::A)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!((commits(&mock), rollbacks(&mock)), (0, 6));
+    assert_eq!(control.staged("foreign-edit", "A").len(), 1);
 }
 
 /// A TTL change of a CNAME stages the deletion of the old record before the record with the

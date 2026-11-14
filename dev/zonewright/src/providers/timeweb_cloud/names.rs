@@ -38,7 +38,27 @@
 //! trailing dot is a full name in either form.
 //!
 //! A record shown by several listings (the zone's and a subdomain's) is one record, taken once
-//! by its identifier; two listings that place it at different names are `Error::Protocol`.
+//! by its identifier when every listing shows it with the same type, value, priority and TTL at
+//! the same name. One identifier at two names, or with different contents, is `Error::Protocol`:
+//! the description does not say whether identifiers are unique across types, and taking two
+//! different records for one would hide one of them from every read.
+//!
+//! # Relative to what
+//!
+//! A relative name is read relative to the zone in every listing, also in the listing of a
+//! subdomain. Assumption, from the wording of the `v2` record schema: "Имя поддомена (только
+//! поддомен без основного домена, например `sub` для `sub.example.com`)" ("the name of the
+//! subdomain, only the subdomain without the main domain, for example `sub` for
+//! `sub.example.com`", `dns-record-v2`, `data.subdomain`, in
+//! <https://timeweb.cloud/api-docs-data/bundle.json>): the part left out is the main domain,
+//! not the subdomain whose listing it is. To be confirmed against the live API. If the listing
+//! of a subdomain stated names relative to that subdomain instead, `www` in the listing of
+//! `www.example.org` would be `www.www.example.org` and not `www.example.org`. That reading
+//! cannot place a record silently at a name of the client's reading wherever a listing shows
+//! evidence of it, since each such evidence is `Error::Protocol` above: a record at the listed
+//! subdomain itself would be stated without a name; a record below it as a name that is not at
+//! or below the subdomain in the zone's reading (`x` in the listing of `www.example.org`); and
+//! a record that the zone's listing also shows would be placed at two names.
 
 use std::collections::HashMap;
 
@@ -169,6 +189,15 @@ fn two_forms() -> Error {
     protocol("the provider states record names both relative to the zone and as full names")
 }
 
+/// Whether two listed records with one identifier state the same record: the same type, value,
+/// priority and TTL (the owner names are compared as placed).
+fn same_contents(a: &Record, b: &Record) -> bool {
+    a.rtype == b.rtype
+        && a.value() == b.value()
+        && a.priority_text() == b.priority_text()
+        && a.ttl() == b.ttl()
+}
+
 /// Every record of `listings` once, with its owner (see the module documentation).
 pub(super) fn place<'a>(
     zone: &DomainName,
@@ -197,7 +226,7 @@ pub(super) fn place<'a>(
     };
 
     let mut placed = Vec::new();
-    let mut seen: HashMap<u64, Owner> = HashMap::new();
+    let mut seen: HashMap<u64, (Owner, &Record)> = HashMap::new();
     for (listed, readings, form) in read {
         for (record, reading) in listed.records.iter().zip(readings) {
             let owner = match (reading, form.or(common)) {
@@ -213,14 +242,20 @@ pub(super) fn place<'a>(
             };
             if let Some(id) = record.id() {
                 match seen.get(&id) {
-                    Some(earlier) if *earlier == owner => continue,
-                    Some(_) => {
+                    Some((earlier, _)) if *earlier != owner => {
                         return Err(protocol(
                             "the provider's listings show one record at two different names",
                         ));
                     }
+                    Some((_, first)) if same_contents(first, record) => continue,
+                    Some(_) => {
+                        return Err(protocol(
+                            "the provider's listings show one record identifier for two \
+                             different records",
+                        ));
+                    }
                     None => {
-                        seen.insert(id, owner.clone());
+                        seen.insert(id, (owner.clone(), record));
                     }
                 }
             }
@@ -359,6 +394,97 @@ mod tests {
         // One record at two names.
         let a = listed(Some("example.org"), &[(1, json!("a")), (1, json!("b"))]);
         assert_eq!(owners(&[a]), Err(ErrorKind::Protocol));
+    }
+
+    fn full_record(
+        id: u64,
+        rtype: &str,
+        subdomain: &str,
+        value: &str,
+        priority: Option<u64>,
+        ttl: u64,
+    ) -> Record {
+        serde_json::from_value(json!({
+            "id": id, "type": rtype, "ttl": ttl,
+            "data": {"subdomain": subdomain, "value": value, "priority": priority}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_repeated_identifier_is_one_record_only_when_everything_matches() {
+        let zone = dn("example.org");
+        let kinds = |records: Vec<Record>| {
+            let listings = [Listed {
+                of: Some(zone.clone()),
+                records,
+            }];
+            place(&zone, &listings)
+                .map(|placed| placed.len())
+                .map_err(|e| e.kind())
+        };
+        let mx = |id, value, priority, ttl| full_record(id, "MX", "www", value, priority, ttl);
+        // The same record twice is taken once.
+        assert_eq!(
+            kinds(vec![
+                mx(7, "mx.example.net", Some(10), 60),
+                mx(7, "mx.example.net", Some(10), 60),
+            ]),
+            Ok(1)
+        );
+        // One identifier, two records: another type, value, priority or TTL.
+        for second in [
+            full_record(7, "TXT", "www", "mx.example.net", Some(10), 60),
+            mx(7, "other.example.net", Some(10), 60),
+            mx(7, "mx.example.net", Some(20), 60),
+            mx(7, "mx.example.net", None, 60),
+            mx(7, "mx.example.net", Some(10), 300),
+        ] {
+            let first = mx(7, "mx.example.net", Some(10), 60);
+            assert_eq!(
+                kinds(vec![first, second]),
+                Err(ErrorKind::Protocol),
+                "one identifier for two records"
+            );
+        }
+        // The reviewer's case: an A and a TXT record at `www`, both with the identifier 7.
+        assert_eq!(
+            kinds(vec![
+                full_record(7, "A", "www", "192.0.2.1", None, 60),
+                full_record(7, "TXT", "www", "v1", None, 60),
+            ]),
+            Err(ErrorKind::Protocol)
+        );
+        // Records without an identifier are never compared.
+        let a: Record = serde_json::from_value(json!({
+            "type": "A", "data": {"subdomain": "www", "value": "192.0.2.1"}
+        }))
+        .unwrap();
+        let b: Record = serde_json::from_value(json!({
+            "type": "TXT", "data": {"subdomain": "www", "value": "v1"}
+        }))
+        .unwrap();
+        assert_eq!(kinds(vec![a, b]), Ok(2));
+    }
+
+    /// Names in a subdomain's listing are relative to the zone (module documentation, "Relative
+    /// to what"); every listing that shows evidence of names relative to the listed subdomain
+    /// instead is refused.
+    #[test]
+    fn names_relative_to_the_listed_subdomain_are_never_placed() {
+        // The client's reading: `www` in the listing of `www.example.org` is that name.
+        let www = listed(Some("www.example.org"), &[(1, json!("www"))]);
+        assert_eq!(owners(&[www]), Ok(vec![at("www.example.org")]));
+        // Evidence of the other reading: the record at the subdomain itself without a name, a
+        // record below it named relative to it, and a record the zone's listing places at the
+        // name that the other reading gives.
+        let nameless = listed(Some("www.example.org"), &[(1, json!(null))]);
+        assert_eq!(owners(&[nameless]), Err(ErrorKind::Protocol));
+        let below = listed(Some("www.example.org"), &[(1, json!("x"))]);
+        assert_eq!(owners(&[below]), Err(ErrorKind::Protocol));
+        let zone = listed(Some("example.org"), &[(1, json!("www.www"))]);
+        let www = listed(Some("www.example.org"), &[(1, json!("www"))]);
+        assert_eq!(owners(&[zone, www]), Err(ErrorKind::Protocol));
     }
 
     #[test]

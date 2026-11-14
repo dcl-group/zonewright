@@ -1143,8 +1143,10 @@ async fn selectel_v2_exact_name_match_ignores_noisy_filter() {
     assert!(query.contains("rrset_types=TXT"), "{query}");
 }
 
-/// The TXT dialect: quoted character-strings are joined, unquoted text is read as it is, and
-/// content the dialect cannot decode is a foreign value written back unchanged.
+/// The TXT dialect: quoted character-strings are joined, and content the rule cannot decode is
+/// a foreign value written back unchanged; unquoted content, whose meaning no source gives, is
+/// never taken for a value, so the value is added next to it
+/// (`selectel_v2_txt_levels_agree` has every spelling).
 #[tokio::test]
 async fn selectel_v2_txt_dialect() {
     let (mock, client) = setup().await;
@@ -1182,8 +1184,162 @@ async fn selectel_v2_txt_dialect() {
             .add_txt_value(&zone(), &dn(other), &txt("plain"), None)
             .await
             .unwrap(),
-        AddOutcome::AlreadyPresent
+        AddOutcome::Appended
     );
+    assert_eq!(
+        control.contents(other, "TXT"),
+        [("plain".to_owned(), false), ("\"plain\"".to_owned(), false)]
+    );
+}
+
+/// Both levels read stored TXT content by one rule: for each spelling, the TXT value operations
+/// take the record for a value of theirs exactly when `get_rrset` reports that value. Content
+/// "wrapped in quotes" is read; anything else is non-canonical at record level, and the value
+/// operations put the value next to it and answer `NotPresent` to its removal, leaving it
+/// untouched.
+#[tokio::test]
+async fn selectel_v2_txt_levels_agree() {
+    // Stored content, what `get_rrset` reports (`None`: non-canonical), the plain value probed.
+    let cases: &[(&str, Option<&str>, &str)] = &[
+        // One quoted string.
+        (r#""abc""#, Some(r#""abc""#), "abc"),
+        // Several quoted strings, with and without whitespace between them.
+        (r#""ab" "c""#, Some(r#""abc""#), "abc"),
+        (r#""ab""c""#, Some(r#""abc""#), "abc"),
+        // Escapes inside quotes.
+        (r#""a\059b""#, Some(r#""a;b""#), "a;b"),
+        (r#""a\"b""#, Some(r#""a\"b""#), "ab"),
+        // Empty.
+        (r#""""#, Some(r#""""#), "x"),
+        ("", None, "x"),
+        // Undecided: unquoted without and with spaces, mixed, an unterminated quote.
+        ("abc", None, "abc"),
+        ("ab c", None, "abc"),
+        (r"a\059b", None, "a;b"),
+        (r#""ab" c"#, None, "abc"),
+        (r#"ab "c""#, None, "abc"),
+        (r#""a" b ""#, None, "ab"),
+    ];
+    for &(spelling, reported, probe) in cases {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        control.insert_rrset("example.org", NAME, "TXT", 60, &[spelling]);
+        let read = client
+            .get_rrset(&zone(), &name(), RecordType::TXT)
+            .await
+            .unwrap()
+            .unwrap();
+        let record = read.records()[0].clone();
+        match reported {
+            Some(text) => assert_eq!(record, rd(RecordType::TXT, text), "{spelling}"),
+            None => {
+                assert!(!record.is_canonical(), "{spelling}");
+                assert_eq!(record.as_str(), spelling);
+            }
+        }
+        let value = txt(probe).to_data().unwrap();
+        let stored = |mock: &SelectelV2Mock| -> Vec<String> {
+            mock.control()
+                .contents(NAME, "TXT")
+                .into_iter()
+                .map(|(content, _)| content)
+                .collect()
+        };
+        if record == value {
+            assert_eq!(
+                add(&client, probe).await.unwrap(),
+                AddOutcome::AlreadyPresent,
+                "{spelling}"
+            );
+            assert_eq!(writes(&mock), 0, "{spelling}");
+            assert_eq!(
+                remove(&client, probe).await.unwrap(),
+                RemoveOutcome::RrsetDeleted,
+                "{spelling}"
+            );
+            assert!(stored(&mock).is_empty(), "{spelling}");
+        } else {
+            assert_eq!(
+                remove(&client, probe).await.unwrap(),
+                RemoveOutcome::NotPresent,
+                "{spelling}"
+            );
+            assert_eq!(writes(&mock), 0, "{spelling}");
+            assert_eq!(
+                add(&client, probe).await.unwrap(),
+                AddOutcome::Appended,
+                "{spelling}"
+            );
+            assert_eq!(stored(&mock), [spelling.to_owned(), format!("\"{probe}\"")]);
+            let read = client
+                .get_rrset(&zone(), &name(), RecordType::TXT)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.records().len(), 2, "{spelling}");
+            assert!(read.records().contains(&record), "{spelling}");
+            assert!(read.records().contains(&value), "{spelling}");
+            assert_eq!(
+                remove(&client, probe).await.unwrap(),
+                RemoveOutcome::Removed,
+                "{spelling}"
+            );
+            assert_eq!(stored(&mock), [spelling], "{spelling}");
+        }
+    }
+}
+
+/// What one level writes, the other reads back as the same value: a value added by the TXT
+/// value operations (quoted) is that value at record level, and a `set_rrset` of it is
+/// `Unchanged`; a value written by `set_rrset` is found by the value operations and removed by
+/// them.
+#[tokio::test]
+async fn selectel_v2_txt_round_trips_through_both_levels() {
+    let long = "z".repeat(255);
+    for probe in ["abc", "a;b", "v=DKIM1;k=rsa", long.as_str()] {
+        let value = txt(probe).to_data().unwrap();
+        // Value operation, then record level.
+        let (mock, client) = setup().await;
+        assert_eq!(add(&client, probe).await.unwrap(), AddOutcome::Created);
+        assert_eq!(
+            mock.control().contents(NAME, "TXT"),
+            [(format!("\"{probe}\""), false)]
+        );
+        let read = client
+            .get_rrset(&zone(), &name(), RecordType::TXT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.records(), std::slice::from_ref(&value), "{probe}");
+        let set = RrSet::new(name(), RecordType::TXT, None, [value.clone()]).unwrap();
+        assert_eq!(
+            client.set_rrset(&zone(), &set, Expect::Any).await.unwrap(),
+            SetOutcome::Unchanged,
+            "{probe}"
+        );
+        assert_eq!(writes(&mock), 1, "{probe}");
+        // Record level, then value operation.
+        let (mock, client) = setup().await;
+        assert_eq!(
+            client
+                .set_rrset(&zone(), &set, Expect::Absent)
+                .await
+                .unwrap(),
+            SetOutcome::Created
+        );
+        assert_eq!(
+            add(&client, probe).await.unwrap(),
+            AddOutcome::AlreadyPresent,
+            "{probe}"
+        );
+        assert_eq!(writes(&mock), 1, "{probe}");
+        assert_eq!(
+            remove(&client, probe).await.unwrap(),
+            RemoveOutcome::RrsetDeleted,
+            "{probe}"
+        );
+        assert!(mock.control().rrset(NAME, "TXT").is_none(), "{probe}");
+    }
 }
 
 /// An rrset created by someone else between the read and the create is a retryable `Conflict`;

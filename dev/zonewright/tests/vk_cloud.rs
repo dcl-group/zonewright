@@ -2803,6 +2803,85 @@ async fn vk_cloud_refused_cname_change_keeps_the_old_record() {
     assert_eq!(stored(&mock, "cname", "www"), ["new.example.net"]);
 }
 
+/// A CNAME change never deletes the last CNAME record of the name before its replacement exists,
+/// whatever the API refuses: with every create refused, a change, also of a name that holds
+/// several CNAME records, leaves a CNAME record at the name. The client changes the record in
+/// place (pinned by `vk_cloud_cname_is_changed_in_place`). Were the layer ever to plan a delete
+/// and then a create for this client, the client's plan check refuses that plan with `Protocol`
+/// before any write; this test accepts that answer and checks only that the name keeps its
+/// record, so that it fails for the plan check missing and not for the plan check working.
+#[tokio::test]
+async fn vk_cloud_cname_is_never_deleted_before_its_replacement() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let www = "www.example.org";
+    let emptied = Arc::new(AtomicBool::new(false));
+    for (old, refused_update) in [
+        (&["old.example.net"][..], false),
+        (&["old.example.net"][..], true),
+        (&["a.example.net", "b.example.net"][..], false),
+        (&["a.example.net", "b.example.net"][..], true),
+    ] {
+        for record in control.records_of(ZONE, "cname", "www") {
+            control.delete_record(&record.uuid);
+        }
+        for target in old {
+            control.insert_record(
+                ZONE,
+                "cname",
+                "www",
+                serde_json::json!({"content": target}),
+                300,
+            );
+        }
+        mock.faults().clear();
+        mock.log().clear();
+        // Before every delete: would it remove the last CNAME record at the name?
+        let (hook, flag) = (control.clone(), emptied.clone());
+        mock.faults()
+            .push(Fault::on("DELETE", MEMBERS).always().run(move || {
+                if hook.records_of(ZONE, "cname", "www").len() <= 1 {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }));
+        mock.faults()
+            .push(Fault::on("POST", COLLECTIONS).always().status(400));
+        if refused_update {
+            mock.faults().push(Fault::on("PUT", MEMBERS).status(400));
+        }
+        let before = stored(&mock, "cname", "www");
+        let set = rr(www, RecordType::CNAME, None, &["new.example.net."]);
+        let result = client.set_rrset(&zone(), &set, Expect::Any).await;
+        let label = format!("{old:?}, update refused: {refused_update}");
+        match result {
+            Ok(outcome) => {
+                assert!(!refused_update, "{label}");
+                assert_eq!(outcome, SetOutcome::Replaced, "{label}");
+                assert_eq!(
+                    stored(&mock, "cname", "www"),
+                    ["new.example.net"],
+                    "{label}"
+                );
+            }
+            // A plan refused before any write leaves every record.
+            Err(e) if e.kind() == ErrorKind::Protocol => {
+                assert_eq!(record_writes(&mock), 0, "{label}");
+                assert_eq!(stored(&mock, "cname", "www"), before, "{label}");
+            }
+            Err(e) => assert_eq!(e.kind(), ErrorKind::Rejected, "{label}: {e:?}"),
+        }
+        assert!(
+            !control.records_of(ZONE, "cname", "www").is_empty(),
+            "{label}"
+        );
+        assert!(!emptied.load(Ordering::SeqCst), "{label}");
+        assert_eq!(mock.log().count(Some("POST"), COLLECTIONS), 0, "{label}");
+    }
+    mock.faults().clear();
+}
+
 /// Two clients sharing a `Context` write one name at once, the first create delayed: the second
 /// reads after the first wrote, so its `Expect::Absent` fails.
 #[tokio::test]

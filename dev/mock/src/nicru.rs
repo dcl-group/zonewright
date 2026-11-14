@@ -67,7 +67,7 @@ use axum::routing::{delete, get, post};
 use base64::Engine as _;
 use serde_json::json;
 
-use crate::MockServer;
+use crate::{Fault, MockServer};
 
 /// Path of the DNS API below the server's base URL.
 pub const API_PATH: &str = "/dns-master";
@@ -161,6 +161,8 @@ struct Inner {
     tokens: Vec<String>,
     tokens_issued: u64,
     next_id: u64,
+    /// How many of the next zone listings fail (see [`Control::fail_zone_listings`]).
+    failing_listings: u32,
 }
 
 impl Inner {
@@ -215,6 +217,7 @@ impl NicruMock {
             tokens: Vec::new(),
             tokens_issued: 0,
             next_id: 227_000,
+            failing_listings: 0,
             seed: seed.clone(),
         };
         for name in &seed.zones {
@@ -267,6 +270,53 @@ impl NicruMock {
     /// The state control.
     pub fn control(&self) -> &Control {
         &self.control
+    }
+
+    /// The next `times` commits are applied and then answered `502`, as commits whose answers
+    /// are lost; each of them also makes the next `failing_listings` zone listings fail
+    /// ([`Control::fail_zone_listings`]), so that a listing right after it fails as well.
+    pub fn lose_commit_answers(&self, times: u32, failing_listings: u32) {
+        let control = self.control.clone();
+        self.server.faults().push(
+            Fault::on("POST", "/dns-master/services/*/zones/*/commit")
+                .times(times)
+                .run(move || {
+                    for zone in control.zone_names() {
+                        control.commit(&zone);
+                    }
+                    control.fail_zone_listings(failing_listings);
+                })
+                .status(502),
+        );
+    }
+
+    /// The next `times` rollbacks are applied and then answered `502`, as rollbacks whose
+    /// answers are lost; each of them also makes the next `failing_listings` zone listings fail.
+    pub fn lose_rollback_answers(&self, times: u32, failing_listings: u32) {
+        let control = self.control.clone();
+        self.server.faults().push(
+            Fault::on("POST", "/dns-master/services/*/zones/*/rollback")
+                .times(times)
+                .run(move || {
+                    for zone in control.zone_names() {
+                        control.rollback(&zone);
+                    }
+                    control.fail_zone_listings(failing_listings);
+                })
+                .status(502),
+        );
+    }
+
+    /// The next `times` record stagings (`PUT …/records`) are answered `502` without being
+    /// applied; each of them also makes the next `failing_listings` zone listings fail.
+    pub fn fail_creates_unapplied(&self, times: u32, failing_listings: u32) {
+        let control = self.control.clone();
+        self.server.faults().push(
+            Fault::on("PUT", "/dns-master/services/*/zones/*/records")
+                .times(times)
+                .run(move || control.fail_zone_listings(failing_listings))
+                .status(502),
+        );
     }
 }
 
@@ -525,6 +575,42 @@ impl Control {
         }
     }
 
+    /// Discards every staged change of zone `zone`, as a rollback request would; for a fault
+    /// hook that applies a rollback whose answer is then lost.
+    pub fn rollback(&self, zone: &str) {
+        let mut inner = lock(&self.state);
+        let Some(id) = inner.zone_by_name(zone).map(|z| z.id) else {
+            return;
+        };
+        let published: Vec<Record> = inner
+            .published
+            .iter()
+            .filter(|r| r.zone_id == id)
+            .cloned()
+            .collect();
+        inner.staged.retain(|r| r.zone_id != id);
+        inner.staged.extend(published);
+        for z in inner.zones.iter_mut().filter(|z| z.id == id) {
+            z.has_changes = false;
+        }
+    }
+
+    /// The names of every zone.
+    pub fn zone_names(&self) -> Vec<String> {
+        lock(&self.state)
+            .zones
+            .iter()
+            .map(|z| z.name.clone())
+            .collect()
+    }
+
+    /// The next `n` zone listings (`GET /dns-master/zones`) are answered `503` with an empty
+    /// body, replacing any count set before. A client's transport repeats an idempotent request
+    /// up to three times, so `3` makes one listing of the client fail.
+    pub fn fail_zone_listings(&self, n: u32) {
+        lock(&self.state).failing_listings = n;
+    }
+
     /// Invalidates every issued token, as an expiry would.
     pub fn expire_tokens(&self) {
         lock(&self.state).tokens.clear();
@@ -711,9 +797,13 @@ fn zone_element(zone: &Zone, admin: &str, children: &str) -> String {
 }
 
 async fn zones(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    let inner = lock(&state);
+    let mut inner = lock(&state);
     if let Err(r) = authorize(&inner, &headers) {
         return r;
+    }
+    if inner.failing_listings > 0 {
+        inner.failing_listings -= 1;
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let mut data = String::new();
     for zone in &inner.zones {

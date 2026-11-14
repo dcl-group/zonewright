@@ -28,7 +28,9 @@
 //!   for `PATCH` and `DELETE` only);
 //! - a TXT record whose content is not quoted is refused with `422`; content that does not have
 //!   the form of its type (below) is refused with `422` as well (the documented validation
-//!   status; the per-type check itself is the mock's reading of the sources);
+//!   status; the per-type check itself is the mock's reading of the sources), except in an
+//!   update for a record whose content the rrset already holds: the provider's own data written
+//!   back unchanged are accepted as they are;
 //! - the content of DNAME, HTTPS and SVCB records is not checked beyond being non-empty: no source
 //!   gives its form;
 //! - a create of an SOA rrset, and an update or delete of the SOA rrset or of the NS rrset at the
@@ -868,17 +870,25 @@ fn validate_ttl(ttl: Option<u64>) -> Result<u32, Response> {
     }
 }
 
-fn validate_records(rtype: &str, records: &Value) -> Result<Vec<Record>, Response> {
+/// The records of a create or update. `held` are the contents the rrset holds now (none for a
+/// create): a record with one of them is the provider's own data written back unchanged and is
+/// not checked against the content rules (invented, see the module documentation).
+fn validate_records(
+    rtype: &str,
+    records: &Value,
+    held: &[String],
+) -> Result<Vec<Record>, Response> {
     let records: Vec<Record> =
         serde_json::from_value(records.clone()).map_err(|_| validation("records are invalid"))?;
     if records.is_empty() || records.len() > MAX_RECORDS {
         return Err(validation("records must hold 1 to 100 items"));
     }
+    let checked = || records.iter().filter(|r| !held.contains(&r.content));
     let quoted = |c: &str| c.len() >= 2 && c.starts_with('"') && c.ends_with('"');
-    if rtype == "TXT" && records.iter().any(|r| !quoted(&r.content)) {
+    if rtype == "TXT" && checked().any(|r| !quoted(&r.content)) {
         return Err(validation("TXT content must be quoted"));
     }
-    if records.iter().any(|r| !content_valid(rtype, &r.content)) {
+    if checked().any(|r| !content_valid(rtype, &r.content)) {
         return Err(validation("content does not match the record type"));
     }
     Ok(records)
@@ -984,7 +994,7 @@ async fn rrset_create(
         Ok(ttl) => ttl,
         Err(response) => return response,
     };
-    let records = match validate_records(rtype, &request["records"]) {
+    let records = match validate_records(rtype, &request["records"], &[]) {
         Ok(records) => records,
         Err(response) => return response,
     };
@@ -1042,11 +1052,14 @@ async fn rrset_update(
         Ok(managed_by) => managed_by,
         Err(response) => return response,
     };
-    let Some((name, rtype)) = lock(&state)
+    let Some((name, rtype, held)) = lock(&state)
         .rrsets
         .iter()
         .find(|r| r.id == rrset_id && r.zone_id == zone_id)
-        .map(|r| (r.name.clone(), r.rtype.clone()))
+        .map(|r| {
+            let held: Vec<String> = r.records.iter().map(|rec| rec.content.clone()).collect();
+            (r.name.clone(), r.rtype.clone(), held)
+        })
     else {
         return error(StatusCode::NOT_FOUND, "rrset not found", None);
     };
@@ -1060,7 +1073,7 @@ async fn rrset_update(
     let Some(records) = request.get("records") else {
         return validation("records are required");
     };
-    let records = match validate_records(&rtype, records) {
+    let records = match validate_records(&rtype, records, &held) {
         Ok(records) => records,
         Err(response) => return response,
     };
