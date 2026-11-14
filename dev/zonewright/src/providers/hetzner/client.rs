@@ -15,10 +15,13 @@ use crate::http::{Http, Poller, ZoneCache};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{Ttl, Txt};
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, Ttl, Txt};
 use crate::redact::Detail;
-use crate::values;
+use crate::{rrsets, values};
 
 use super::api::{self, Api, PRIMARY};
 use super::config::{self, ACTION_POLLS, HetznerConfig, HetznerCredentials};
@@ -30,11 +33,15 @@ const NOT_PRIMARY: &str = "the zone is not in primary mode; only primary zones c
 /// The Hetzner DNS client (Hetzner Cloud API, zones and RRSets).
 ///
 /// Authenticates with a project API token in `Authorization: Bearer`. The native unit is the
-/// rrset with value-level actions: TXT value operations ask the API to add one value to an
-/// rrset or to remove the values that equal ours, spelled as the API returned them. Values of
-/// other writers are never part of a request (`ValueGuarantee::PerValue`); a writer outside this
-/// process can at worst cause a duplicate of our own value. Writes are actions the API completes
-/// asynchronously: the operation returns after the action has finished.
+/// rrset, addressed by name and type. TXT value operations use its value-level actions: they ask
+/// the API to add one value to an rrset or to remove the values that equal ours, spelled as the
+/// API returned them. Values of other writers are never part of such a request
+/// (`ValueGuarantee::PerValue`); a writer outside this process can at worst cause a duplicate of
+/// our own value. The record-level operations read the rrset and then create it or replace its
+/// records in one request, without a condition the API checks (`Preconditions::ReadThenWrite`);
+/// record comments, rrset labels and change protection are kept, and a protected rrset is not
+/// changed. Writes are actions the API completes asynchronously: the operation returns after the
+/// action has finished.
 ///
 /// Zone identifiers are cached for the life of the client; a stale one is detected and
 /// resolved again.
@@ -198,6 +205,41 @@ impl Provider for Hetzner {
             names.insert(name);
         }
         Ok(names.into_iter().map(ZoneInfo::new).collect())
+    }
+
+    /// Every rrset of the zone, all pages.
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        self.list_zone(zone).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        rrsets::get_whole_set(self, zone, name, rtype).await
+    }
+
+    /// Reads the rrset, then creates it or replaces its records, and changes its TTL when one
+    /// is requested.
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        rrsets::set_whole_set(self, zone, rrset, expect).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        rrsets::delete_whole_set(self, zone, name, rtype, expect).await
     }
 
     async fn add_txt_value(

@@ -4,9 +4,9 @@
 //! implementation, with the changes listed in design section 11.3; the client carries the
 //! references to the provider's documentation (hard rule 3).
 //!
-//! Capabilities describe what this version of the crate implements: `check`, `list_zones` and
-//! the TXT value operations on plain values. The record-level operations are not written yet, so
-//! their flags are false and `record_types` is empty.
+//! Capabilities describe what this version of the crate implements: `check`, `list_zones`, the
+//! TXT value operations on plain values, and the record-level operations for the types whose
+//! value form the provider's documentation gives (the client's `records.rs` cites each).
 
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use crate::meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderMeta, TtlSupport, TypeSet,
     ValueGuarantee,
 };
+use crate::record::RecordType;
 
 /// The metadata of Hetzner.
 pub(crate) static META: ProviderMeta = ProviderMeta {
@@ -79,29 +80,50 @@ const FIELDS: &[ConfigField] = &[
 /// What this version of the crate implements for Hetzner.
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: true,
-    list_rrsets: false,
-    get_rrset: false,
-    set_rrset: false,
-    delete_rrset: false,
+    list_rrsets: true,
+    get_rrset: true,
+    set_rrset: true,
+    delete_rrset: true,
     add_txt_value: true,
     remove_txt_value: true,
-    record_types: TypeSet::Listed(&[]),
-    read_only_types: &[],
+    // The types whose value form a source gives (the client's `records.rs`). CAA, DS, HINFO,
+    // HTTPS, RP and SVCB are in the API's enumeration, but their value form is not documented;
+    // they are listed, not read alone or written.
+    record_types: TypeSet::Listed(&[
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::CNAME,
+        RecordType::MX,
+        RecordType::NS,
+        RecordType::PTR,
+        RecordType::SOA,
+        RecordType::SRV,
+        RecordType::TLSA,
+        RecordType::TXT,
+    ]),
+    // Created and kept by the provider with the zone (design section 3.4; the client's
+    // `records.rs`).
+    read_only_types: &[RecordType::SOA],
     // The reference says only that a TXT value "has to be quoted"; how the API treats spaces,
     // quotes, backslashes and non-ASCII bytes inside the quotes is not established (design
     // section 4.4).
     txt_plain_only: true,
     // The API adds and removes values of an rrset by value (design section 3.5).
     txt_values: ValueGuarantee::PerValue,
+    // No write carries a condition on the rrset as read (the reference has none).
     preconditions: Preconditions::ReadThenWrite,
-    // Values are added and removed by value actions, so a replacement is several requests; a
-    // whole-set call is not established for this client (design section 11.2).
-    atomic_rrset_write: false,
+    // The records of an rrset are replaced by one request: `set_records` for an existing rrset,
+    // `POST /zones/{id}/rrsets` for a new one. A TTL change is a separate `change_ttl` action
+    // and does not touch the records.
+    atomic_rrset_write: true,
     // Source: the reference, Zone RRSets, `ttl`: 60 to 2147483647 seconds, one per rrset.
     ttl: TtlSupport::PerRrset {
         min: 60,
         max: 2_147_483_647,
     },
-    provider_default_ttl: false,
+    // An rrset whose `ttl` is `null` uses the zone's default TTL ("If not set, the Zone's
+    // Default TTL is used") and reads as `ttl() == None`. The client itself always sends a TTL
+    // for a new rrset; the `ttl` setting has no spelling for the zone's default.
+    provider_default_ttl: true,
     asynchronous: true,
 };

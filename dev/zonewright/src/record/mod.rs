@@ -26,6 +26,7 @@ pub use rrset::RrSet;
     feature = "digitalocean",
     feature = "cloudflare",
     feature = "yandex_cloud",
+    feature = "hetzner",
     feature = "route53",
     feature = "rfc2136"
 ))]

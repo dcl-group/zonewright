@@ -56,6 +56,8 @@ All notable changes to this crate are recorded in this file. The format follows
 - Record-level operations for RFC 2136: get, set and delete of an rrset of any type with a wire
   form, with prerequisites checked by the server in the same update; listing is impossible in the
   protocol.
+- Record-level operations for Hetzner: A, AAAA, CNAME, MX, NS, PTR, SRV, TLSA and TXT; SOA is read
+  only. A protected rrset is refused; record comments are kept.
 
 ### Changed
 

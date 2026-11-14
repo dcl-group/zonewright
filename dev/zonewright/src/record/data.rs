@@ -90,7 +90,8 @@ impl RecordData {
         feature = "selectel_v2",
         feature = "digitalocean",
         feature = "cloudflare",
-        feature = "yandex_cloud"
+        feature = "yandex_cloud",
+        feature = "hetzner"
     ))]
     pub(crate) fn from_provider(
         rtype: RecordType,
@@ -516,7 +517,8 @@ fn parse_generic(tokens: &[Token<'_>]) -> Result<Vec<u8>, RecordError> {
     feature = "selectel_v2",
     feature = "digitalocean",
     feature = "cloudflare",
-    feature = "yandex_cloud"
+    feature = "yandex_cloud",
+    feature = "hetzner"
 ))]
 mod tests {
     use super::RecordData;

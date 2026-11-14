@@ -6,9 +6,10 @@
 //! and a foreign value cannot be part of it (`ValueGuarantee::PerValue`). The value layer takes
 //! the per-name lock, reads and decides; this file maps its calls onto the API:
 //!
-//! - read: `GET …/rrsets/{rr_name}/TXT` under the zone-ID cache. The `404` answer cannot tell a
-//!   missing rrset from a missing zone: under an identifier resolved in this call it means the
-//!   rrset is absent; under a cached one the zone is looked up again and the read repeated;
+//! - read: `GET …/rrsets/{rr_name}/TXT` under the zone-ID cache (`rrset.rs`). The `404` answer
+//!   cannot tell a missing rrset from a missing zone: under an identifier resolved in this call
+//!   it means the rrset is absent; under a cached one the zone is looked up again and the read
+//!   repeated;
 //! - add: `add_records` with the value in zone-file text (quoted), sent once, then the action is
 //!   waited for. The TTL is the one the value layer chose: the rrset's as read when it exists
 //!   (the API refuses another one), else the caller's or the configured one;
@@ -23,17 +24,17 @@
 //! value (hetznerv1.go:125). Plain values, the only ones the capabilities accept, need no escape.
 
 use crate::error::Error;
-use crate::http::{Attempt, ZoneId};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
 use crate::name::DomainName;
-use crate::record::{Ttl, Txt, TxtDialect};
+use crate::record::{Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::values::{TxtBase, TxtRecord, ValueCalls, WriteTtl};
 
-use super::api::MAX_RECORDS_PER_CALL;
+use super::api::{MAX_RECORDS_PER_CALL, TXT};
 use super::client::Hetzner;
+use super::rrset::{rr_name, rrset_ttl, vanished};
 
 /// How TXT data is read.
 const READ: TxtDialect = TxtDialect::Auto;
@@ -65,15 +66,19 @@ impl ValueCalls for Hetzner {
         name: &DomainName,
     ) -> Result<Vec<TxtRecord<String>>, Error> {
         let rr = rr_name(zone, name)?;
-        let (_, records) = self
-            .zones
-            .read_zone(
-                zone,
-                || self.resolve_zone(zone),
-                |id| self.read_txt(&rr, id),
-            )
-            .await?;
-        Ok(records)
+        let Some(set) = self.read_rrset(zone, &rr, TXT).await?.1 else {
+            return Ok(Vec::new());
+        };
+        let ttl = rrset_ttl(&set)?;
+        Ok(set
+            .records
+            .into_iter()
+            .map(|record| TxtRecord {
+                value: READ.read(&record.value),
+                ttl,
+                handle: record.value,
+            })
+            .collect())
     }
 
     async fn add(
@@ -143,63 +148,5 @@ impl ValueCalls for Hetzner {
                 }
             }
         }
-    }
-}
-
-impl Hetzner {
-    /// The read phase under the zone cache: the TXT values of the rrset `rr` in the zone `id`,
-    /// or `Stale` when the API does not know the rrset under a cached identifier.
-    async fn read_txt(
-        &self,
-        rr: &str,
-        id: ZoneId,
-    ) -> Result<Attempt<Vec<TxtRecord<String>>>, Error> {
-        match self.api.rrset(&id.id, rr).await? {
-            Some(set) => {
-                // A TTL outside the crate's range is outside the documented one (60 to
-                // 2147483647) too. Read as "no TTL" it would make the add send none and could
-                // change the rrset's TTL (design section 3.6), so it is an answer the client
-                // cannot use.
-                let ttl = match set.ttl {
-                    None => None,
-                    Some(secs) => Some(Ttl::from_secs(secs).map_err(|_| Error::Protocol {
-                        detail: Detail::constant("the provider's rrset has an unusable TTL"),
-                    })?),
-                };
-                Ok(Attempt::Done(
-                    set.records
-                        .into_iter()
-                        .map(|record| TxtRecord {
-                            value: READ.read(&record.value),
-                            ttl,
-                            handle: record.value,
-                        })
-                        .collect(),
-                ))
-            }
-            // The zone was resolved in this call: it exists, so the rrset does not.
-            None if id.fresh => Ok(Attempt::Done(Vec::new())),
-            // A cached identifier: the zone may have been deleted and created again.
-            None => Ok(Attempt::Stale),
-        }
-    }
-}
-
-/// The owner name relative to the zone, `@` for the apex.
-// Source: the reference, Zone RRSets, `rr_name`: "must not end with a dot or the Zone name ...
-// For the Zone apex, use `@`".
-fn rr_name(zone: &DomainName, name: &DomainName) -> Result<String, Error> {
-    match name.relative_to(zone) {
-        None => Err(Error::name_outside_zone(name.clone(), zone.clone())),
-        Some("") => Ok("@".to_owned()),
-        Some(relative) => Ok(relative.to_owned()),
-    }
-}
-
-/// A write addressed a zone or rrset that no longer exists: it changed after the read, and
-/// nothing was written.
-fn vanished() -> Error {
-    Error::Conflict {
-        detail: Detail::constant("the zone was removed between the read and the write"),
     }
 }

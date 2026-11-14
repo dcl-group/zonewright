@@ -321,8 +321,9 @@ const ATOMIC_RRSET_WRITE: &[(ProviderId, bool)] = &[
     // Individual records: a replacement is several requests.
     (ProviderId::Cloudflare, false),
     (ProviderId::DigitalOcean, false),
-    // Value-level add and remove actions; a whole-set call is not established (design 11.2).
-    (ProviderId::Hetzner, false),
+    // `set_records` replaces the records of an rrset in one request; `POST …/rrsets` creates it
+    // with its records.
+    (ProviderId::Hetzner, true),
     // Individual records, staged and committed: several requests.
     (ProviderId::Nicru, false),
     (ProviderId::Regru, false),
