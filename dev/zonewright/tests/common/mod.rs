@@ -84,9 +84,11 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
             r#"{"username":"zw-test-user","base_url":"http://127.0.0.1:9/api/regru2"}"#,
             r#"{"password":"test-only-password"}"#,
         ),
-        ProviderId::AcmeDns | ProviderId::Beget | ProviderId::CloudRu | ProviderId::Nicru => {
-            ("{}", "{}")
-        }
+        ProviderId::CloudRu => (
+            r#"{"project_id":"0f1e2d3c-0000-4000-8000-000000000001","key_id":"zw-test-key-id","dns_url":"http://127.0.0.1:9","iam_url":"http://127.0.0.1:9/api/v1/auth/token"}"#,
+            r#"{"secret":"test-only-secret"}"#,
+        ),
+        ProviderId::AcmeDns | ProviderId::Beget | ProviderId::Nicru => ("{}", "{}"),
         _ => panic!("no sample configuration for {id}"),
     }
 }
