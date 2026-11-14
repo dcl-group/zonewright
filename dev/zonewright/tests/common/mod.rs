@@ -80,11 +80,13 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
             r#"{"base_url":"http://127.0.0.1:9/v1"}"#,
             r#"{"api_token":"test-only-token"}"#,
         ),
-        ProviderId::AcmeDns
-        | ProviderId::Beget
-        | ProviderId::CloudRu
-        | ProviderId::Nicru
-        | ProviderId::Regru => ("{}", "{}"),
+        ProviderId::Regru => (
+            r#"{"username":"zw-test-user","base_url":"http://127.0.0.1:9/api/regru2"}"#,
+            r#"{"password":"test-only-password"}"#,
+        ),
+        ProviderId::AcmeDns | ProviderId::Beget | ProviderId::CloudRu | ProviderId::Nicru => {
+            ("{}", "{}")
+        }
         _ => panic!("no sample configuration for {id}"),
     }
 }

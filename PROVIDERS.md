@@ -23,28 +23,28 @@ None yet.
 
 ## Implemented, not yet verified
 
-| Provider     | ID             | Levels     | Notes                                                                                            |
-| ------------ | -------------- | ---------- | ------------------------------------------------------------------------------------------------ |
-| Selectel v2  | `selectel_v2`  | TXT values | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
-| Cloudflare   | `cloudflare`   | TXT values |                                                                                                  |
-| Yandex Cloud | `yandex_cloud` | TXT values | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
-| Route 53     | `route53`      | TXT values |                                                                                                  |
-| DigitalOcean | `digitalocean` | TXT values |                                                                                                  |
-| VK Cloud     | `vk_cloud`     | TXT values |                                                                                                  |
-| RFC 2136     | `rfc2136`      | TXT values | Dynamic update has no operation that lists the records of a zone.                                |
-| Yandex 360   | `yandex_360`   | TXT values |                                                                                                  |
+| Provider      | ID              | Levels     | Notes                                                                                            |
+| ------------- | --------------- | ---------- | ------------------------------------------------------------------------------------------------ |
+| Selectel v2   | `selectel_v2`   | TXT values | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
+| Cloudflare    | `cloudflare`    | TXT values |                                                                                                  |
+| Yandex Cloud  | `yandex_cloud`  | TXT values | An earlier version of this client was proven against the live API. The API does not accept TLSA. |
+| Route 53      | `route53`       | TXT values |                                                                                                  |
+| DigitalOcean  | `digitalocean`  | TXT values |                                                                                                  |
+| VK Cloud      | `vk_cloud`      | TXT values |                                                                                                  |
+| RFC 2136      | `rfc2136`       | TXT values | Dynamic update has no operation that lists the records of a zone.                                |
+| Yandex 360    | `yandex_360`    | TXT values |                                                                                                  |
+| Timeweb Cloud | `timeweb_cloud` | TXT values |                                                                                                  |
 
 ## Planned
 
-| Provider      | ID              | Notes                                                              |
-| ------------- | --------------- | ------------------------------------------------------------------ |
-| acme-dns      | `acme_dns`      | TXT values only: the acme-dns API offers nothing else.             |
-| Beget         | `beget`         |                                                                    |
-| Cloud.ru      | `cloud_ru`      |                                                                    |
-| Hetzner       | `hetzner`       |                                                                    |
-| nic.ru        | `nicru`         |                                                                    |
-| reg.ru        | `regru`         | An earlier version of this client was proven against the live API. |
-| Timeweb Cloud | `timeweb_cloud` |                                                                    |
+| Provider | ID         | Notes                                                              |
+| -------- | ---------- | ------------------------------------------------------------------ |
+| acme-dns | `acme_dns` | TXT values only: the acme-dns API offers nothing else.             |
+| Beget    | `beget`    |                                                                    |
+| Cloud.ru | `cloud_ru` |                                                                    |
+| Hetzner  | `hetzner`  |                                                                    |
+| nic.ru   | `nicru`    |                                                                    |
+| reg.ru   | `regru`    | An earlier version of this client was proven against the live API. |
 
 "An earlier version was proven" does not make the client verified here: it is verified again once it
 is implemented in this crate.

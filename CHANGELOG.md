@@ -27,3 +27,4 @@ All notable changes to this crate are recorded in this file. The format follows
 - RFC 2136 client (`rfc2136`): connection check and TXT value operations by dynamic update over TCP,
   authenticated with TSIG.
 - Yandex 360 client (`yandex_360`): connection check, zone listing, TXT value operations.
+- Timeweb Cloud client (`timeweb_cloud`): connection check, zone listing, TXT value operations.
