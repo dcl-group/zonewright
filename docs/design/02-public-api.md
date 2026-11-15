@@ -14,63 +14,13 @@ feature `inspector`) are modules too.
 One type represents zone names and the owner names of rrsets. Names inside RDATA have a second, more
 permissive type, introduced at the end of this section.
 
-```rust
-/// An absolute domain name in canonical form: lowercase ASCII (A-labels), every label valid,
-/// stored with the trailing dot. The root name is ".".
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DomainName(/* private */);
+- `DomainName`, `NameError` — `src/name.rs`.
 
-impl DomainName {
-    pub fn parse(s: &str) -> Result<DomainName, NameError>;
-    /// `relative` is a zone-file style name relative to `origin`: "" or "@" is the origin itself,
-    /// "www" is "www.<origin>". A name ending in a dot is taken as absolute.
-    pub fn from_relative(relative: &str, origin: &DomainName) -> Result<DomainName, NameError>;
-    pub fn root() -> DomainName;
+Not stated in the rustdoc:
 
-    /// With the trailing dot: "www.example.org.". The root is ".".
-    pub fn as_str(&self) -> &str;
-    /// Without the trailing dot: "www.example.org". The root is "".
-    pub fn without_dot(&self) -> &str;
-    /// U-label form for display and for provider APIs that store Unicode names. Falls back to the
-    /// A-label form for labels that do not decode.
-    pub fn to_unicode(&self) -> String;
-
-    pub fn is_root(&self) -> bool;
-    /// The leftmost label is "*".
-    pub fn is_wildcard(&self) -> bool;
-    pub fn label_count(&self) -> usize;
-    /// Labels from the leftmost to the rightmost, without dots.
-    pub fn labels(&self) -> impl Iterator<Item = &str>;
-
-    /// `self` equals `zone` or is below it. Compared label by label, never by string suffix.
-    pub fn is_within(&self, zone: &DomainName) -> bool;
-    /// The part of `self` left of `zone`, without the separating dot; "" when `self == zone`;
-    /// `None` when `self` is not within `zone`.
-    pub fn relative_to(&self, zone: &DomainName) -> Option<&str>;
-    /// The name without its leftmost label; `None` for the root.
-    pub fn parent(&self) -> Option<DomainName>;
-    pub fn prepend(&self, label: &str) -> Result<DomainName, NameError>;
-}
-
-impl std::str::FromStr for DomainName { type Err = NameError; }
-impl std::fmt::Display for DomainName {}   // same as as_str()
-impl std::fmt::Debug for DomainName {}     // DomainName("www.example.org.")
-impl serde::Serialize for DomainName {}    // as_str()
-impl<'de> serde::Deserialize<'de> for DomainName {}  // through parse()
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum NameError {
-    Empty,
-    TooLong,            // more than 253 octets without the trailing dot
-    BadLabelLength,     // a label is empty or longer than 63 octets
-    BadCharacter,
-    BadHyphen,          // a label starts or ends with "-"
-    BadWildcard,        // "*" anywhere but as the whole leftmost label
-    Idna,
-    BadEscape,          // TargetName only: a malformed "\DDD" or a trailing "\"
-}
-```
+- `DomainName` serializes as the canonical string with the trailing dot and deserializes through
+  `parse`. Its `Display` is the same string; `Debug` prints `DomainName("www.example.org.")`.
+- `NameError` is `#[non_exhaustive]`.
 
 Parsing rules, in order:
 
@@ -99,30 +49,10 @@ There is no separate zone type. Functions that take a zone reject the root and w
 `Error::InvalidInput`. `Ord` is byte order of the canonical string, not DNSSEC canonical order; it
 exists so names can be map keys and sorted deterministically.
 
-```rust
-/// An absolute domain name as it occurs inside RDATA: any label contents DNS allows.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TargetName(/* private */);
+- `TargetName` — `src/name.rs`, with `From<DomainName>` and `From<&DomainName>`.
 
-impl TargetName {
-    /// Presentation format (RFC 1035 section 5.1) with the escapes `\DDD` and `\X`.
-    /// A name without a trailing dot is taken as absolute.
-    pub fn parse(s: &str) -> Result<TargetName, NameError>;
-    /// Zone-file semantics: "@" is `origin`; a name without a trailing dot is below `origin`.
-    pub fn from_relative(relative: &str, origin: &DomainName) -> Result<TargetName, NameError>;
-    /// From one uncompressed wire-format name.
-    pub fn from_wire(name: &[u8]) -> Result<TargetName, NameError>;
-    pub fn root() -> TargetName;
-    /// Canonical text with the trailing dot (section 4.2).
-    pub fn as_str(&self) -> &str;
-    pub fn is_root(&self) -> bool;
-    /// `Some` when the name also satisfies the owner-name rules above.
-    pub fn to_domain_name(&self) -> Option<DomainName>;
-}
-impl From<DomainName> for TargetName {}
-impl From<&DomainName> for TargetName {}
-// Display, Debug, FromStr, Serialize and Deserialize as for DomainName.
-```
+Not stated in the rustdoc: `Display`, `Debug`, `FromStr`, `Serialize` and `Deserialize` behave as
+for `DomainName`; `Debug` prints `TargetName("…")`.
 
 `TargetName` accepts labels of 1 to 63 arbitrary octets and names of at most 255 octets in wire
 form. Its canonical text and the one rule that serves both wire data and provider text are in
@@ -130,35 +60,16 @@ section 4.2. A `DomainName` is always a valid `TargetName`; the reverse conversi
 
 ### 2.2 Record model
 
-```rust
-/// A DNS record type: any 16-bit type code, plus the provider pseudo-types that have no code.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RecordType(/* private */);
+- `RecordType` — `src/record/rtype.rs`: the constants `A`, `AAAA`, `NS`, `CNAME`, `SOA`, `PTR`,
+  `MX`, `TXT`, `SRV`, `DNAME`, `CAA`, `TLSA`, `SSHFP`, `SVCB`, `HTTPS` and the pseudo-types `ALIAS`,
+  `ANAME`; `from_code` and `code`; `FromStr`, `Display`, `Debug`, `Serialize`, `Deserialize`.
 
-impl RecordType {
-    pub const A: RecordType;      pub const AAAA: RecordType;  pub const NS: RecordType;
-    pub const CNAME: RecordType;  pub const SOA: RecordType;   pub const PTR: RecordType;
-    pub const MX: RecordType;     pub const TXT: RecordType;   pub const SRV: RecordType;
-    pub const DNAME: RecordType;  pub const CAA: RecordType;   pub const TLSA: RecordType;
-    pub const SSHFP: RecordType;  pub const SVCB: RecordType;  pub const HTTPS: RecordType;
-    /// Provider pseudo-types: address records synthesized from a target name. No type code.
-    pub const ALIAS: RecordType;  pub const ANAME: RecordType;
-
-    pub const fn from_code(code: u16) -> RecordType;
-    /// `None` for pseudo-types.
-    pub const fn code(self) -> Option<u16>;
-}
-
-impl std::str::FromStr for RecordType { type Err = RecordError; }
-impl std::fmt::Display for RecordType {}
-impl std::fmt::Debug for RecordType {}
-impl serde::Serialize for RecordType {}              // the Display form
-impl<'de> serde::Deserialize<'de> for RecordType {}  // through FromStr
-```
+Not stated in the rustdoc: `RecordType` serializes as its `Display` form and deserializes through
+`FromStr`.
 
 The crate carries the complete mnemonic table of the IANA "Resource Record (RR) TYPEs" registry as
 of the release, as a hand-maintained table (`MNEMONICS` in `record/rtype.rs`) with the registry's
-date and source recorded next to it; the constants above are only the types that also have a
+date and source recorded next to it; the `RecordType` constants are only the types that also have a
 canonical form (section 4.3). `Display` prints the registry mnemonic for a registered code and
 `TYPE<code>` (RFC 3597) for any other. One departure: code 255, which the registry spells `*`, is
 printed as `ANY`; both `ANY` and `*` are accepted on input. `FromStr` is case-insensitive and
@@ -175,37 +86,9 @@ Code 0, OPT (41) and the range 128 ..= 255 that RFC 6895 section 3.1 reserves fo
 types (TKEY, TSIG, IXFR, AXFR, MAILB, MAILA, ANY and future ones) are representable but rejected by
 every operation with `Error::InvalidInput`.
 
-```rust
-/// Time to live in seconds, 0 ..= 2^31 - 1 (RFC 2181 section 8).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Ttl(/* private u32 */);
+- `Ttl`, `RrsetTtl` — `src/record/ttl.rs`.
 
-impl Ttl {
-    pub const MAX: Ttl;
-    pub fn from_secs(secs: u32) -> Result<Ttl, RecordError>;
-    pub const fn as_secs(self) -> u32;
-}
-impl From<Ttl> for std::time::Duration {}
-impl TryFrom<std::time::Duration> for Ttl { type Error = RecordError; }  // whole seconds only
-// Serialize / Deserialize as an integer number of seconds.
-
-/// The TTL an rrset states: a number, or the provider's default.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum RrsetTtl {
-    Explicit(Ttl),
-    /// No TTL of the caller's: the provider's default applies (Cloudflare's "automatic", the zone
-    /// default of Hetzner, nic.ru and Timeweb Cloud, the TTL a provider that sets every TTL itself
-    /// chooses).
-    ProviderDefault,
-}
-impl RrsetTtl {
-    pub fn from_secs(secs: u32) -> Result<RrsetTtl, RecordError>;  // Explicit
-    pub const fn explicit(self) -> Option<Ttl>;                    // None for ProviderDefault
-}
-impl From<Ttl> for RrsetTtl {}
-// Serialize / Deserialize as the number of seconds, or the string "provider_default".
-```
+Not stated in the rustdoc: `Ttl` serializes as an integer number of seconds.
 
 TTL is an integer type, not `Duration`: a DNS TTL has no sub-second part and a 31-bit range, and a
 `Duration` field would admit values that cannot be sent. The conversions keep `std::time` available
@@ -214,79 +97,12 @@ no TTL of its own and the provider's default applies. It is a separate type so t
 number everywhere else (inspector answers, `TtlSupport` bounds), and no number is reserved to mean
 "default" (`0` and `1` are valid TTLs).
 
-```rust
-/// The RDATA of one record in normalized zone-file text form (section 4).
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RecordData(/* private */);
+- `RecordData` — `src/record/data.rs`.
+- `RrSet` — `src/record/rrset.rs`.
+- `RecordError` — `src/record/mod.rs`.
 
-impl RecordData {
-    /// Strict parse of presentation-format RDATA. Domain names without a trailing dot are taken
-    /// as absolute. Fails for text that is not valid for `rtype`.
-    pub fn parse(rtype: RecordType, text: &str) -> Result<RecordData, RecordError>;
-    /// Zone-file semantics: a domain name without a trailing dot is relative to `origin`,
-    /// and "@" is `origin`.
-    pub fn parse_relative(
-        rtype: RecordType,
-        text: &str,
-        origin: &DomainName,
-    ) -> Result<RecordData, RecordError>;
-    /// From uncompressed wire-format RDATA.
-    pub fn from_wire(rtype: RecordType, rdata: &[u8]) -> Result<RecordData, RecordError>;
-    /// Wire-format RDATA without name compression. Fails for non-canonical data and pseudo-types.
-    pub fn to_wire(&self, rtype: RecordType) -> Result<Vec<u8>, RecordError>;
-
-    pub fn as_str(&self) -> &str;
-    /// False for a value a provider returned that the crate could not parse (section 4.9).
-    pub fn is_canonical(&self) -> bool;
-}
-impl std::fmt::Display for RecordData {}  // as_str()
-impl std::fmt::Debug for RecordData {}
-impl serde::Serialize for RecordData {}   // canonical: a string; otherwise { "raw": text }.
-                                          // No Deserialize: the type is needed to parse.
-
-/// All records of one owner name and type.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RrSet { /* private */ }
-
-impl RrSet {
-    /// `records` must not be empty. Duplicates are removed and the records are kept sorted by
-    /// their text, so two sets with the same members are equal. Every canonical member is
-    /// parsed again for `rtype` and must give the same text. CNAME, SOA, DNAME, ALIAS and ANAME
-    /// sets hold exactly one record.
-    pub fn new(
-        name: DomainName,
-        rtype: RecordType,
-        ttl: Option<RrsetTtl>,
-        records: impl IntoIterator<Item = RecordData>,
-    ) -> Result<RrSet, RecordError>;
-
-    pub fn name(&self) -> &DomainName;
-    pub fn rtype(&self) -> RecordType;
-    pub fn ttl(&self) -> Option<RrsetTtl>;
-    pub fn records(&self) -> &[RecordData];
-    pub fn contains(&self, record: &RecordData) -> bool;
-    /// Same name, type and members; TTL ignored.
-    pub fn same_records(&self, other: &RrSet) -> bool;
-    pub fn with_ttl(self, ttl: Option<RrsetTtl>) -> RrSet;
-}
-// Serialize / Deserialize as { "name", "type", "ttl", "records": [...] }. "ttl" is a number, the
-// string "provider_default", or null (also when missing) for a set that states no TTL. A
-// canonical record is a string, parsed with RecordData::parse for the set's type; a
-// non-canonical one is { "raw": text }.
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum RecordError {
-    UnknownType,                 // RecordType::from_str
-    Syntax { detail: String },   // text or wire data not valid for the type
-    OutOfRange { field: &'static str },
-    TooLong,                     // RDATA would exceed 65535 octets, or a character-string 255
-    Name(NameError),             // a domain name inside RDATA
-    EmptySet,                    // RrSet::new with no records
-    NotSingleton,                // more than one record for CNAME, SOA, DNAME, ALIAS, ANAME
-    NotCanonical,                // an operation that needs canonical data got raw provider text
-}
-```
+Not stated in the rustdoc: `RecordData` has no `Deserialize`, because the type is needed to parse
+it. `Display` is the text, `Debug` prints `RecordData("…")` or `RecordData(raw "…")`.
 
 `RecordError::Syntax::detail` describes the position and kind of the problem and never quotes the
 input.
@@ -325,50 +141,14 @@ Typed views exist for the types named in decision 9, and for TXT. Each converts 
 `RecordData` in the canonical form of section 4. They are plain data: the fields of MX, SRV, CAA and
 TLSA are fixed by their RFCs, so these structs are exhaustive.
 
-```rust
-/// TXT data as one byte string: the concatenation of the record's character-strings.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Txt(/* private Vec<u8> */);
-impl Txt {
-    /// At most 65279 octets (the most that fits one RDATA after splitting into 255-octet
-    /// character-strings). Empty data is allowed.
-    pub fn new(data: impl Into<Vec<u8>>) -> Result<Txt, RecordError>;
-    pub fn as_bytes(&self) -> &[u8];
-    /// `Some` when the data is valid UTF-8.
-    pub fn as_str(&self) -> Option<&str>;
-    /// 1 ..= 255 octets, each in 0x21 ..= 0x7E and none of them `"` or `\`.
-    /// ACME DNS-01 values are plain.
-    pub fn is_plain(&self) -> bool;
-}
+- `Txt` — `src/record/txt.rs`.
+- `Mx` — `src/record/mx.rs`.
+- `Srv` — `src/record/srv.rs`.
+- `Caa` — `src/record/caa.rs`.
+- `Tlsa` — `src/record/tlsa.rs`.
+- `Svcb`, `SvcParam` — `src/record/svcb.rs`.
 
-pub struct Mx  { pub preference: u16, pub exchange: TargetName }
-pub struct Srv { pub priority: u16, pub weight: u16, pub port: u16, pub target: TargetName }
-pub struct Caa { pub flags: u8, pub tag: String, pub value: Vec<u8> }
-impl Caa { pub const CRITICAL: u8 = 0b1000_0000; pub fn is_critical(&self) -> bool; }
-pub struct Tlsa { pub usage: u8, pub selector: u8, pub matching_type: u8, pub data: Vec<u8> }
-
-/// RDATA shared by SVCB and HTTPS (RFC 9460).
-pub struct Svcb { pub priority: u16, pub target: TargetName, pub params: Vec<SvcParam> }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SvcParam {
-    Mandatory(Vec<u16>),
-    Alpn(Vec<Vec<u8>>),
-    NoDefaultAlpn,
-    Port(u16),
-    Ipv4Hint(Vec<std::net::Ipv4Addr>),
-    Ech(Vec<u8>),
-    Ipv6Hint(Vec<std::net::Ipv6Addr>),
-    Other { key: u16, value: Vec<u8> },
-}
-
-// For each of Txt, Mx, Srv, Caa, Tlsa, Svcb (all derive Clone, Debug, PartialEq, Eq):
-impl Mx {
-    pub fn to_data(&self) -> Result<RecordData, RecordError>;
-    pub fn from_data(data: &RecordData) -> Result<Mx, RecordError>;
-}
-```
+Each has `to_data` and `from_data`. `SvcParam` is `#[non_exhaustive]`.
 
 `to_data` fails only for field values that have no valid encoding (a CAA tag outside `[a-z0-9]`,
 duplicate SVCB parameter keys, data too long). `from_data` fails with `NotCanonical` for raw
@@ -379,34 +159,7 @@ produces data valid for both `RecordType::SVCB` and `RecordType::HTTPS`.
 
 ### 2.4 Provider identifiers
 
-```rust
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[non_exhaustive]
-pub enum ProviderId {
-    AcmeDns, Beget, CloudRu, Cloudflare, DigitalOcean, Hetzner, Nicru, Regru, Rfc2136, Route53,
-    SelectelV2, TimewebCloud, VkCloud, Yandex360, YandexCloud,
-}
-
-impl ProviderId {
-    /// Every identifier, in alphabetical order of the persisted strings. Complete in every build.
-    pub const ALL: &'static [ProviderId];
-    /// The persisted string. Never changes for an existing variant.
-    pub const fn as_str(self) -> &'static str;
-    /// Exact, case-sensitive match of `as_str`.
-    pub fn parse(s: &str) -> Option<ProviderId>;
-    /// The client for this provider is compiled into this build (its cargo feature is enabled).
-    pub const fn available(self) -> bool;
-    pub fn meta(self) -> &'static ProviderMeta;
-}
-
-impl std::fmt::Display for ProviderId {}             // as_str()
-impl std::str::FromStr for ProviderId { type Err = UnknownProviderId; }
-impl serde::Serialize for ProviderId {}              // as_str()
-impl<'de> serde::Deserialize<'de> for ProviderId {}  // through parse()
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub struct UnknownProviderId(/* private; Display does not echo more than 64 bytes of input */);
-```
+- `ProviderId`, `UnknownProviderId` — `src/id.rs`.
 
 `as_str` and `parse` are hand-written `match` expressions over this table and are the only place the
 strings exist. The serde impls call them; no derive with rename rules is used, because a derived
@@ -439,191 +192,17 @@ IDs under "Verified against the live API" are exactly those whose metadata has `
 Metadata is static data, present for every provider in every build. An application can show a
 configuration form or decide what to offer for a provider whose client is not compiled in.
 
-```rust
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct ProviderMeta {
-    pub id: ProviderId,
-    /// Human-readable name, as in PROVIDERS.md.
-    pub name: &'static str,
-    /// True only for providers listed under "Verified against the live API" in PROVIDERS.md.
-    pub verified: bool,
-    /// How long the application should be prepared to wait for a change to reach all name
-    /// servers, when the provider is known to need more or less than usual. `None`: no
-    /// provider-specific value; the application uses its own default.
-    pub default_propagation_timeout: Option<std::time::Duration>,
-    /// Every key of the settings object and of the credentials object.
-    pub fields: &'static [ConfigField],
-    pub capabilities: Capabilities,
-}
-impl ProviderMeta {
-    /// The field with this key, if any.
-    pub fn field(&self, key: &str) -> Option<&'static ConfigField>;
-}
+- `ProviderMeta`, `ConfigField`, `FieldKind`, `Capabilities`, `TypeSet`, `Preconditions`,
+  `TtlSupport`, `ProviderDefaultTtl`, `ValueGuarantee` — `src/meta.rs`.
+- `Operation` — `src/error.rs`.
 
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct ConfigField {
-    /// Key in the JSON object: the credentials object when `secret`, else the settings object.
-    pub key: &'static str,
-    pub secret: bool,
-    pub required: bool,
-    pub kind: FieldKind,
-    /// Default as text, for display. `None` for required fields and for fields with no default.
-    pub default: Option<&'static str>,
-    /// English label and one-sentence help text.
-    pub label: &'static str,
-    pub help: &'static str,
-    /// Rarely changed (endpoint overrides, polling intervals).
-    pub advanced: bool,
-}
+Not stated in the rustdoc:
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FieldKind {
-    Text,
-    /// Long or multi-line text (a PEM block, a JSON document).
-    Multiline,
-    Url,
-    Integer { min: i64, max: i64 },
-    /// A TTL: a number of seconds within the bounds, and, when `provider_default`, also the
-    /// string "provider_default" (equal to `ProviderDefaultTtl::can_request` of the provider's
-    /// capabilities). Every key named `ttl` has this kind.
-    Ttl { min: u32, max: u32, provider_default: bool },
-}
-
-#[derive(Clone, Copy, Debug)]
-#[non_exhaustive]
-pub struct Capabilities {
-    pub list_zones: bool,
-    pub list_rrsets: bool,
-    pub get_rrset: bool,
-    pub set_rrset: bool,
-    pub delete_rrset: bool,
-    pub add_txt_value: bool,
-    pub remove_txt_value: bool,
-    /// Types the record-level operations accept.
-    pub record_types: TypeSet,
-    /// Types within `record_types` that can be read but not written.
-    pub read_only_types: &'static [RecordType],
-    /// The TXT value operations accept only `Txt::is_plain` values.
-    pub txt_plain_only: bool,
-    /// What the TXT value operations guarantee against writers outside this process.
-    pub txt_values: ValueGuarantee,
-    pub preconditions: Preconditions,
-    /// Replacing an rrset is one request at the provider. False where the API works with
-    /// individual records (or individual values) and a replacement is several requests, and
-    /// where the API cannot replace a set at all. For a provider without record-level operations
-    /// in this crate, the flag says what a set replacement is at the provider's API.
-    pub atomic_rrset_write: bool,
-    pub ttl: TtlSupport,
-    /// Whether an rrset can have the provider's default TTL instead of an explicit one
-    /// (`RrsetTtl::ProviderDefault`), and whether a write can ask for it (section 3.6).
-    pub provider_default_ttl: ProviderDefaultTtl,
-    /// Writes complete through a provider-side operation that the client polls.
-    pub asynchronous: bool,
-}
-
-impl Capabilities {
-    /// The operation is offered; `Operation::Check` always is.
-    pub fn supports(&self, operation: Operation) -> bool;
-    /// In `record_types` and not a query or meta type (section 2.2). `AnyWithCode` excludes the
-    /// pseudo-types, which have no code.
-    pub fn can_read(&self, rtype: RecordType) -> bool;
-    /// `can_read` and not in `read_only_types`.
-    pub fn can_write(&self, rtype: RecordType) -> bool;
-    /// A number within `ttl`, or the provider's default where `provider_default_ttl` allows a
-    /// request for it. Anything else is `InvalidInput` before any request.
-    pub fn accepts_ttl(&self, ttl: RrsetTtl) -> bool;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TypeSet {
-    /// Exactly these types. An empty list: no record-level support.
-    Listed(&'static [RecordType]),
-    /// Every type that has a type code and a wire form (a protocol-level client such as RFC 2136).
-    AnyWithCode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Preconditions {
-    /// The provider checks the precondition in the same request that writes.
-    Atomic,
-    /// The client reads, compares and then writes; a change by another writer between the read
-    /// and the write is not detected.
-    ReadThenWrite,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TtlSupport {
-    /// One TTL per rrset, within the given bounds (seconds).
-    PerRrset { min: u32, max: u32 },
-    /// The API stores a TTL on every record. The crate writes the same TTL to all records of an
-    /// rrset and reports the smallest one it reads; a requested TTL counts as already set only
-    /// when every record has it.
-    PerRecord { min: u32, max: u32 },
-    /// The provider chooses the TTL; a requested number is refused, and the provider's default
-    /// is the only TTL a write can ask for.
-    NotSettable,
-}
-impl TtlSupport {
-    /// `secs` is within the bounds; always false for `NotSettable`.
-    pub fn accepts(&self, secs: u32) -> bool;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ProviderDefaultTtl {
-    /// Every rrset has an explicit TTL; every request for the provider's default is refused
-    /// before any request, and the `ttl` setting cannot be "provider_default".
-    Absent,
-    /// An rrset can have the provider's default (it reads so), and a write can ask for it for
-    /// the records it creates; a write that would turn an existing explicit TTL into it is
-    /// refused after the read and before any write (Timeweb Cloud).
-    ForNewRecords,
-    /// Every write can ask for it, also in place of an explicit TTL (Cloudflare, Hetzner, nic.ru,
-    /// and both NotSettable providers, whose TTL is always the provider's).
-    Requestable,
-}
-impl ProviderDefaultTtl {
-    pub const fn exists(self) -> bool;               // not Absent: reads can report it
-    pub const fn can_request(self) -> bool;          // not Absent: writes and the setting
-    pub const fn can_replace_explicit(self) -> bool; // Requestable
-}
-
-/// How far "a TXT value operation never overwrites or deletes a foreign value" holds when
-/// someone outside this process writes to the same rrset at the same time (section 3.5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ValueGuarantee {
-    /// Requests name only our value. Foreign values cannot be lost.
-    PerValue,
-    /// The whole set is written under a condition the provider checks. A concurrent change
-    /// makes the write fail instead of being overwritten.
-    Conditional,
-    /// The whole set is written after a read, unconditionally. A value added by another writer
-    /// between the read and the write is lost. Hard rule 2 holds only inside one process.
-    ReadThenWrite,
-    /// The provider keeps a fixed number of most recent values and drops the oldest (acme-dns).
-    Rotating,
-    /// The provider has no TXT value operations in this crate.
-    NotOffered,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum Operation {
-    Check, ListZones, ListRrsets, GetRrset, SetRrset, DeleteRrset, AddTxtValue, RemoveTxtValue,
-}
-impl Operation {
-    /// Stable snake_case identifier: "check", "list_zones", ...
-    pub const fn as_str(self) -> &'static str;
-}
-impl std::fmt::Display for Operation {}  // as_str()
-```
+- `Capabilities::can_read`: `TypeSet::AnyWithCode` excludes the pseudo-types, which have no code
+  (section 2.2).
+- `ProviderDefaultTtl::ForNewRecords` is the level of Timeweb Cloud.
+- `ProviderDefaultTtl::Requestable` is the level of Cloudflare, Hetzner, nic.ru, and both providers
+  whose `TtlSupport` is `NotSettable`, whose TTL is always the provider's.
 
 Capabilities are per provider, not per client instance, and describe this version of the crate: a
 provider without record-level operations in this crate (acme-dns, Beget) has `list_rrsets == false`
@@ -638,72 +217,7 @@ whose capability flag is false and asserts the error and zero requests (section 
 
 ### 2.6 The provider trait
 
-```rust
-pub trait Provider: Send + Sync {
-    fn id(&self) -> ProviderId;
-
-    fn capabilities(&self) -> &'static Capabilities {
-        &self.id().meta().capabilities
-    }
-
-    /// Verifies the credentials and reports, for each zone, whether it is visible and usable.
-    fn check(
-        &self,
-        zones: &[DomainName],
-    ) -> impl Future<Output = Result<CheckReport, Error>> + Send;
-
-    /// Zones in which these credentials can change records.
-    fn list_zones(&self) -> impl Future<Output = Result<Vec<ZoneInfo>, Error>> + Send;
-
-    /// Every rrset of the zone, of every type the provider reports.
-    fn list_rrsets(
-        &self,
-        zone: &DomainName,
-    ) -> impl Future<Output = Result<ZoneListing, Error>> + Send;
-
-    fn get_rrset(
-        &self,
-        zone: &DomainName,
-        name: &DomainName,
-        rtype: RecordType,
-    ) -> impl Future<Output = Result<Option<RrSet>, Error>> + Send;
-
-    /// Makes the rrset at `rrset.name()` / `rrset.rtype()` equal to `rrset`.
-    fn set_rrset(
-        &self,
-        zone: &DomainName,
-        rrset: &RrSet,
-        expect: Expect<'_>,
-    ) -> impl Future<Output = Result<SetOutcome, Error>> + Send;
-
-    fn delete_rrset(
-        &self,
-        zone: &DomainName,
-        name: &DomainName,
-        rtype: RecordType,
-        expect: Expect<'_>,
-    ) -> impl Future<Output = Result<DeleteOutcome, Error>> + Send;
-
-    /// Adds one value to the TXT rrset at `name` without touching its other values.
-    /// `ttl` is used only if the rrset has to be created: a number, the provider's default, or
-    /// `None` for the client's `ttl` setting. An existing rrset keeps its TTL.
-    fn add_txt_value(
-        &self,
-        zone: &DomainName,
-        name: &DomainName,
-        value: &Txt,
-        ttl: Option<RrsetTtl>,
-    ) -> impl Future<Output = Result<AddOutcome, Error>> + Send;
-
-    /// Removes that one value from the TXT rrset at `name` and nothing else.
-    fn remove_txt_value(
-        &self,
-        zone: &DomainName,
-        name: &DomainName,
-        value: &Txt,
-    ) -> impl Future<Output = Result<RemoveOutcome, Error>> + Send;
-}
-```
+- `Provider` — `src/provider.rs`.
 
 `id` and `check` are the only methods without a default body. Every other method has a default that
 returns `Error::Unsupported` for its operation, so a client implements exactly what its capabilities
@@ -716,154 +230,13 @@ implementation has to return can be built outside the crate: the report types be
 constructors, and `Error` has a constructor function for each kind (section 2.9). Adding a method
 with a default body is not a breaking change; adding a required method is (section 13.2).
 
-```rust
-/// Precondition of a write, evaluated against the rrset as it is at the provider.
-#[derive(Clone, Copy, Debug)]
-#[non_exhaustive]
-pub enum Expect<'a> {
-    /// No precondition: create or replace.
-    Any,
-    /// The rrset must not exist: create only.
-    Absent,
-    /// The rrset must have exactly these records and, if the given set states a TTL, that TTL:
-    /// `Explicit(n)` holds for an rrset that reads with n, `ProviderDefault` for one that has
-    /// the provider's default, and no stated TTL for any TTL. The given set must have the name
-    /// and type the operation is about; anything else is `Error::InvalidInput` before any
-    /// request.
-    Matches(&'a RrSet),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SetOutcome { Created, Replaced, Unchanged }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum DeleteOutcome { Deleted, NotPresent }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AddOutcome {
-    /// The rrset did not exist and now holds the value.
-    Created,
-    /// The rrset existed with other values and now also holds the value.
-    Appended,
-    /// The value was already there; nothing was written.
-    AlreadyPresent,
-    /// The value was sent and not refused; the state before and after could not be observed.
-    Accepted,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum RemoveOutcome {
-    /// The value was removed; other values remain.
-    Removed,
-    /// The value was the only one; the rrset no longer exists.
-    RrsetDeleted,
-    /// The value was not there; nothing was written.
-    NotPresent,
-    /// The removal was sent and not refused; the state before and after could not be observed.
-    Accepted,
-}
-
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct CheckReport {
-    /// The credentials were exercised against the provider and accepted. False when the provider
-    /// offers no request that tests credentials without changing anything (acme-dns), or none
-    /// that does so without naming a zone and `zones` was empty.
-    pub credentials_verified: bool,
-    /// One entry per requested zone, in the order given.
-    pub zones: Vec<ZoneCheck>,
-}
-
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct ZoneCheck {
-    pub zone: DomainName,
-    /// The zone exists at the provider, is visible to these credentials and accepts changes.
-    pub found: bool,
-    /// Why the zone is not usable, or a warning about a usable one.
-    pub detail: Option<Detail>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ZoneInfo {
-    pub name: DomainName,
-}
-
-/// The result of `list_rrsets`.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct ZoneListing {
-    /// Sorted by name, then type.
-    pub rrsets: Vec<RrSet>,
-    /// What the provider reported for the zone but the model cannot hold. Never silently empty:
-    /// every such rrset has an entry.
-    pub skipped: Vec<SkippedRrset>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct SkippedRrset {
-    pub name: DomainName,
-    /// The type as the provider spells it, at most 32 characters, control characters removed.
-    pub type_name: String,
-    pub reason: SkipReason,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SkipReason {
-    /// The type name is neither a registered mnemonic, nor `TYPE<code>`, nor a pseudo-type.
-    UnknownType,
-    /// Not a plain rrset: an alias to a provider resource, a routing-policy set and the like.
-    NotPlainRecords,
-    /// The owner name is not a valid `DomainName` (section 2.1).
-    UnsupportedName,
-}
-
-impl CheckReport { pub fn new(credentials_verified: bool, zones: Vec<ZoneCheck>) -> CheckReport; }
-impl ZoneCheck { pub fn new(zone: DomainName, found: bool, detail: Option<Detail>) -> ZoneCheck; }
-impl ZoneInfo { pub fn new(name: DomainName) -> ZoneInfo; }
-/// Sorts `rrsets` by name, then type.
-impl ZoneListing { pub fn new(rrsets: Vec<RrSet>, skipped: Vec<SkippedRrset>) -> ZoneListing; }
-impl SkippedRrset {
-    pub fn new(name: DomainName, type_name: &str, reason: SkipReason) -> SkippedRrset;
-}
-```
+- `Expect`, `SetOutcome`, `DeleteOutcome`, `AddOutcome`, `RemoveOutcome`, `CheckReport`,
+  `ZoneCheck`, `ZoneInfo`, `ZoneListing`, `SkippedRrset`, `SkipReason` — `src/provider.rs`.
 
 ### 2.7 Dispatch
 
-```rust
-/// One client of any provider compiled into this build.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum AnyProvider {
-    #[cfg(feature = "acme_dns")]
-    AcmeDns(providers::acme_dns::AcmeDns),
-    #[cfg(feature = "beget")]
-    Beget(providers::beget::Beget),
-    // ... one variant per ProviderId, each behind its feature
-}
-
-impl AnyProvider {
-    /// Builds the client for `id` from stored configuration: `settings` is the text of a JSON
-    /// object with the non-secret fields, `credentials` the text of a JSON object with the
-    /// secret fields (see ProviderMeta::fields).
-    pub fn from_json(
-        id: ProviderId,
-        settings: &str,
-        credentials: &secrecy::SecretString,
-        ctx: &Context,
-    ) -> Result<AnyProvider, Error>;
-}
-
-impl Provider for AnyProvider { /* forwards every method to the variant */ }
-// impl From<providers::cloudflare::Cloudflare> for AnyProvider, and so on for every client.
-```
+- `AnyProvider`, with `AnyProvider::from_json`, `impl Provider for AnyProvider` and one `From<…>`
+  impl per client — `src/providers/mod.rs`.
 
 `from_json` returns `Error::NotCompiled { provider }` for an ID whose feature is off. With no
 provider feature enabled the enum has no variants; it still compiles and `from_json` returns
@@ -872,57 +245,13 @@ with a `#[cfg]` on each arm.
 
 ### 2.8 Configuration, credentials and the shared context
 
-```rust
-/// State shared by all clients of one process: the HTTP client, the per-name locks and the
-/// process-local memory of the providers that need one. Cheap to clone.
-#[derive(Clone)]
-pub struct Context { /* private Arc */ }
-impl std::fmt::Debug for Context {}  // the options and the locks, nothing else
+- `Context`, `ContextOptions`, `HttpProxy` — `src/context.rs`.
 
-impl Context {
-    pub fn new(options: ContextOptions) -> Result<Context, Error>;
-}
+Not stated in the rustdoc:
 
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct ContextOptions {
-    /// Appended to the user agent: "zonewright/<version> <suffix>". At most 128 characters,
-    /// printable ASCII.
-    pub user_agent_suffix: Option<String>,
-    /// TCP and TLS connect timeout. Default 10 s.
-    pub connect_timeout: std::time::Duration,
-    /// Limit for one HTTP request from start to the end of the body. Default 30 s.
-    pub request_timeout: std::time::Duration,
-    /// DER-encoded certificates trusted in addition to the platform's roots.
-    pub extra_root_certificates: Vec<Vec<u8>>,
-    /// Refuse to connect to anything but loopback addresses. For tests. Default false.
-    /// With a proxy, the proxy must be a loopback IP literal too.
-    pub loopback_only: bool,
-    /// The HTTP proxy of every HTTP provider request. Default None. Section 5.1.
-    pub proxy: Option<HttpProxy>,
-}
-impl Default for ContextOptions {}
-
-#[derive(Clone)]
-#[non_exhaustive]
-pub struct HttpProxy {
-    /// "http://", "https://", "socks5://" or "socks5h://", then host:port (without a port, 80,
-    /// 443 or 1080); no user info, path, query or fragment.
-    pub url: String,
-    /// Proxy authentication: not empty, no ':' and no control characters.
-    pub username: Option<String>,
-    /// No control characters; requires `username`, and is required with it for SOCKS5.
-    pub password: Option<secrecy::SecretString>,
-    /// Hosts reached directly, bypassing the proxy. Default empty. Section 5.1.
-    pub exclusions: Vec<String>,
-}
-impl HttpProxy {
-    pub fn new(url: String) -> HttpProxy;
-    pub fn with_credentials(self, username: String, password: secrecy::SecretString) -> HttpProxy;
-    pub fn with_exclusions(self, exclusions: Vec<String>) -> HttpProxy;
-}
-impl std::fmt::Debug for HttpProxy {}  // the URL (withheld if it contains '@'), whether credentials are set
-```
+- The proxy rules, including what `proxy` and `exclusions` accept, are in section 5.1.
+- `HttpProxy`'s `Debug` shows the URL, withheld if it contains `@`, and whether credentials are set
+  (a code comment in the `Debug` impl in `src/context.rs`, not rustdoc).
 
 `Context::new` checks the options and fails with `Error::Config` for an empty or longer user agent
 suffix or one outside printable ASCII, a zero timeout, and, when an HTTP provider is compiled in, an
@@ -938,47 +267,13 @@ serialization (hard rule 2) holds between clients that share a `Context` and not
 built from different ones (section 3.3).
 
 Each provider module has the same three public types (Yandex Cloud adds `AuthorizedKey`, the typed
-form of its key file). Shown for one provider with a static token and one with required settings:
+form of its key file). Examples in the source: one provider with a static token and one with
+required settings.
 
-```rust
-// zonewright::providers::cloudflare — the module exists in every build (its metadata);
-// these types are compiled with feature "cloudflare"
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields, default)]
-#[non_exhaustive]
-pub struct CloudflareConfig {
-    pub base_url: String,   // default "https://api.cloudflare.com/client/v4"
-    pub ttl: RrsetTtl,      // default 120; 60 ..= 86400, or "provider_default" (also spelled 1)
-}
-impl Default for CloudflareConfig {}
-
-#[derive(Debug, serde::Deserialize)]
-#[non_exhaustive]
-pub struct CloudflareCredentials {
-    pub api_token: secrecy::SecretString,
-}
-impl CloudflareCredentials {
-    pub fn new(api_token: secrecy::SecretString) -> CloudflareCredentials;
-}
-
-pub struct Cloudflare { /* private */ }
-impl Cloudflare {
-    pub fn new(
-        config: CloudflareConfig,
-        credentials: CloudflareCredentials,
-        ctx: &Context,
-    ) -> Result<Cloudflare, Error>;
-}
-impl Provider for Cloudflare {}
-impl std::fmt::Debug for Cloudflare {}  // non-secret settings only
-
-// zonewright::providers::selectel_v2 — a config with required fields has a constructor that
-// takes them; the remaining fields are public and start at their defaults.
-impl SelectelV2Config {
-    pub fn new(account_id: String, username: String) -> SelectelV2Config;
-}
-```
+- `CloudflareConfig`, `CloudflareCredentials`, `Cloudflare` — `src/providers/cloudflare/config.rs`
+  and `src/providers/cloudflare/client.rs`.
+- `SelectelV2Config::new` — `src/providers/selectel_v2/config.rs`.
+- `AuthorizedKey` — `src/providers/yandex_cloud/config.rs`.
 
 Rules that hold for every provider module:
 
@@ -1037,148 +332,8 @@ Rules that hold for every provider module:
 
 ### 2.9 Errors
 
-```rust
-#[derive(Clone, Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum Error {
-    /// Settings or credentials are malformed, the context could not be built, or it cannot do
-    /// what is asked of it (no CA certificates to verify an HTTPS endpoint with).
-    #[error("invalid provider configuration: {detail}")]
-    #[non_exhaustive]
-    Config { detail: Detail },
-
-    #[error("provider {provider} is not compiled into this build")]
-    #[non_exhaustive]
-    NotCompiled { provider: ProviderId },
-
-    #[error("provider {provider} does not support {operation}")]
-    #[non_exhaustive]
-    Unsupported { provider: ProviderId, operation: Operation },
-
-    #[error("provider {provider} does not support record type {rtype}")]
-    #[non_exhaustive]
-    UnsupportedRecordType { provider: ProviderId, rtype: RecordType },
-
-    /// The request cannot be sent as given: a value the provider's encoding cannot carry, a TTL
-    /// outside the provider's range, a wildcard zone, an rrset over the provider's size limit.
-    #[error("invalid request: {detail}")]
-    #[non_exhaustive]
-    InvalidInput { detail: Detail },
-
-    #[error("name {name} is outside zone {zone}")]
-    #[non_exhaustive]
-    NameOutsideZone { name: DomainName, zone: DomainName },
-
-    #[error("zone {zone} not found at the provider")]
-    #[non_exhaustive]
-    ZoneNotFound { zone: DomainName },
-
-    #[error("provider authentication failed: {detail}")]
-    #[non_exhaustive]
-    Auth { detail: Detail },
-
-    #[error("provider denied access: {detail}")]
-    #[non_exhaustive]
-    Forbidden { detail: Detail },
-
-    /// The context's proxy refused the proxy credentials or demanded credentials that are not
-    /// configured. Never retried. Section 5.3.
-    #[error("the proxy refused the proxy credentials; check proxy.username and proxy.password")]
-    #[non_exhaustive]
-    ProxyAuth {},
-
-    /// `retry_after` is how long to wait, counted from the moment the error was returned.
-    #[error("provider rate limit reached")]
-    #[non_exhaustive]
-    RateLimited { retry_after: Option<std::time::Duration> },
-
-    /// The caller's `Expect` does not hold for the rrset as it is at the provider. Repeating the
-    /// same call gives the same answer until someone changes the rrset or the expectation.
-    #[error("precondition failed: {detail}")]
-    #[non_exhaustive]
-    PreconditionFailed { detail: Detail },
-
-    /// The provider detected that the rrset changed between this operation's read and its
-    /// write, and nothing was written. Repeating the call reads the new state.
-    #[error("concurrent change: {detail}")]
-    #[non_exhaustive]
-    Conflict { detail: Detail },
-
-    /// Network failure, timeout, a 5xx answer, or a provider-side operation still running.
-    /// The outcome of a write may be unknown.
-    #[error("transient provider error: {detail}")]
-    #[non_exhaustive]
-    Transient { detail: Detail },
-
-    /// The provider understood the request and refused it. `status` is the HTTP status when the
-    /// refusal was an HTTP-level one.
-    #[error("provider rejected the request: {detail}")]
-    #[non_exhaustive]
-    Rejected { status: Option<u16>, detail: Detail },
-
-    /// The provider answered with something the client cannot interpret.
-    #[error("unexpected provider response: {detail}")]
-    #[non_exhaustive]
-    Protocol { detail: Detail },
-}
-
-impl Error {
-    pub fn kind(&self) -> ErrorKind;
-    /// True for RateLimited, Conflict and Transient: repeating the same operation later can
-    /// succeed without anyone changing anything.
-    pub fn is_retryable(&self) -> bool;
-    /// The wait the provider asked for, for RateLimited; None otherwise.
-    pub fn retry_after(&self) -> Option<std::time::Duration>;
-
-    // Constructors, one per kind, for implementations of `Provider` outside the crate.
-    // Text arguments become a `Detail` through `Detail::new`.
-    pub fn config(detail: &str) -> Error;
-    pub fn not_compiled(provider: ProviderId) -> Error;
-    pub fn unsupported(provider: ProviderId, operation: Operation) -> Error;
-    pub fn unsupported_record_type(provider: ProviderId, rtype: RecordType) -> Error;
-    pub fn invalid_input(detail: &str) -> Error;
-    pub fn name_outside_zone(name: DomainName, zone: DomainName) -> Error;
-    pub fn zone_not_found(zone: DomainName) -> Error;
-    pub fn proxy_auth() -> Error;
-    pub fn auth(detail: &str) -> Error;
-    pub fn forbidden(detail: &str) -> Error;
-    pub fn rate_limited(retry_after: Option<std::time::Duration>) -> Error;
-    pub fn precondition_failed(detail: &str) -> Error;
-    pub fn conflict(detail: &str) -> Error;
-    pub fn transient(detail: &str) -> Error;
-    pub fn rejected(status: Option<u16>, detail: &str) -> Error;
-    pub fn protocol(detail: &str) -> Error;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ErrorKind {
-    Config, NotCompiled, Unsupported, UnsupportedRecordType, InvalidInput, NameOutsideZone,
-    ZoneNotFound, ProxyAuth, Auth, Forbidden, RateLimited, PreconditionFailed, Conflict, Transient,
-    Rejected, Protocol,
-}
-impl ErrorKind {
-    /// Every kind of this version, each once, in declaration order. An application's test walks
-    /// it to notice a kind added later, which its wildcard `match` arm would absorb silently.
-    pub const ALL: &'static [ErrorKind];
-    /// Stable snake_case identifier: "config", "not_compiled", ..., "protocol".
-    pub const fn as_str(self) -> &'static str;
-}
-impl std::fmt::Display for ErrorKind {}  // as_str()
-
-/// Bounded text taken from a provider's answer or composed by the client.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Detail(/* private */);
-impl Detail {
-    /// Replaces control characters, line and paragraph separators and bidirectional formatting
-    /// characters by spaces and truncates to at most 512 bytes on a character boundary. It does
-    /// not know any secret: whoever calls it is responsible for the text containing none.
-    pub fn new(text: &str) -> Detail;
-    pub fn as_str(&self) -> &str;
-}
-impl std::fmt::Display for Detail {}
-impl std::fmt::Debug for Detail {}
-```
+- `Error`, `ErrorKind`, `Operation` — `src/error.rs`.
+- `Detail` — `src/redact.rs`.
 
 Properties:
 

@@ -36,222 +36,32 @@ normalization, never by a dependency's `Display`.
 
 ### 8.2 Public API
 
-```rust
-// zonewright::inspector — compiled with feature "inspector"
+The module `zonewright::inspector` is compiled with the feature `inspector`. Its public items, by
+source file under `dev/zonewright/src/inspector/`:
 
-pub struct Inspector { /* private */ }
+- `src/inspector/mod.rs`:
+  - `Inspector` with `new`, `name_servers`, `query_server`, `query_recursive`, `observe` and `wait`.
+  - `Question`, `Answer`, `Condition`, `Expectation`.
+  - `InspectorError` (variants `Config`, `InvalidInput`, `NoNameServers`, `TooManyNameServers`,
+    `Timeout`).
+- `src/inspector/config.rs`:
+  - `InspectorConfig` and its `Default`. Every field carries its default and its range in its
+    rustdoc; the limits of the section 8.8 table are the fields `resolvers`, `query_timeout`,
+    `ns_cache_ttl`, `max_servers`, `discovery_timeout`, `max_questions` and
+    `max_questions_per_round`.
+  - The constants `InspectorConfig::QUESTIONS_CEILING`,
+    `InspectorConfig::QUESTIONS_PER_ROUND_CEILING` and `InspectorConfig::QUESTIONS_IN_FLIGHT`.
+  - `PUBLIC_RESOLVERS`, `NsDiscovery`, `IpFamilies`.
+  - `NameServer` (`new`, `query_addr`), `NotAsked`, `AddressRefusal`. `NotAsked` and
+    `AddressRefusal` have `as_str` and `Display`.
+- `src/inspector/wait.rs`:
+  - `WaitOptions` (`new`, and the constant `WaitOptions::MIN_INTERVAL`), `ServerReport`, `Report`.
+    The default and the range of `interval` and `jitter_percent` are in their rustdoc.
+- `src/inspector/cname.rs`: `impl crate::dns01::CnameLookup for Inspector`.
 
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct InspectorConfig {
-    /// Recursive resolvers, tried in order. Default: PUBLIC_RESOLVERS. At most 16, each once.
-    pub resolvers: Vec<std::net::SocketAddr>,
-    pub discovery: NsDiscovery,
-    /// Address families of discovered name servers to query. Default: V4.
-    pub ip_families: IpFamilies,
-    /// Limit for one question to one server, including a TCP retry. Default 3 s.
-    pub query_timeout: std::time::Duration,
-    /// How long a discovered server list is reused. Default 300 s. Zero disables the cache.
-    pub ns_cache_ttl: std::time::Duration,
-    /// Upper bound on the name servers (addresses) of one zone. Default 32.
-    pub max_servers: usize,
-    /// Limit for the whole discovery of one zone's servers. Default 10 s.
-    pub discovery_timeout: std::time::Duration,
-    /// Ask discovered name servers at private addresses (section 8.3). Default false.
-    pub allow_private_addresses: bool,
-    /// Read an answer without AA from a server of a static list by its content (section 8.4).
-    /// Default false.
-    pub accept_static_without_aa: bool,
-    /// Expectations or questions per call. Default 32; 1 to QUESTIONS_CEILING.
-    pub max_questions: usize,
-    /// Asked servers × questions of one round (in `wait`, identical questions count once).
-    /// Default 1024; from `max_questions` to QUESTIONS_PER_ROUND_CEILING.
-    pub max_questions_per_round: usize,
-}
-impl InspectorConfig {
-    pub const QUESTIONS_CEILING: usize = 256;
-    pub const QUESTIONS_PER_ROUND_CEILING: usize = 8192;
-    pub const QUESTIONS_IN_FLIGHT: usize = 128;
-}
-impl Default for InspectorConfig {}
+Not stated in the rustdoc:
 
-/// 1.1.1.1:53, 8.8.8.8:53, 9.9.9.9:53.
-pub const PUBLIC_RESOLVERS: &[std::net::SocketAddr];
-
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub enum NsDiscovery {
-    /// Ask the resolvers for the zone's NS rrset and the servers' addresses.
-    Recursive,
-    /// Use exactly these servers for every zone.
-    Static(Vec<NameServer>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum IpFamilies { V4, V6, Both }
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub struct NameServer {
-    /// The NS name, when known.
-    pub name: Option<TargetName>,
-    /// For a server that is not asked: the refused address, or None (no address in the families).
-    pub addr: Option<std::net::SocketAddr>,
-    /// Why the server is not asked; None for a server that is asked.
-    pub not_asked: Option<NotAsked>,
-}
-impl NameServer {
-    /// A server that is asked.
-    pub fn new(name: Option<TargetName>, addr: std::net::SocketAddr) -> NameServer;
-    /// `addr` when the server is asked, None otherwise.
-    pub fn query_addr(&self) -> Option<std::net::SocketAddr>;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum NotAsked {
-    /// The resolvers answered NODATA or NXDOMAIN for every configured family.
-    NoAddress,
-    AddressRefused(AddressRefusal),
-}
-
-/// Why the address policy refuses an address (section 8.3, step 4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum AddressRefusal {
-    Unspecified, Loopback, LinkLocal, Multicast, Reserved, ProtocolAssignment, Relay6to4,
-    Benchmarking, NotGlobalUnicast, Ipv4Mapped, Ipv4Compatible,
-    // lifted by allow_private_addresses:
-    Private, SharedAddressSpace, UniqueLocal, SiteLocal, LocalTranslation,
-}
-// NotAsked and AddressRefusal have `as_str` and `Display`.
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Question { pub name: DomainName, pub rtype: RecordType }
-
-/// What one server said about one question.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Answer {
-    /// The rrset, normalized. `ttl` is the smallest TTL among its records.
-    Records { ttl: Ttl, records: Vec<RecordData> },
-    /// The name exists, there is no rrset of this type.
-    NoData,
-    NxDomain,
-    /// The name is a CNAME; the server did not answer the question itself.
-    Cname(TargetName),
-    Refused,
-    ServFail,
-    /// An answer without the AA flag, or a referral, from a server queried as authoritative.
-    NotAuthoritative,
-    Timeout,
-    /// Anything else: another response code, a malformed message, a network error.
-    Failed(String),
-    /// The server was not asked (only in `observe` and `wait` results).
-    NotAsked(NotAsked),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Condition {
-    /// The rrset contains all of these values; other values may be present.
-    Present(Vec<RecordData>),
-    /// The rrset is exactly this set. An empty list means: there is no such rrset.
-    Exact(Vec<RecordData>),
-    /// The rrset contains none of these values, or does not exist.
-    Absent(Vec<RecordData>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Expectation { pub question: Question, pub condition: Condition }
-
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct WaitOptions {
-    /// Total time to wait. At least one round always runs.
-    pub timeout: std::time::Duration,
-    /// Pause between rounds. Default 5 s; at least MIN_INTERVAL.
-    pub interval: std::time::Duration,
-    /// The pause varies by up to this percentage either way. Default 20; at most 50.
-    pub jitter_percent: u8,
-    /// Leave the servers that are not asked out of "every server agrees". Default false.
-    pub ignore_unaskable_name_servers: bool,
-}
-impl WaitOptions {
-    /// 1 s.
-    pub const MIN_INTERVAL: std::time::Duration;
-    pub fn new(timeout: std::time::Duration) -> WaitOptions;
-}
-
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct ServerReport {
-    pub server: NameServer,
-    /// All expectations held at this server in the last round. Always false when not asked.
-    pub satisfied: bool,
-    /// The last round's answers, one per expectation, in the order given.
-    pub answers: Vec<Answer>,
-    /// When this server first satisfied all expectations, from the start of the wait.
-    pub first_satisfied_after: Option<std::time::Duration>,
-}
-
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct Report {
-    pub servers: Vec<ServerReport>,
-    pub rounds: u32,
-    pub elapsed: std::time::Duration,
-    /// Servers left out of the condition; 0 unless `ignore_unaskable_name_servers` is set.
-    pub unaskable_ignored: usize,
-}
-
-#[derive(Clone, Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum InspectorError {
-    #[error("invalid inspector configuration: {detail}")]
-    Config { detail: String },
-    #[error("invalid request: {detail}")]
-    InvalidInput { detail: String },
-    /// The complete server list could not be established; transient, nothing cached.
-    #[error("no usable name servers for zone {zone}: {detail}")]
-    NoNameServers { zone: DomainName, detail: String },
-    #[error("zone {zone} has {count} name server addresses, more than the configured limit")]
-    TooManyNameServers { zone: DomainName, count: usize },
-    #[error("expectations not met within the timeout")]
-    Timeout { report: Report },
-}
-
-impl Inspector {
-    pub fn new(config: InspectorConfig) -> Result<Inspector, InspectorError>;
-
-    /// The authoritative servers of `zone`, by the configured discovery, those not asked included.
-    pub async fn name_servers(&self, zone: &DomainName) -> Result<Vec<NameServer>, InspectorError>;
-
-    /// One question to one server, recursion not desired. No address policy applies.
-    pub async fn query_server(&self, server: std::net::SocketAddr, question: &Question) -> Answer;
-
-    /// One question to every configured resolver, recursion desired.
-    pub async fn query_recursive(&self, question: &Question) -> Vec<(std::net::SocketAddr, Answer)>;
-
-    /// One round: every question at every name server of the zone.
-    pub async fn observe(
-        &self,
-        zone: &DomainName,
-        questions: &[Question],
-    ) -> Result<Vec<(NameServer, Vec<Answer>)>, InspectorError>;
-
-    /// Polls until every name server of the zone satisfies every expectation in the same round.
-    pub async fn wait(
-        &self,
-        zone: &DomainName,
-        expectations: &[Expectation],
-        options: &WaitOptions,
-    ) -> Result<Report, InspectorError>;
-}
-
-impl crate::dns01::CnameLookup for Inspector {}
-```
+- `AddressRefusal` is the reason set of step 4 of section 8.3.
 
 All durations are `std::time::Duration`. Strings in `Answer::Failed` and in the error details are at
 most 512 bytes without control characters.

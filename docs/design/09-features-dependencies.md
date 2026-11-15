@@ -10,7 +10,7 @@ No feature is enabled by default (decision 6).
 
 | Feature                | Enables                                              | Optional dependencies it turns on                                                    |
 | ---------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| one per provider (2.4) | that provider's client and its `AnyProvider` variant | see the feature list below                                                           |
+| one per provider (2.4) | that provider's client and its `AnyProvider` variant | see the `[features]` table of the manifest                                           |
 | `all-providers`        | all fifteen provider features                        | their union                                                                          |
 | `inspector`            | `zonewright::inspector`                              | `hickory-proto`, `futures-util`, `fastrand`, `tracing`; `tokio/net`, `tokio/io-util` |
 
@@ -28,40 +28,9 @@ documented as internal, and they are not part of the SemVer surface:
 | `__crypto`      | `aws-lc-rs`                                                                                                               | `rfc2136`, `route53`, `yandex_cloud` |
 | `__xml`         | `roxmltree`                                                                                                               | `route53`, `nicru`                   |
 
-```toml
-[features]
-default = []
-all-providers = [
-    "acme_dns", "beget", "cloud_ru", "cloudflare", "digitalocean", "hetzner", "nicru", "regru",
-    "rfc2136", "route53", "selectel_v2", "timeweb_cloud", "vk_cloud", "yandex_360", "yandex_cloud",
-]
-inspector = [
-    "dep:hickory-proto", "dep:futures-util", "dep:fastrand", "dep:tracing", "tokio/net", "tokio/io-util",
-]
-
-acme_dns = ["__http"]
-beget = ["__http"]
-cloud_ru = ["__http"]
-cloudflare = ["__http"]
-digitalocean = ["__http"]
-hetzner = ["__http"]
-nicru = ["__http", "__xml"]
-regru = ["__http"]
-rfc2136 = ["__crypto", "dep:fastrand", "dep:serde_json", "dep:tracing", "tokio/net", "tokio/io-util"]
-route53 = ["__http", "__crypto", "__xml"]
-selectel_v2 = ["__http"]
-timeweb_cloud = ["__http"]
-vk_cloud = ["__http"]
-yandex_360 = ["__http"]
-yandex_cloud = ["__http", "__crypto"]
-
-__http = [
-    "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:rustls-pki-types",
-    "dep:bytes", "dep:jiff", "dep:fastrand", "dep:serde_json", "dep:tracing",
-]
-__crypto = ["dep:aws-lc-rs"]
-__xml = ["dep:roxmltree"]
-```
+The feature table is the `[features]` table of `dev/zonewright/Cargo.toml`: `default` is empty,
+`all-providers` and `inspector` are listed first, then one entry per provider, then the three
+private features.
 
 ### 9.2 What compiles with no features
 
@@ -87,46 +56,7 @@ is still found.
 
 Versions are the latest stable releases on 2026-11-14.
 
-```toml
-[dependencies]
-serde = { version = "1.0.229", features = ["derive"] }
-secrecy = { version = "0.10.3", features = ["serde"] }
-zeroize = { version = "1.9.1", features = ["derive"] }
-thiserror = "2.0.21"
-idna = "1.1.0"
-base64 = "0.23.1"
-tokio = { version = "1.54.1", features = ["sync", "time"] }
-
-# __http (serde_json and tracing also serve rfc2136; tracing also serves the inspector)
-serde_json = { version = "1.0.154", optional = true }
-tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "socks"], optional = true }
-# Must stay on the same 0.23 line as the rustls inside reqwest.
-rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
-rustls-platform-verifier = { version = "0.7.1", optional = true }
-rustls-pki-types = { version = "1.16.0", optional = true }
-bytes = { version = "1.12.1", optional = true }
-jiff = { version = "0.2.43", default-features = false, features = ["std"], optional = true }
-fastrand = { version = "2.5.0", optional = true }
-
-# __crypto
-aws-lc-rs = { version = "1.19.0", optional = true }
-
-# __xml
-roxmltree = { version = "0.21.2", optional = true }
-
-# inspector
-hickory-proto = { version = "0.26.3", default-features = false, features = ["std"], optional = true }
-futures-util = { version = "0.3.34", default-features = false, features = ["std"], optional = true }
-
-[dev-dependencies]
-serde_json = "1.0.154"
-tracing = { version = "0.1.44", default-features = false, features = ["std"] }
-zonewright-mock = { version = "0.1.0", path = "../mock" }
-tokio = { version = "1.54.1", features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util"] }
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt"] }
-rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
-```
+The dependencies are in `dev/zonewright/Cargo.toml`, in `[dependencies]` and `[dev-dependencies]`.
 
 Why each is there, and what is deliberately absent:
 

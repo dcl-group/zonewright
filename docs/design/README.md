@@ -12,8 +12,11 @@ Conventions used below:
 - "Client" is the code that talks to one provider. "Application" is the program that uses the crate.
 - "An earlier TXT-only implementation" and "an earlier record-level implementation" are the two
   bodies of prior code this crate replaces. They are sources of behavior, not of API shape.
-- Code blocks show the public signatures as implemented; doc comments and `#[must_use]` are left
-  out. Private items are described in prose.
+- The design does not repeat declarations. Where a section introduces types or functions, it names
+  them and their source file under `dev/zonewright/`; signatures, fields, defaults and variants are
+  read in the source and its rustdoc. The design states what the source does not: rules, reasons,
+  limits that span several items, and facts about providers. Under "Not stated in the rustdoc" a
+  section lists facts about an item that its documentation does not carry.
 - Facts about dependencies were checked on 2026-11-14 against the published crate sources; the
   checks that were run are listed in section 9.4.
 
