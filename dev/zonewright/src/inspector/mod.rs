@@ -252,9 +252,11 @@ impl InspectorError {
 
 impl Inspector {
     /// An inspector with this configuration. Fails with [`InspectorError::Config`] for a zero
-    /// timeout, `max_servers` of zero, more than 16 resolvers, a resolver listed twice,
-    /// recursive discovery without
-    /// resolvers, or a static list that is empty or longer than `max_servers`.
+    /// timeout, `max_servers` of zero, `max_questions` of zero or above
+    /// [`InspectorConfig::QUESTIONS_CEILING`], `max_questions_per_round` above
+    /// [`InspectorConfig::QUESTIONS_PER_ROUND_CEILING`] or below `max_questions`, more than 16
+    /// resolvers, a resolver listed twice, recursive discovery without resolvers, or a static
+    /// list that is empty or longer than `max_servers`.
     ///
     /// No socket is opened here.
     pub fn new(config: InspectorConfig) -> Result<Inspector, InspectorError> {
@@ -274,9 +276,18 @@ impl Inspector {
     /// (ALIAS, ANAME, OPT, the query and meta types) is answered [`Answer::Failed`] without a
     /// query. The address is the caller's choice: no address policy applies, as for a static
     /// list. A [`NameServer`] that is not asked has no [`NameServer::query_addr`] to pass.
+    ///
+    /// The answer always needs the AA flag: without it, it is [`Answer::NotAuthoritative`].
+    /// [`InspectorConfig::accept_static_without_aa`] does not reach this call, also when the
+    /// address is one of the static list, because the address here is not taken from that
+    /// list. A caller that wants a static list read without AA uses [`Inspector::observe`].
     pub async fn query_server(&self, server: SocketAddr, question: &Question) -> Answer {
         match ask_for(question, false) {
-            Ok(ask) => self.engine.ask(server, &ask, Mode::Server).await,
+            Ok(ask) => {
+                self.engine
+                    .ask(server, &ask, Mode::Server { require_aa: true })
+                    .await
+            }
             Err(detail) => Answer::Failed(detail),
         }
     }
@@ -290,8 +301,13 @@ impl Inspector {
 
     /// One round: every question at every name server of the zone, at most 128 questions in
     /// flight at a time. The answers of a server are in the order of `questions`; a server that
-    /// is not asked has an [`Answer::NotAsked`] for each. 1 to 32 questions, every name within
-    /// the zone, at most 1,024 questions in all.
+    /// is not asked has an [`Answer::NotAsked`] for each. 1 to
+    /// [`InspectorConfig::max_questions`] questions (default 32), every name within the zone;
+    /// the servers that are asked times the distinct questions at most
+    /// [`InspectorConfig::max_questions_per_round`] (default 1024). Beyond either limit the
+    /// call is [`InspectorError::InvalidInput`], naming the configured limit, and sends nothing
+    /// to a name server. The round takes at most
+    /// `ceil(asked servers × distinct questions / 128) × query_timeout`.
     ///
     /// `observe` returns the answers only and judges nothing: there is no "every server
     /// agrees" verdict, so [`WaitOptions::ignore_unaskable_name_servers`] has no counterpart
@@ -315,7 +331,14 @@ impl Inspector {
     /// A pause is cut to the deadline but never below `options.interval` less the jitter: when
     /// less time than that is left, the wait ends without a further round. An
     /// `options.interval` below [`WaitOptions::MIN_INTERVAL`] is
-    /// [`InspectorError::InvalidInput`]. Dropping the future cancels every query it started.
+    /// [`InspectorError::InvalidInput`], and so are more than
+    /// [`InspectorConfig::max_questions`] expectations (default 32) and a round of more than
+    /// [`InspectorConfig::max_questions_per_round`] questions (asked servers times distinct
+    /// questions, default 1024), before anything is sent to a name server. Each round sends at
+    /// most that many questions and takes at most
+    /// `ceil(asked servers × distinct questions / 128) × query_timeout`, so the call returns
+    /// within discovery plus `options.timeout` plus one such round. Dropping the future cancels
+    /// every query it started.
     pub async fn wait(
         &self,
         zone: &DomainName,

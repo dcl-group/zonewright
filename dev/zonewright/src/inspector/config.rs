@@ -25,7 +25,8 @@ pub enum NsDiscovery {
     /// 8.3).
     Recursive,
     /// Use exactly these servers for every zone. The list is used as given: no address filter
-    /// and no cache apply, because the application chose the addresses.
+    /// and no cache apply, because the application chose the addresses. Their answers need the
+    /// AA flag unless [`InspectorConfig::accept_static_without_aa`] is set.
     Static(Vec<NameServer>),
 }
 
@@ -251,6 +252,60 @@ pub struct InspectorConfig {
     /// of [`AddressRefusal`] apply regardless (design section 8.3). A refused address is not
     /// left out: it is reported as a server that is not asked.
     pub allow_private_addresses: bool,
+    /// Read an answer without the AA flag from a server of a static list
+    /// ([`NsDiscovery::Static`]) by its content, as if the flag were set. Default false.
+    ///
+    /// Off, an answer without AA is [`Answer::NotAuthoritative`](super::Answer::NotAuthoritative)
+    /// and satisfies nothing, from every server. On, an answer without AA from a server of the
+    /// static list is classified like an authoritative one: records of the asked type are
+    /// [`Answer::Records`](super::Answer::Records), an empty NOERROR answer is
+    /// [`Answer::NoData`](super::Answer::NoData), NXDOMAIN is
+    /// [`Answer::NxDomain`](super::Answer::NxDomain), a CNAME is
+    /// [`Answer::Cname`](super::Answer::Cname). This serves a static list that points at a test
+    /// DNS server which answers correctly but never sets AA.
+    ///
+    /// **Risk.** With the option on, whatever a server of the static list answers is believed.
+    /// A recursive resolver, a forwarder or a caching server in the list counts as the zone's
+    /// authority: its cached or stale answer can satisfy a wait. Put only servers in the list
+    /// that answer from the zone's own data.
+    ///
+    /// What stays as it is: the ID and question checks, the response-code handling (REFUSED,
+    /// SERVFAIL, other codes), the truncation and `FORMERR` retries, the CNAME rules and the
+    /// size limits. A referral stays [`Answer::NotAuthoritative`](super::Answer::NotAuthoritative):
+    /// an answer without AA whose answer section is empty and whose authority section holds NS
+    /// records and no SOA is never read as NODATA or NXDOMAIN, whatever its response code
+    /// (RFC 2308 sections 2.1 and 2.2.1: without AA, such a negative answer cannot be told from
+    /// a referral). An answer with the AA flag is read exactly as with the option off.
+    ///
+    /// The option never applies to discovered servers ([`NsDiscovery::Recursive`]): for them
+    /// the AA flag is always required, because a recursive or lame server must never count as
+    /// the zone's authority. With recursive discovery the option has no effect. It does not
+    /// apply to [`Inspector::query_server`](super::Inspector::query_server) either, which takes
+    /// an address of the caller's choice, not a member of the static list: that call always
+    /// requires AA.
+    pub accept_static_without_aa: bool,
+    /// Most questions (for [`Inspector::observe`](super::Inspector::observe)) or expectations
+    /// (for [`Inspector::wait`](super::Inspector::wait)) in one call. Default 32; at least 1 and
+    /// at most [`InspectorConfig::QUESTIONS_CEILING`] (256), and not more than
+    /// `max_questions_per_round`. A call with more is
+    /// [`InspectorError::InvalidInput`](super::InspectorError::InvalidInput) before anything is
+    /// sent.
+    pub max_questions: usize,
+    /// Most questions in one round: the servers that are asked times the distinct questions of
+    /// the call. Default 1024; at least `max_questions` and at most
+    /// [`InspectorConfig::QUESTIONS_PER_ROUND_CEILING`] (8192). A call whose round would hold
+    /// more is [`InspectorError::InvalidInput`](super::InspectorError::InvalidInput) after
+    /// discovery and before any question is sent to a name server.
+    ///
+    /// This is the load one round puts on name servers the application usually does not run,
+    /// and it bounds the duration of a round. A round sends at most `max_questions_per_round`
+    /// questions, each of them at most 3 network exchanges (UDP, UDP without EDNS, TCP), at most
+    /// [`InspectorConfig::QUESTIONS_IN_FLIGHT`] (128) at a time, each bounded by
+    /// `query_timeout`. One round therefore takes at most
+    /// `ceil(max_questions_per_round / 128) × query_timeout`, and more precisely
+    /// `ceil(asked servers × distinct questions / 128) × query_timeout`. With the defaults:
+    /// 1024 questions, 8 × 3 s = 24 s. At the ceiling: 8192 questions, 64 × `query_timeout`.
+    pub max_questions_per_round: usize,
 }
 
 impl Default for InspectorConfig {
@@ -264,11 +319,34 @@ impl Default for InspectorConfig {
             max_servers: 32,
             discovery_timeout: Duration::from_secs(10),
             allow_private_addresses: false,
+            accept_static_without_aa: false,
+            max_questions: 32,
+            max_questions_per_round: 1024,
         }
     }
 }
 
 impl InspectorConfig {
+    /// The largest accepted `max_questions`: 256. It is several times what one zone's
+    /// propagation check needs, and at the default `max_servers` (32) it fills the largest
+    /// round, [`InspectorConfig::QUESTIONS_PER_ROUND_CEILING`].
+    pub const QUESTIONS_CEILING: usize = 256;
+
+    /// The largest accepted `max_questions_per_round`: 8192, that is
+    /// [`InspectorConfig::QUESTIONS_CEILING`] questions at 32 servers. A round of that size
+    /// takes at most 64 × `query_timeout` and is load on name servers the application does not
+    /// run, which is why there is a ceiling at all.
+    pub const QUESTIONS_PER_ROUND_CEILING: usize = 8192;
+
+    /// Questions of one round in flight at the same time: 128, fixed. Each holds one socket.
+    pub const QUESTIONS_IN_FLIGHT: usize = 128;
+
+    /// True when answers from the configured servers are read without requiring the AA flag:
+    /// only for a static list with [`InspectorConfig::accept_static_without_aa`] set.
+    pub(crate) fn reads_without_aa(&self) -> bool {
+        self.accept_static_without_aa && matches!(self.discovery, NsDiscovery::Static(_))
+    }
+
     /// Checks the configuration; the reasons are the `Config` errors of [`Inspector::new`].
     ///
     /// [`Inspector::new`]: super::Inspector::new
@@ -282,6 +360,30 @@ impl InspectorConfig {
         }
         if self.max_servers == 0 {
             return fail("max_servers must be at least 1");
+        }
+        if self.max_questions == 0 {
+            return fail("max_questions must be at least 1");
+        }
+        if self.max_questions > Self::QUESTIONS_CEILING {
+            return Err(InspectorError::config(&format!(
+                "max_questions is {}, more than the ceiling of {}",
+                self.max_questions,
+                Self::QUESTIONS_CEILING
+            )));
+        }
+        if self.max_questions_per_round > Self::QUESTIONS_PER_ROUND_CEILING {
+            return Err(InspectorError::config(&format!(
+                "max_questions_per_round is {}, more than the ceiling of {}",
+                self.max_questions_per_round,
+                Self::QUESTIONS_PER_ROUND_CEILING
+            )));
+        }
+        // Otherwise a call with max_questions questions could not run even at one server.
+        if self.max_questions_per_round < self.max_questions {
+            return Err(InspectorError::config(&format!(
+                "max_questions_per_round ({}) is less than max_questions ({})",
+                self.max_questions_per_round, self.max_questions
+            )));
         }
         if self.resolvers.len() > MAX_RESOLVERS {
             return fail("more than 16 resolvers");

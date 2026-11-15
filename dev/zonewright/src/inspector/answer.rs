@@ -73,8 +73,14 @@ pub(crate) fn convert_record(data: &RData, rtype: u16, raw: &[u8]) -> Result<Rec
 /// How an answer is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
-    /// A name server asked with recursion not desired: AA is required, a CNAME is reported.
-    Server,
+    /// A name server asked with recursion not desired: a CNAME is reported. With `require_aa`
+    /// an answer without AA is [`Answer::NotAuthoritative`]; without it (a static list with
+    /// `accept_static_without_aa`) such an answer is read by its content, except a referral,
+    /// which stays [`Answer::NotAuthoritative`].
+    Server {
+        /// An answer without the AA flag satisfies nothing.
+        require_aa: bool,
+    },
     /// A resolver asked with recursion desired: AA is not required. With `follow`, a CNAME
     /// chain inside the answer is followed to the records of the asked type.
     Resolver {
@@ -99,7 +105,12 @@ fn classify_reply(reply: &Reply, ask: &Ask, mode: Mode) -> Answer {
         SERVFAIL => return Answer::ServFail,
         other => return Answer::Failed(format!("response code {other}")),
     }
-    if mode == Mode::Server && !reply.authoritative {
+    if let Mode::Server { require_aa } = mode
+        && !reply.authoritative
+        // Without AA a referral and a negative answer of RFC 2308 type 3 or 4 look the same;
+        // neither may read as absence (design section 8.4).
+        && (require_aa || reply.referral)
+    {
         return Answer::NotAuthoritative;
     }
     let follow = matches!(mode, Mode::Resolver { follow: true });
@@ -213,8 +224,59 @@ mod tests {
         }
     }
 
-    const SERVER: Mode = Mode::Server;
+    const SERVER: Mode = Mode::Server { require_aa: true };
+    const UNFLAGGED: Mode = Mode::Server { require_aa: false };
     const RESOLVER: Mode = Mode::Resolver { follow: true };
+
+    fn referral(rcode: u16) -> Reply {
+        let mut r = reply(rcode, false, vec![]);
+        r.referral = true;
+        r
+    }
+
+    #[test]
+    fn without_required_aa_an_answer_is_read_by_its_content_but_a_referral_is_not() {
+        let q = ask("a.example.org", RecordType::TXT);
+        let txt = rec("a.example.org", RecordType::TXT, 60, "\"v\"");
+        let cname = rec("a.example.org", RecordType::CNAME, 60, "b.example.net.");
+        let c = |r: Reply, m| classify(Ok(r), &q, m);
+        assert_eq!(
+            c(reply(0, false, vec![txt.clone()]), UNFLAGGED),
+            Answer::Records {
+                ttl: Ttl::from_secs(60).unwrap(),
+                records: vec![data(RecordType::TXT, "\"v\"")],
+            }
+        );
+        assert_eq!(c(reply(0, false, vec![]), UNFLAGGED), Answer::NoData);
+        assert_eq!(c(reply(3, false, vec![]), UNFLAGGED), Answer::NxDomain);
+        assert_eq!(
+            c(reply(0, false, vec![cname]), UNFLAGGED),
+            Answer::Cname(TargetName::parse("b.example.net.").unwrap())
+        );
+        // The contradiction rule and the response codes stay.
+        assert!(matches!(
+            c(reply(3, false, vec![txt.clone()]), UNFLAGGED),
+            Answer::Failed(_)
+        ));
+        assert_eq!(c(reply(5, false, vec![]), UNFLAGGED), Answer::Refused);
+        assert_eq!(c(reply(2, false, vec![]), UNFLAGGED), Answer::ServFail);
+        // A referral is never absence, whatever its response code.
+        assert_eq!(c(referral(0), UNFLAGGED), Answer::NotAuthoritative);
+        assert_eq!(c(referral(3), UNFLAGGED), Answer::NotAuthoritative);
+        assert_eq!(c(referral(0), SERVER), Answer::NotAuthoritative);
+        // With AA set the referral shape changes nothing: unchanged behavior.
+        let mut flagged = referral(0);
+        flagged.authoritative = true;
+        assert_eq!(c(flagged.clone(), SERVER), Answer::NoData);
+        assert_eq!(c(flagged, UNFLAGGED), Answer::NoData);
+        // A resolver reads a referral shape as before.
+        assert_eq!(c(referral(0), RESOLVER), Answer::NoData);
+        // With AA required nothing without AA counts.
+        assert_eq!(
+            c(reply(0, false, vec![txt]), SERVER),
+            Answer::NotAuthoritative
+        );
+    }
 
     #[test]
     fn response_codes_and_the_aa_flag_come_first() {

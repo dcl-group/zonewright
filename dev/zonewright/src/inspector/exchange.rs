@@ -48,6 +48,10 @@ pub(crate) struct Reply {
     pub(crate) authoritative: bool,
     /// The records of the answer section of class IN, in the order received.
     pub(crate) records: Vec<ReplyRecord>,
+    /// The shape of a referral: the answer section is empty, and the authority section holds
+    /// NS records of class IN and no SOA record of class IN (RFC 2308 sections 2.1 and 2.2.1).
+    /// Only read for an answer without AA when AA is not required.
+    pub(crate) referral: bool,
 }
 
 /// One record of the answer section.
@@ -366,10 +370,20 @@ fn reply_from(received: &Received) -> Result<Reply, Failure> {
             data: convert_record(&record.data, rtype, raw),
         });
     }
+    let authority_has = |rtype: WireType| {
+        received
+            .message
+            .authorities
+            .iter()
+            .any(|record| record.dns_class == DNSClass::IN && record.record_type() == rtype)
+    };
+    let referral =
+        answers.is_empty() && authority_has(WireType::NS) && !authority_has(WireType::SOA);
     Ok(Reply {
         rcode: u16::from(received.message.metadata.response_code),
         authoritative: received.message.metadata.authoritative,
         records,
+        referral,
     })
 }
 

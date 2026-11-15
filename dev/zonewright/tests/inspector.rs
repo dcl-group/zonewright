@@ -1804,3 +1804,249 @@ async fn duplicate_resolvers_are_a_configuration_error() {
         "{result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Static servers that answer without the AA flag
+
+/// A server for the zone that never sets AA: data at `www` (A), a SOA at the apex, and a
+/// delegation of `sub`.
+async fn unflagged_server() -> DnsMock {
+    let mock = authoritative().await;
+    mock.add(&format!("www.{ZONE}"), TYPE_A, 60, Data::a([192, 0, 2, 1]));
+    mock.add(
+        ZONE,
+        TYPE_SOA,
+        60,
+        Data::Soa {
+            mname: format!("ns.{ZONE}"),
+            rname: format!("hostmaster.{ZONE}"),
+            serial: 1,
+            refresh: 3600,
+            retry: 600,
+            expire: 86400,
+            minimum: 60,
+        },
+    );
+    mock.add(
+        &format!("sub.{ZONE}"),
+        TYPE_NS,
+        60,
+        Data::name("ns.sub.example.test"),
+    );
+    mock.push(Fault::new(Action::NotAuthoritative).always());
+    mock
+}
+
+fn unflagged_expectations() -> [Expectation; 3] {
+    [
+        Expectation::new(
+            question(&format!("www.{ZONE}"), RecordType::A),
+            Condition::Exact(vec![parse(RecordType::A, "192.0.2.1")]),
+        ),
+        Expectation::new(
+            question(&format!("www.{ZONE}"), RecordType::TXT),
+            Condition::Exact(Vec::new()),
+        ),
+        Expectation::new(
+            question(&format!("nope.{ZONE}"), RecordType::A),
+            Condition::Absent(vec![parse(RecordType::A, "192.0.2.1")]),
+        ),
+    ]
+}
+
+fn quick() -> WaitOptions {
+    let mut options = WaitOptions::new(Duration::ZERO);
+    options.jitter_percent = 0;
+    options
+}
+
+#[tokio::test]
+async fn by_default_a_static_server_without_aa_satisfies_nothing() {
+    assert!(!InspectorConfig::default().accept_static_without_aa);
+    let mock = unflagged_server().await;
+    let inspector = static_inspector(&[mock.addr()]);
+    let err = inspector
+        .wait(&name(ZONE), &unflagged_expectations(), &quick())
+        .await
+        .unwrap_err();
+    let InspectorError::Timeout { report } = err else {
+        panic!("expected a timeout");
+    };
+    assert_eq!(report.servers[0].answers, vec![Answer::NotAuthoritative; 3]);
+}
+
+#[tokio::test]
+async fn with_the_option_a_static_server_without_aa_is_read_by_its_content() {
+    let mock = unflagged_server().await;
+    let mut config = static_config(&[mock.addr()], Duration::from_millis(500));
+    config.accept_static_without_aa = true;
+    let inspector = Inspector::new(config).unwrap();
+    let report = inspector
+        .wait(&name(ZONE), &unflagged_expectations(), &quick())
+        .await
+        .unwrap();
+    assert_eq!(report.rounds, 1);
+    let answers = &report.servers[0].answers;
+    assert_eq!(records(&answers[0]), &[parse(RecordType::A, "192.0.2.1")]);
+    assert_eq!(answers[1], Answer::NoData);
+    assert_eq!(answers[2], Answer::NxDomain);
+
+    // A referral without AA is not absence, also with the option.
+    let referral = [Expectation::new(
+        question(&format!("x.sub.{ZONE}"), RecordType::A),
+        Condition::Exact(Vec::new()),
+    )];
+    let err = inspector
+        .wait(&name(ZONE), &referral, &quick())
+        .await
+        .unwrap_err();
+    let InspectorError::Timeout { report } = err else {
+        panic!("expected a timeout");
+    };
+    assert_eq!(report.servers[0].answers, vec![Answer::NotAuthoritative]);
+    let observed = inspector
+        .observe(
+            &name(ZONE),
+            &[question(&format!("x.sub.{ZONE}"), RecordType::A)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(observed[0].1, vec![Answer::NotAuthoritative]);
+
+    // query_server always requires AA, also for an address of the static list.
+    assert_eq!(
+        inspector
+            .query_server(
+                mock.addr(),
+                &question(&format!("www.{ZONE}"), RecordType::A)
+            )
+            .await,
+        Answer::NotAuthoritative
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The configurable question limits
+
+#[test]
+fn question_limits_are_settings_with_ceilings() {
+    let defaults = InspectorConfig::default();
+    assert_eq!(defaults.max_questions, 32);
+    assert_eq!(defaults.max_questions_per_round, 1024);
+    assert_eq!(InspectorConfig::QUESTIONS_CEILING, 256);
+    assert_eq!(InspectorConfig::QUESTIONS_PER_ROUND_CEILING, 8192);
+    assert_eq!(InspectorConfig::QUESTIONS_IN_FLIGHT, 128);
+    let server = NameServer::new(None, "127.0.0.1:53".parse().unwrap());
+    let with = |questions: usize, per_round: usize| {
+        let mut c = InspectorConfig::default();
+        c.discovery = NsDiscovery::Static(vec![server.clone()]);
+        c.max_questions = questions;
+        c.max_questions_per_round = per_round;
+        Inspector::new(c)
+    };
+    for (questions, per_round) in [(0, 1024), (257, 8192), (32, 8193), (100, 99), (32, 0)] {
+        let result = with(questions, per_round);
+        assert!(
+            matches!(&result, Err(InspectorError::Config { .. })),
+            "{questions} {per_round} {result:?}"
+        );
+    }
+    let Err(InspectorError::Config { detail }) = with(257, 8192) else {
+        panic!("expected a configuration error");
+    };
+    assert!(detail.contains("256"), "{detail}");
+    for (questions, per_round) in [(1, 1), (100, 1024), (256, 8192), (32, 32)] {
+        assert!(
+            with(questions, per_round).is_ok(),
+            "{questions} {per_round}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_hundred_names_of_one_zone_in_one_call() {
+    let mock = authoritative().await;
+    let names: Vec<String> = (0..101).map(|i| format!("h{i}.{ZONE}")).collect();
+    for name in &names {
+        mock.add(name, TYPE_A, 60, Data::a([192, 0, 2, 7]));
+    }
+    let mut config = static_config(&[mock.addr()], Duration::from_secs(2));
+    config.max_questions = 100;
+    let inspector = Inspector::new(config).unwrap();
+    let expectations: Vec<Expectation> = names
+        .iter()
+        .map(|name| {
+            Expectation::new(
+                question(name, RecordType::A),
+                Condition::Present(vec![parse(RecordType::A, "192.0.2.7")]),
+            )
+        })
+        .collect();
+
+    // 101: refused, nothing sent, the limit named.
+    let err = inspector
+        .wait(&name(ZONE), &expectations, &quick())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, InspectorError::InvalidInput { detail } if detail.contains("100")),
+        "{err:?}"
+    );
+    let questions: Vec<Question> = expectations.iter().map(|e| e.question.clone()).collect();
+    assert!(matches!(
+        inspector.observe(&name(ZONE), &questions).await,
+        Err(InspectorError::InvalidInput { .. })
+    ));
+    assert!(mock.log().is_empty());
+
+    // 100: accepted, every name asked once.
+    let report = inspector
+        .wait(&name(ZONE), &expectations[..100], &quick())
+        .await
+        .unwrap();
+    assert!(report.servers[0].satisfied);
+    assert_eq!(report.servers[0].answers.len(), 100);
+    assert_eq!(mock.log().len(), 100);
+    for name in &names[..100] {
+        assert_eq!(mock.count(name, TYPE_A), 1, "{name}");
+    }
+
+    // The default limit is unchanged: 33 refused.
+    let default = static_inspector(&[mock.addr()]);
+    mock.clear_log();
+    assert!(matches!(
+        default.observe(&name(ZONE), &questions[..33]).await,
+        Err(InspectorError::InvalidInput { .. })
+    ));
+    assert!(default.observe(&name(ZONE), &questions[..32]).await.is_ok());
+    assert_eq!(mock.log().len(), 32);
+}
+
+#[tokio::test]
+async fn the_round_limit_is_enforced_before_anything_is_sent() {
+    let mocks = [authoritative().await, authoritative().await];
+    let servers: Vec<SocketAddr> = mocks.iter().map(DnsMock::addr).collect();
+    let mut config = static_config(&servers, Duration::from_secs(2));
+    config.max_questions = 100;
+    config.max_questions_per_round = 150;
+    let inspector = Inspector::new(config).unwrap();
+    let questions: Vec<Question> = (0..76)
+        .map(|i| question(&format!("h{i}.{ZONE}"), RecordType::A))
+        .collect();
+    let err = inspector
+        .observe(&name(ZONE), &questions)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, InspectorError::InvalidInput { detail }
+            if detail.contains("152") && detail.contains("150")),
+        "{err:?}"
+    );
+    assert!(mocks.iter().all(|mock| mock.log().is_empty()));
+    let observed = inspector
+        .observe(&name(ZONE), &questions[..75])
+        .await
+        .unwrap();
+    assert_eq!(observed.len(), 2);
+    assert!(mocks.iter().all(|mock| mock.log().len() == 75));
+}

@@ -9,16 +9,13 @@ use tokio::time::Instant;
 use super::answer::Mode;
 use super::exchange::{Ask, Transport};
 use super::{
-    Answer, Condition, Engine, Expectation, InspectorError, NameServer, Question, ask_for,
+    Answer, Condition, Engine, Expectation, InspectorConfig, InspectorError, NameServer, Question,
+    ask_for,
 };
 use crate::name::DomainName;
 
-/// Most expectations or questions in one call.
-pub(crate) const MAX_QUESTIONS: usize = 32;
-/// Most questions in one round: servers times distinct questions.
-pub(crate) const MAX_QUESTIONS_PER_ROUND: usize = 1024;
 /// Most questions of one round in flight at the same time; each holds one socket.
-pub(crate) const QUESTIONS_AT_ONCE: usize = 128;
+pub(crate) const QUESTIONS_AT_ONCE: usize = InspectorConfig::QUESTIONS_IN_FLIGHT;
 /// Largest accepted jitter.
 const MAX_JITTER_PERCENT: u8 = 50;
 
@@ -59,8 +56,9 @@ pub struct WaitOptions {
 }
 
 impl WaitOptions {
-    /// The shortest accepted `interval`, 1 s. A round can ask up to 1024 questions of servers
-    /// the application does not run; a shorter interval is
+    /// The shortest accepted `interval`, 1 s. A round can ask up to
+    /// [`InspectorConfig::max_questions_per_round`] questions (default 1024) of servers the
+    /// application does not run; a shorter interval is
     /// [`InspectorError::InvalidInput`]. With the largest jitter the shortest pause is 500 ms.
     pub const MIN_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -136,17 +134,21 @@ pub(crate) fn holds(condition: &Condition, answer: &Answer) -> bool {
     }
 }
 
-/// Checks the questions of a call: 1 to 32, every name within the zone, every type askable.
+/// Checks the questions of a call: 1 to `max_questions`, every name within the zone, every
+/// type askable.
 fn validate_questions<'a>(
     zone: &DomainName,
     questions: impl ExactSizeIterator<Item = &'a Question>,
+    max_questions: usize,
 ) -> Result<Vec<Ask>, InspectorError> {
     let count = questions.len();
     if count == 0 {
         return Err(InspectorError::invalid("at least one question is needed"));
     }
-    if count > MAX_QUESTIONS {
-        return Err(InspectorError::invalid("more than 32 questions"));
+    if count > max_questions {
+        return Err(InspectorError::invalid(&format!(
+            "{count} questions, more than the configured max_questions of {max_questions}"
+        )));
     }
     let mut asks = Vec::with_capacity(count);
     for question in questions {
@@ -231,14 +233,22 @@ impl<T: Transport> Engine<T> {
     /// Every question at every server that is asked, at most [`QUESTIONS_AT_ONCE`] in flight.
     /// The answers of a server are in the order of `asks`; a server that is not asked gets
     /// [`Answer::NotAsked`] for each, without a query.
+    ///
+    /// The servers are those of [`Engine::name_servers`]: the static list when there is one,
+    /// whose answers are read without AA when the configuration says so, and discovered
+    /// servers otherwise, which always need AA.
     async fn round(&self, servers: &[NameServer], asks: &[Ask]) -> Vec<Vec<Answer>> {
+        let mode = Mode::Server {
+            require_aa: !self.config.reads_without_aa(),
+        };
         // Built with loops rather than closures: a closure here makes the future's `Send`
-        // bound fail to be proven for every lifetime.
+        // bound fail to be proven for every lifetime. The size is bounded by
+        // `check_round_size` before a round runs.
         let mut pending = Vec::with_capacity(servers.len().saturating_mul(asks.len()));
         for server in servers {
             if let Some(addr) = server.query_addr() {
                 for ask in asks {
-                    pending.push(self.ask(addr, ask, Mode::Server));
+                    pending.push(self.ask(addr, ask, mode));
                 }
             }
         }
@@ -257,17 +267,24 @@ impl<T: Transport> Engine<T> {
         out
     }
 
-    /// Fails when a round would hold more than 1024 questions. Only servers that are asked
-    /// count.
-    fn check_round_size(servers: &[NameServer], questions: usize) -> Result<(), InspectorError> {
+    /// Fails when a round would hold more than `max_questions_per_round` questions. Only
+    /// servers that are asked count.
+    fn check_round_size(
+        &self,
+        servers: &[NameServer],
+        questions: usize,
+    ) -> Result<(), InspectorError> {
+        let limit = self.config.max_questions_per_round;
         let asked = servers
             .iter()
             .filter(|server| server.query_addr().is_some())
             .count();
-        if asked.saturating_mul(questions) > MAX_QUESTIONS_PER_ROUND {
-            return Err(InspectorError::invalid(
-                "servers times questions exceeds 1024 per round",
-            ));
+        let total = asked.saturating_mul(questions);
+        if total > limit {
+            return Err(InspectorError::invalid(&format!(
+                "{asked} servers times {questions} questions is {total}, more than the \
+                 configured max_questions_per_round of {limit}"
+            )));
         }
         Ok(())
     }
@@ -277,9 +294,9 @@ impl<T: Transport> Engine<T> {
         zone: &DomainName,
         questions: &[Question],
     ) -> Result<Vec<(NameServer, Vec<Answer>)>, InspectorError> {
-        let asks = validate_questions(zone, questions.iter())?;
+        let asks = validate_questions(zone, questions.iter(), self.config.max_questions)?;
         let servers = self.name_servers(zone).await?;
-        Self::check_round_size(&servers, asks.len())?;
+        self.check_round_size(&servers, asks.len())?;
         let answers = self.round(&servers, &asks).await;
         Ok(servers.into_iter().zip(answers).collect())
     }
@@ -296,13 +313,17 @@ impl<T: Transport> Engine<T> {
         if options.interval < WaitOptions::MIN_INTERVAL {
             return Err(InspectorError::invalid("interval is shorter than 1 s"));
         }
-        let asks = validate_questions(zone, expectations.iter().map(|e| &e.question))?;
+        let asks = validate_questions(
+            zone,
+            expectations.iter().map(|e| &e.question),
+            self.config.max_questions,
+        )?;
         for expectation in expectations {
             validate_values(expectation)?;
         }
         let (asks, index) = dedup(asks);
         let servers = self.name_servers(zone).await?;
-        Self::check_round_size(&servers, asks.len())?;
+        self.check_round_size(&servers, asks.len())?;
 
         // Servers that cannot be asked, left out of the condition when the option is on. The
         // list is fixed for the whole wait, so the count is too.
@@ -980,9 +1001,19 @@ mod tests {
     /// entry, `nsN.example.net` with the given IPv4 address, or with none (NODATA for `A`).
     /// What the servers answer is up to the test.
     fn engine_with(addresses: &[Option<&str>]) -> Engine<Fake> {
+        engine_with_config(addresses, |_| {})
+    }
+
+    /// [`engine_with`] with the configuration changed by `change`.
+    fn engine_with_config(
+        addresses: &[Option<&str>],
+        change: impl FnOnce(&mut InspectorConfig),
+    ) -> Engine<Fake> {
         use crate::inspector::testing::config_with;
         let r1 = addr(1);
-        let e = Engine::new(config_with(vec![r1]), Fake::default()).unwrap();
+        let mut config = config_with(vec![r1]);
+        change(&mut config);
+        let e = Engine::new(config, Fake::default()).unwrap();
         let hosts: Vec<String> = (1..=addresses.len())
             .map(|i| format!("ns{i}.example.net"))
             .collect();
@@ -1333,5 +1364,280 @@ mod tests {
         // The exchange future was dropped with the wait: nothing is in flight.
         tokio::time::advance(Duration::from_secs(10)).await;
         assert_eq!(e.transport.total_calls(), 1);
+    }
+
+    /// An engine over a static list of `servers` with the configuration changed by `change`.
+    fn engine_cfg(
+        servers: &[SocketAddr],
+        change: impl FnOnce(&mut InspectorConfig),
+    ) -> Engine<Fake> {
+        let mut config = InspectorConfig {
+            discovery: NsDiscovery::Static(
+                servers.iter().map(|a| NameServer::new(None, *a)).collect(),
+            ),
+            max_servers: servers.len().max(32),
+            ..InspectorConfig::default()
+        };
+        change(&mut config);
+        Engine::new(config, Fake::default()).unwrap()
+    }
+
+    fn unflagged(
+        rcode: u16,
+        records: Vec<crate::inspector::exchange::ReplyRecord>,
+    ) -> Result<crate::inspector::exchange::Reply, Failure> {
+        Ok(crate::inspector::testing::reply(rcode, false, records))
+    }
+
+    /// Records at `a`, NODATA at `b`, NXDOMAIN at `c`, all without AA, at `server`.
+    fn script_unflagged(e: &Engine<Fake>, server: SocketAddr) -> [Expectation; 3] {
+        let at = |label: &str| format!("{label}.example.org");
+        e.transport.reply(
+            server,
+            &at("a"),
+            RecordType::TXT,
+            unflagged(0, vec![rec(&at("a"), RecordType::TXT, 60, "\"v\"")]),
+        );
+        e.transport
+            .reply(server, &at("b"), RecordType::TXT, unflagged(0, Vec::new()));
+        e.transport
+            .reply(server, &at("c"), RecordType::TXT, unflagged(3, Vec::new()));
+        let q =
+            |label: &str| Question::new(DomainName::parse(&at(label)).unwrap(), RecordType::TXT);
+        [
+            Expectation::new(q("a"), Condition::Present(vec![txt("v")])),
+            Expectation::new(q("b"), Condition::Exact(Vec::new())),
+            Expectation::new(q("c"), Condition::Absent(vec![txt("v")])),
+        ]
+    }
+
+    #[test]
+    fn answers_without_aa_are_not_accepted_by_default() {
+        assert!(!InspectorConfig::default().accept_static_without_aa);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_static_server_without_aa_is_not_authoritative_by_default() {
+        let s1 = addr(1);
+        let e = engine(&[s1]);
+        let expectations = script_unflagged(&e, s1);
+        let err = e
+            .wait(&zone(), &expectations, &WaitOptions::new(Duration::ZERO))
+            .await
+            .unwrap_err();
+        let InspectorError::Timeout { report } = err else {
+            panic!("expected a timeout");
+        };
+        assert_eq!(report.servers[0].answers, vec![Answer::NotAuthoritative; 3]);
+        assert!(!report.servers[0].satisfied);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_the_option_a_static_server_without_aa_is_read_by_its_content() {
+        let s1 = addr(1);
+        let e = engine_cfg(&[s1], |c| c.accept_static_without_aa = true);
+        let expectations = script_unflagged(&e, s1);
+        let report = e
+            .wait(&zone(), &expectations, &WaitOptions::new(Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(report.rounds, 1);
+        assert_eq!(
+            report.servers[0].answers,
+            vec![records(&["v"]), Answer::NoData, Answer::NxDomain]
+        );
+        assert!(report.servers[0].satisfied);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_the_option_a_referral_without_aa_is_not_absence() {
+        let s1 = addr(1);
+        let e = engine_cfg(&[s1], |c| c.accept_static_without_aa = true);
+        for rcode in [0, 3] {
+            let mut referral = crate::inspector::testing::reply(rcode, false, Vec::new());
+            referral.referral = true;
+            e.transport.reply(s1, name(), RecordType::TXT, Ok(referral));
+            for condition in [
+                Condition::Exact(Vec::new()),
+                Condition::Absent(vec![txt("v")]),
+            ] {
+                let expectations = [Expectation::new(question(), condition.clone())];
+                let err = e
+                    .wait(&zone(), &expectations, &WaitOptions::new(Duration::ZERO))
+                    .await
+                    .unwrap_err();
+                let InspectorError::Timeout { report } = err else {
+                    panic!("expected a timeout for {rcode} {condition:?}");
+                };
+                assert_eq!(
+                    report.servers[0].answers,
+                    vec![Answer::NotAuthoritative],
+                    "{rcode} {condition:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_the_option_a_discovered_server_without_aa_is_still_not_authoritative() {
+        // ns1 at 192.0.2.53 answers the value without AA.
+        let e = engine_with_config(&[Some("192.0.2.53")], |c| {
+            c.accept_static_without_aa = true;
+        });
+        assert!(e.config.accept_static_without_aa);
+        e.transport.reply(
+            addr(53),
+            name(),
+            RecordType::TXT,
+            unflagged(0, vec![rec(name(), RecordType::TXT, 60, "\"v\"")]),
+        );
+        let err = e
+            .wait(&zone(), &present_v(), &WaitOptions::new(Duration::ZERO))
+            .await
+            .unwrap_err();
+        let InspectorError::Timeout { report } = err else {
+            panic!("expected a timeout");
+        };
+        assert_eq!(report.servers[0].answers, vec![Answer::NotAuthoritative]);
+        assert_eq!(server_calls(&e), vec![addr(53)]);
+    }
+
+    fn a_questions(count: usize) -> Vec<Question> {
+        (0..count)
+            .map(|i| {
+                Question::new(
+                    DomainName::parse(&format!("n{i}.example.org")).unwrap(),
+                    RecordType::A,
+                )
+            })
+            .collect()
+    }
+
+    fn script_nodata(e: &Engine<Fake>, servers: &[SocketAddr], questions: &[Question]) {
+        for server in servers {
+            for q in questions {
+                e.transport
+                    .reply(*server, &q.name.to_string(), RecordType::A, nodata());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_configured_question_limit_of_100_takes_100_and_refuses_101() {
+        let s1 = addr(1);
+        let e = engine_cfg(&[s1], |c| c.max_questions = 100);
+        let questions = a_questions(101);
+        script_nodata(&e, &[s1], &questions);
+
+        // 101 questions or expectations: refused before anything is sent, naming the limit.
+        let err = e.observe(&zone(), &questions).await.unwrap_err();
+        assert!(
+            matches!(&err, InspectorError::InvalidInput { detail } if detail.contains("max_questions of 100")),
+            "{err:?}"
+        );
+        let gone: Vec<Expectation> = questions
+            .iter()
+            .map(|q| Expectation::new(q.clone(), Condition::Exact(Vec::new())))
+            .collect();
+        let err = e
+            .wait(&zone(), &gone, &WaitOptions::new(Duration::ZERO))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, InspectorError::InvalidInput { .. }),
+            "{err:?}"
+        );
+        assert_eq!(e.transport.total_calls(), 0);
+
+        // 100: every one asked.
+        let observed = e.observe(&zone(), &questions[..100]).await.unwrap();
+        assert_eq!(observed[0].1, vec![Answer::NoData; 100]);
+        assert_eq!(e.transport.total_calls(), 100);
+        let report = e
+            .wait(&zone(), &gone[..100], &WaitOptions::new(Duration::ZERO))
+            .await
+            .unwrap();
+        assert!(report.servers[0].satisfied);
+        assert_eq!(e.transport.total_calls(), 200);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_configured_round_limit_is_enforced_before_anything_is_sent() {
+        let servers: Vec<SocketAddr> = (1..=4).map(addr).collect();
+        let e = engine_cfg(&servers, |c| {
+            c.max_questions = 100;
+            c.max_questions_per_round = 300;
+        });
+        let questions = a_questions(76);
+        script_nodata(&e, &servers, &questions);
+        // 4 servers × 76 questions = 304 > 300.
+        let err = e.observe(&zone(), &questions).await.unwrap_err();
+        assert!(
+            matches!(&err, InspectorError::InvalidInput { detail }
+                if detail.contains("304") && detail.contains("max_questions_per_round of 300")),
+            "{err:?}"
+        );
+        assert_eq!(e.transport.total_calls(), 0);
+        // 4 × 75 = 300: allowed, all asked.
+        let observed = e.observe(&zone(), &questions[..75]).await.unwrap();
+        assert_eq!(observed.len(), 4);
+        assert_eq!(e.transport.total_calls(), 300);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_round_at_a_raised_limit_keeps_128_in_flight() {
+        // 8 servers × 256 questions = 2048 questions, 128 at a time, one second each.
+        let servers: Vec<SocketAddr> = (1..=8).map(addr).collect();
+        let e = engine_cfg(&servers, |c| {
+            c.max_questions = InspectorConfig::QUESTIONS_CEILING;
+            c.max_questions_per_round = 2048;
+        });
+        *e.transport.delay.lock().unwrap() = Duration::from_secs(1);
+        let questions = a_questions(256);
+        script_nodata(&e, &servers, &questions);
+        let started = Instant::now();
+        let observed = e.observe(&zone(), &questions).await.unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(16));
+        assert_eq!(
+            e.transport.peak.load(std::sync::atomic::Ordering::SeqCst),
+            QUESTIONS_AT_ONCE
+        );
+        assert!(observed.iter().all(|(_, a)| a.len() == 256));
+        assert_eq!(e.transport.total_calls(), 2048);
+    }
+
+    #[test]
+    fn question_limits_are_validated_at_construction() {
+        let refused = |change: fn(&mut InspectorConfig)| {
+            let mut config = InspectorConfig::default();
+            change(&mut config);
+            matches!(
+                Engine::new(config, Fake::default()),
+                Err(InspectorError::Config { .. })
+            )
+        };
+        assert!(refused(|c| c.max_questions = 0));
+        assert!(refused(
+            |c| c.max_questions = InspectorConfig::QUESTIONS_CEILING + 1
+        ));
+        assert!(refused(|c| c.max_questions_per_round = 0));
+        assert!(refused(|c| {
+            c.max_questions_per_round = InspectorConfig::QUESTIONS_PER_ROUND_CEILING + 1;
+        }));
+        assert!(refused(|c| {
+            c.max_questions = 100;
+            c.max_questions_per_round = 99;
+        }));
+        assert!(!refused(|c| {
+            c.max_questions = InspectorConfig::QUESTIONS_CEILING;
+            c.max_questions_per_round = InspectorConfig::QUESTIONS_PER_ROUND_CEILING;
+        }));
+        assert!(!refused(|c| {
+            c.max_questions = 1;
+            c.max_questions_per_round = 1;
+        }));
+        let defaults = InspectorConfig::default();
+        assert_eq!(defaults.max_questions, 32);
+        assert_eq!(defaults.max_questions_per_round, 1024);
     }
 }

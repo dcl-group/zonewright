@@ -127,6 +127,7 @@ pub(crate) fn reply(rcode: u16, authoritative: bool, records: Vec<ReplyRecord>) 
         rcode,
         authoritative,
         records,
+        referral: false,
     }
 }
 
