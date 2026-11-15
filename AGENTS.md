@@ -64,8 +64,9 @@ Top-level directories:
 - `docs/` — documentation. The design document is `docs/design/`: one document in several files,
   with the index in `docs/design/README.md`. Section numbers run through all of its files; code and
   tests refer to a place in it as "design section N.M".
-- `dev/` — the Cargo workspace: `dev/zonewright` (the crate) and `dev/mock` (the mock provider
-  servers used by the tests, not published). Cargo commands, including the gates, run from `dev/`.
+- `dev/` — the Cargo workspace: `dev/zonewright` (the crate) and `dev/mock` (the crate
+  `zonewright-mock`: the mock provider servers the tests run against, published with the same
+  version). Cargo commands, including the gates, run from `dev/`.
 - `todo/` — short documents, one per concrete task, created when the first task is filed. A task's
   file is deleted when the task is closed; finished tasks are not archived here.
 

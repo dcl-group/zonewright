@@ -103,8 +103,8 @@ the workspace clippy denials do not apply to it.
 `[package.metadata.docs.rs] all-features = true` and `[lints] workspace = true`.
 
 `cargo deny` (`dev/deny.toml`): `ring`, `openssl`, `openssl-sys` and `native-tls` are banned;
-`[graph] all-features = true`; wildcard versions denied except for path dependencies (the mock
-crate); duplicate versions are a warning; only the crates.io registry is allowed; licenses allowed:
-MIT, Apache-2.0, ISC, Unicode-3.0, Unlicense, BSD-3-Clause, CDLA-Permissive-2.0 (confidence 0.8).
-`openssl-probe`, a certificate-path helper pulled in by the platform verifier, is not OpenSSL and is
-not banned.
+`[graph] all-features = true`; wildcard versions denied, path dependencies included (the mock crate
+is named with its version); duplicate versions are a warning; only the crates.io registry is
+allowed; licenses allowed: MIT, Apache-2.0, ISC, Unicode-3.0, Unlicense, BSD-3-Clause,
+CDLA-Permissive-2.0 (confidence 0.8). `openssl-probe`, a certificate-path helper pulled in by the
+platform verifier, is not OpenSSL and is not banned.

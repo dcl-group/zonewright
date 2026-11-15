@@ -22,8 +22,6 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# The mock crate is a path dependency without a version.
-allow-wildcard-paths = true
 # Crypto is rustls + aws-lc-rs only.
 deny = [
     { crate = "ring" },
