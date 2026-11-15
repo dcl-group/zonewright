@@ -65,14 +65,17 @@ The first version, 0.1.0. Not tagged yet.
   authoritative name servers of a zone (`Inspector::name_servers`), asks a `Question` of any record
   type at one server (`query_server`), at every server of the zone (`observe`) or through the
   recursive resolvers (`query_recursive`), each answer an `Answer`, and waits (`wait`, with
-  `WaitOptions`, whose interval between rounds is at least `WaitOptions::MIN_INTERVAL`, 1 s) until
-  an `Expectation` with a `Condition` (value present, exact set, absent) holds at every server, with
-  a `Report` and a `ServerReport` per name server. Discovery never shortens the server list: a name
-  server without an address in the configured families, or at an address the policy refuses, is
-  returned with `NameServer::not_asked` (`NotAsked`, `AddressRefusal`) and reported as a row that
-  never satisfies (`Answer::NotAsked`); with `WaitOptions::ignore_unaskable_name_servers` such
-  servers are left out of the condition and counted in `Report::unaskable_ignored`. Errors are
-  `InspectorError`. It also implements `CnameLookup`.
+  `WaitOptions`, whose interval between rounds is at least `WaitOptions::MIN_INTERVAL`, 1 s; at most
+  `InspectorConfig::max_questions` expectations per call, default 32, and `max_questions_per_round`
+  questions per round, default 1024) until an `Expectation` with a `Condition` (value present, exact
+  set, absent) holds at every server, with a `Report` and a `ServerReport` per name server.
+  Discovery never shortens the server list: a name server without an address in the configured
+  families, or at an address the policy refuses, is returned with `NameServer::not_asked`
+  (`NotAsked`, `AddressRefusal`) and reported as a row that never satisfies (`Answer::NotAsked`);
+  with `WaitOptions::ignore_unaskable_name_servers` such servers are left out of the condition and
+  counted in `Report::unaskable_ignored`. With `InspectorConfig::accept_static_without_aa` (off by
+  default) an answer without AA from a server of a static list is read by its content, never a
+  referral. Errors are `InspectorError`. It also implements `CnameLookup`.
 - Features: one per provider, named like its ID; `all-providers`, which enables every provider;
   `inspector`. No feature is enabled by default.
 - Configuration types per provider, in `providers::<id>`: a settings type and a credentials type,

@@ -2402,6 +2402,19 @@ pub struct InspectorConfig {
     pub discovery_timeout: std::time::Duration,
     /// Ask discovered name servers at private addresses (section 8.3). Default false.
     pub allow_private_addresses: bool,
+    /// Read an answer without AA from a server of a static list by its content (section 8.4).
+    /// Default false.
+    pub accept_static_without_aa: bool,
+    /// Expectations or questions per call. Default 32; 1 to QUESTIONS_CEILING.
+    pub max_questions: usize,
+    /// Asked servers × distinct questions of one round. Default 1024; from `max_questions` to
+    /// QUESTIONS_PER_ROUND_CEILING.
+    pub max_questions_per_round: usize,
+}
+impl InspectorConfig {
+    pub const QUESTIONS_CEILING: usize = 256;
+    pub const QUESTIONS_PER_ROUND_CEILING: usize = 8192;
+    pub const QUESTIONS_IN_FLIGHT: usize = 128;
 }
 impl Default for InspectorConfig {}
 
@@ -2699,6 +2712,14 @@ More entries than `max_servers`, or an entry that is not asked (no address, or `
   `Failed` when the response code is NXDOMAIN (a contradiction that must not read as absence).
   NXDOMAIN: `NxDomain`. No such records but a CNAME owned by the asked name (and the question was
   not for CNAME): `Cname`. Otherwise `NoData`.
+- AA without the flag, for a static list only (`accept_static_without_aa`, off by default; asked for
+  by an application whose test DNS server answers correctly but never sets AA). In a round over
+  `NsDiscovery::Static` an answer without AA is then classified by its content as above, with one
+  exception: a referral — an empty answer section with NS and no SOA in the authority section —
+  stays `NotAuthoritative` whatever the response code, so that a delegation never reads as "no such
+  data" (RFC 2308, sections 2.1 and 2.2.1). With the option on, a recursive resolver put into the
+  static list is believed; that is the application's choice, like the list itself. Discovered
+  servers always need AA, and so does `query_server`, whatever the address.
 - To a resolver: recursion desired; AA is not required. A CNAME chain inside the answer is followed
   within the answer (at most 8 links, loops rejected) to the records of the asked type.
 - The inspector does not validate DNSSEC and does not use DoT or DoH.
@@ -2734,11 +2755,11 @@ non-canonical value is `InvalidInput`. `Present` and `Absent` need at least one 
 
 `wait`:
 
-1. Validate: 1 to 32 expectations, every name within the zone, `interval` at least
+1. Validate: 1 to `max_questions` expectations, every name within the zone, `interval` at least
    `WaitOptions::MIN_INTERVAL` (1 s; with the largest jitter the shortest pause is 500 ms; a round
-   can ask up to 1,024 questions of servers the application does not run), jitter at most 50, the
-   expected values valid. All of this happens before discovery, so an invalid request sends nothing.
-   Discover the servers.
+   can ask up to `max_questions_per_round` questions of servers the application does not run),
+   jitter at most 50, the expected values valid. All of this happens before discovery, so an invalid
+   request sends nothing. Discover the servers.
 2. A round asks every server that is asked every question, at most 128 questions at a time (each
    bounded by `query_timeout`, each holding one socket), evaluates the expectations and builds the
    report, with a row for every server that is not asked (section 8.2).
@@ -2778,23 +2799,32 @@ written at; it is reported as a lookup error.
 
 ### 8.8 Bounds
 
-| Bound                                       | Value                                      |
-| ------------------------------------------- | ------------------------------------------ |
-| NS names of one zone                        | 16                                         |
-| Addresses per NS name and family            | 8                                          |
-| Servers per zone, those not asked included  | `max_servers`, default 32                  |
-| Time for one discovery                      | `discovery_timeout`, default 10 s          |
-| Concurrent address lookups during discovery | 8                                          |
-| Expectations or questions per call          | 32                                         |
-| Questions per round                         | asked servers × questions ≤ 1024           |
-| Questions of a round in flight at once      | 128                                        |
-| Pause between rounds                        | `interval` ≥ 1 s, ± up to 50 % jitter      |
-| Network exchanges per question              | 3 (UDP, UDP without EDNS, TCP)             |
-| Sockets per question                        | one new UDP socket, one new TCP connection |
-| Time per question                           | `query_timeout`, default 3 s               |
-| CNAME links (in an answer, in a chain)      | 8, with loop detection                     |
-| Message size                                | 4096 octets UDP, 65535 TCP                 |
-| Cached zones                                | 256                                        |
+| Bound                                       | Value                                                                                      |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| NS names of one zone                        | 16                                                                                         |
+| Addresses per NS name and family            | 8                                                                                          |
+| Servers per zone, those not asked included  | `max_servers`, default 32                                                                  |
+| Time for one discovery                      | `discovery_timeout`, default 10 s                                                          |
+| Concurrent address lookups during discovery | 8                                                                                          |
+| Expectations or questions per call          | `max_questions`, default 32, at most 256                                                   |
+| Questions per round                         | asked servers × distinct questions ≤ `max_questions_per_round`, default 1024, at most 8192 |
+| Network exchanges per round                 | at most 3 × `max_questions_per_round`                                                      |
+| Time for one round                          | at most `ceil(max_questions_per_round / 128) × query_timeout`; 24 s with the defaults      |
+| Questions of a round in flight at once      | 128                                                                                        |
+| Pause between rounds                        | `interval` ≥ 1 s, ± up to 50 % jitter                                                      |
+| Network exchanges per question              | 3 (UDP, UDP without EDNS, TCP)                                                             |
+| Sockets per question                        | one new UDP socket, one new TCP connection                                                 |
+| Time per question                           | `query_timeout`, default 3 s                                                               |
+| CNAME links (in an answer, in a chain)      | 8, with loop detection                                                                     |
+| Message size                                | 4096 octets UDP, 65535 TCP                                                                 |
+| Cached zones                                | 256                                                                                        |
+
+The two question limits are settings (decided by the maintainer on 2026-11-15, for an application
+that waits for about a hundred names of one zone in one call). The per-round limit is a setting of
+its own rather than `max_servers × max_questions`, so that every earlier configuration behaves as
+before, also one with `max_servers` above 32; its ceiling is 256 × 32. The number of questions in
+flight stays 128, so a larger round takes longer rather than opening more sockets. The limits bound
+the load on name servers the application does not run, which is why they have ceilings at all.
 
 ### 8.9 Decisions made in the implementation
 
@@ -2813,9 +2843,11 @@ Points this section left open, as implemented:
 - The wait timeout counts from the first round of queries, after discovery; discovery has its own
   deadline.
 - Refused as invalid input: jitter above 50 percent, an interval below 1 s, expected values that
-  have no wire form for the question's type, pseudo-types and meta-types, more than 1,024 questions
-  in one round. Refused as configuration errors: zero timeouts, `max_servers` of zero, more than 16
-  resolvers, a resolver listed twice, recursive discovery without resolvers, an empty static list.
+  have no wire form for the question's type, pseudo-types and meta-types, more than `max_questions`
+  questions in a call or more than `max_questions_per_round` in one round. Refused as configuration
+  errors: zero timeouts, `max_servers` of zero, `max_questions` outside 1 to 256,
+  `max_questions_per_round` below `max_questions` or above 8192, more than 16 resolvers, a resolver
+  listed twice, recursive discovery without resolvers, an empty static list.
 - The values of an answer are deduplicated and sorted; a TTL with the high bit set is read as zero
   (RFC 2181 section 8); identical questions are asked once per round.
 
@@ -3967,10 +3999,15 @@ documentation. The remaining items stay open until a live check or a concrete ne
     only on a mark confirmed by a listing and otherwise refuses the zone until a person commits or
     rolls back (section 11.3). Knowing the view could allow a check of the staged state against what
     the client staged.
-23. **RFC 2136 servers.** The messages and the TSIG computation are verified only against the
-    independent mock; BIND, Knot and PowerDNS have not been tried. A synthesized wildcard answer at
-    a name that does not exist looks like a value there, so an add can report `AlreadyPresent`
-    wrongly; without DNSSEC this cannot be detected. Is that limitation acceptable as documented?
+23. **RFC 2136 servers.** The messages and the TSIG computation are verified against the mock, and
+    the mock is cross-checked against BIND's `nsupdate` and `dig` (9.10.6, on 2026-11-15) by ignored
+    tests in `tests/rfc2136_interop.rs`, which need those tools and touch loopback only: updates,
+    prerequisites, TSIG refusals and the TXT forms agree in both directions. The cross-check found
+    three defects, all in the mock (compressed names in request RDATA, no SOA in negative answers,
+    no UDP) and none in the client. No server implementation (BIND's `named`, Knot, PowerDNS) has
+    been tried. A synthesized wildcard answer at a name that does not exist looks like a value
+    there, so an add can report `AlreadyPresent` wrongly; without DNSSEC this cannot be detected. Is
+    that limitation acceptable as documented?
 24. **reg.ru `INVALID_DOMAIN_NAME_FORMAT`** is classed as "zone not found" by assumption (the
     documentation does not say when it is returned). Keep, or report it as `Rejected`?
 25. **The provider's default TTL where only the schema speaks.** Hetzner: `change_ttl` with `null`

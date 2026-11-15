@@ -153,6 +153,11 @@ policy refuses) is reported with its reason and, by default, keeps the wait from
 `WaitOptions::ignore_unaskable_name_servers` to wait only for the name servers that can be asked;
 `Report::unaskable_ignored` then says how many were left out.
 
+`InspectorConfig` bounds what one call may ask: `max_questions` (default 32, at most 256) per call
+and `max_questions_per_round` (default 1024) for the servers × questions of one round. Answers must
+carry the AA flag; `accept_static_without_aa` lifts that for the servers of a static list only, for
+example a test DNS server that never sets it.
+
 ## TLS and crypto
 
 HTTP clients use `reqwest` with `rustls` and `aws-lc-rs`. The crate builds its own TLS configuration
