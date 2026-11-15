@@ -14,8 +14,8 @@ desired-state diffing, no scheduling, no audit and no metrics.
 ## Status
 
 Pre-release, version 0.1.0. The crate is not published to crates.io; use it as a git dependency
-pinned by tag. The provider clients are implemented and tested against mocks. No client is verified
-against a live API yet.
+pinned by tag. The provider clients are implemented and tested against mocks. One client, Selectel
+v2, is verified against the live API; the others are not yet.
 
 [`PROVIDERS.md`](./PROVIDERS.md) is the single list of providers, with the state of each client and
 the definition of "verified". Each provider reports its capabilities at run time

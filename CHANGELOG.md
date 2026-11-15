@@ -102,3 +102,5 @@ The first version, 0.1.0. Not tagged yet.
   `tracing` events. The crate emits `tracing` events only, without request or response bodies or
   headers.
 - Minimum supported Rust version 1.99, edition 2024.
+- Selectel v2 is verified against the live API (`ProviderMeta::verified` is true for it); what the
+  run covered is recorded in `PROVIDERS.md`. No other client is verified yet.

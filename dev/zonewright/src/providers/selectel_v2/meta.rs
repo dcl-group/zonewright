@@ -20,7 +20,7 @@ use crate::record::RecordType;
 pub(crate) static META: ProviderMeta = ProviderMeta {
     id: ProviderId::SelectelV2,
     name: "Selectel v2",
-    verified: false,
+    verified: true,
     default_propagation_timeout: None,
     fields: FIELDS,
     capabilities: CAPABILITIES,
