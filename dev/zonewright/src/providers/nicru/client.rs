@@ -462,7 +462,12 @@ impl Provider for Nicru {
     /// Exchanges the credentials for a new token, even when one is cached, and lists the zones
     /// once. A zone with staged changes is reported as found, with a detail that says whose
     /// they are as far as this process knows.
-    async fn check(&self, zones: &[DomainName]) -> Result<CheckReport, Error> {
+    async fn check<'a>(
+        &self,
+        zones: impl IntoIterator<Item = &'a DomainName> + Send,
+    ) -> Result<CheckReport, Error> {
+        let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
+        let zones = zones.as_slice();
         self.api.authenticate().await?;
         let listed = self.api.zones().await?;
         let checks = zones

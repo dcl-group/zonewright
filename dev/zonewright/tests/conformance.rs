@@ -1093,7 +1093,12 @@ async fn provider_trait_is_implementable_outside_the_crate() {
             ProviderId::Cloudflare
         }
 
-        async fn check(&self, zones: &[DomainName]) -> Result<CheckReport, Error> {
+        async fn check<'a>(
+            &self,
+            zones: impl IntoIterator<Item = &'a DomainName> + Send,
+        ) -> Result<CheckReport, Error> {
+            let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
+            let zones = zones.as_slice();
             let zones = zones
                 .iter()
                 .map(|zone| ZoneCheck::new(zone.clone(), true, Some(Detail::new("ok"))))
@@ -1102,11 +1107,31 @@ async fn provider_trait_is_implementable_outside_the_crate() {
         }
     }
 
+    fn assert_send<T: Send>(value: T) -> T {
+        value
+    }
+
     let double = Double;
     let report = double.check(&[dn("example.org")]).await.unwrap();
     assert!(report.credentials_verified);
     assert_eq!(report.zones.len(), 1);
     assert!(report.zones[0].found);
+
+    // `check` takes any list of zone references, and its future is `Send` for each of them.
+    let zones = vec![dn("example.org"), dn("example.net")];
+    let one = assert_send(double.check([&zones[0]])).await.unwrap();
+    assert_eq!(one.zones.len(), 1);
+    let all = assert_send(double.check(&zones)).await.unwrap();
+    assert_eq!(all.zones.len(), 2);
+    let slice = assert_send(double.check(zones.as_slice())).await.unwrap();
+    assert_eq!(slice.zones.len(), 2);
+    let tail = assert_send(double.check(zones.iter().skip(1)))
+        .await
+        .unwrap();
+    assert_eq!(tail.zones.len(), 1);
+    let none = assert_send(double.check([])).await.unwrap();
+    assert!(none.credentials_verified);
+    assert!(none.zones.is_empty());
     let zone = dn("example.org");
     let err = double.list_zones().await.unwrap_err();
     assert!(matches!(

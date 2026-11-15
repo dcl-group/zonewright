@@ -133,7 +133,12 @@ impl Provider for Regru {
     /// Calls `nop`, which authenticates and does nothing else, so the credentials are exercised
     /// on every call whether or not a zone is given, and looks every zone up afresh with
     /// `zone/nop`.
-    async fn check(&self, zones: &[DomainName]) -> Result<CheckReport, Error> {
+    async fn check<'a>(
+        &self,
+        zones: impl IntoIterator<Item = &'a DomainName> + Send,
+    ) -> Result<CheckReport, Error> {
+        let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
+        let zones = zones.as_slice();
         self.api.nop().await?;
         let mut checks = Vec::with_capacity(zones.len());
         for zone in zones {

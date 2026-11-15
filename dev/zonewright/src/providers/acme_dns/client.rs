@@ -169,7 +169,12 @@ impl Provider for AcmeDns {
     /// which is what the client can know; every zone's detail says that the credentials were not
     /// tested. The client cannot verify that the application's `_acme-challenge` CNAME points to
     /// a `fulldomain`, or that the server answers for it in DNS.
-    async fn check(&self, zones: &[DomainName]) -> Result<CheckReport, Error> {
+    async fn check<'a>(
+        &self,
+        zones: impl IntoIterator<Item = &'a DomainName> + Send,
+    ) -> Result<CheckReport, Error> {
+        let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
+        let zones = zones.as_slice();
         let checks = zones
             .iter()
             .map(|zone| {

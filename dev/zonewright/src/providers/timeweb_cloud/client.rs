@@ -110,7 +110,12 @@ impl Provider for TimewebCloud {
 
     /// Reads one page of the account's domains, which exercises the token on every call without
     /// naming a zone, and looks every zone up afresh.
-    async fn check(&self, zones: &[DomainName]) -> Result<CheckReport, Error> {
+    async fn check<'a>(
+        &self,
+        zones: impl IntoIterator<Item = &'a DomainName> + Send,
+    ) -> Result<CheckReport, Error> {
+        let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
+        let zones = zones.as_slice();
         self.api.probe().await?;
         let mut checks = Vec::with_capacity(zones.len());
         for zone in zones {

@@ -224,7 +224,12 @@ impl Provider for SelectelV2 {
     /// Obtains a token (which verifies the credentials) and looks every zone up afresh. A zone
     /// of another project that the API lists is reported as found; writing to it is
     /// `Error::Forbidden`.
-    async fn check(&self, zones: &[DomainName]) -> Result<CheckReport, Error> {
+    async fn check<'a>(
+        &self,
+        zones: impl IntoIterator<Item = &'a DomainName> + Send,
+    ) -> Result<CheckReport, Error> {
+        let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
+        let zones = zones.as_slice();
         self.api.authenticate().await?;
         let mut checks = Vec::with_capacity(zones.len());
         for zone in zones {

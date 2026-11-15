@@ -121,7 +121,12 @@ impl Provider for DigitalOcean {
 
     /// Reads the account, which exercises the token on every call, and looks every zone up
     /// afresh.
-    async fn check(&self, zones: &[DomainName]) -> Result<CheckReport, Error> {
+    async fn check<'a>(
+        &self,
+        zones: impl IntoIterator<Item = &'a DomainName> + Send,
+    ) -> Result<CheckReport, Error> {
+        let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
+        let zones = zones.as_slice();
         self.api.account().await?;
         let mut checks = Vec::with_capacity(zones.len());
         for zone in zones {

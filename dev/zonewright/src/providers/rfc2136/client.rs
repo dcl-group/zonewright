@@ -119,7 +119,12 @@ impl Provider for Rfc2136 {
     /// server signs its answer, whatever it is, only when it accepted the request's signature
     /// (RFC 8945 section 5.3), so that tests the key without naming a zone. A TSIG error is
     /// `Error::Auth`.
-    async fn check(&self, zones: &[DomainName]) -> Result<CheckReport, Error> {
+    async fn check<'a>(
+        &self,
+        zones: impl IntoIterator<Item = &'a DomainName> + Send,
+    ) -> Result<CheckReport, Error> {
+        let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
+        let zones = zones.as_slice();
         if zones.is_empty() {
             let query = Builder::query(&DomainName::root(), TYPE_SOA).finish()?;
             let answer = self.transport.exchange(&query, "check").await?;

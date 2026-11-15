@@ -231,7 +231,12 @@ impl Provider for Route53 {
 
     /// Makes a signed request on every call, which verifies the keys: one lookup per zone, or
     /// the first hosted zone when no zone is given. Every zone is looked up afresh.
-    async fn check(&self, zones: &[DomainName]) -> Result<CheckReport, Error> {
+    async fn check<'a>(
+        &self,
+        zones: impl IntoIterator<Item = &'a DomainName> + Send,
+    ) -> Result<CheckReport, Error> {
+        let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
+        let zones = zones.as_slice();
         if zones.is_empty() {
             self.api.probe().await?;
         }

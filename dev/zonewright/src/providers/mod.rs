@@ -307,7 +307,10 @@ impl Provider for AnyProvider {
         forward!(self, client => client.id())
     }
 
-    async fn check(&self, zones: &[DomainName]) -> Result<CheckReport, Error> {
+    async fn check<'a>(
+        &self,
+        zones: impl IntoIterator<Item = &'a DomainName> + Send,
+    ) -> Result<CheckReport, Error> {
         forward!(self, client => client.check(zones).await)
     }
 

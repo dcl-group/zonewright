@@ -144,7 +144,12 @@ impl Provider for Beget {
 
     /// Lists the account's domains, which exercises the credentials on every call even with no
     /// zone given, and reads every zone afresh.
-    async fn check(&self, zones: &[DomainName]) -> Result<CheckReport, Error> {
+    async fn check<'a>(
+        &self,
+        zones: impl IntoIterator<Item = &'a DomainName> + Send,
+    ) -> Result<CheckReport, Error> {
+        let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
+        let zones = zones.as_slice();
         let domains: BTreeSet<DomainName> = self.api.domains().await?.into_iter().collect();
         let mut checks = Vec::with_capacity(zones.len());
         for zone in zones {

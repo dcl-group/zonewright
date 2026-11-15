@@ -35,9 +35,15 @@ pub trait Provider: Send + Sync {
     }
 
     /// Verifies the credentials and reports, for each zone, whether it is visible and usable.
-    fn check(
+    ///
+    /// `zones` is anything that yields zone names by reference: `[&zone]` for one zone, a slice
+    /// or a `&Vec` for several, an empty array to verify the credentials alone.
+    ///
+    /// An implementation collects `zones` before its first `.await`: the argument is `Send`, but
+    /// the iterator it turns into need not be, so that iterator cannot be held across one.
+    fn check<'a>(
         &self,
-        zones: &[DomainName],
+        zones: impl IntoIterator<Item = &'a DomainName> + Send,
     ) -> impl Future<Output = Result<CheckReport, Error>> + Send;
 
     /// Zones in which these credentials can change records.
