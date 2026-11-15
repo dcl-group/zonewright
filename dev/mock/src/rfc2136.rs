@@ -1,5 +1,7 @@
 //! Mock of an authoritative name server that accepts DNS UPDATE (RFC 2136) signed with TSIG
-//! (RFC 8945), over TCP (RFC 1035 section 4.2.2, RFC 7766).
+//! (RFC 8945), over TCP (RFC 1035 section 4.2.2, RFC 7766) and over UDP on the same port number
+//! (RFC 1035 section 4.2.1). The client under test speaks TCP only; UDP serves the tests that
+//! cross-check the mock with independent tools, which use UDP by default.
 //!
 //! The parser, the signer and the verifier here are written for the mock and share nothing with
 //! the client under test; the HMAC comes from `aws-lc-rs` directly. The behavior follows these
@@ -32,6 +34,13 @@
 //!   any type (step 3a), without following the chain. Names inside the RDATA of the RFC 1035
 //!   types NS, CNAME, PTR, MX and SOA are compressed against the question name where a suffix
 //!   matches (RFC 1035 section 4.1.4; RFC 3597 section 4 allows it for these types only).
+//! - Names inside the RDATA of NS, CNAME, PTR, MX and SOA in a request may be compressed (RFC
+//!   1035 section 4.1.4; RFC 3597 section 4 requires a receiver to decompress them for these
+//!   types); the mock stores them uncompressed. `nsupdate` compresses the MX exchange against the
+//!   zone section, so a mock that kept the raw octets answered with a corrupted name.
+//! - Queries, negative answers: NXDOMAIN, or no data of the type, carries the zone's SOA in the
+//!   authority section with the lower of its TTL and MINIMUM as the TTL (RFC 2308 section 3),
+//!   when the seed holds an apex SOA.
 //! - RFC 8945: TSIG is the last record of the additional section (5.1); the request MAC covers
 //!   the message without the TSIG record (ARCOUNT less one, the original ID) and the TSIG
 //!   variables (4.3.3); the response MAC covers the request MAC with its length, the response,
@@ -39,6 +48,12 @@
 //!   (5.2.1, 5.3.2), a MAC that does not verify NOTAUTH with BADSIG and no MAC (5.2.2), a time
 //!   outside the fudge NOTAUTH with BADTIME, signed, with the server's time in the other data
 //!   (5.2.3). Fudge 300 s (section 10).
+//! - UDP: the mock does not implement EDNS (RFC 6891), so it never echoes an OPT record and an
+//!   answer over UDP holds at most 512 octets (RFC 1035 sections 2.3.4 and 4.2.1; RFC 6891
+//!   section 7). A longer answer is sent with TC set and without its answer and authority
+//!   records (RFC 2181 section 9), signed like any other answer, so that the requester retries
+//!   over TCP. [`Fault::truncate`] and [`Fault::short_length`] send the same cut octets in one
+//!   datagram.
 //!
 //! Answers this mock invents because the sources are silent, each chosen so that a client cannot
 //! rely on a lenient reading. A test that depends on one of them proves only how the client
@@ -59,6 +74,8 @@
 //!   its SOA there and the seeds usually leave it out;
 //! - an update answer copies the zone section (RFC 2136 section 3.8 also allows zero counts;
 //!   [`Fault::omit_question`] produces that form).
+//! - a UDP answer cut for length (see above) drops every answer and authority record rather than
+//!   as many as needed, and is signed over the cut message like any other answer.
 //!
 //! A test holds an [`Rfc2136Mock`] and changes its state and its behavior through
 //! [`Rfc2136Mock::control`]:
@@ -77,7 +94,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::hmac;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 /// Type code of TXT (RFC 1035 section 3.2.2).
 pub const TYPE_TXT: u16 = 16;
@@ -135,6 +152,9 @@ pub const BADTIME: u16 = 18;
 
 /// Fudge the mock signs with (RFC 8945 section 10 recommends 300 s).
 const FUDGE: u16 = 300;
+
+/// The largest answer sent over UDP without EDNS (RFC 1035 section 2.3.4).
+const UDP_LIMIT: usize = 512;
 
 /// The secret of the standard SHA-256 key, 32 octets. Synthetic.
 pub const STANDARD_SECRET: &[u8; 32] = b"zonewright-rfc2136-mock-secret!!";
@@ -603,11 +623,11 @@ impl Control {
 pub struct Rfc2136Mock {
     addr: SocketAddr,
     control: Control,
-    _shutdown: tokio::sync::oneshot::Sender<()>,
+    _shutdown: tokio::sync::watch::Sender<()>,
 }
 
 impl Rfc2136Mock {
-    /// Starts the server on `127.0.0.1` with an ephemeral port.
+    /// Starts the server on `127.0.0.1` with an ephemeral port, the same number for TCP and UDP.
     pub async fn start(seed: Seed) -> Rfc2136Mock {
         let state = State {
             records: seed.records.clone(),
@@ -617,22 +637,39 @@ impl Rfc2136Mock {
             seed: Arc::new(seed),
             state: Arc::new(Mutex::new(state)),
         };
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("bind 127.0.0.1:0");
-        let addr = listener.local_addr().expect("local address");
-        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        // The ephemeral TCP port may be taken for UDP by another process: try another one.
+        let mut bound = None;
+        for _ in 0..32 {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind 127.0.0.1:0");
+            let addr = listener.local_addr().expect("local address");
+            if let Ok(socket) = UdpSocket::bind(addr).await {
+                bound = Some((listener, socket, addr));
+                break;
+            }
+        }
+        let (listener, socket, addr) = bound.expect("bind TCP and UDP on one port of 127.0.0.1");
+        let (tx, mut rx) = tokio::sync::watch::channel(());
+        let mut udp_rx = rx.clone();
         let accept_control = control.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = &mut rx => break,
+                    _ = rx.changed() => break,
                     accepted = listener.accept() => {
                         if let Ok((stream, _)) = accepted {
                             tokio::spawn(serve(stream, accept_control.clone()));
                         }
                     }
                 }
+            }
+        });
+        let udp_control = control.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = udp_rx.changed() => {}
+                () = serve_udp(socket, udp_control) => {}
             }
         });
         Rfc2136Mock {
@@ -642,7 +679,7 @@ impl Rfc2136Mock {
         }
     }
 
-    /// The address the server listens on.
+    /// The address the server listens on (TCP and UDP).
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -655,6 +692,25 @@ impl Rfc2136Mock {
     /// The control handle.
     pub fn control(&self) -> &Control {
         &self.control
+    }
+}
+
+async fn serve_udp(socket: UdpSocket, control: Control) {
+    let mut buf = vec![0u8; 65_535];
+    loop {
+        let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
+            return;
+        };
+        let request = buf.get(..len).unwrap_or_default().to_vec();
+        let Reply::Send(bytes, how) = handle_on(&request, &control, Transport::Udp).await else {
+            continue;
+        };
+        let out = match how {
+            Write::Full => &bytes[..],
+            Write::Truncated => &bytes[..bytes.len() / 2],
+            Write::ShortLength => &bytes[..4.min(bytes.len())],
+        };
+        let _ = socket.send_to(out, peer).await;
     }
 }
 
@@ -744,6 +800,65 @@ fn read_name(b: &[u8], mut i: usize) -> Option<(String, usize)> {
     None
 }
 
+/// A name with compression as uncompressed wire octets, the case of its labels kept, and the
+/// position after it.
+fn read_wire_name(b: &[u8], mut i: usize) -> Option<(Vec<u8>, usize)> {
+    let mut out = Vec::new();
+    let mut end = None;
+    for _ in 0..128 {
+        let len = *b.get(i)?;
+        if len & 0xc0 == 0xc0 {
+            end.get_or_insert(i + 2);
+            i = (usize::from(len & 0x3f) << 8) | usize::from(*b.get(i + 1)?);
+            continue;
+        }
+        if len & 0xc0 != 0 {
+            return None;
+        }
+        out.push(len);
+        if len == 0 {
+            return (out.len() <= 255).then_some((out, end.unwrap_or(i + 1)));
+        }
+        out.extend_from_slice(b.get(i + 1..i + 1 + usize::from(len))?);
+        i += 1 + usize::from(len);
+    }
+    None
+}
+
+/// The RDATA of a request record at `start`, `len` octets long. The names inside the RDATA of
+/// NS, CNAME, PTR, MX and SOA may be compressed against the rest of the message (RFC 1035
+/// section 4.1.4; RFC 3597 section 4: a receiver decompresses them for these types); they are
+/// stored uncompressed, since a pointer means nothing outside the message it came in. `None`
+/// when a name runs outside the RDATA or the RDATA has octets left over.
+fn request_rdata(b: &[u8], rtype: u16, start: usize, len: usize) -> Option<Vec<u8>> {
+    let raw = b.get(start..start + len)?;
+    let end = start + len;
+    if raw.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    let name = |at: usize, out: &mut Vec<u8>| -> Option<usize> {
+        let (wire, next) = read_wire_name(b, at)?;
+        out.extend_from_slice(&wire);
+        (next <= end).then_some(next)
+    };
+    let next = match rtype {
+        TYPE_NS | TYPE_CNAME | TYPE_PTR => name(start, &mut out)?,
+        TYPE_MX => {
+            out.extend_from_slice(b.get(start..start + 2)?);
+            name(start + 2, &mut out)?
+        }
+        TYPE_SOA => {
+            let second = name(start, &mut out)?;
+            let fixed = name(second, &mut out)?;
+            out.extend_from_slice(b.get(fixed..fixed + 20)?);
+            fixed + 20
+        }
+        _ => return Some(raw.to_vec()),
+    };
+    (next == end).then_some(out)
+}
+
 /// The uncompressed wire form of a name given as text with a trailing dot.
 fn wire_name(name: &str) -> Vec<u8> {
     let mut out = Vec::new();
@@ -821,7 +936,7 @@ fn parse(b: &[u8]) -> Option<Request> {
             let class = be16(b, j + 2)?;
             let ttl = be32(b, j + 4)?;
             let len = usize::from(be16(b, j + 8)?);
-            let rdata = b.get(j + 10..j + 10 + len)?.to_vec();
+            let rdata = request_rdata(b, rtype, j + 10, len)?;
             i = j + 10 + len;
             section.push(Rr {
                 name,
@@ -925,6 +1040,7 @@ fn now(skew: i64) -> u64 {
 // ---- Processing --------------------------------------------------------------------------------
 
 /// How the answer is signed.
+#[derive(Clone)]
 struct Signing<'a> {
     key_name: String,
     algorithm: &'a str,
@@ -936,7 +1052,18 @@ struct Signing<'a> {
     other: Vec<u8>,
 }
 
+/// The transport a request came over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Tcp,
+    Udp,
+}
+
 async fn handle(b: &[u8], control: &Control) -> Reply {
+    handle_on(b, control, Transport::Tcp).await
+}
+
+async fn handle_on(b: &[u8], control: &Control, transport: Transport) -> Reply {
     let Some(req) = parse(b) else {
         return Reply::Close;
     };
@@ -1076,7 +1203,20 @@ async fn handle(b: &[u8], control: &Control) -> Reply {
         error: fault.tsig_error,
         other: Vec::new(),
     });
-    let reply = answer(&req, &outcome, signing, &fault);
+    let mut reply = answer(&req, &outcome, signing.clone(), &fault);
+    if transport == Transport::Udp && reply.len() > UDP_LIMIT {
+        let cut = Outcome {
+            answers: Vec::new(),
+            authority: Vec::new(),
+            ..outcome
+        };
+        let tc = Fault {
+            set_tc: true,
+            extra_answer: None,
+            ..fault.clone()
+        };
+        reply = answer(&req, &cut, signing, &tc);
+    }
     let how = if fault.truncate {
         Write::Truncated
     } else if fault.short_length {
@@ -1176,7 +1316,7 @@ fn process(req: &Request, control: &Control, refuse_queries: bool) -> Outcome {
             }
             // A CNAME at the name answers a query of any type (RFC 1034 section 4.3.2, step
             // 3a). The mock does not follow the chain to the target.
-            let answers = state
+            let answers: Vec<AnswerRr> = state
                 .records
                 .iter()
                 .filter(|r| {
@@ -1187,11 +1327,27 @@ fn process(req: &Request, control: &Control, refuse_queries: bool) -> Outcome {
                 .collect();
             let exists =
                 state.records.iter().any(|r| r.name == req.qname) || zones.contains(&req.qname);
+            // A negative answer (NXDOMAIN, or no data of the type) carries the zone's SOA in the
+            // authority section, with the lower of its TTL and its MINIMUM field as the TTL (RFC
+            // 2308 section 3). A seed without an apex SOA gets an empty authority section.
+            let authority = if answers.is_empty() {
+                state
+                    .records
+                    .iter()
+                    .filter(|r| &r.name == zone && r.rtype == TYPE_SOA)
+                    .map(|r| AnswerRr {
+                        ttl: soa_minimum(&r.rdata).map_or(r.ttl, |m| m.min(r.ttl)),
+                        ..to_answer(r)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             Outcome {
                 rcode: if exists { NOERROR } else { NXDOMAIN },
                 authoritative: true,
                 answers,
-                authority: Vec::new(),
+                authority,
             }
         }
         5 => Outcome::rcode(update(req, zones, &mut state.records)),
@@ -1204,6 +1360,13 @@ fn soa_serial(rdata: &[u8]) -> Option<u32> {
     let (_, i) = read_name(rdata, 0)?;
     let (_, j) = read_name(rdata, i)?;
     be32(rdata, j)
+}
+
+/// The MINIMUM field of SOA RDATA: the last 32-bit field.
+fn soa_minimum(rdata: &[u8]) -> Option<u32> {
+    let (_, i) = read_name(rdata, 0)?;
+    let (_, j) = read_name(rdata, i)?;
+    be32(rdata, j + 16).filter(|_| rdata.len() == j + 20)
 }
 
 /// `a` is lower than or equal to `b` in serial number arithmetic (RFC 1982 section 3.2).
@@ -1956,6 +2119,65 @@ mod tests {
         assert_eq!(&reply[at..at + 2], &[0xc0, 12]);
         assert_eq!(&reply[at + 10..at + 12], &[0, 7]);
         assert_eq!(&reply[at + 12..at + 19], b"\x04host\xc0\x10");
+    }
+
+    /// Names in the RDATA of an MX record are decompressed against the request, case kept
+    /// (RFC 1035 section 4.1.4, RFC 3597 section 4); other types are kept as they came.
+    #[test]
+    fn request_rdata_is_decompressed_for_rfc_1035_types() {
+        let mut m = vec![0u8; 12];
+        m.extend_from_slice(b"\x07Example\x03org\x00");
+        let start = m.len();
+        m.extend_from_slice(&[0, 10]);
+        m.extend_from_slice(b"\x04mail\xc0\x0c");
+        let len = m.len() - start;
+        let mut want = vec![0, 10];
+        want.extend_from_slice(b"\x04mail\x07Example\x03org\x00");
+        assert_eq!(request_rdata(&m, TYPE_MX, start, len).unwrap(), want);
+        assert_eq!(
+            request_rdata(&m, TYPE_TXT, start, len).unwrap(),
+            m[start..].to_vec()
+        );
+        assert_eq!(
+            request_rdata(&m, TYPE_MX, start, 0).unwrap(),
+            Vec::<u8>::new()
+        );
+        // A name that ends before the RDATA does, or runs past it.
+        assert!(request_rdata(&m, TYPE_MX, start, len - 1).is_none());
+        m.push(0);
+        assert!(request_rdata(&m, TYPE_MX, start, len + 1).is_none());
+    }
+
+    /// Over UDP an answer longer than 512 octets is cut to the header and the question with TC
+    /// set, and still signed; over TCP it is whole.
+    #[tokio::test]
+    async fn long_udp_answer_is_truncated_and_signed() {
+        let mock = Rfc2136Mock::start(Seed::standard()).await;
+        let key = mock.control().seed().keys[0].clone();
+        for c in *b"abc" {
+            mock.control()
+                .add_txt(A, &String::from_utf8(vec![c; 200]).unwrap(), 60);
+        }
+        let mut query = 5u16.to_be_bytes().to_vec();
+        query.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        query.extend_from_slice(&wire_name(A));
+        query.extend_from_slice(&[0, 16, 0, 1]);
+        let (msg, _) = signed(&query, &key, now(0));
+        let Reply::Send(udp, Write::Full) = handle_on(&msg, mock.control(), Transport::Udp).await
+        else {
+            panic!("no reply");
+        };
+        assert!(udp.len() <= UDP_LIMIT);
+        assert_eq!(udp[2] & 0x02, 0x02, "TC");
+        assert_eq!(&udp[6..10], &[0, 0, 0, 0], "no answer or authority records");
+        let reply = parse(&udp).unwrap();
+        let tsig = parse_tsig(reply.additional.last().unwrap()).unwrap();
+        assert_eq!(tsig.mac.len(), 32);
+        let Reply::Send(tcp, Write::Full) = handle(&msg, mock.control()).await else {
+            panic!("no reply");
+        };
+        assert_eq!(tcp[2] & 0x02, 0);
+        assert_eq!(&tcp[6..8], &[0, 3]);
     }
 
     #[test]
