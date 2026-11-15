@@ -43,28 +43,32 @@ The provider IDs are listed in [`PROVIDERS.md`](./PROVIDERS.md).
 
 ## Usage
 
-A client is built from the provider ID, a JSON object of settings and a JSON object of credentials,
-as an application would keep them in its own storage. Settings and credentials are different for
-each provider; `ProviderId::meta` describes the fields. The examples in this file need the features
-`cloudflare` and `inspector`, as in the installation snippet above.
+There are two ways to build a client, and they give the same result. The examples in this file need
+the features `cloudflare` and `inspector`, as in the installation snippet above.
+
+### A client from typed values
+
+Every provider has a module under `zonewright::providers` with its client, a settings struct and a
+credentials struct. This is the way to build a client when the code knows which provider it talks
+to.
 
 ```rust,no_run
 use secrecy::SecretString;
+use zonewright::providers::cloudflare::{Cloudflare, CloudflareConfig, CloudflareCredentials};
 use zonewright::{
-    AddOutcome, AnyProvider, Context, ContextOptions, DomainName, Error, ErrorKind, Provider,
-    ProviderId, Txt, dns01,
+    AddOutcome, Context, ContextOptions, DomainName, Error, ErrorKind, Provider, Txt, dns01,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = Context::new(ContextOptions::default())?;
 
-    let id: ProviderId = "cloudflare".parse()?;
-    let credentials = SecretString::from(r#"{"api_token": "placeholder-not-a-real-token"}"#);
-    let provider = AnyProvider::from_json(id, "{}", &credentials, &ctx)?;
+    let credentials =
+        CloudflareCredentials::new(SecretString::from("placeholder-not-a-real-token"));
+    let provider = Cloudflare::new(CloudflareConfig::default(), credentials, &ctx)?;
 
     let zone = DomainName::parse("example.org")?;
-    let report = provider.check(std::slice::from_ref(&zone)).await?;
+    let report = provider.check([&zone]).await?;
     println!(
         "credentials verified: {}, zone visible: {}",
         report.credentials_verified,
@@ -98,6 +102,46 @@ fn explain(e: &Error) -> String {
     }
 }
 ```
+
+`AnyProvider::from(provider)` turns the client into `AnyProvider`, the enum over all providers, for
+code that handles several of them through one type.
+
+### A client from stored configuration
+
+An application that lets its users add provider accounts keeps each account in its own storage, and
+since every provider has different fields, what it keeps is a provider ID as a string, a JSON object
+of settings and a JSON object of credentials. `AnyProvider::from_json` builds the client from
+exactly these three values, so the application needs no `match` over providers and no change to its
+code when a new provider is added. It deserializes the two objects into the provider's settings and
+credentials structs and calls the same `new`.
+
+```rust,no_run
+use secrecy::SecretString;
+use zonewright::{AnyProvider, Context, Error, ProviderId};
+
+// `id`, `settings` and `credentials` are what the application stored for one account,
+// for example "cloudflare", "{}" and {"api_token": "..."}.
+fn client_of_account(
+    id: &str,
+    settings: &str,
+    credentials: &SecretString,
+    ctx: &Context,
+) -> Result<AnyProvider, Box<dyn std::error::Error>> {
+    let id: ProviderId = id.parse()?;
+    match AnyProvider::from_json(id, settings, credentials, ctx) {
+        Ok(provider) => Ok(provider),
+        // The ID is valid, but this build does not include that provider's feature.
+        Err(Error::NotCompiled { .. }) => Err(format!("{id} is not in this build").into()),
+        Err(e) => Err(e.into()),
+    }
+}
+```
+
+`ProviderId` is an enum; its string form is stable, because applications persist it, and every ID
+parses in any build, whatever features are enabled. The credentials are passed as one `SecretString`
+holding the JSON text, so a secret is never held in a plain string on its way to the client.
+`ProviderId::meta` describes the settings and credentials fields of a provider, for an application
+that builds its account form from them.
 
 `Error::kind` returns an `ErrorKind` with a stable snake_case identifier (`ErrorKind::as_str`) that
 an application can map to its own error codes. `ErrorKind::ALL` lists every kind, so that a test of
