@@ -1193,11 +1193,14 @@ impl Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorKind {
-        Config, NotCompiled, Unsupported, UnsupportedRecordType, InvalidInput, NameOutsideZone,
-    ZoneNotFound, Auth, Forbidden, RateLimited, PreconditionFailed, Conflict, Transient, Rejected,
-    Protocol,
+    Config, NotCompiled, Unsupported, UnsupportedRecordType, InvalidInput, NameOutsideZone,
+    ZoneNotFound, ProxyAuth, Auth, Forbidden, RateLimited, PreconditionFailed, Conflict, Transient,
+    Rejected, Protocol,
 }
 impl ErrorKind {
+    /// Every kind of this version, each once, in declaration order. An application's test walks
+    /// it to notice a kind added later, which its wildcard `match` arm would absorb silently.
+    pub const ALL: &'static [ErrorKind];
     /// Stable snake_case identifier: "config", "not_compiled", ..., "protocol".
     pub const fn as_str(self) -> &'static str;
 }
@@ -3063,6 +3066,9 @@ dev/
   clippy.toml            lets test code use unwrap, expect, panic, indexing, dbg and print
   zonewright/
     Cargo.toml           features and dependencies (section 9); [lints] workspace = true
+    LICENSE-MIT, LICENSE-APACHE
+                         copies of the repository's, so that the published package carries
+                         them; a conformance test compares them byte for byte
     src/
       lib.rs             module tree, re-exports, crate docs
       name.rs            DomainName, TargetName

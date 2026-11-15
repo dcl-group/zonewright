@@ -406,6 +406,31 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    /// Every kind this version of the crate knows, each once, in declaration order.
+    ///
+    /// An application that maps kinds to its own error codes can walk this list in a test to
+    /// notice a kind added by a newer version of the crate, which a `match` with a wildcard arm
+    /// (required, since the enum is `#[non_exhaustive]`) would otherwise absorb silently. The
+    /// list grows when a kind is added; that is not a breaking change.
+    pub const ALL: &'static [ErrorKind] = &[
+        ErrorKind::Config,
+        ErrorKind::NotCompiled,
+        ErrorKind::Unsupported,
+        ErrorKind::UnsupportedRecordType,
+        ErrorKind::InvalidInput,
+        ErrorKind::NameOutsideZone,
+        ErrorKind::ZoneNotFound,
+        ErrorKind::ProxyAuth,
+        ErrorKind::Auth,
+        ErrorKind::Forbidden,
+        ErrorKind::RateLimited,
+        ErrorKind::PreconditionFailed,
+        ErrorKind::Conflict,
+        ErrorKind::Transient,
+        ErrorKind::Rejected,
+        ErrorKind::Protocol,
+    ];
+
     /// Stable snake_case identifier: `"config"`, `"not_compiled"`, ..., `"protocol"`. Part of
     /// the public API: applications map these to their own error codes.
     #[must_use]
@@ -514,6 +539,41 @@ mod tests {
             Some(Duration::from_secs(3))
         );
         assert_eq!(Error::transient("t").retry_after(), None);
+    }
+
+    #[test]
+    fn all_lists_every_kind_once() {
+        // No wildcard arm: a new kind does not compile until it is given the next position
+        // here, and then the assertions fail until it is added to `ALL` at that position.
+        fn position(kind: ErrorKind) -> usize {
+            match kind {
+                ErrorKind::Config => 0,
+                ErrorKind::NotCompiled => 1,
+                ErrorKind::Unsupported => 2,
+                ErrorKind::UnsupportedRecordType => 3,
+                ErrorKind::InvalidInput => 4,
+                ErrorKind::NameOutsideZone => 5,
+                ErrorKind::ZoneNotFound => 6,
+                ErrorKind::ProxyAuth => 7,
+                ErrorKind::Auth => 8,
+                ErrorKind::Forbidden => 9,
+                ErrorKind::RateLimited => 10,
+                ErrorKind::PreconditionFailed => 11,
+                ErrorKind::Conflict => 12,
+                ErrorKind::Transient => 13,
+                ErrorKind::Rejected => 14,
+                ErrorKind::Protocol => 15,
+            }
+        }
+        const COUNT: usize = 16;
+        assert_eq!(ErrorKind::ALL.len(), COUNT);
+        for (i, kind) in ErrorKind::ALL.iter().enumerate() {
+            assert_eq!(position(*kind), i, "{kind}");
+        }
+        let mut names: Vec<&str> = ErrorKind::ALL.iter().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), COUNT);
     }
 
     #[test]

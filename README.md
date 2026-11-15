@@ -100,7 +100,8 @@ fn explain(e: &Error) -> String {
 ```
 
 `Error::kind` returns an `ErrorKind` with a stable snake_case identifier (`ErrorKind::as_str`) that
-an application can map to its own error codes.
+an application can map to its own error codes. `ErrorKind::ALL` lists every kind, so that a test of
+that mapping notices a kind added by a newer version.
 
 ### Inspector
 

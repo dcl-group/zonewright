@@ -54,9 +54,9 @@ The first version, 0.1.0. Not tagged yet.
   `SecretString`. Proxy environment variables are ignored with and without it; SOCKS4 and URLs with
   user info are refused. Proxy credentials the proxy refuses are `Error::ProxyAuth`
   (`ErrorKind::ProxyAuth`, `proxy_auth`). RFC 2136 and the inspector do not use the proxy.
-- `Error` with `ErrorKind` (stable snake_case identifiers), `Operation`, `Error::is_retryable`,
-  `Error::retry_after`, a constructor per kind for implementations of `Provider` outside the crate,
-  and `Detail`, the redacted text an error carries.
+- `Error` with `ErrorKind` (stable snake_case identifiers, all of them listed in `ErrorKind::ALL`),
+  `Operation`, `Error::is_retryable`, `Error::retry_after`, a constructor per kind for
+  implementations of `Provider` outside the crate, and `Detail`, the redacted text an error carries.
 - DNS-01 helpers in the module `dns01`: `challenge_name` and `CHALLENGE_LABEL`; `follow_cname` over
   the `CnameLookup` trait, with `CnameChain`, `CnameError`, `LookupError` and the default limit
   `CNAME_CHAIN_MAX`; `select_zone` for the zone of a name.
