@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["dns", "acme", "dns-01", "zone"]
 categories = ["network-programming", "api-bindings"]
 
@@ -81,7 +81,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 [dev-dependencies]
 serde_json = "1.0.154"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
-zonewright-mock = { path = "../mock" }
+zonewright-mock = { version = "0.1.0", path = "../mock" }
 tokio = { version = "1.54.1", features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

@@ -44,6 +44,14 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// True when the tests run from the published package rather than from the repository. Cargo adds
+/// `.cargo_vcs_info.json` to every package it builds from a git checkout. The checks that compare
+/// the crate with files of the repository (`PROVIDERS.md`, the license texts) do not apply there:
+/// those files are not in the package.
+fn packaged() -> bool {
+    manifest_dir().join(".cargo_vcs_info.json").exists()
+}
+
 // ---- Provider IDs ------------------------------------------------------------------------------
 
 #[test]
@@ -153,6 +161,9 @@ fn providers_md() -> BTreeMap<String, BTreeMap<String, String>> {
 
 #[test]
 fn ids_equal_providers_md() {
+    if packaged() {
+        return;
+    }
     let sections = providers_md();
     let mut listed = BTreeSet::new();
     for ids in sections.values() {
@@ -172,6 +183,9 @@ fn ids_equal_providers_md() {
 
 #[test]
 fn names_equal_providers_md() {
+    if packaged() {
+        return;
+    }
     let sections = providers_md();
     for ids in sections.values() {
         for (id, name) in ids {
@@ -183,6 +197,9 @@ fn names_equal_providers_md() {
 
 #[test]
 fn verified_flags_equal_providers_md() {
+    if packaged() {
+        return;
+    }
     let sections = providers_md();
     let verified = sections
         .get("Verified against the live API")
@@ -1282,16 +1299,21 @@ fn provider_test_files_define_the_required_tests() {
     assert!(missing.is_empty(), "{}", missing.join("\n"));
 }
 
-/// The crate directory carries the license texts, so that they are in the published package;
+/// Both crate directories carry the license texts, so that they are in the published packages;
 /// they are copies of the repository's and must not drift from them.
 #[test]
 fn crate_license_files_equal_the_repository_ones() {
-    let krate = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let root = krate.join("../..");
-    for name in ["LICENSE-MIT", "LICENSE-APACHE"] {
-        let ours = std::fs::read(krate.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let theirs = std::fs::read(root.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert!(!ours.is_empty(), "{name}");
-        assert_eq!(ours, theirs, "{name}");
+    if packaged() {
+        return;
+    }
+    let root = manifest_dir().join("../..");
+    for krate in [manifest_dir(), manifest_dir().join("../mock")] {
+        for name in ["LICENSE-MIT", "LICENSE-APACHE"] {
+            let ours = std::fs::read(krate.join(name))
+                .unwrap_or_else(|e| panic!("{}/{name}: {e}", krate.display()));
+            let theirs = std::fs::read(root.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!ours.is_empty(), "{name}");
+            assert_eq!(ours, theirs, "{}/{name}", krate.display());
+        }
     }
 }

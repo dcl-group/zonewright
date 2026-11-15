@@ -3030,12 +3030,13 @@ Why each is there, and what is deliberately absent:
   encoders, which avoids a second copy of a type that must match `reqwest`'s), `httpdate`, `hex`,
   `async-trait`, `metrics`, `chrono`, `time`, `hickory-resolver`, `hickory-net`, any mock library.
 
-The mock crate (`publish = false`) depends on `axum` 0.8.9 with `default-features = false` and the
-features `http1`, `tokio`, `json`, `query`, `form`; `tokio`; `serde`; `serde_json`; `aws-lc-rs` (its
-own verification of SigV4, TSIG and PS256, independent of the crate under test); `base64`;
-`roxmltree`; `hickory-proto` with `std` only (the DNS server for the inspector tests). It does not
-depend on `zonewright`. It does not inherit `[workspace.lints]`: its own `[lints.rust]` denies
-`unsafe_code` and warns on `missing_docs`, and the workspace clippy denials do not apply to it.
+The mock crate (published as `zonewright-mock`) depends on `axum` 0.8.9 with
+`default-features = false` and the features `http1`, `tokio`, `json`, `query`, `form`; `tokio`;
+`serde`; `serde_json`; `aws-lc-rs` (its own verification of SigV4, TSIG and PS256, independent of
+the crate under test); `base64`; `roxmltree`; `hickory-proto` with `std` only (the DNS server for
+the inspector tests). It does not depend on `zonewright`. It does not inherit `[workspace.lints]`:
+its own `[lints.rust]` denies `unsafe_code` and warns on `missing_docs`, and the workspace clippy
+denials do not apply to it.
 
 `tracing` is also a dev-dependency because the secret tests' `tracing` capture
 (`tests/common/echo.rs`) builds without any feature. The crate's manifest also sets
@@ -3148,7 +3149,7 @@ dev/
                          scans, required tests
       names.rs, records.rs, dns01.rs, transport.rs, inspector.rs
   mock/
-    Cargo.toml           zonewright-mock, publish = false; its own [lints.rust]
+    Cargo.toml           zonewright-mock, published with the crate; its own [lints.rust]
     src/
       lib.rs             module tree, MockServer, re-exports
       conn.rs            listener and connection type under every mock server
@@ -3760,8 +3761,9 @@ Foundations:
 6. **`Cargo.lock` is committed.** The gates, in particular the ban on `ring`, are reproducible only
    with pinned versions; a library's lock file does not affect its users.
 7. **Workspace layout `dev/zonewright` and `dev/mock`.** The mocks are several thousand lines used
-   by integration tests of every provider; as a separate unpublished crate they compile once and
-   cannot leak into the published one.
+   by integration tests of every provider; as a separate crate they compile once and cannot leak
+   into `zonewright`. The mock crate is published too, as `zonewright-mock` with the same version,
+   so that the tests build from the package and applications can test against the mocks.
 8. **Stateful mock servers on `axum`, not a request-matching mock library.** Section 12.1. Rejected:
    rewriting the suites for a mock library, which would lose the state-based assertions.
 9. **RFC 2136: hand-written wire format and TSIG, not a DNS client library.** It is existing,

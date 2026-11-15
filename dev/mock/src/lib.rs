@@ -1,8 +1,12 @@
 //! Stateful mock provider APIs for the `zonewright` test suite.
 //!
-//! This crate is test tooling and is not published. It holds one stateful mock per provider API
-//! (one module per provider ID), the echo server used by the secret tests ([`echo`]), and the
-//! harness they share:
+//! This crate is test tooling. It is published so that the tests of `zonewright` can be built from
+//! its package, and so that an application can test its own use of `zonewright` without live
+//! accounts. Its API follows the needs of those tests and changes more freely than that of
+//! `zonewright`; it is released with the same version number.
+//!
+//! It holds one stateful mock per provider API (one module per provider ID), the echo server used
+//! by the secret tests ([`echo`]), and the harness they share:
 //!
 //! - [`MockServer`]: serves an [`axum::Router`] over plain HTTP/1.1 on `127.0.0.1` with an
 //!   ephemeral port, and shuts it down when dropped. Nothing is global; any number of servers run

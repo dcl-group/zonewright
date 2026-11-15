@@ -108,5 +108,5 @@ pub use redact::Detail;
 
 /// Compiles the examples of the README as documentation tests when the features they use are on.
 #[cfg(all(doctest, feature = "cloudflare", feature = "inspector"))]
-#[doc = include_str!("../../../README.md")]
+#[doc = include_str!("../README.md")]
 struct ReadmeExamples;

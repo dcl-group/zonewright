@@ -104,3 +104,6 @@ The first version, 0.1.0. Not tagged yet.
 - Minimum supported Rust version 1.99, edition 2024.
 - Selectel v2 is verified against the live API (`ProviderMeta::verified` is true for it); what the
   run covered is recorded in `PROVIDERS.md`. No other client is verified yet.
+- `zonewright-mock`, the stateful mock provider APIs the test suite runs against, is a published
+  crate with the same version: the tests build from the package, and an application can test its own
+  use of `zonewright` without live accounts. Its API may change more freely.
