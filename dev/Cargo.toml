@@ -6,7 +6,7 @@ resolver = "3"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/dcl-vc/zonewright"
+repository = "https://github.com/dcl-group/zonewright"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

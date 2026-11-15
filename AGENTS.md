@@ -23,7 +23,7 @@ for "how to read and change records at provider X".
 
 License: `MIT OR Apache-2.0`.
 
-Repository: <https://github.com/dcl-vc/zonewright>.
+Repository: <https://github.com/dcl-group/zonewright>.
 
 What records should exist, and when, is the business of the application that uses the crate. The
 crate only knows how to talk to providers and how to observe DNS.
@@ -232,7 +232,7 @@ Not formatted: `target/`, lock files, test fixtures (compared byte for byte).
 - Stage files by explicit path — never `git add -A` or `git add .` — and read the staged list before
   committing. The working directory can hold files that must not be committed, such as keys and
   local notes; `.gitignore` is the second line of defense, not the first.
-- The remote is `origin` (`git@github.com:dcl-vc/zonewright.git`), default branch `main`.
+- The remote is `origin` (`git@github.com:dcl-group/zonewright.git`), default branch `main`.
 - Never push without an explicit instruction for that push.
 
 ### Branches and releases

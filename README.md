@@ -27,7 +27,7 @@ the definition of "verified". Each provider reports its capabilities at run time
 ```toml
 [dependencies]
 # The tag does not exist until the first release is tagged.
-zonewright = { git = "https://github.com/dcl-vc/zonewright", tag = "v0.1.0", features = ["cloudflare", "inspector"] }
+zonewright = { git = "https://github.com/dcl-group/zonewright", tag = "v0.1.0", features = ["cloudflare", "inspector"] }
 ```
 
 No feature is enabled by default. A provider that is not compiled in is still a valid `ProviderId`;
