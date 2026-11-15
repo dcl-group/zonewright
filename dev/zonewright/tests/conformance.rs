@@ -1281,3 +1281,17 @@ fn provider_test_files_define_the_required_tests() {
     }
     assert!(missing.is_empty(), "{}", missing.join("\n"));
 }
+
+/// The crate directory carries the license texts, so that they are in the published package;
+/// they are copies of the repository's and must not drift from them.
+#[test]
+fn crate_license_files_equal_the_repository_ones() {
+    let krate = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = krate.join("../..");
+    for name in ["LICENSE-MIT", "LICENSE-APACHE"] {
+        let ours = std::fs::read(krate.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let theirs = std::fs::read(root.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(!ours.is_empty(), "{name}");
+        assert_eq!(ours, theirs, "{name}");
+    }
+}
