@@ -3453,7 +3453,7 @@ async fn live_vk_cloud_add_and_remove() {
         let (client, zone, name, values) =
             (client.clone(), zone.clone(), name.clone(), values.clone());
         tokio::spawn(async move {
-            let report = client.check(std::slice::from_ref(&zone)).await.unwrap();
+            let report = client.check([&zone]).await.unwrap();
             assert!(report.zones[0].found, "{report:?}");
             let listed = client.list_zones().await.unwrap();
             assert!(listed.iter().any(|z| z.name == zone), "{listed:?}");

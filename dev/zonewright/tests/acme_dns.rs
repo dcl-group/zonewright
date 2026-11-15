@@ -1313,7 +1313,7 @@ async fn live_acme_dns_add() {
         assert_eq!(v.as_bytes().len(), 43);
     }
     // `check` sends nothing: the credentials are tested by the first add.
-    let report = client.check(std::slice::from_ref(&zone)).await.unwrap();
+    let report = client.check([&zone]).await.unwrap();
     assert!(!report.credentials_verified);
     assert!(report.zones[0].found, "{report:?}");
     for v in &values {

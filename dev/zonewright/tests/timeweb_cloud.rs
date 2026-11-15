@@ -3664,7 +3664,7 @@ async fn live_timeweb_cloud_add_and_remove() {
         let (client, zone, name, values) =
             (client.clone(), zone.clone(), name.clone(), values.clone());
         tokio::spawn(async move {
-            let report = client.check(std::slice::from_ref(&zone)).await.unwrap();
+            let report = client.check([&zone]).await.unwrap();
             assert!(report.credentials_verified);
             assert!(report.zones[0].found, "{report:?}");
             let [a, b] = &values;

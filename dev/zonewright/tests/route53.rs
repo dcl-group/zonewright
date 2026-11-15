@@ -3094,7 +3094,7 @@ async fn live_route53_add_and_remove() {
         let (client, zone, name, values) =
             (client.clone(), zone.clone(), name.clone(), values.clone());
         tokio::spawn(async move {
-            let report = client.check(std::slice::from_ref(&zone)).await.unwrap();
+            let report = client.check([&zone]).await.unwrap();
             assert!(report.zones[0].found, "{report:?}");
             assert!(client.check(&[]).await.unwrap().credentials_verified);
             let [a, b] = &values;
