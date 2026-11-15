@@ -8,19 +8,27 @@ Part of the [zonewright design](./README.md). Section numbers are those of the w
 
 The default test run needs no network and no real credentials. Every client is tested against a
 stateful mock of its provider's API in the workspace member `zonewright-mock`: an HTTP server on
-`127.0.0.1` with an ephemeral port (for RFC 2136, a DNS-over-TCP server), holding zones and records
-in memory and behaving as the provider's documentation describes. Stateful mocks rather than a
-request-matching library, because the properties under test are about state: a foreign value is
-still there afterwards, a second identical call writes nothing, a write is rejected when the set
-changed in between.
+`127.0.0.1` with an ephemeral port (for RFC 2136, a DNS server on TCP and UDP, the client using
+TCP), holding zones and records in memory and behaving as the provider's documentation describes.
+`zonewright-mock` is a published crate, released with `zonewright` under the same version number, so
+that the tests can be built from the published package and applications can test their own use of
+`zonewright` without live accounts. Stateful mocks rather than a request-matching library, because
+the properties under test are about state: a foreign value is still there afterwards, a second
+identical call writes nothing, a write is rejected when the set changed in between.
 
 Every mock offers the same control surface: a seed, the list of requests received (method, path,
-selected headers, body), direct access to the stored records, and fault injection (answer the next N
-matching requests with a status, a `Retry-After`, a delay, or a dropped connection; insert a foreign
-change before the next write; recreate a zone under a new identifier). Mocks that issue tokens can
-revoke them and count how many they issued. The Route 53 mock verifies the SigV4 signature, the RFC
-2136 mock verifies and produces TSIG, and the Yandex Cloud mock verifies the PS256 signature, each
-with code that shares nothing with the crate under test.
+query, all headers, body and the status answered; for RFC 2136, the list of messages), direct access
+to the stored records, and fault injection (answer the next N matching requests with a status, a
+`Retry-After`, a redirect, an oversized or truncated body, slow headers, a delay, or a dropped
+connection; insert a foreign change before the next write; recreate a zone under a new identifier).
+Mocks that issue tokens can revoke them and count how many they issued. The Route 53 mock verifies
+the SigV4 signature, the RFC 2136 mock verifies and produces TSIG, and the Yandex Cloud mock
+verifies the PS256 signature, each with code that shares nothing with the crate under test.
+
+The crate also holds the echo server of the secret tests (section 12.2), a forward proxy (`CONNECT`
+and plain forwarding, optional Basic authentication) and a SOCKS5 proxy (optional username and
+password) for the transport's proxy tests, and a loopback DNS server over UDP and TCP, either
+authoritative or recursive, for the inspector tests.
 
 Fixtures are synthetic. Keys are generated inside the tests.
 
@@ -32,19 +40,20 @@ For every client, in its own test file:
   repeats the request's body and its authentication headers inside the fields a client reads error
   text from (JSON or XML as the client expects); token endpoints hand out a canary token and the
   server then echoes that too. The credentials are canaries containing `@`, a space, `/`, `+`, both
-  quotes, `& < > \ ~ * =`, non-ASCII letters and (where a header does not carry them) a newline, so
-  that every encoding and escaping changes them. The test runs for every dialect of the shared
-  support in `tests/common/echo.rs`: each renderer of the echo server (JSON as `serde_json`, PHP, Go
-  and .NET escape it, with `\uXXXX` and a plain `/`, PHP JSON after a notice line, JSON inside JSON,
-  JSON under a key no client reads, form-encoded JSON, XML with named entities, numeric references
-  or minimal escaping, plain text) with the text verbatim, and each spelling (form-encoding with
-  `+`, `%20` or lowercase hex; the percent-encodings of Python, JavaScript, RFC 3986 and Go) inside
-  JSON and plain text. It runs `check` and a write, requires the write to fail, and asserts on the
-  `Display` and `Debug` of every error, on every `ZoneCheck::detail`, and on the client's `Debug`:
-  no canary in any of those spellings, no fragment of one, no JWT; and the write's error does
-  contain `[redacted]`, which proves the echo reached the error path and the test is not vacuous. It
-  also asserts that the API endpoint, and for token clients the token endpoint, were actually
-  reached. Every secret field of the credentials is covered.
+  quotes, `& < > \ ~ * =`, non-ASCII letters (in the password canary) and (where a header does not
+  carry them) a newline, so that every encoding and escaping changes them. The test runs for every
+  dialect of the shared support in `tests/common/echo.rs`: each renderer of the echo server (JSON as
+  `serde_json`, PHP, Go and .NET escape it, with `\uXXXX` and a plain `/`, PHP JSON after a notice
+  line, JSON inside JSON, JSON under a key no client reads, form-encoded JSON, XML with named
+  entities, numeric references or minimal escaping, plain text) with the text verbatim, and each
+  spelling (form-encoding with `+`, `%20` or lowercase hex; the percent-encodings of Python,
+  JavaScript, RFC 3986 and Go) inside JSON and plain text. It runs `check` and a write, requires the
+  write to fail, and asserts on the `Display` and `Debug` of every error, on every
+  `ZoneCheck::detail`, and on the client's `Debug`: no canary in any of those spellings, no fragment
+  of one, no JWT; and the write's error does contain `[redacted]`, which proves the echo reached the
+  error path and the test is not vacuous. It also asserts that the API endpoint, and for token
+  clients the token endpoint, were actually reached. Every secret field of the credentials is
+  covered.
 - RFC 2136 has no HTTP echo. Its equivalent, `rfc2136_secret_not_in_errors`, asserts that the TSIG
   secret, in base64 and in hex, does not occur in any error or `Debug` output across the error paths
   of its mock.
@@ -82,7 +91,8 @@ For every client, in its own test file, where the operation exists:
   between the read and the write is not lost.
 - For providers with record-level operations, `<id>_failed_expectation_is_precondition_failed`:
   `Expect::Absent` on an existing set and `Expect::Matches` on a changed one return
-  `PreconditionFailed` and write nothing; and `<id>_listing_reports_skipped_sets`.
+  `PreconditionFailed` and write nothing; and, for those that can list rrsets,
+  `<id>_listing_reports_skipped_sets`.
 - `<id>_stale_zone_id`, for every client that caches zone identifiers: after the mock recreates the
   zone under a new identifier, the next operation succeeds or fails cleanly and the one after it
   succeeds; a removal never reports `NotPresent` for a value that is there.
@@ -108,9 +118,18 @@ with one explicit exception: `rfc2136` has its own secret test instead of `secre
 every missing name of every provider at once. The scan is what keeps "tests cover this for every
 client" true when a sixteenth provider is added.
 
+Four of these checks compare the crate with files of the repository: the comparisons with
+`PROVIDERS.md` (identifiers, names, verified flags) and the one that the license texts in the crate
+directories, `zonewright` and `zonewright-mock`, equal those at the repository root. A published
+package does not contain those files, so `packaged()` (the package carries `.cargo_vcs_info.json`)
+makes the four return early when the tests run from the package; the other checks run there as well.
+
 The generic value layer is additionally tested against an in-memory backend for all three native
 shapes, including duplicates of a value, non-plain values and failures injected between the read and
 the write.
+
+Section 12.4, on carrying over the tests of the earlier implementations, is in
+[`history.md`](./history.md).
 
 ### 12.5 Live tests
 
@@ -146,8 +165,9 @@ true, only by the maintainer's commit after these tests passed.
 `cargo deny check`; `cargo test --all-features`; `cargo hack check --each-feature` over the public
 features and `cargo hack test --each-feature` likewise, plus the no-feature build; `cargo doc` with
 warnings denied; a build with the MSRV toolchain. Workspace lints: `unsafe_code = "deny"`,
-`missing_docs` (a warning, denied by the gates), and the clippy lints `unwrap_used`, `expect_used`,
-`panic`, `unreachable`, `todo`, `unimplemented`, `indexing_slicing`, `dbg_macro`, `print_stdout` and
-`print_stderr` denied in library code; `clippy.toml` allows unwrap, expect, panic, indexing, `dbg!`
-and printing in test code. The gates are run by hand from `dev/`; no CI configuration is part of the
-repository.
+`missing_docs` (a warning, denied by the gates), and, for the `zonewright` crate, the clippy lints
+`unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`, `indexing_slicing`,
+`dbg_macro`, `print_stdout` and `print_stderr` denied in library code (`zonewright-mock` does not
+inherit the workspace lints; it sets `unsafe_code` and `missing_docs` itself); `clippy.toml` allows
+unwrap, expect, panic, indexing, `dbg!` and printing in test code. The gates are run by hand from
+`dev/`; no CI configuration is part of the repository.

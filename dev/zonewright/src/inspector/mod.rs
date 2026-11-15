@@ -303,11 +303,12 @@ impl Inspector {
     /// flight at a time. The answers of a server are in the order of `questions`; a server that
     /// is not asked has an [`Answer::NotAsked`] for each. 1 to
     /// [`InspectorConfig::max_questions`] questions (default 32), every name within the zone;
-    /// the servers that are asked times the distinct questions at most
+    /// the servers that are asked times the questions at most
     /// [`InspectorConfig::max_questions_per_round`] (default 1024). Beyond either limit the
     /// call is [`InspectorError::InvalidInput`], naming the configured limit, and sends nothing
     /// to a name server. The round takes at most
-    /// `ceil(asked servers × distinct questions / 128) × query_timeout`.
+    /// `ceil(asked servers × questions / 128) × query_timeout`. A question given twice is asked
+    /// twice; only [`Inspector::wait`] asks identical questions once.
     ///
     /// `observe` returns the answers only and judges nothing: there is no "every server
     /// agrees" verdict, so [`WaitOptions::ignore_unaskable_name_servers`] has no counterpart
@@ -322,23 +323,22 @@ impl Inspector {
     }
 
     /// Polls until every name server of the zone satisfies every expectation in the same round
-    /// (design section 8.6). A server that is not asked never satisfies anything, so with one
-    /// the wait ends in [`InspectorError::Timeout`], whose report names the reason — unless
-    /// [`WaitOptions::ignore_unaskable_name_servers`] is on, which leaves such servers out of
-    /// the condition (but never all of them: a zone none of whose servers can be asked still
-    /// ends in the timeout) and counts them in [`Report::unaskable_ignored`]. At least
-    /// one round runs; the last round starts no later than `options.timeout` after the start.
-    /// A pause is cut to the deadline but never below `options.interval` less the jitter: when
-    /// less time than that is left, the wait ends without a further round. An
-    /// `options.interval` below [`WaitOptions::MIN_INTERVAL`] is
-    /// [`InspectorError::InvalidInput`], and so are more than
-    /// [`InspectorConfig::max_questions`] expectations (default 32) and a round of more than
+    /// (design section 8.6, `docs/design/08-inspector.md` in the repository). A server that is not
+    /// asked never satisfies anything, so with one the wait ends in [`InspectorError::Timeout`],
+    /// whose report names the reason — unless [`WaitOptions::ignore_unaskable_name_servers`] is on,
+    /// which leaves such servers out of the condition (but never all of them: a zone none of whose
+    /// servers can be asked still ends in the timeout) and counts them in
+    /// [`Report::unaskable_ignored`]. At least one round runs; the last round starts no later than
+    /// `options.timeout` after the start. A pause is cut to the deadline but never below
+    /// `options.interval` less the jitter: when less time than that is left, the wait ends without
+    /// a further round. An `options.interval` below [`WaitOptions::MIN_INTERVAL`] is
+    /// [`InspectorError::InvalidInput`], and so are more than [`InspectorConfig::max_questions`]
+    /// expectations (default 32) and a round of more than
     /// [`InspectorConfig::max_questions_per_round`] questions (asked servers times distinct
-    /// questions, default 1024), before anything is sent to a name server. Each round sends at
-    /// most that many questions and takes at most
-    /// `ceil(asked servers × distinct questions / 128) × query_timeout`, so the call returns
-    /// within discovery plus `options.timeout` plus one such round. Dropping the future cancels
-    /// every query it started.
+    /// questions, default 1024), before anything is sent to a name server. Each round sends at most
+    /// that many questions and takes at most `ceil(asked servers × distinct questions / 128) ×
+    /// query_timeout`, so the call returns within discovery plus `options.timeout` plus one such
+    /// round. Dropping the future cancels every query it started.
     pub async fn wait(
         &self,
         zone: &DomainName,

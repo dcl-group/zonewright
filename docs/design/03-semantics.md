@@ -261,6 +261,17 @@ no read, is outside this layer. The outcome computation and the foreign-value ru
 the same code for every provider and are tested once against an in-memory backend in addition to the
 per-provider tests.
 
+The record-level operations of section 3.4 have a parallel layer in `rrsets.rs`: a base trait
+`RrsetBase` and two shape traits that carry the hooks named in section 3.4. `WholeSet` serves Route
+53, Yandex Cloud, Selectel v2, Cloud.ru, Hetzner and RFC 2136, and has the hooks
+`reread_before_write` (with `same_snapshot`), `check_write`, `holds_cname` and `holds_other_data`.
+`PerRecord` serves Cloudflare, DigitalOcean, nic.ru, reg.ru, Timeweb Cloud, VK Cloud and Yandex 360,
+and has `check_plan`, `updates_in_place`, `holds_cname` and `holds_other_data`. These two share
+their names with traits of `values.rs` but are separate traits: the shape of a client can differ
+between the layers (RFC 2136 is `PerRecord` for TXT values and `WholeSet` for rrsets, and Hetzner is
+`ValueCalls` for TXT values and `WholeSet` for rrsets). There is no `rrsets.rs` counterpart of
+`ValueCalls`, and Beget and acme-dns have no record-level layer.
+
 ### 3.6 TTL policy
 
 One rule for every write: **an existing rrset keeps its TTL unless the caller asked for another

@@ -66,7 +66,7 @@ pub enum NameError {
     BadLabelLength,     // a label is empty or longer than 63 octets
     BadCharacter,
     BadHyphen,          // a label starts or ends with "-"
-        BadWildcard,        // "*" anywhere but as the whole leftmost label
+    BadWildcard,        // "*" anywhere but as the whole leftmost label
     Idna,
     BadEscape,          // TargetName only: a malformed "\DDD" or a trailing "\"
 }
@@ -705,8 +705,8 @@ pub trait Provider: Send + Sync {
 }
 ```
 
-`check` is the only method without a default body. Every other method has a default that returns
-`Error::Unsupported` for its operation, so a client implements exactly what its capabilities
+`id` and `check` are the only methods without a default body. Every other method has a default that
+returns `Error::Unsupported` for its operation, so a client implements exactly what its capabilities
 announce. The trait is declared with `-> impl Future<Output = …> + Send` so the futures are `Send`
 by contract; implementations write `async fn`. There is no `async-trait` and no `dyn Provider`. The
 checks every operation makes before any request, and their order, are in section 3.1.
@@ -1139,6 +1139,7 @@ impl Error {
     pub fn invalid_input(detail: &str) -> Error;
     pub fn name_outside_zone(name: DomainName, zone: DomainName) -> Error;
     pub fn zone_not_found(zone: DomainName) -> Error;
+    pub fn proxy_auth() -> Error;
     pub fn auth(detail: &str) -> Error;
     pub fn forbidden(detail: &str) -> Error;
     pub fn rate_limited(retry_after: Option<std::time::Duration>) -> Error;
@@ -1171,8 +1172,7 @@ pub struct Detail(/* private */);
 impl Detail {
     /// Replaces control characters, line and paragraph separators and bidirectional formatting
     /// characters by spaces and truncates to at most 512 bytes on a character boundary. It does
-    /// not know any
-    /// secret: whoever calls it is responsible for the text containing none.
+    /// not know any secret: whoever calls it is responsible for the text containing none.
     pub fn new(text: &str) -> Detail;
     pub fn as_str(&self) -> &str;
 }

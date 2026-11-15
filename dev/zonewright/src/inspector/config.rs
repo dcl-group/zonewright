@@ -21,8 +21,8 @@ pub(crate) const MAX_RESOLVERS: usize = 16;
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum NsDiscovery {
-    /// Ask the resolvers for the zone's NS rrset and the servers' addresses (design section
-    /// 8.3).
+    /// Ask the resolvers for the zone's NS rrset and the servers' addresses
+    /// (design section 8.3, `docs/design/08-inspector.md` in the repository).
     Recursive,
     /// Use exactly these servers for every zone. The list is used as given: no address filter
     /// and no cache apply, because the application chose the addresses. Their answers need the
@@ -55,14 +55,15 @@ impl IpFamilies {
 
 /// One authoritative name server: an address, and the NS name it was found under when known.
 ///
-/// Discovery also returns the servers it cannot ask (design section 8.3): an NS name for which
-/// the resolvers answered that it has no address in the configured families, and every address
-/// the address policy refuses. Such an entry has [`not_asked`](NameServer::not_asked) set; it is
-/// never queried, and in [`Inspector::observe`](super::Inspector::observe) and
+/// Discovery also returns the servers it cannot ask (design section 8.3,
+/// `docs/design/08-inspector.md` in the repository): an NS name for which the resolvers answered
+/// that it has no address in the configured families, and every address the address policy refuses.
+/// Such an entry has [`not_asked`](NameServer::not_asked) set; it is never queried, and in
+/// [`Inspector::observe`](super::Inspector::observe) and
 /// [`Inspector::wait`](super::Inspector::wait) it is a row whose answers are
-/// [`Answer::NotAsked`](super::Answer::NotAsked) and which never satisfies anything. A wait
-/// over a zone with such a server therefore runs to its timeout, and the report says why,
-/// unless [`WaitOptions::ignore_unaskable_name_servers`](super::WaitOptions::ignore_unaskable_name_servers)
+/// [`Answer::NotAsked`](super::Answer::NotAsked) and which never satisfies anything. A wait over a
+/// zone with such a server therefore runs to its timeout, and the report says why, unless
+/// [`WaitOptions::ignore_unaskable_name_servers`](super::WaitOptions::ignore_unaskable_name_servers)
 /// leaves such servers out of the condition.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -128,7 +129,8 @@ pub enum NotAsked {
     /// The resolvers answered that the NS name has no address in the configured
     /// [`IpFamilies`] (NODATA or NXDOMAIN for every family asked).
     NoAddress,
-    /// The address policy refuses the address (design section 8.3, step 4).
+    /// The address policy refuses the address, for a reason in [`AddressRefusal`]
+    /// (design section 8.3, `docs/design/08-inspector.md` in the repository).
     AddressRefused(AddressRefusal),
 }
 
@@ -152,9 +154,9 @@ impl std::fmt::Display for NotAsked {
     }
 }
 
-/// Why the address policy refuses a discovered name-server address (design section 8.3, step
-/// 4). The reasons marked "private" are lifted by `allow_private_addresses`; the others apply
-/// regardless.
+/// Why the address policy refuses a discovered name-server address. The reasons marked "private"
+/// are lifted by `allow_private_addresses`; the others apply regardless
+/// (design section 8.3, `docs/design/08-inspector.md` in the repository).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AddressRefusal {
@@ -245,12 +247,12 @@ pub struct InspectorConfig {
     pub max_servers: usize,
     /// Limit for the whole discovery of one zone's servers. Default 10 s.
     pub discovery_timeout: Duration,
-    /// Accept discovered name-server addresses in private ranges (RFC 1918, RFC 6598, RFC 4193,
-    /// the deprecated site-local `fec0::/10` and the local-use translation prefix
-    /// `64:ff9b:1::/48`), also when embedded in a 6to4, Teredo, NAT64 or ISATAP address.
-    /// Default false. The other reasons
-    /// of [`AddressRefusal`] apply regardless (design section 8.3). A refused address is not
-    /// left out: it is reported as a server that is not asked.
+    /// Accept discovered name-server addresses in private ranges (RFC 1918, RFC 6598, RFC 4193, the
+    /// deprecated site-local `fec0::/10` and the local-use translation prefix `64:ff9b:1::/48`),
+    /// also when embedded in a 6to4, Teredo, NAT64 or ISATAP address. Default false. The other
+    /// reasons of [`AddressRefusal`] apply regardless (design section 8.3,
+    /// `docs/design/08-inspector.md` in the repository). A refused address is not left out: it is
+    /// reported as a server that is not asked.
     pub allow_private_addresses: bool,
     /// Read an answer without the AA flag from a server of a static list
     /// ([`NsDiscovery::Static`]) by its content, as if the flag were set. Default false.

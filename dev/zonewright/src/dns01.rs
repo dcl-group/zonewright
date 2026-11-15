@@ -1,4 +1,5 @@
-//! DNS-01 helpers (design section 7): the challenge name, CNAME chains and zone selection.
+//! DNS-01 helpers: the challenge name, CNAME chains and zone selection
+//! (design section 7, `docs/design/07-dns01.md` in the repository).
 //!
 //! Pure functions and one trait; no network code. The inspector implements [`CnameLookup`] when
 //! its feature is enabled; an application can implement it over any resolver.

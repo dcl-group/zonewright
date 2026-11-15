@@ -11,20 +11,20 @@ use crate::redact::Detail;
 
 /// The operations of one provider client.
 ///
-/// [`Provider::check`] is the only method without a default body. Every other method has a
-/// default that returns [`Error::Unsupported`] for its operation, so a client implements exactly
-/// what its [`Capabilities`] announce. Implementations write `async fn`; the declared futures are
-/// `Send` by contract. There is no `dyn Provider`: the set of providers is dispatched through
-/// [`AnyProvider`](crate::AnyProvider).
+/// [`Provider::id`] and [`Provider::check`] are the only methods without a default body. Every
+/// other method has a default that returns [`Error::Unsupported`] for its operation, so a client
+/// implements exactly what its [`Capabilities`] announce. Implementations write `async fn`; the
+/// declared futures are `Send` by contract. There is no `dyn Provider`: the set of providers is
+/// dispatched through [`AnyProvider`](crate::AnyProvider).
 ///
 /// The trait is not sealed: an application can implement it for a test double. Everything an
 /// implementation has to return can be built outside the crate through the `new` constructors of
 /// the report types and the constructor functions of [`Error`].
 ///
 /// Every operation that takes a zone and a name checks, before any network request and in this
-/// order: that the operation and the record type are supported; that the zone is neither the
-/// root nor a wildcard and the type not a meta type; that the name is within the zone; and that
-/// the request fits the provider (design section 3.1).
+/// order: that the operation and the record type are supported; that the zone is neither the root
+/// nor a wildcard and the type not a meta type; that the name is within the zone; and that the
+/// request fits the provider (design section 3.1, `docs/design/03-semantics.md` in the repository).
 pub trait Provider: Send + Sync {
     /// The provider this client talks to.
     fn id(&self) -> ProviderId;
@@ -72,14 +72,15 @@ pub trait Provider: Send + Sync {
     /// Makes the rrset at `rrset.name()` / `rrset.rtype()` equal to `rrset`, if `expect` holds
     /// for the rrset as it is at the provider.
     ///
-    /// `rrset.ttl()` is what the write asks for the TTL (design section 3.6): `None` keeps the
-    /// TTL of an existing rrset and gives a new one the client's `ttl` setting;
-    /// `Some(RrsetTtl::Explicit(n))` sets `n`; `Some(RrsetTtl::ProviderDefault)` gives the rrset
-    /// the provider's default TTL, and is `Error::InvalidInput` before any request where
-    /// [`Capabilities::provider_default_ttl`] does not allow it. A CNAME at a name that holds other data, or another type at a
-    /// name that holds a CNAME (RFC 1034 section 3.6.2), is `Error::InvalidInput` where the
-    /// client's read shows it; elsewhere the provider's own answer is returned (design section
-    /// 3.4).
+    /// `rrset.ttl()` is what the write asks for the TTL: `None` keeps the TTL of an existing
+    /// rrset and gives a new one the client's `ttl` setting; `Some(RrsetTtl::Explicit(n))` sets
+    /// `n`; `Some(RrsetTtl::ProviderDefault)` gives the rrset the provider's default TTL, and is
+    /// `Error::InvalidInput` before any request where [`Capabilities::provider_default_ttl`]
+    /// does not allow it (TTL policy: design section 3.6, `docs/design/03-semantics.md` in the
+    /// repository). A CNAME at a name that holds other data, or another type at a name that
+    /// holds a CNAME (RFC 1034 section 3.6.2), is `Error::InvalidInput` where the client's read
+    /// shows it; elsewhere the provider's own answer is returned
+    /// (design section 3.4, `docs/design/03-semantics.md` in the repository).
     fn set_rrset(
         &self,
         zone: &DomainName,
@@ -327,7 +328,8 @@ pub enum SkipReason {
     UnknownType,
     /// Not a plain rrset: an alias to a provider resource, a routing-policy set and the like.
     NotPlainRecords,
-    /// The owner name is not a valid `DomainName` (design section 2.1).
+    /// The owner name is not a valid `DomainName` (design section 2.1,
+    /// `docs/design/02-public-api.md` in the repository).
     UnsupportedName,
 }
 

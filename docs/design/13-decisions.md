@@ -202,3 +202,5 @@ Added after review:
 56. **The provider's default TTL has three capability levels.** Section 2.5, `ProviderDefaultTtl`.
     Timeweb Cloud can request it only for new records; a bool would either overstate it or hide it.
     The `ttl` setting's spelling is `"provider_default"`, not `null` (section 2.8).
+
+Section 13.4, the open points, is in [`13-open-points.md`](./13-open-points.md).

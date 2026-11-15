@@ -50,11 +50,12 @@ const UNTESTED: &str = "the credentials were not tested: the only authenticated 
 ///   of exactly 43 characters of the base64url alphabet, the only thing the server accepts. It
 ///   always reports `AddOutcome::Accepted`: the state before and after cannot be observed, and
 ///   another writer may have displaced the value since. A value this process sent recently is not
-///   sent again (design section 11.3), because a repeat would be written into the other slot and
-///   displace a live neighbor. Such a suppressed repeat is `Accepted` although nothing was sent,
-///   so a value that another writer (another process, or a client with another `Context`)
-///   displaced since is not restored by it. Sends to one name are at least 1.1 s apart, so that
-///   the server, which stamps its writes with whole seconds, overwrites the oldest value.
+///   sent again, because a repeat would be written into the other slot and displace a live neighbor
+///   (design section 11.3, `docs/design/11-providers.md` in the repository). Such a suppressed
+///   repeat is `Accepted` although nothing was sent, so a value that another writer (another
+///   process, or a client with another `Context`) displaced since is not restored by it. Sends to
+///   one name are at least 1.1 s apart, so that the server, which stamps its writes with whole
+///   seconds, overwrites the oldest value.
 /// - `remove_txt_value` is not offered: the server keeps the two most recent values and has no
 ///   delete. It returns `Error::Unsupported`; it does not pretend that the value is gone.
 /// - `list_zones` and every record-level operation are not offered: the API has no read.
@@ -153,8 +154,8 @@ impl Provider for AcmeDns {
         ProviderId::AcmeDns
     }
 
-    /// Sends nothing and reports `credentials_verified: false` (design section 2.6: the provider
-    /// has no request that tests credentials).
+    /// Sends nothing and reports `credentials_verified: false`: the provider has no request that
+    /// tests credentials (design section 2.6, `docs/design/02-public-api.md` in the repository).
     ///
     /// The update is the only request the server authenticates, and it is a write. An update with
     /// an invalid value would test the credentials without storing anything only because the

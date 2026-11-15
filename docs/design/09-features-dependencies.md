@@ -78,8 +78,10 @@ An application that only needs the inspector enables `inspector` and gets `hicko
 UDP/TCP sockets on top of that, still without a TLS stack.
 
 Shared helpers are not all used by every provider. In builds without `all-providers`, `http/`,
-`crypto/`, `values.rs`, `rrsets.rs` and `redact/scrub.rs` allow `dead_code`; the build with all
-features does not, so code no provider uses is still found.
+`crypto/`, `values.rs`, `rrsets.rs` and `redact/scrub.rs` allow `dead_code`, as do the `Auto`
+variant of the TXT text form (`record/txt.rs`) and two helpers of `Ttl` (`record/ttl.rs`) in builds
+without the providers that use them; the build with all features does not, so code no provider uses
+is still found.
 
 ### 9.3 Dependencies
 
@@ -98,7 +100,8 @@ tokio = { version = "1.54.1", features = ["sync", "time"] }
 # __http (serde_json and tracing also serve rfc2136; tracing also serves the inspector)
 serde_json = { version = "1.0.154", optional = true }
 tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"], optional = true }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "socks"], optional = true }
+# Must stay on the same 0.23 line as the rustls inside reqwest.
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
 rustls-platform-verifier = { version = "0.7.1", optional = true }
 rustls-pki-types = { version = "1.16.0", optional = true }
@@ -119,7 +122,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 [dev-dependencies]
 serde_json = "1.0.154"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
-zonewright-mock = { path = "../mock" }
+zonewright-mock = { version = "0.1.0", path = "../mock" }
 tokio = { version = "1.54.1", features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
@@ -157,13 +160,13 @@ Why each is there, and what is deliberately absent:
   encoders, which avoids a second copy of a type that must match `reqwest`'s), `httpdate`, `hex`,
   `async-trait`, `metrics`, `chrono`, `time`, `hickory-resolver`, `hickory-net`, any mock library.
 
-The mock crate (published as `zonewright-mock`) depends on `axum` 0.8.9 with
-`default-features = false` and the features `http1`, `tokio`, `json`, `query`, `form`; `tokio`;
-`serde`; `serde_json`; `aws-lc-rs` (its own verification of SigV4, TSIG and PS256, independent of
-the crate under test); `base64`; `roxmltree`; `hickory-proto` with `std` only (the DNS server for
-the inspector tests). It does not depend on `zonewright`. It does not inherit `[workspace.lints]`:
-its own `[lints.rust]` denies `unsafe_code` and warns on `missing_docs`, and the workspace clippy
-denials do not apply to it.
+The mock crate (published as `zonewright-mock`, with the same version as `zonewright`) depends on
+`axum` 0.8.9 with `default-features = false` and the features `http1`, `tokio`, `json`, `query`,
+`form`; `tokio`; `serde`; `serde_json`; `aws-lc-rs` (its own verification of SigV4, TSIG and PS256,
+independent of the crate under test); `base64`; `roxmltree`; `hickory-proto` with `std` only (the
+DNS server for the inspector tests). It does not depend on `zonewright`. It does not inherit
+`[workspace.lints]`: its own `[lints.rust]` denies `unsafe_code` and warns on `missing_docs`, and
+the workspace clippy denials do not apply to it.
 
 `tracing` is also a dev-dependency because the secret tests' `tracing` capture
 (`tests/common/echo.rs`) builds without any feature. The crate's manifest also sets

@@ -76,11 +76,11 @@ impl RrSet {
     ///
     /// In a set read from a provider: `Some(Explicit(n))` for a TTL of `n` seconds,
     /// `Some(ProviderDefault)` for a set with no TTL of its own (the provider's default
-    /// applies), and `None` when the read cannot tell (design section 3.6). In a set passed to a
+    /// applies), and `None` when the read cannot tell. In a set passed to a
     /// write: `Some(Explicit(n))` requests `n`, `Some(ProviderDefault)` requests the provider's
     /// default, and `None` requests nothing: an existing rrset keeps its TTL and a new one gets
     /// the client's `ttl` setting. A set read and written back unchanged therefore keeps its
-    /// TTL in every case.
+    /// TTL in every case (design section 3.6, `docs/design/03-semantics.md` in the repository).
     pub fn ttl(&self) -> Option<RrsetTtl> {
         self.ttl
     }

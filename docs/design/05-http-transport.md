@@ -171,15 +171,15 @@ a whole rrset, which can hold values another writer added after the read: it is 
   repeating the operation is safe because it starts with a read (section 3.2).
 - 429 and other rate-limit answers: a client declares the answers it treats as rate limits besides
   429 with a classifier (`HttpBuilder::rate_limit`; Route 53 answers HTTP 400 with the codes
-  `Throttling` and `PriorRequestNotComplete`), and such an answer is handled exactly like a 429. The
-  wait is taken from `Retry-After` (delay-seconds or an HTTP date in the IMF-fixdate form; the
-  obsolete RFC 850 and asctime forms are not read) or `RateLimit-Reset` (a value above 10⁹ is a Unix
-  time, as Hetzner sends it, a smaller one delay-seconds). For an idempotent request with attempts
-  left and a wait of at most 30 s, the transport sleeps for the wait or the back-off, whichever is
-  longer, and retries, so a wait of zero or a time in the past does not produce three requests in a
-  few milliseconds; without a header it uses the back-off. Otherwise the result is
-  `Error::RateLimited { retry_after }`, with the wait clamped to 24 hours so that a caller can add
-  it to an `Instant`.
+  `Throttling`, `ThrottlingException` and `PriorRequestNotComplete`), and such an answer is handled
+  exactly like a 429. The wait is taken from `Retry-After` (delay-seconds or an HTTP date in the
+  IMF-fixdate form; the obsolete RFC 850 and asctime forms are not read) or `RateLimit-Reset` (a
+  value above 10⁹ is a Unix time, as Hetzner sends it, a smaller one delay-seconds). For an
+  idempotent request with attempts left and a wait of at most 30 s, the transport sleeps for the
+  wait or the back-off, whichever is longer, and retries, so a wait of zero or a time in the past
+  does not produce three requests in a few milliseconds; without a header it uses the back-off.
+  Otherwise the result is `Error::RateLimited { retry_after }`, with the wait clamped to 24 hours so
+  that a caller can add it to an `Instant`.
 - A request that fails because a redirect was refused, because `loopback_only` or the endpoint
   binding of section 5.2 blocked it, or because a TLS certificate was refused (the server's, or the
   client certificate by the server) is never retried. A refused certificate is `Error::Config`: the
@@ -236,13 +236,14 @@ a whole rrset, which can hold values another writer added after the read: it is 
   limit. The cap applies to error bodies too.
 - Listings read at most 1000 pages; reaching the page limit is `Error::Protocol` whose detail names
   it. Page sizes are the documented maxima where a source states one, otherwise the documented
-  default: 1000 rrsets (Selectel v2), 1000 record sets (Yandex Cloud), 100 records (Cloudflare
-  records, Cloud.ru, Timeweb Cloud), 200 (DigitalOcean), 300 rrsets and 100 zones (Route 53), 50
-  (Hetzner zones and rrsets, Cloudflare zones, Yandex 360 records), 10 (Yandex 360 domains). With
-  1000 pages the smallest of these still covers 10 000 entries. A client whose provider returns a
-  whole zone in one response (VK Cloud's TXT list, reg.ru, nic.ru) is bounded by the 4 MiB cap
-  alone, and its rustdoc says so. Raising either constant is not a breaking change. A zone beyond
-  them fails to list with an error that says why; it is never returned in part.
+  default (Cloudflare's record listing states a far larger maximum and uses the default): 1000
+  rrsets (Selectel v2), 1000 record sets (Yandex Cloud), 100 records (Cloudflare records, Cloud.ru,
+  Timeweb Cloud), 200 (DigitalOcean), 300 rrsets and 100 zones (Route 53), 50 (Hetzner zones and
+  rrsets, Cloudflare zones, Yandex 360 records), 10 (Yandex 360 domains). With 1000 pages the
+  smallest of these still covers 10 000 entries. A client whose provider returns a whole zone in one
+  response (VK Cloud's zone and record listings, reg.ru, nic.ru) is bounded by the 4 MiB cap alone,
+  and its rustdoc says so. Raising either constant is not a breaking change. A zone beyond them
+  fails to list with an error that says why; it is never returned in part.
 - Status mapping shared by all clients unless a client documents an exception: 401 → `Auth`, 403 →
   `Forbidden`, 429 → section 5.3, 5xx → `Transient`, other non-success → the client's classifier,
   which returns `Rejected`, `Conflict`, `ZoneNotFound` or `Protocol`. Providers that answer 200 with
@@ -271,7 +272,9 @@ holds. It is the only way to make a `Detail` from dynamic text.
   echoes it — verbatim; form-urlencoded with `+` and with `%20` for a space; RFC 3986
   percent-encoding (the crate's own URL encoding); as the inside of a JSON string; JSON with `\/`
   and lowercase `\uXXXX` escapes for non-ASCII characters; XML-escaped. Each occurrence is replaced
-  by `[redacted]`. Longer spellings are tried first. Empty secrets are ignored.
+  by `[redacted]`. Occurrences are found in the original text, overlapping ones included, and
+  overlapping or adjacent occurrences become one marker. The spellings are searched longest first.
+  Empty secrets are ignored.
 - A decoded haystack, for every other dialect: lowercase percent-hex, other percent-encoding safe
   sets (Python, JavaScript, Go), numeric XML character references, escaping of `&` and `<` only,
   uppercase or additional JSON `\u` escapes (Go, .NET), JSON inside JSON, form-encoded JSON. After
@@ -302,7 +305,10 @@ The same rules apply to `ZoneCheck::detail`.
 
 The transport emits one event per HTTP attempt at `DEBUG`, target `zonewright::http`, with the
 fields `provider` (the ID), `method`, `path` (URL path, no query string), `status` (absent when
-there was no answer), `attempt` and `elapsed_ms`. Nothing else in a provider client logs a request.
+there was no answer), `attempt` and `elapsed_ms`. Nothing else in an HTTP provider client logs a
+request. The RFC 2136 client emits its own event per DNS exchange at `DEBUG`, target
+`zonewright::rfc2136`, with the fields `op` (the operation), `rcode` (absent when there was no
+answer) and `elapsed_ms`.
 
 Never written to `tracing`, at any level: request or response bodies, any header, query strings,
 `Detail` text (it is derived from a body), TXT values. The proxy setting adds nothing to the event:

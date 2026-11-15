@@ -6,27 +6,28 @@ Part of the [zonewright design](./README.md). Section numbers are those of the w
 
 `PROVIDERS.md` remains the list of providers and of what is implemented and verified. The tables
 here record what each API is like and what this design plans on it. "Earlier version proven live"
-repeats the note of `PROVIDERS.md`; it does not make a client verified.
+repeats the note of `PROVIDERS.md`; it does not make a client verified. Which clients are verified,
+and what each live run covered, is recorded in `PROVIDERS.md` only.
 
 ### 11.1 API facts
 
-| ID              | Authentication                                                             | Native unit                                                   | Zone listing                      | `txt_values`                                               | `preconditions`                 | Provider-side operations |
-| --------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------- | --------------------------------- | ---------------------------------------------------------- | ------------------------------- | ------------------------ |
-| `acme_dns`      | `X-Api-User` and `X-Api-Key` headers of a registration                     | two rotating TXT values per registration                      | no                                | `Rotating`                                                 | —                               | no                       |
-| `beget`         | login and API password in the form body of every POST                      | the TXT set of one name, replaced whole                       | yes                               | `ReadThenWrite`                                            | `ReadThenWrite`                 | no                       |
-| `cloud_ru`      | access key exchanged for a bearer token (1 h)                              | one record per name and type holding a list of values         | yes                               | `ReadThenWrite` (re-read before the write)                 | `ReadThenWrite`                 | yes                      |
-| `cloudflare`    | static bearer API token                                                    | individual record with an ID                                  | yes (active zones)                | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
-| `digitalocean`  | static bearer token                                                        | individual record with an ID                                  | yes                               | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
-| `hetzner`       | static bearer project token (Cloud API, not the legacy DNS API)            | rrset with value-level add and remove actions                 | yes (primary zones)               | `PerValue`                                                 | `ReadThenWrite`                 | yes (actions)            |
-| `nicru`         | OAuth 2 password grant, bearer token                                       | individual record with an ID, staged until a zone-wide commit | yes                               | `PerValue` (a zone with foreign staged changes is refused) | `ReadThenWrite`                 | no                       |
-| `regru`         | user name and API password in every form POST; optional client certificate | individual record without an ID                               | no                                | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
-| `rfc2136`       | TSIG (HMAC-SHA-256 or -512) on every message, DNS over TCP                 | individual RR                                                 | no (the protocol has none)        | `PerValue`                                                 | `Atomic` (update prerequisites) | no                       |
-| `route53`       | AWS Signature Version 4; optional session token                            | rrset, changed by an atomic change batch                      | yes (public zones)                | `Conditional`                                              | `Atomic`                        | yes (`INSYNC`)           |
-| `selectel_v2`   | Keystone password exchanged for an `X-Auth-Token` (24 h)                   | rrset with an ID                                              | yes (own project, enabled zones)  | `ReadThenWrite`                                            | `ReadThenWrite`                 | no                       |
-| `timeweb_cloud` | static bearer token                                                        | individual record with an ID                                  | yes                               | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
-| `vk_cloud`      | Keystone password exchanged for an `X-Auth-Token`                          | individual record with an ID (TXT-specific paths)             | yes                               | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
-| `yandex_360`    | static OAuth token                                                         | individual record with an ID                                  | yes (domains delegated to Yandex) | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
-| `yandex_cloud`  | service-account key, PS256 JWT exchanged for an IAM token (≤ 12 h)         | rrset addressed by name and type                              | yes (public zones of the folder)  | `Conditional`                                              | `Atomic`                        | yes (operations)         |
+| ID              | Authentication                                                             | Native unit                                                     | Zone listing                      | `txt_values`                                               | `preconditions`                 | Provider-side operations |
+| --------------- | -------------------------------------------------------------------------- | --------------------------------------------------------------- | --------------------------------- | ---------------------------------------------------------- | ------------------------------- | ------------------------ |
+| `acme_dns`      | `X-Api-User` and `X-Api-Key` headers of a registration                     | two rotating TXT values per registration                        | no                                | `Rotating`                                                 | —                               | no                       |
+| `beget`         | login and API password in the form body of every POST                      | the TXT set of one name, replaced whole                         | yes                               | `ReadThenWrite`                                            | `ReadThenWrite`                 | no                       |
+| `cloud_ru`      | access key exchanged for a bearer token (1 h)                              | one record per name and type holding a list of values           | yes                               | `ReadThenWrite` (re-read before the write)                 | `ReadThenWrite`                 | yes                      |
+| `cloudflare`    | static bearer API token                                                    | individual record with an ID                                    | yes (active zones)                | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
+| `digitalocean`  | static bearer token                                                        | individual record with an ID                                    | yes                               | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
+| `hetzner`       | static bearer project token (Cloud API, not the legacy DNS API)            | rrset with value-level add and remove actions                   | yes (primary zones)               | `PerValue`                                                 | `ReadThenWrite`                 | yes (actions)            |
+| `nicru`         | OAuth 2 password grant, bearer token                                       | individual record with an ID, staged until a zone-wide commit   | yes                               | `PerValue` (a zone with foreign staged changes is refused) | `ReadThenWrite`                 | no                       |
+| `regru`         | user name and API password in every form POST; optional client certificate | individual record without an ID                                 | no                                | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
+| `rfc2136`       | TSIG (HMAC-SHA-256 or -512) on every message, DNS over TCP                 | individual RR                                                   | no (the protocol has none)        | `PerValue`                                                 | `Atomic` (update prerequisites) | no                       |
+| `route53`       | AWS Signature Version 4; optional session token                            | rrset, changed by an atomic change batch                        | yes (public zones)                | `Conditional`                                              | `Atomic`                        | yes (`INSYNC`)           |
+| `selectel_v2`   | Keystone password exchanged for an `X-Auth-Token` (24 h)                   | rrset with an ID                                                | yes (own project, enabled zones)  | `ReadThenWrite`                                            | `ReadThenWrite`                 | no                       |
+| `timeweb_cloud` | static bearer token                                                        | individual record with an ID                                    | yes                               | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
+| `vk_cloud`      | Keystone password exchanged for an `X-Auth-Token`                          | individual record with an ID, on paths of its own for each type | yes                               | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
+| `yandex_360`    | static OAuth token                                                         | individual record with an ID                                    | yes (domains delegated to Yandex) | `PerValue`                                                 | `ReadThenWrite`                 | no                       |
+| `yandex_cloud`  | service-account key, PS256 JWT exchanged for an IAM token (≤ 12 h)         | rrset addressed by name and type                                | yes (public zones of the folder)  | `Conditional`                                              | `Atomic`                        | yes (operations)         |
 
 `txt_values` and `preconditions` are the capability values of section 2.5; what they mean for a
 concurrent writer outside the process is in sections 3.5 and 3.4. `preconditions` matters only for
@@ -52,7 +53,7 @@ this table is a guess about such an API.
 | `regru`         | yes; plain values      | list, get, set, delete for A, AAAA, TXT (several requests per set)                      | A, AAAA, TXT                                                                                          | not settable          | —                           | Auto / Raw                                                                                                   | reg.ru API 2 documentation, lego. Earlier version proven live                             |
 | `rfc2136`       | yes                    | get, set, delete with server-checked prerequisites; listing impossible                  | any type with a wire form; SOA read only                                                              | 60                    | —                           | wire format                                                                                                  | RFC 2136, RFC 8945, RFC 7766, RFC 1035                                                    |
 | `route53`       | yes; plain values      | list, get, set, delete; alias and routing-policy sets are skipped and refused           | A, AAAA, CAA, CNAME, DS, HTTPS, MX, NAPTR, NS, PTR, SOA (read only), SPF, SRV, SSHFP, SVCB, TLSA, TXT | 60                    | 120 s                       | Auto / Presentation                                                                                          | Amazon Route 53 API reference, lego                                                       |
-| `selectel_v2`   | yes; plain values      | list, get, set, delete                                                                  | A, AAAA, ALIAS, CAA, CNAME, MX, NS, SOA (read only), SRV, SSHFP, TXT                                  | 60                    | —                           | Presentation, quoted content only / Presentation                                                             | Selectel DNS API v2 and authorization documentation. Earlier version proven live          |
+| `selectel_v2`   | yes; plain values      | list, get, set, delete                                                                  | A, AAAA, ALIAS, CAA, CNAME, MX, NS, SOA (read only), SRV, SSHFP, TXT                                  | 60                    | —                           | Presentation, quoted content only / Presentation                                                             | Selectel DNS API v2 and authorization documentation                                       |
 | `timeweb_cloud` | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CNAME, MX, TXT                                                                               | `provider_default`    | —                           | Auto / Raw                                                                                                   | the public API description (OpenAPI document), lego                                       |
 | `vk_cloud`      | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CNAME, MX, NS, SRV, TXT                                                                      | 60                    | —                           | Auto / Raw                                                                                                   | the provider's published API description, lego                                            |
 | `yandex_360`    | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CAA, CNAME, MX, SRV, TXT                                                                     | 300                   | —                           | Auto / Raw                                                                                                   | Yandex 360 API documentation, lego                                                        |
@@ -146,8 +147,10 @@ Behavior that the design fixes because the generic sections cannot:
   zone, are `Error::Protocol`. A record with GSLB links answers from its links, not from its values:
   it is not an rrset (section 3.4), a listing skips it, and every record-level operation and TXT
   value operation at its name and type is `Error::Rejected` after the read. The read again before
-  every write (section 3.5) is the layers' `reread_before_write`; refusals that need the read (a
-  read-only record, a wildcard NS record) are made before that second read.
+  every write (section 3.5) is the layers' `reread_before_write`. In the record layer the refusal of
+  a read-only record, which needs the read, and that of a wildcard NS record are made before that
+  second read (`WholeSet::check_write`); in the TXT value operations a read-only record is refused
+  at the write, after it.
 - `hetzner`. Only zones in primary mode are usable; a secondary zone is reported by `check` as not
   found with a detail, and operations on it are `Error::Rejected`. Values are removed using exactly
   the text the API returned. An rrset with `ttl: null` ("If not set, the Zone's Default TTL is
@@ -291,15 +294,16 @@ Behavior that the design fixes because the generic sections cannot:
   The `ttl` setting's default is `"provider_default"`; `null` and a missing key mean the same.
 - `cloudflare`. Record attributes the model does not carry (`comment`, `tags`, `proxied`,
   `private_routing`, `settings`) survive: a record that keeps its value is not touched, and a TTL
-  change or the in-place change of a CNAME is a `PATCH` naming only that field. A new record in an
-  existing rrset takes over `proxied`, `private_routing` and `settings` when every record read
-  agrees on them; when they disagree, a write that has to create a record is `InvalidInput`. A TTL
-  of 1 means automatic and reads as the provider's default; a create and a `PATCH` with `ttl: 1`
-  request it, also in place of an explicit TTL (`Requestable`; the API schema of `ttl` is the same
-  for create and edit, "Setting to 1 means 'automatic'"). A requested explicit TTL for a proxied
-  record is `InvalidInput`; the provider's default is what a proxied record has anyway. The `ttl`
-  setting accepts `"provider_default"` and, with the same meaning, the stored `1`. Both refusals are
-  made in the record layer's `check_plan` hook, over the whole plan, before any write.
+  change or the in-place change of a CNAME is a `PATCH` whose body carries the record type and only
+  the changed field. A new record in an existing rrset takes over `proxied`, `private_routing` and
+  `settings` when every record read agrees on them; when they disagree, a write that has to create a
+  record is `InvalidInput`. A TTL of 1 means automatic and reads as the provider's default; a create
+  and a `PATCH` with `ttl: 1` request it, also in place of an explicit TTL (`Requestable`; the API
+  schema of `ttl` is the same for create and edit, "Setting to 1 means 'automatic'"). A requested
+  explicit TTL for a proxied record is `InvalidInput`; the provider's default is what a proxied
+  record has anyway. The `ttl` setting accepts `"provider_default"` and, with the same meaning, the
+  stored `1`. Both refusals are made in the record layer's `check_plan` hook, over the whole plan,
+  before any write.
 - `digitalocean`. A host name stated as exactly `@` in the data of a CNAME, NS, MX or SRV record
   reads as the domain's name.
 - `vk_cloud`. The documented update (`PUT`) carries no TTL and, for A, AAAA and SRV, no value, so a
@@ -314,10 +318,11 @@ Behavior that the design fixes because the generic sections cannot:
   `@`, or by a dotless name that is not within the zone). The full form cannot: every set of dotless
   names a full-form listing can state is also a possible relative-form listing, since the documented
   create form writes `name: "www.example.org"` as a record at `www.example.org.example.org`. A name
-  whose relative reading would be longer than a domain name can be is placed at its full reading. A
-  record whose dotless name reads as two different names in a listing that does not decide the form
-  is `Error::Protocol` for `get_rrset`, `set_rrset`, `delete_rrset` and the TXT value operations of
-  its type at either name (a record of another type counts there as data of an unknown type), and is
+  whose relative reading would be longer than a domain name can be is placed at its full reading in
+  a listing that has not proven the relative form; in one that has, it is not placed. A record whose
+  dotless name reads as two different names in a listing that does not decide the form is
+  `Error::Protocol` for `get_rrset`, `set_rrset`, `delete_rrset` and the TXT value operations of its
+  type at either name (a record of another type counts there as data of an unknown type), and is
   reported in `skipped` by `list_rrsets`. If the live listing states full names, every operation on
   a name and type that has records is refused this way until the form is confirmed (section 13.4,
   item 27). Names are written relative to the domain, `@` for the apex. A CNAME is replaced in place

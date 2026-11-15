@@ -18,8 +18,8 @@ exactly when they are the same record.
   and rejects values outside the field's range (`OutOfRange`).
 - Hexadecimal data is written lowercase without spaces. Parsing accepts either case and whitespace
   between groups.
-- Base64 data is written in the standard alphabet with padding, without spaces. Parsing accepts
-  whitespace between groups.
+- Base64 data (the SVCB `ech` parameter) is written in the standard alphabet with padding, without
+  spaces. Parsing does not accept whitespace inside the value.
 - The comparison rule: two `RecordData` are equal iff their text is byte-for-byte equal. Two rrsets
   have the same records iff their sorted, deduplicated member lists are equal. There is no
   type-aware comparison beyond canonicalization, so the rule is the same in the crate, in an
@@ -59,20 +59,20 @@ trailing space; both are closed by parsing fields instead of editing strings.
 
 ### 4.3 Canonical form per type
 
-| Type                                | Canonical text                                                         | Notes                                                                                           |
-| ----------------------------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| A                                   | `192.0.2.1`                                                            | Four decimal octets. Leading zeros are a syntax error (they read as octal elsewhere)            |
-| AAAA                                | `2001:db8::1`                                                          | RFC 5952: lowercase, longest zero run compressed. IPv4-mapped addresses as `::ffff:192.0.2.1`   |
-| NS, CNAME, PTR, DNAME, ALIAS, ANAME | `host.example.org.`                                                    | One name (section 4.2)                                                                          |
-| MX                                  | `10 mail.example.org.`                                                 | Preference `u16`, then a name                                                                   |
-| SRV                                 | `0 5 443 host.example.org.`                                            | Priority, weight, port (`u16` each), then a name                                                |
-| TXT                                 | `"v=spf1 mx -all"`                                                     | Section 4.4                                                                                     |
-| CAA                                 | `0 issue "ca.example.net"`                                             | Section 4.5                                                                                     |
-| TLSA                                | `3 1 1 0a1b…`                                                          | Usage, selector, matching type (`u8` each), then hex. At least one data octet                   |
-| SSHFP                               | `4 2 0a1b…`                                                            | Algorithm, fingerprint type (`u8` each), then hex                                               |
-| SVCB, HTTPS                         | `1 . alpn="h2,h3" port=8443`                                           | Section 4.6                                                                                     |
-| SOA                                 | `ns1.example.org. admin.example.org. 2026111401 7200 3600 1209600 300` | Two names, five `u32` in seconds. Time-unit suffixes (`1h`) are accepted and written as seconds |
-| any other code                      | `\# 4 0a000001`                                                        | RFC 3597 (section 4.7)                                                                          |
+| Type                                | Canonical text                                                         | Notes                                                                                                                                                 |
+| ----------------------------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A                                   | `192.0.2.1`                                                            | Four decimal octets. Leading zeros are a syntax error (they read as octal elsewhere)                                                                  |
+| AAAA                                | `2001:db8::1`                                                          | RFC 5952: lowercase, longest zero run compressed. IPv4-mapped addresses as `::ffff:192.0.2.1`                                                         |
+| NS, CNAME, PTR, DNAME, ALIAS, ANAME | `host.example.org.`                                                    | One name (section 4.2)                                                                                                                                |
+| MX                                  | `10 mail.example.org.`                                                 | Preference `u16`, then a name                                                                                                                         |
+| SRV                                 | `0 5 443 host.example.org.`                                            | Priority, weight, port (`u16` each), then a name                                                                                                      |
+| TXT                                 | `"v=spf1 mx -all"`                                                     | Section 4.4                                                                                                                                           |
+| CAA                                 | `0 issue "ca.example.net"`                                             | Section 4.5                                                                                                                                           |
+| TLSA                                | `3 1 1 0a1b…`                                                          | Usage, selector, matching type (`u8` each), then hex. At least one data octet                                                                         |
+| SSHFP                               | `4 2 0a1b…`                                                            | Algorithm, fingerprint type (`u8` each), then hex                                                                                                     |
+| SVCB, HTTPS                         | `1 . alpn="h2,h3" port=8443`                                           | Section 4.6                                                                                                                                           |
+| SOA                                 | `ns1.example.org. admin.example.org. 2026111401 7200 3600 1209600 300` | Two names, then serial and four times (`u32` each). Time-unit suffixes (`1h`) are accepted for the four times, not the serial, and written as seconds |
+| any other code                      | `\# 4 0a000001`                                                        | RFC 3597 (section 4.7)                                                                                                                                |
 
 ### 4.4 TXT
 
@@ -167,7 +167,7 @@ one of RFC 3597 section 5: `\# <length> <hex>`, length in decimal, hex lowercase
 
 For a type that has a row, the generic form is accepted on input and converted: the wire data is
 decoded and written in the type's own canonical form. So `\# 4 c0000201` for type A is the same
-`RecordData` as `192.0.2.1`.
+`RecordData` as `192.0.2.1`. The pseudo-types ALIAS and ANAME have no generic form.
 
 A provider that returns its own text for a type the crate has no row for cannot be normalized: the
 value is carried as non-canonical data (section 4.9) and will not compare equal to what the

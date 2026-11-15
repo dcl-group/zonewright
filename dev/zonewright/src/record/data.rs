@@ -9,7 +9,8 @@ use super::wire::{MAX_RDATA, Reader};
 use super::{Caa, Mx, RecordError, RecordType, Srv, Svcb, Tlsa, Txt};
 use crate::name::{DomainName, TargetName};
 
-/// The RDATA of one record in normalized zone-file text form (design section 4).
+/// The RDATA of one record in normalized zone-file text form (design section 4,
+/// `docs/design/04-normalization.md` in the repository).
 ///
 /// Two values are equal exactly when their text (and canonical flag) is equal. `RecordData` does
 /// not know its type; the [`RrSet`](super::RrSet) holding it does.
@@ -66,8 +67,9 @@ impl RecordData {
         &self.text
     }
 
-    /// False for a value a provider returned that the crate could not parse (design section
-    /// 4.9).
+    /// False for a value a provider returned that the crate could not parse; such a value is kept
+    /// as the provider's text and compares by that text (design section 4.9,
+    /// `docs/design/04-normalization.md` in the repository).
     pub fn is_canonical(&self) -> bool {
         self.canonical
     }

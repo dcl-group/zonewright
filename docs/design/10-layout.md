@@ -8,7 +8,9 @@ Part of the [zonewright design](./README.md). Section numbers are those of the w
 README.md, CHANGELOG.md, PROVIDERS.md, AGENTS.md, CLAUDE.md, LICENSE-MIT, LICENSE-APACHE,
 .gitignore, .prettierrc.json, .prettierignore
 docs/
-  design.md              this document
+  design/                this document: README.md (the index and section 1), 02-public-api.md to
+                         13-open-points.md (one file per section, two for section 13), and
+                         history.md (sections 9.4 and 12.4)
 dev/
   Cargo.toml             virtual workspace: members "zonewright", "mock"; resolver "3";
                          [workspace.package] edition, rust-version, license, repository;
@@ -21,6 +23,7 @@ dev/
     LICENSE-MIT, LICENSE-APACHE
                          copies of the repository's, so that the published package carries
                          them; a conformance test compares them byte for byte
+    README.md            symbolic link to the repository's README.md (`readme = "README.md"`)
     src/
       lib.rs             module tree, re-exports, crate docs
       name.rs            DomainName, TargetName
@@ -39,8 +42,8 @@ dev/
                                                                             acme_dns, beget)
       dns01.rs
       http/              mod.rs, tls.rs, request.rs, retry.rs, token.rs, keystone.rs, gate.rs,
-                         poll.rs, pager.rs, zone_cache.rs, encode.rs, url.rs;
-                         testing.rs and tests.rs (test builds only)               (__http)
+                         poll.rs, pager.rs, zone_cache.rs, encode.rs, url.rs, proxy.rs;
+                         testing.rs, tests.rs and proxy_tests.rs (test builds only) (__http)
       crypto/            mod.rs, hmac.rs, ps256.rs (yandex_cloud),
                          sigv4.rs (route53)                                       (__crypto)
       inspector/         mod.rs, config.rs, exchange.rs, discovery.rs, answer.rs,
@@ -67,8 +70,13 @@ dev/
       conformance.rs     IDs, metadata, PROVIDERS.md, capability/behavior agreement, source
                          scans, required tests
       names.rs, records.rs, dns01.rs, transport.rs, inspector.rs
+      rfc2136_interop.rs cross-checks of the RFC 2136 mock and client against `nsupdate` and
+                         `dig`; #[ignore]d
   mock/
-    Cargo.toml           zonewright-mock, published with the crate; its own [lints.rust]
+    Cargo.toml           zonewright-mock, published with the same version as the crate; its own
+                         [lints.rust]
+    LICENSE-MIT, LICENSE-APACHE
+                         copies of the repository's, checked by the same conformance test
     src/
       lib.rs             module tree, MockServer, re-exports
       conn.rs            listener and connection type under every mock server
@@ -76,6 +84,8 @@ dev/
       fault.rs           fault injection
       echo.rs            the echo server of section 12.2
       dns.rs             UDP+TCP DNS server for the inspector tests
+      proxy.rs           HTTP forward proxy (CONNECT and plain) for the transport tests
+      socks.rs           SOCKS5 proxy for the transport tests
       <id>.rs            one stateful mock per provider
     tests/
       harness.rs         tests of the mock servers themselves

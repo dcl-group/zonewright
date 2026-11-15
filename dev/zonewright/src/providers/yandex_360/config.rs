@@ -39,7 +39,8 @@ const ORG_ID_MAX_DIGITS: usize = 19;
 /// Settings of the Yandex 360 client: the non-secret part of its configuration.
 ///
 /// `org_id` is required, so the type has no `Default` and no container-level serde default: a
-/// settings object without `org_id` is an error naming the key (design section 2.8).
+/// settings object without `org_id` is an error naming the key (design section 2.8,
+/// `docs/design/02-public-api.md` in the repository).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]

@@ -133,7 +133,7 @@ pub struct Capabilities {
     pub ttl: TtlSupport,
     /// Whether an rrset can have the provider's default TTL instead of an explicit one
     /// ([`RrsetTtl::ProviderDefault`](crate::RrsetTtl::ProviderDefault)), and whether a write can
-    /// ask for it (design section 3.6).
+    /// ask for it (design section 3.6, `docs/design/03-semantics.md` in the repository).
     pub provider_default_ttl: ProviderDefaultTtl,
     /// Writes complete through a provider-side operation that the client polls.
     pub asynchronous: bool,
@@ -250,9 +250,10 @@ impl TtlSupport {
     }
 }
 
-/// Whether an rrset can have no explicit TTL at a provider, the provider's default applying
-/// instead (an "automatic" TTL, a zone default that applies while none is stored, or a TTL the
-/// provider always chooses itself), and what a write can do about it (design section 3.6).
+/// Whether an rrset can have no explicit TTL at a provider, the provider's default applying instead
+/// (an "automatic" TTL, a zone default that applies while none is stored, or a TTL the provider
+/// always chooses itself), and what a write can do about it (design section 3.6,
+/// `docs/design/03-semantics.md` in the repository).
 ///
 /// Where the provider's default exists, an rrset that has it reads as
 /// [`RrsetTtl::ProviderDefault`](crate::RrsetTtl::ProviderDefault), and a write that states no
@@ -303,7 +304,8 @@ impl ProviderDefaultTtl {
 }
 
 /// How far "a TXT value operation never overwrites or deletes a foreign value" holds when
-/// someone outside this process writes to the same rrset at the same time (design section 3.5).
+/// someone outside this process writes to the same rrset at the same time
+/// (design section 3.5, `docs/design/03-semantics.md` in the repository).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ValueGuarantee {
@@ -313,7 +315,8 @@ pub enum ValueGuarantee {
     /// makes the write fail instead of being overwritten.
     Conditional,
     /// The whole set is written after a read, unconditionally. A value added by another writer
-    /// between the read and the write is lost. Hard rule 2 holds only inside one process.
+    /// between the read and the write is lost. The guarantee that a TXT value operation never
+    /// overwrites or deletes a foreign value holds only inside one process.
     ReadThenWrite,
     /// The provider keeps a fixed number of most recent values and drops the oldest (acme-dns).
     Rotating,

@@ -64,8 +64,8 @@ pub struct InspectorConfig {
     pub accept_static_without_aa: bool,
     /// Expectations or questions per call. Default 32; 1 to QUESTIONS_CEILING.
     pub max_questions: usize,
-    /// Asked servers × distinct questions of one round. Default 1024; from `max_questions` to
-    /// QUESTIONS_PER_ROUND_CEILING.
+    /// Asked servers × questions of one round (in `wait`, identical questions count once).
+    /// Default 1024; from `max_questions` to QUESTIONS_PER_ROUND_CEILING.
     pub max_questions_per_round: usize,
 }
 impl InspectorConfig {
@@ -310,7 +310,9 @@ static list.
    - IPv6 forms that route to an embedded IPv4 address get the IPv4 rules for that address: the
      NAT64 well-known prefix `64:ff9b::/96`, 6to4 `2002::/16`, Teredo `2001::/32` (the server
      address and the de-obfuscated client address), and an ISATAP interface identifier
-     (`0:5efe:a.b.c.d` or `200:5efe:a.b.c.d`, RFC 5214 section 6.1) under any global prefix.
+     (`0:5efe:a.b.c.d`; the universal/local and group bits of its first octet are free, so
+     `100:5efe:`, `200:5efe:` and `300:5efe:` count too; RFC 5214 section 6.1) under any global
+     prefix.
    - Accepted on purpose, although the registries mark them not globally reachable: the
      documentation blocks (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32`,
      `3fff::/20`). They are routed nowhere, so a query to them times out and satisfies nothing; they
@@ -333,8 +335,9 @@ static list.
    `TooManyNameServers`. The list is never truncated, because success means "every server", and a
    silently shortened list would turn that into "some servers".
 6. Steps 1 to 5 together are bounded by `discovery_timeout`; when it passes, the result is
-   `NoNameServers` with a detail that says so. With the defaults that is at most 3 + 16 × 2 × 3
-   questions, each bounded by `query_timeout` as well.
+   `NoNameServers` with a detail that says so. With three resolvers and both families that is at
+   most 3 + 16 × 2 × 3 questions, each bounded by `query_timeout` as well (the default `ip_families`
+   is `V4`, which halves the address lookups).
 7. The result is cached per zone for `ns_cache_ttl`, at most 256 zones (the oldest entry is
    evicted). Only a complete list is cached, entries that are not asked included; failures, and
    whatever a failed discovery found before it failed, are not. Concurrent discoveries of one zone
@@ -366,9 +369,10 @@ More entries than `max_servers`, or an entry that is not asked (no address, or `
 - To a name server: recursion not desired. The answer is classified as follows. Response code
   REFUSED or SERVFAIL: the variant of that name. Any other code than NOERROR and NXDOMAIN: `Failed`.
   AA not set: `NotAuthoritative`. Records of the asked type owned by the asked name: `Records`, or
-  `Failed` when the response code is NXDOMAIN (a contradiction that must not read as absence).
-  NXDOMAIN: `NxDomain`. No such records but a CNAME owned by the asked name (and the question was
-  not for CNAME): `Cname`. Otherwise `NoData`.
+  `Failed` when the response code is NXDOMAIN (a contradiction that must not read as absence). No
+  such records but a CNAME owned by the asked name (and the question was not for CNAME): `Cname`,
+  whatever the response code (section 8.9). Otherwise `NxDomain` for NXDOMAIN and `NoData` for
+  NOERROR.
 - AA without the flag, for a static list only (`accept_static_without_aa`, off by default; asked for
   by an application whose test DNS server answers correctly but never sets AA). In a round over
   `NsDiscovery::Static` an answer without AA is then classified by its content as above, with one
@@ -385,7 +389,7 @@ More entries than `max_servers`, or an entry that is not asked (no address, or `
 
 Answer records are converted to `RecordData` through the typed constructors and `from_wire` of
 section 4: fields are taken from the decoded message for the types whose RDATA can contain
-compressed names (NS, CNAME, PTR, MX, SOA, SRV, DNAME), and the raw RDATA goes through
+compressed names (NS, CNAME, PTR, MX, SOA, SRV), and the raw RDATA goes through
 `RecordData::from_wire` for everything else, including types the codec does not know. TXT
 character-strings are concatenated as bytes; nothing is lossily converted to UTF-8. Names inside
 RDATA become `TargetName` values, for which every valid wire name has a text form, so an unusual
@@ -456,25 +460,25 @@ written at; it is reported as a lookup error.
 
 ### 8.8 Bounds
 
-| Bound                                       | Value                                                                                      |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| NS names of one zone                        | 16                                                                                         |
-| Addresses per NS name and family            | 8                                                                                          |
-| Servers per zone, those not asked included  | `max_servers`, default 32                                                                  |
-| Time for one discovery                      | `discovery_timeout`, default 10 s                                                          |
-| Concurrent address lookups during discovery | 8                                                                                          |
-| Expectations or questions per call          | `max_questions`, default 32, at most 256                                                   |
-| Questions per round                         | asked servers × distinct questions ≤ `max_questions_per_round`, default 1024, at most 8192 |
-| Network exchanges per round                 | at most 3 × `max_questions_per_round`                                                      |
-| Time for one round                          | at most `ceil(max_questions_per_round / 128) × query_timeout`; 24 s with the defaults      |
-| Questions of a round in flight at once      | 128                                                                                        |
-| Pause between rounds                        | `interval` ≥ 1 s, ± up to 50 % jitter                                                      |
-| Network exchanges per question              | 3 (UDP, UDP without EDNS, TCP)                                                             |
-| Sockets per question                        | one new UDP socket, one new TCP connection                                                 |
-| Time per question                           | `query_timeout`, default 3 s                                                               |
-| CNAME links (in an answer, in a chain)      | 8, with loop detection                                                                     |
-| Message size                                | 4096 octets UDP, 65535 TCP                                                                 |
-| Cached zones                                | 256                                                                                        |
+| Bound                                       | Value                                                                                     |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| NS names of one zone                        | 16                                                                                        |
+| Addresses per NS name and family            | 8                                                                                         |
+| Servers per zone, those not asked included  | `max_servers`, default 32                                                                 |
+| Time for one discovery                      | `discovery_timeout`, default 10 s                                                         |
+| Concurrent address lookups during discovery | 8                                                                                         |
+| Expectations or questions per call          | `max_questions`, default 32, at most 256                                                  |
+| Questions per round                         | asked servers × questions ≤ `max_questions_per_round`, default 1024, at most 8192         |
+| Network exchanges per round                 | at most 3 × `max_questions_per_round`                                                     |
+| Time for one round                          | at most `ceil(max_questions_per_round / 128) × query_timeout`; 24 s with the defaults     |
+| Questions of a round in flight at once      | 128                                                                                       |
+| Pause between rounds                        | `interval` ≥ 1 s, ± up to 50 % jitter                                                     |
+| Network exchanges per question              | 3 (UDP, UDP without EDNS, TCP)                                                            |
+| Sockets per question                        | a new UDP socket per UDP exchange (at most 2), one new TCP connection, one open at a time |
+| Time per question                           | `query_timeout`, default 3 s                                                              |
+| CNAME links (in an answer, in a chain)      | 8, with loop detection                                                                    |
+| Message size                                | 4096 octets UDP, 65535 TCP                                                                |
+| Cached zones                                | 256                                                                                       |
 
 The two question limits are settings (decided by the maintainer on 2026-11-15, for an application
 that waits for about a hundred names of one zone in one call). The per-round limit is a setting of
@@ -504,9 +508,11 @@ Points this section left open, as implemented:
   questions in a call or more than `max_questions_per_round` in one round. Refused as configuration
   errors: zero timeouts, `max_servers` of zero, `max_questions` outside 1 to 256,
   `max_questions_per_round` below `max_questions` or above 8192, more than 16 resolvers, a resolver
-  listed twice, recursive discovery without resolvers, an empty static list.
+  listed twice, recursive discovery without resolvers, an empty static list, a static list longer
+  than `max_servers` or with an entry that is not asked.
 - The values of an answer are deduplicated and sorted; a TTL with the high bit set is read as zero
-  (RFC 2181 section 8); identical questions are asked once per round.
+  (RFC 2181 section 8); in `wait`, identical questions are asked once per round (`observe` asks each
+  question it is given).
 
 ### 8.10 Tracing and testing
 
@@ -516,6 +522,8 @@ Events, target `zonewright::inspector`:
   question name and no record value.
 - `WARN`, one per discovered name server that is not asked: the zone, the NS name, the address when
   there is one, and the reason.
+- `WARN`, one per wait that succeeds with servers that are not asked left out (section 8.6): the
+  zone, the number left out, the rounds and the elapsed time in milliseconds.
 
 NS names and their addresses are public delegation data, not secrets (hard rule 1 concerns secrets).
 No event carries a value of a record the application asks about, and none carries a question name

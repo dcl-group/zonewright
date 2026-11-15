@@ -15,7 +15,8 @@
 //!
 //! - `add_txt_value` always returns `AddOutcome::Accepted`, because the state before the write
 //!   cannot be observed. The client keeps a bounded process-local memory of recent sends so that
-//!   a needless repeat does not displace a live value (design section 11.3).
+//!   a needless repeat, which the server would write into the other slot, does not displace a
+//!   live value (design section 11.3, `docs/design/11-providers.md` in the repository).
 //! - `remove_txt_value` is not offered (`Error::Unsupported`, capability off). The server drops
 //!   the oldest value when a third arrives; the application decides that a missing removal is
 //!   acceptable.
