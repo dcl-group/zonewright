@@ -13,21 +13,19 @@ desired-state diffing, no scheduling, no audit and no metrics.
 
 ## Status
 
-Pre-release, version 0.1.0. The crate is not published to crates.io; use it as a git dependency
-pinned by tag. The provider clients are implemented and tested against mocks. One client, Selectel
-v2, is verified against the live API; the others are not yet.
+Version 0.1.0, the first release. The provider clients are implemented and tested against mocks. One
+client, Selectel v2, is verified against the live API; the others are not yet.
 
-[`PROVIDERS.md`](./PROVIDERS.md) is the single list of providers, with the state of each client and
-the definition of "verified". Each provider reports its capabilities at run time
-(`Provider::capabilities`), and a client answers an operation it does not support with an
-`Unsupported` error rather than failing in some other way.
+[`PROVIDERS.md`](https://github.com/dcl-group/zonewright/blob/main/PROVIDERS.md) is the single list
+of providers, with the state of each client and the definition of "verified". Each provider reports
+its capabilities at run time (`Provider::capabilities`), and a client answers an operation it does
+not support with an `Unsupported` error rather than failing in some other way.
 
 ## Installation
 
 ```toml
 [dependencies]
-# The tag does not exist until the first release is tagged.
-zonewright = { git = "https://github.com/dcl-group/zonewright", tag = "v0.1.0", features = ["cloudflare", "inspector"] }
+zonewright = { version = "0.1", features = ["cloudflare", "inspector"] }
 ```
 
 No feature is enabled by default. A provider that is not compiled in is still a valid `ProviderId`;
@@ -39,7 +37,8 @@ building a client for it returns an `Error` of kind `NotCompiled`.
 | `all-providers`  | Every provider client                                                  |
 | `inspector`      | The propagation inspector                                              |
 
-The provider IDs are listed in [`PROVIDERS.md`](./PROVIDERS.md).
+The provider IDs are listed in
+[`PROVIDERS.md`](https://github.com/dcl-group/zonewright/blob/main/PROVIDERS.md).
 
 ## Usage
 

@@ -75,6 +75,7 @@ dev/
   mock/
     Cargo.toml           zonewright-mock, published with the same version as the crate; its own
                          [lints.rust]
+    README.md            what the mock crate is and how a test uses it; the page on crates.io
     LICENSE-MIT, LICENSE-APACHE
                          copies of the repository's, checked by the same conformance test
     src/

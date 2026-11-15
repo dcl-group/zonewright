@@ -6,7 +6,11 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
-The first version, 0.1.0. Not tagged yet.
+Nothing yet.
+
+## 0.1.0 - 2026-11-16
+
+The first release.
 
 ### Added
 
