@@ -3603,3 +3603,85 @@ async fn live_vk_cloud_record_round_trip() {
     }
     assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
 }
+
+// ---- Served over DNS ---------------------------------------------------------------------------
+
+/// What the mock holds is answered by the DNS mock through a link.
+#[cfg(feature = "inspector")]
+mod served_over_dns {
+    use zonewright::{Expect, Provider, RecordType, RrSet};
+    use zonewright_mock::changes::ChangeSource as _;
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+
+    use super::common::dn;
+    use super::common::link::{NAME, ZONE, ask, is_absent, rd, txt, txt_round_trip, values};
+    use super::{REL, setup};
+
+    /// A TXT value goes to DNS and away again; an MX and a CNAME written through `set_rrset`,
+    /// which the API stores relative and without the trailing dot, are answered with their names
+    /// fully qualified.
+    #[tokio::test]
+    async fn vk_cloud_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = txt_round_trip(&mock, &client, &dns).await;
+
+        let mx = rd(RecordType::MX, "10 mail.example.net.");
+        let cname = rd(RecordType::CNAME, "target.example.net.");
+        for (name, rtype, data) in [
+            (ZONE, RecordType::MX, &mx),
+            ("alias.example.org", RecordType::CNAME, &cname),
+        ] {
+            let rrset = RrSet::new(dn(name), rtype, None, [data.clone()]).unwrap();
+            client
+                .set_rrset(&dn(ZONE), &rrset, Expect::Any)
+                .await
+                .unwrap();
+        }
+        let stored = mock.control().records_of(ZONE, "mx", "@");
+        assert_eq!(
+            stored[0].field("content").as_deref(),
+            Some("mail.example.net")
+        );
+        link.settled().await;
+        assert_eq!(values(ask(dns.addr(), ZONE, RecordType::MX).await), [mx]);
+        assert_eq!(
+            values(ask(dns.addr(), "alias.example.org", RecordType::CNAME).await),
+            [cname]
+        );
+        assert_eq!(link.skipped(), 0);
+    }
+
+    /// A reset returns the mock to its seed: the record written through the client is gone from
+    /// the mock and from DNS, the request log and the issued tokens are empty, and the client
+    /// works again.
+    #[tokio::test]
+    async fn vk_cloud_reset_returns_to_the_seed() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        let mut stream = mock.changes().subscribe();
+        super::add(&client, "before-reset").await.unwrap();
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("before-reset")]
+        );
+        assert!(stream.try_next().is_some());
+
+        mock.control().reset();
+        let removal = stream.try_next().unwrap();
+        assert_eq!((removal.name.as_str(), removal.rrset), (NAME, None));
+        assert!(mock.control().all_records().is_empty());
+        assert!(mock.log().is_empty());
+        assert_eq!(mock.control().tokens_issued(), 0);
+        link.settled().await;
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+
+        super::add(&client, "after-reset").await.unwrap();
+        assert_eq!(mock.control().txt_values(ZONE, REL), ["after-reset"]);
+        assert_eq!(mock.control().tokens_issued(), 1);
+    }
+}

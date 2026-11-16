@@ -2926,3 +2926,118 @@ async fn rfc2136_record_answers_for_other_names_are_ignored() {
     assert_eq!(calls[0].prereqs.len(), 1);
     assert_eq!(calls[0].prereqs[0].rdata, [192, 0, 2, 1]);
 }
+
+// ---- Served over DNS ---------------------------------------------------------------------------
+
+/// The mock's published state, linked to the DNS mock, is what the mock answers itself. The
+/// mock answers only signed queries, so its own answers are read through the client.
+#[cfg(feature = "inspector")]
+mod served_over_dns {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use zonewright::{Expect, Provider, RecordType, RrSet};
+    use zonewright_mock::changes::ChangeSource as _;
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+    use zonewright_mock::rfc2136::{Op, Rfc2136Mock, Seed};
+
+    use super::common::dn;
+    use super::common::link::{NAME, ZONE, ask, is_absent, rd, txt, txt_round_trip, values};
+    use super::{KEY, NAME_DOT, setup};
+    use zonewright_mock::rfc2136::STANDARD_SECRET;
+
+    /// A TXT value goes to DNS and away again. An MX, a CNAME, a CAA and a TXT of two strings
+    /// written through `set_rrset` are answered by the linked DNS mock exactly as the mock answers
+    /// them itself.
+    #[tokio::test]
+    async fn rfc2136_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = txt_round_trip(&mock, &client, &dns).await;
+
+        let records = [
+            (ZONE, RecordType::MX, "10 mail.example.net."),
+            (
+                "alias.example.org",
+                RecordType::CNAME,
+                "target.example.net.",
+            ),
+            (ZONE, RecordType::CAA, "0 issue \"ca.example.net\""),
+            (NAME, RecordType::TXT, "\"first\" \"second\""),
+        ];
+        for (name, rtype, text) in records {
+            let rrset = RrSet::new(dn(name), rtype, None, [rd(rtype, text)]).unwrap();
+            client
+                .set_rrset(&dn(ZONE), &rrset, Expect::Any)
+                .await
+                .unwrap();
+        }
+        link.settled().await;
+        for (name, rtype, text) in records {
+            let linked = values(ask(dns.addr(), name, rtype).await);
+            assert_eq!(linked, [rd(rtype, text)], "{name} {rtype}");
+            let own = client.get_rrset(&dn(ZONE), &dn(name), rtype).await.unwrap();
+            assert_eq!(own.unwrap().records(), linked.as_slice(), "{name} {rtype}");
+        }
+        assert_eq!(link.skipped(), 0);
+    }
+
+    /// A reset returns the mock to its seed: the record written through the client is gone from
+    /// the mock, from its own answers and from the linked DNS mock, no request is recorded, and
+    /// the client works again.
+    #[tokio::test]
+    async fn rfc2136_reset_returns_to_the_seed() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        let mut stream = mock.changes().subscribe();
+        super::add(&client, "before-reset").await.unwrap();
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("before-reset")]
+        );
+        assert!(stream.try_next().is_some());
+
+        mock.control().reset();
+        let removal = stream.try_next().unwrap();
+        assert_eq!((removal.name.as_str(), removal.rrset), (NAME, None));
+        assert!(mock.control().all_records().is_empty());
+        assert!(mock.control().calls().is_empty());
+        link.settled().await;
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+
+        super::add(&client, "after-reset").await.unwrap();
+        assert_eq!(mock.control().txt(NAME_DOT), ["after-reset"]);
+        assert!(mock.control().count(Op::Update) > 0);
+    }
+
+    /// `start_on` binds to the address given; on a wildcard address the server answers on
+    /// loopback.
+    #[tokio::test]
+    async fn rfc2136_mock_starts_on_a_given_address() {
+        let mock = Rfc2136Mock::start_on(
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            Seed::standard(),
+        )
+        .await;
+        assert!(mock.addr().ip().is_unspecified());
+        let port = mock.addr().port();
+        let mut config = super::settings(&mock, KEY);
+        config.server = format!("127.0.0.1:{port}");
+        let client = super::Rfc2136::new(
+            config,
+            super::credentials(STANDARD_SECRET),
+            &super::context(),
+        )
+        .unwrap();
+        super::add(&client, "on-loopback").await.unwrap();
+        assert_eq!(mock.control().txt(NAME_DOT), ["on-loopback"]);
+        let own = client
+            .get_rrset(&dn(ZONE), &dn(NAME), RecordType::TXT)
+            .await
+            .unwrap();
+        assert_eq!(own.unwrap().records(), [txt("on-loopback")]);
+    }
+}

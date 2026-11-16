@@ -54,6 +54,19 @@
 //! - routing-policy sets of one name and type are sorted by `SetIdentifier`.
 //!
 //! Error texts are invented.
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`Route53Mock::changes`], and a [`link`](crate::link::link) serves them over DNS. Published
+//! are the public hosted zones, the first of each name (in the order the zones were added; a
+//! resolver follows one delegation), and in them every simple rrset with its TTL and its values
+//! as stored, a host name inside a CNAME, NS, PTR, MX or SRV value with the trailing dot added
+//! where it was written without one. Left out: private hosted zones (answered only inside their
+//! VPCs), alias sets (Route 53 answers them with the records of the target, which the mock does
+//! not hold), routing-policy sets (sets with a `SetIdentifier` or routing elements, whose answer
+//! depends on the asker), and the SOA rrset (the server that serves the zone answers with its
+//! own). A change batch is published when it is accepted, as the mock applies it to its state
+//! then; the `PENDING` answers of `GetChange` do not hold it back (a held link models a change
+//! that has not reached the name servers). [`Control::reset`] returns the mock to its seed.
 
 // Handlers return finished HTTP answers as their error values and hand them straight to axum;
 // boxing them would only add noise.
@@ -61,6 +74,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,7 +87,8 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
-use crate::MockServer;
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, MockServer, RequestLog};
 
 /// The XML namespace of the API.
 pub const XMLNS: &str = "https://route53.amazonaws.com/doc/2013-04-01/";
@@ -182,16 +197,74 @@ pub struct Rrset {
 #[derive(Debug)]
 struct Inner {
     seed: Seed,
+    /// The hub the published changes are reported to.
+    changes: Changes,
     zones: Vec<Zone>,
     rrsets: Vec<Rrset>,
     /// Change ID to the number of `PENDING` answers left.
-    changes: HashMap<String, u32>,
+    change_ids: HashMap<String, u32>,
     batches: Vec<String>,
     pending_polls: u32,
     next_id: u64,
 }
 
 impl Inner {
+    /// The state of a mock started with `seed`.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        let mut inner = Inner {
+            seed: seed.clone(),
+            changes,
+            zones: Vec::new(),
+            rrsets: Vec::new(),
+            change_ids: HashMap::new(),
+            batches: Vec::new(),
+            pending_polls: 0,
+            next_id: 0,
+        };
+        for zone in &seed.zones {
+            inner.add_zone(&zone.id, &zone.name, zone.private);
+        }
+        inner
+    }
+
+    /// What the name servers of the mock's public zones would answer (module documentation).
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        let mut served: Vec<&Zone> = Vec::new();
+        for zone in self.zones.iter().filter(|z| !z.private) {
+            if served.iter().all(|z| z.name != zone.name) {
+                served.push(zone);
+                out.zone(&zone.name);
+            }
+        }
+        for rrset in &self.rrsets {
+            let Some(zone) = served.iter().find(|z| z.id == rrset.zone_id) else {
+                continue;
+            };
+            if rrset.alias.is_some()
+                || rrset.set_identifier.is_some()
+                || rrset.routing.is_some()
+                || rrset.rtype == "SOA"
+            {
+                continue;
+            }
+            let values = rrset
+                .values
+                .iter()
+                .map(|v| published_value(&rrset.rtype, v))
+                .collect();
+            let ttl = u32::try_from(rrset.ttl).unwrap_or(u32::MAX);
+            out.rrset(&zone.name, &rrset.name, &rrset.rtype, Some(ttl), values);
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+
     fn new_id(&mut self, prefix: char) -> String {
         self.next_id += 1;
         format!("{prefix}{:013X}", self.next_id)
@@ -253,6 +326,9 @@ pub struct Route53Mock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for Route53Mock {
@@ -264,21 +340,15 @@ impl Deref for Route53Mock {
 }
 
 impl Route53Mock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let mut inner = Inner {
-            seed: seed.clone(),
-            zones: Vec::new(),
-            rrsets: Vec::new(),
-            changes: HashMap::new(),
-            batches: Vec::new(),
-            pending_polls: 0,
-            next_id: 0,
-        };
-        for zone in &seed.zones {
-            inner.add_zone(&zone.id, &zone.name, zone.private);
-        }
-        let state = Arc::new(Mutex::new(inner));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new()
             .route("/2013-04-01/hostedzonesbyname", get(zones_by_name))
             .route("/2013-04-01/hostedzone/{id}", get(get_zone))
@@ -286,10 +356,14 @@ impl Route53Mock {
             .route("/2013-04-01/hostedzone/{id}/rrset/", post(change_rrsets))
             .route("/2013-04-01/change/{id}", get(get_change))
             .with_state(state.clone());
-        Self {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The API endpoint, for the client's `base_url`.
@@ -303,7 +377,39 @@ impl Route53Mock {
     }
 }
 
+impl ChangeSource for Route53Mock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its credentials, its zones with only
+    /// their SOA and NS rrsets, no change IDs, no batches, no `PENDING` answers, an empty request
+    /// log and no pending faults. Reports the removal of every rrset that was published and is
+    /// not in the seed.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.seed.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// Every hosted zone.
     pub fn zones(&self) -> Vec<Zone> {
         lock(&self.state).zones.clone()
@@ -326,7 +432,7 @@ impl Control {
 
     /// Adds a hosted zone.
     pub fn insert_zone(&self, id: &str, name: &str, private: bool) {
-        lock(&self.state).add_zone(id, name, private);
+        self.change(|inner| inner.add_zone(id, name, private));
     }
 
     /// Deletes the public zone `name` and creates it again under a new ID, with the same rrsets.
@@ -337,15 +443,16 @@ impl Control {
     /// If there is no such zone.
     pub fn recreate_zone(&self, name: &str) -> String {
         let old = self.zone_id(name);
-        let mut inner = lock(&self.state);
-        let new = inner.new_id('Z');
-        for zone in inner.zones.iter_mut().filter(|z| z.id == old) {
-            zone.id = new.clone();
-        }
-        for rrset in inner.rrsets.iter_mut().filter(|r| r.zone_id == old) {
-            rrset.zone_id = new.clone();
-        }
-        new
+        self.change(|inner| {
+            let new = inner.new_id('Z');
+            for zone in inner.zones.iter_mut().filter(|z| z.id == old) {
+                zone.id = new.clone();
+            }
+            for rrset in inner.rrsets.iter_mut().filter(|r| r.zone_id == old) {
+                rrset.zone_id = new.clone();
+            }
+            new
+        })
     }
 
     /// Every rrset of every zone.
@@ -366,19 +473,20 @@ impl Control {
     /// Creates or replaces an rrset directly, as another writer would.
     pub fn insert_rrset(&self, zone_id: &str, name: &str, rtype: &str, ttl: u64, values: &[&str]) {
         let name = fqdn(name);
-        let mut inner = lock(&self.state);
-        inner
-            .rrsets
-            .retain(|r| !(r.zone_id == zone_id && r.name == name && r.rtype == rtype));
-        inner.rrsets.push(Rrset {
-            zone_id: zone_id.to_owned(),
-            name,
-            rtype: rtype.to_owned(),
-            ttl,
-            values: values.iter().map(|v| (*v).to_owned()).collect(),
-            set_identifier: None,
-            routing: None,
-            alias: None,
+        self.change(|inner| {
+            inner
+                .rrsets
+                .retain(|r| !(r.zone_id == zone_id && r.name == name && r.rtype == rtype));
+            inner.rrsets.push(Rrset {
+                zone_id: zone_id.to_owned(),
+                name,
+                rtype: rtype.to_owned(),
+                ttl,
+                values: values.iter().map(|v| (*v).to_owned()).collect(),
+                set_identifier: None,
+                routing: None,
+                alias: None,
+            });
         });
     }
 
@@ -396,51 +504,59 @@ impl Control {
         values: &[&str],
     ) {
         let name = fqdn(name);
-        lock(&self.state).rrsets.push(Rrset {
-            zone_id: zone_id.to_owned(),
-            name,
-            rtype: rtype.to_owned(),
-            ttl,
-            values: values.iter().map(|v| (*v).to_owned()).collect(),
-            set_identifier: identifier.map(str::to_owned),
-            routing: Some(routing.to_owned()),
-            alias: None,
+        self.change(|inner| {
+            inner.rrsets.push(Rrset {
+                zone_id: zone_id.to_owned(),
+                name,
+                rtype: rtype.to_owned(),
+                ttl,
+                values: values.iter().map(|v| (*v).to_owned()).collect(),
+                set_identifier: identifier.map(str::to_owned),
+                routing: Some(routing.to_owned()),
+                alias: None,
+            });
         });
     }
 
     /// Adds an alias set of `name` and `rtype` pointing at `dns_name`.
     pub fn insert_alias(&self, zone_id: &str, name: &str, rtype: &str, dns_name: &str) {
         let name = fqdn(name);
-        lock(&self.state).rrsets.push(Rrset {
-            zone_id: zone_id.to_owned(),
-            name,
-            rtype: rtype.to_owned(),
-            ttl: 0,
-            values: Vec::new(),
-            set_identifier: None,
-            routing: None,
-            alias: Some(dns_name.to_owned()),
+        self.change(|inner| {
+            inner.rrsets.push(Rrset {
+                zone_id: zone_id.to_owned(),
+                name,
+                rtype: rtype.to_owned(),
+                ttl: 0,
+                values: Vec::new(),
+                set_identifier: None,
+                routing: None,
+                alias: Some(dns_name.to_owned()),
+            });
         });
     }
 
     /// Marks the rrsets of `name` and `rtype` as a routing-policy set with this identifier.
     pub fn set_set_identifier(&self, name: &str, rtype: &str, identifier: &str) {
         let name = fqdn(name);
-        for rrset in lock(&self.state)
-            .rrsets
-            .iter_mut()
-            .filter(|r| r.name == name && r.rtype == rtype)
-        {
-            rrset.set_identifier = Some(identifier.to_owned());
-        }
+        self.change(|inner| {
+            for rrset in inner
+                .rrsets
+                .iter_mut()
+                .filter(|r| r.name == name && r.rtype == rtype)
+            {
+                rrset.set_identifier = Some(identifier.to_owned());
+            }
+        });
     }
 
     /// Deletes the rrsets of `name` and `rtype` directly, as another writer would.
     pub fn delete_rrset(&self, name: &str, rtype: &str) {
         let name = fqdn(name);
-        lock(&self.state)
-            .rrsets
-            .retain(|r| !(r.name == name && r.rtype == rtype));
+        self.change(|inner| {
+            inner
+                .rrsets
+                .retain(|r| !(r.name == name && r.rtype == rtype));
+        });
     }
 
     /// The TXT values of `name` with the outer quotes removed, in rrset order.
@@ -565,6 +681,28 @@ fn render_name(name: &str) -> String {
         }
     }
     out
+}
+
+/// A value as a DNS server would answer it in zone-file text: a host name inside a CNAME, NS,
+/// PTR, MX or SRV value with the trailing dot added where it was stored without one; any other
+/// value as stored.
+fn published_value(rtype: &str, value: &str) -> String {
+    let host = |name: &str| {
+        if name.ends_with('.') {
+            name.to_owned()
+        } else {
+            format!("{name}.")
+        }
+    };
+    let fields: Vec<&str> = value.split_whitespace().collect();
+    match (rtype, fields.as_slice()) {
+        ("CNAME" | "NS" | "PTR", [target]) => host(target),
+        ("MX", [preference, exchange]) => format!("{preference} {}", host(exchange)),
+        ("SRV", [priority, weight, port, target]) => {
+            format!("{priority} {weight} {port} {}", host(target))
+        }
+        _ => value.to_owned(),
+    }
 }
 
 /// The sort key of a name: the labels reversed, with a trailing dot.
@@ -1423,11 +1561,13 @@ async fn change_rrsets(
             ));
         }
     }
+    let before = inner.published();
     inner.rrsets = next;
+    inner.report(&before, Origin::Api);
     inner.batches.push(text);
     let change_id = inner.new_id('C');
     let pending = inner.pending_polls;
-    inner.changes.insert(change_id.clone(), pending);
+    inner.change_ids.insert(change_id.clone(), pending);
     xml(
         StatusCode::OK,
         format!(
@@ -1451,7 +1591,7 @@ async fn get_change(
     }
     let status = {
         let mut inner = lock(&state);
-        match inner.changes.get_mut(&id) {
+        match inner.change_ids.get_mut(&id) {
             None => {
                 return aws_error(
                     StatusCode::NOT_FOUND,

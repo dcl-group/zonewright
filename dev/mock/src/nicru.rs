@@ -49,12 +49,28 @@
 //!   lacks its trailing dot as sent).
 //!
 //! Error texts are invented.
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`NicruMock::changes`], the records of one name and type grouped into one rrset, and a
+//! [`link`](crate::link::link) serves them over DNS. Only the committed state is published:
+//! staging a record, deleting one and a rollback change nothing published and report nothing;
+//! a commit reports the whole difference the zone's staged changes make. Every zone is
+//! published. An owner name is read as a zone file reads it: `@` is the apex, a name with the
+//! trailing dot is absolute, any other name is relative to the zone. The published form of a
+//! value: TXT as its strings, each quoted, separated by spaces; A and AAAA as stored; a name in
+//! a CNAME, NS, PTR, DNAME, MX or SRV value read the same way as an owner name and written
+//! fully qualified; other types as their fields separated by spaces. The TTL of the set is the
+//! smallest TTL of its records (a BIND-form TTL converted to seconds), none when no record has
+//! one (the zone's default applies). Left out: the SOA record (the server that serves the zone
+//! answers with its own) and records added through [`Control::insert_raw`], whose content the
+//! documentation does not describe. [`Control::reset`] returns the mock to its seed.
 
 // Handlers return finished HTTP answers as their error values and hand them straight to axum.
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -67,7 +83,8 @@ use axum::routing::{delete, get, post};
 use base64::Engine as _;
 use serde_json::json;
 
-use crate::{Fault, MockServer};
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Fault, Faults, MockServer, RequestLog};
 
 /// Path of the DNS API below the server's base URL.
 pub const API_PATH: &str = "/dns-master";
@@ -152,6 +169,10 @@ impl Record {
 
 #[derive(Debug)]
 struct Inner {
+    /// The seed the mock was started with, for [`Control::reset`]; `seed` below can be changed
+    /// by [`Control::set_password`].
+    initial: Seed,
+    changes: Changes,
     seed: Seed,
     zones: Vec<Zone>,
     /// What the zone files hold now, staged changes included.
@@ -166,6 +187,141 @@ struct Inner {
 }
 
 impl Inner {
+    /// The state of a mock started with `seed`.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        let mut inner = Inner {
+            initial: seed.clone(),
+            changes,
+            zones: Vec::new(),
+            staged: Vec::new(),
+            published: Vec::new(),
+            tokens: Vec::new(),
+            tokens_issued: 0,
+            next_id: 227_000,
+            failing_listings: 0,
+            seed: seed.clone(),
+        };
+        for name in &seed.zones {
+            let id = inner.new_id();
+            inner.zones.push(Zone {
+                id,
+                name: normalize(name),
+                service: seed.service.clone(),
+                primary: true,
+                has_changes: false,
+            });
+        }
+        inner
+    }
+
+    /// What the name servers of the mock's zones answer: the committed records (module
+    /// documentation).
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        for zone in &self.zones {
+            out.zone(&zone.name);
+        }
+        for record in &self.published {
+            let Some(zone) = self.zones.iter().find(|z| z.id == record.zone_id) else {
+                continue;
+            };
+            if record.raw.is_some() || record.rtype == "SOA" {
+                continue;
+            }
+            let ttl = record.ttl.as_deref().and_then(ttl_seconds);
+            out.record(
+                &zone.name,
+                &absolute(&record.name, &zone.name),
+                &record.rtype,
+                ttl,
+                published_value(record, &zone.name),
+            );
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+
+    /// Publishes every staged change of zone `zone`.
+    fn commit(&mut self, zone: u64) {
+        let staged: Vec<Record> = self
+            .staged
+            .iter()
+            .filter(|r| r.zone_id == zone)
+            .cloned()
+            .collect();
+        self.published.retain(|r| r.zone_id != zone);
+        self.published.extend(staged);
+        for z in self.zones.iter_mut().filter(|z| z.id == zone) {
+            z.has_changes = false;
+        }
+    }
+
+    /// Stages a record of zone `zone_id` (see [`Control::stage_record`]); returns its identifier.
+    fn stage(
+        &mut self,
+        zone_id: u64,
+        name: &str,
+        rtype: &str,
+        data: &str,
+        ttl: Option<&str>,
+    ) -> u64 {
+        let id = self.new_id();
+        let strings = if rtype == "TXT" || shape(rtype).is_none() {
+            vec![data.to_owned()]
+        } else {
+            data.split_whitespace().map(str::to_owned).collect()
+        };
+        self.staged.push(Record {
+            id,
+            zone_id,
+            name: name.to_lowercase(),
+            ttl: ttl.map(str::to_owned),
+            rtype: rtype.to_owned(),
+            strings,
+            raw: None,
+        });
+        for z in self.zones.iter_mut().filter(|z| z.id == zone_id) {
+            z.has_changes = true;
+        }
+        id
+    }
+
+    /// The identifier of zone `zone`.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such zone.
+    fn zone_id(&self, zone: &str) -> u64 {
+        self.zone_by_name(zone)
+            .map(|z| z.id)
+            .unwrap_or_else(|| panic!("no zone {zone}"))
+    }
+
+    /// Adds a record published and staged alike (see [`Control::insert_record`]).
+    fn insert(
+        &mut self,
+        zone: &str,
+        name: &str,
+        rtype: &str,
+        data: &str,
+        ttl: Option<&str>,
+    ) -> u64 {
+        let zone_id = self.zone_id(zone);
+        let id = self.stage(zone_id, name, rtype, data, ttl);
+        if let Some(record) = self.staged.iter().find(|r| r.id == id).cloned() {
+            self.published.push(record);
+        }
+        for z in self.zones.iter_mut().filter(|z| z.id == zone_id) {
+            z.has_changes = false;
+        }
+        id
+    }
+
     fn new_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
@@ -197,6 +353,9 @@ pub struct NicruMock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for NicruMock {
@@ -208,29 +367,15 @@ impl Deref for NicruMock {
 }
 
 impl NicruMock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let mut inner = Inner {
-            zones: Vec::new(),
-            staged: Vec::new(),
-            published: Vec::new(),
-            tokens: Vec::new(),
-            tokens_issued: 0,
-            next_id: 227_000,
-            failing_listings: 0,
-            seed: seed.clone(),
-        };
-        for name in &seed.zones {
-            let id = inner.new_id();
-            inner.zones.push(Zone {
-                id,
-                name: normalize(name),
-                service: seed.service.clone(),
-                primary: true,
-                has_changes: false,
-            });
-        }
-        let state = Arc::new(Mutex::new(inner));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new()
             .route("/oauth/token", post(token))
             .route("/dns-master/zones", get(zones))
@@ -251,10 +396,14 @@ impl NicruMock {
                 post(rollback),
             )
             .with_state(state.clone());
-        Self {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The DNS API endpoint, for the client's `base_url`.
@@ -281,8 +430,9 @@ impl NicruMock {
             Fault::on("POST", "/dns-master/services/*/zones/*/commit")
                 .times(times)
                 .run(move || {
+                    // The commit request itself is applied: an API change.
                     for zone in control.zone_names() {
-                        control.commit(&zone);
+                        control.commit_as(&zone, Origin::Api);
                     }
                     control.fail_zone_listings(failing_listings);
                 })
@@ -320,7 +470,39 @@ impl NicruMock {
     }
 }
 
+impl ChangeSource for NicruMock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its credentials, its zones under their
+    /// first identifiers without staged changes, no records, no tokens, no failing listings, an
+    /// empty request log and no pending faults. Reports the removal of every rrset that was
+    /// published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.initial.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// Every zone.
     pub fn zones(&self) -> Vec<Zone> {
         lock(&self.state).zones.clone()
@@ -328,14 +510,15 @@ impl Control {
 
     /// Adds a zone under `service`; `primary` false makes it a zone of a Secondary service.
     pub fn insert_zone(&self, name: &str, service: &str, primary: bool) {
-        let mut inner = lock(&self.state);
-        let id = inner.new_id();
-        inner.zones.push(Zone {
-            id,
-            name: normalize(name),
-            service: service.to_owned(),
-            primary,
-            has_changes: false,
+        self.change(|inner| {
+            let id = inner.new_id();
+            inner.zones.push(Zone {
+                id,
+                name: normalize(name),
+                service: service.to_owned(),
+                primary,
+                has_changes: false,
+            });
         });
     }
 
@@ -346,25 +529,25 @@ impl Control {
     /// If there is no such zone.
     pub fn move_zone(&self, name: &str, service: &str) {
         let name = normalize(name);
-        let mut inner = lock(&self.state);
-        let new_id = inner.new_id();
-        let zone = inner
-            .zones
-            .iter_mut()
-            .find(|z| z.name == name)
-            .unwrap_or_else(|| panic!("no zone {name}"));
-        let old_id = zone.id;
-        zone.id = new_id;
-        zone.service = service.to_owned();
-        let inner = &mut *inner;
-        for record in inner
-            .staged
-            .iter_mut()
-            .chain(inner.published.iter_mut())
-            .filter(|r| r.zone_id == old_id)
-        {
-            record.zone_id = new_id;
-        }
+        self.change(|inner| {
+            let new_id = inner.new_id();
+            let zone = inner
+                .zones
+                .iter_mut()
+                .find(|z| z.name == name)
+                .unwrap_or_else(|| panic!("no zone {name}"));
+            let old_id = zone.id;
+            zone.id = new_id;
+            zone.service = service.to_owned();
+            for record in inner
+                .staged
+                .iter_mut()
+                .chain(inner.published.iter_mut())
+                .filter(|r| r.zone_id == old_id)
+            {
+                record.zone_id = new_id;
+            }
+        });
     }
 
     /// True when zone `name` has staged changes that are not committed.
@@ -401,16 +584,7 @@ impl Control {
         data: &str,
         ttl: Option<&str>,
     ) -> u64 {
-        let id = self.stage_record(zone, name, rtype, data, ttl);
-        let mut inner = lock(&self.state);
-        if let Some(record) = inner.staged.iter().find(|r| r.id == id).cloned() {
-            inner.published.push(record);
-        }
-        let zone_id = record_zone(&inner, id);
-        for z in inner.zones.iter_mut().filter(|z| Some(z.id) == zone_id) {
-            z.has_changes = false;
-        }
-        id
+        self.change(|inner| inner.insert(zone, name, rtype, data, ttl))
     }
 
     /// Stages a record without committing it, as another writer's edit would; the zone then
@@ -427,30 +601,11 @@ impl Control {
         data: &str,
         ttl: Option<&str>,
     ) -> u64 {
-        let mut inner = lock(&self.state);
-        let zone_id = inner
-            .zone_by_name(zone)
-            .map(|z| z.id)
-            .unwrap_or_else(|| panic!("no zone {zone}"));
-        let id = inner.new_id();
-        let strings = if rtype == "TXT" || shape(rtype).is_none() {
-            vec![data.to_owned()]
-        } else {
-            data.split_whitespace().map(str::to_owned).collect()
-        };
-        inner.staged.push(Record {
-            id,
-            zone_id,
-            name: name.to_lowercase(),
-            ttl: ttl.map(str::to_owned),
-            rtype: rtype.to_owned(),
-            strings,
-            raw: None,
-        });
-        for z in inner.zones.iter_mut().filter(|z| z.id == zone_id) {
-            z.has_changes = true;
-        }
-        id
+        // Staged only: nothing published changes, and the helper reports nothing.
+        self.change(|inner| {
+            let zone_id = inner.zone_id(zone);
+            inner.stage(zone_id, name, rtype, data, ttl)
+        })
     }
 
     /// Adds a published record of `rtype` at `name` (relative, as listed) whose type element is
@@ -468,19 +623,19 @@ impl Control {
         element: &str,
         ttl: Option<&str>,
     ) -> u64 {
-        let id = self.insert_record(zone, name, rtype, "", ttl);
-        let mut inner = lock(&self.state);
-        let inner = &mut *inner;
-        for record in inner
-            .staged
-            .iter_mut()
-            .chain(inner.published.iter_mut())
-            .filter(|r| r.id == id)
-        {
-            record.name = name.to_owned();
-            record.raw = Some(element.to_owned());
-        }
-        id
+        self.change(|inner| {
+            let id = inner.insert(zone, name, rtype, "", ttl);
+            for record in inner
+                .staged
+                .iter_mut()
+                .chain(inner.published.iter_mut())
+                .filter(|r| r.id == id)
+            {
+                record.name = name.to_owned();
+                record.raw = Some(element.to_owned());
+            }
+            id
+        })
     }
 
     /// Every published record of zone `zone`.
@@ -515,19 +670,21 @@ impl Control {
     /// whose answer was lost would; the zone then has changes.
     pub fn stage_txt_deletion(&self, name: &str, value: &str) {
         let name = name.to_lowercase();
-        let mut inner = lock(&self.state);
-        let zones: Vec<u64> = inner
-            .staged
-            .iter()
-            .filter(|r| r.name == name && r.rtype == "TXT" && r.value() == value)
-            .map(|r| r.zone_id)
-            .collect();
-        inner
-            .staged
-            .retain(|r| !(r.name == name && r.rtype == "TXT" && r.value() == value));
-        for z in inner.zones.iter_mut().filter(|z| zones.contains(&z.id)) {
-            z.has_changes = true;
-        }
+        // Staged only: nothing published changes, and the helper reports nothing.
+        self.change(|inner| {
+            let zones: Vec<u64> = inner
+                .staged
+                .iter()
+                .filter(|r| r.name == name && r.rtype == "TXT" && r.value() == value)
+                .map(|r| r.zone_id)
+                .collect();
+            inner
+                .staged
+                .retain(|r| !(r.name == name && r.rtype == "TXT" && r.value() == value));
+            for z in inner.zones.iter_mut().filter(|z| zones.contains(&z.id)) {
+                z.has_changes = true;
+            }
+        });
     }
 
     /// The staged records of `name` (relative, `@` for the apex) and `rtype`.
@@ -558,21 +715,18 @@ impl Control {
     /// Publishes every staged change of zone `zone`, as a commit request would; for a fault hook
     /// that applies a commit whose answer is then lost.
     pub fn commit(&self, zone: &str) {
+        self.commit_as(zone, Origin::Control);
+    }
+
+    /// [`Control::commit`], reported with `origin`.
+    fn commit_as(&self, zone: &str, origin: Origin) {
         let mut inner = lock(&self.state);
         let Some(id) = inner.zone_by_name(zone).map(|z| z.id) else {
             return;
         };
-        let staged: Vec<Record> = inner
-            .staged
-            .iter()
-            .filter(|r| r.zone_id == id)
-            .cloned()
-            .collect();
-        inner.published.retain(|r| r.zone_id != id);
-        inner.published.extend(staged);
-        for z in inner.zones.iter_mut().filter(|z| z.id == id) {
-            z.has_changes = false;
-        }
+        let before = inner.published();
+        inner.commit(id);
+        inner.report(&before, origin);
     }
 
     /// Discards every staged change of zone `zone`, as a rollback request would; for a fault
@@ -627,10 +781,6 @@ impl Control {
     }
 }
 
-fn record_zone(inner: &Inner, id: u64) -> Option<u64> {
-    inner.staged.iter().find(|r| r.id == id).map(|r| r.zone_id)
-}
-
 fn of(records: &[Record], name: &str, rtype: &str) -> Vec<Record> {
     let name = name.to_lowercase();
     records
@@ -638,6 +788,83 @@ fn of(records: &[Record], name: &str, rtype: &str) -> Vec<Record> {
         .filter(|r| r.name == name && r.rtype == rtype)
         .cloned()
         .collect()
+}
+
+/// A name of zone `zone` as a zone file reads it, fully qualified with the trailing dot: `@` or
+/// an empty name is the apex, a name with the trailing dot is absolute, any other name is
+/// relative to the zone.
+fn absolute(name: &str, zone: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() || name == "@" {
+        format!("{zone}.")
+    } else if name.ends_with('.') {
+        name.to_owned()
+    } else {
+        format!("{name}.{zone}.")
+    }
+}
+
+/// The value of `record` of zone `zone` in zone-file text (module documentation).
+fn published_value(record: &Record, zone: &str) -> String {
+    let field = |i: usize| record.strings.get(i).map(String::as_str).unwrap_or("");
+    match record.rtype.as_str() {
+        "TXT" => {
+            let quoted: Vec<String> = record.strings.iter().map(|s| quote(s)).collect();
+            quoted.join(" ")
+        }
+        "CNAME" | "NS" | "PTR" | "DNAME" => absolute(field(0), zone),
+        "MX" => format!("{} {}", field(0), absolute(field(1), zone)),
+        "SRV" => format!(
+            "{} {} {} {}",
+            field(0),
+            field(1),
+            field(2),
+            absolute(field(3), zone)
+        ),
+        _ => record.strings.join(" "),
+    }
+}
+
+/// `text` as one quoted character-string, `"` and `\` escaped.
+fn quote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        if matches!(c, '"' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// A TTL in seconds from its numeric or BIND form ([`valid_ttl`]); `None` for anything else.
+fn ttl_seconds(ttl: &str) -> Option<u32> {
+    if let Ok(seconds) = ttl.parse::<u32>() {
+        return Some(seconds);
+    }
+    if !valid_ttl(ttl) {
+        return None;
+    }
+    let mut total: u64 = 0;
+    let mut number: u64 = 0;
+    for c in ttl.chars() {
+        if let Some(digit) = c.to_digit(10) {
+            number = number.saturating_mul(10).saturating_add(u64::from(digit));
+        } else {
+            let unit = match c.to_ascii_lowercase() {
+                'w' => 604_800,
+                'd' => 86_400,
+                'h' => 3600,
+                'm' => 60,
+                _ => 1,
+            };
+            total = total.saturating_add(number.saturating_mul(unit));
+            number = 0;
+        }
+    }
+    u32::try_from(total).ok()
 }
 
 fn normalize(name: &str) -> String {
@@ -1170,17 +1397,9 @@ async fn commit(
         Ok(zone) => zone,
         Err(r) => return r,
     };
-    let staged: Vec<Record> = inner
-        .staged
-        .iter()
-        .filter(|r| r.zone_id == zone.id)
-        .cloned()
-        .collect();
-    inner.published.retain(|r| r.zone_id != zone.id);
-    inner.published.extend(staged);
-    for z in inner.zones.iter_mut().filter(|z| z.id == zone.id) {
-        z.has_changes = false;
-    }
+    let before = inner.published();
+    inner.commit(zone.id);
+    inner.report(&before, Origin::Api);
     success(None)
 }
 
@@ -1232,6 +1451,21 @@ mod tests {
         for bad in ["", "h", "1h3", "-1", "1x"] {
             assert!(!valid_ttl(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn bind_ttls_convert_to_seconds() {
+        assert_eq!(ttl_seconds("300"), Some(300));
+        assert_eq!(ttl_seconds("1h30m"), Some(5400));
+        assert_eq!(ttl_seconds("2W"), Some(1_209_600));
+        assert_eq!(ttl_seconds("1x"), None);
+    }
+
+    #[test]
+    fn names_are_read_as_a_zone_file_reads_them() {
+        assert_eq!(absolute("@", "example.org"), "example.org.");
+        assert_eq!(absolute("www", "example.org"), "www.example.org.");
+        assert_eq!(absolute("x.example.net.", "example.org"), "x.example.net.");
     }
 
     #[test]

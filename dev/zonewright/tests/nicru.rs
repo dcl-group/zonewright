@@ -3604,3 +3604,118 @@ async fn nicru_provider_default_ttl() {
         .unwrap();
     assert_eq!(control.published("new", "A")[0].ttl, None);
 }
+
+// ---- Served over DNS ---------------------------------------------------------------------------
+
+/// What the mock publishes, its committed state, is answered by the DNS mock through a link.
+#[cfg(feature = "inspector")]
+mod served_over_dns {
+    use std::sync::{Arc, Mutex};
+
+    use zonewright::RecordType;
+    use zonewright_mock::Fault;
+    use zonewright_mock::changes::{ChangeSource as _, Origin};
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+
+    use super::common::link::{NAME, ZONE, ask, is_absent, rd, txt, txt_round_trip, values};
+    use super::{COMMIT, REL, setup};
+
+    /// A TXT value goes to DNS and away again. A staged change reports nothing; the commit
+    /// reports it. A name inside a value stored without the trailing dot is read relative to the
+    /// zone, as a zone file reads it.
+    #[tokio::test]
+    async fn nicru_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = txt_round_trip(&mock, &client, &dns).await;
+
+        // What the hub had emitted and what the mock held when each commit request arrived.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook = {
+            let (seen, hub, control) =
+                (seen.clone(), mock.changes().clone(), mock.control().clone());
+            move || {
+                seen.lock().unwrap().push((
+                    hub.emitted(),
+                    control.staged_txt(REL),
+                    control.published_txt(REL),
+                ))
+            }
+        };
+        mock.faults()
+            .push(Fault::on("POST", COMMIT).always().run(hook));
+        let mut stream = mock.changes().subscribe();
+        let emitted = mock.changes().emitted();
+        super::add(&client, "staged-first").await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(emitted, vec!["staged-first".to_owned()], Vec::new())]
+        );
+        let change = stream.try_next().unwrap();
+        assert_eq!(change.name, NAME);
+        assert_eq!(change.origin, Origin::Api);
+        assert_eq!(change.rrset.unwrap().values, ["\"staged-first\""]);
+        assert!(stream.try_next().is_none());
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("staged-first")]
+        );
+
+        // A deletion is staged too, and reported by its commit.
+        seen.lock().unwrap().clear();
+        super::remove(&client, "staged-first").await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(emitted + 1, Vec::new(), vec!["staged-first".to_owned()])]
+        );
+        let change = stream.try_next().unwrap();
+        assert_eq!((change.name.as_str(), change.rrset), (NAME, None));
+        mock.faults().clear();
+
+        mock.control()
+            .insert_record(ZONE, "www", "CNAME", "target", Some("1h"));
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), "www.example.org", RecordType::CNAME).await),
+            [rd(RecordType::CNAME, "target.example.org.")]
+        );
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+        assert_eq!(link.skipped(), 0);
+    }
+
+    /// A reset returns the mock to its seed: the record written through the client is gone from
+    /// the mock and from DNS, the request log and the issued tokens are empty, and the client
+    /// works again.
+    #[tokio::test]
+    async fn nicru_reset_returns_to_the_seed() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        let mut stream = mock.changes().subscribe();
+        super::add(&client, "before-reset").await.unwrap();
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("before-reset")]
+        );
+        assert!(stream.try_next().is_some());
+
+        mock.control().reset();
+        let removal = stream.try_next().unwrap();
+        assert_eq!((removal.name.as_str(), removal.rrset), (NAME, None));
+        assert!(mock.control().published_all(ZONE).is_empty());
+        assert!(mock.control().staged_all(ZONE).is_empty());
+        assert!(mock.log().is_empty());
+        assert_eq!(mock.control().tokens_issued(), 0);
+        link.settled().await;
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+
+        super::add(&client, "after-reset").await.unwrap();
+        assert_eq!(mock.control().published_txt(REL), ["after-reset"]);
+        assert_eq!(mock.control().tokens_issued(), 1);
+    }
+}

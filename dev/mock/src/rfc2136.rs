@@ -90,15 +90,30 @@
 //! // ... drive the client against mock.server() ...
 //! assert_eq!(mock.control().txt("_acme-challenge.example.org."), ["v1"]);
 //! ```
+//!
+//! For uniformity with the provider mocks, the mock is also a [`ChangeSource`]: it reports every
+//! change of the records it serves through [`Rfc2136Mock::changes`] (an accepted update with
+//! [`Origin::Api`]; [`Control::add_record`], [`Control::add_txt`], the foreign writes of a
+//! [`Fault`] and [`Control::reset`] with [`Origin::Control`]), and its published state is what it
+//! answers itself. Every zone of the seed is published, and every record inside one of them (in
+//! the longest zone that holds its name), in zone-file text: A and AAAA as addresses; NS, CNAME,
+//! PTR and the exchange of MX fully qualified with the trailing dot; TXT as its quoted
+//! character-strings; CAA as `<flags> <tag> "<value>"`; any other type in the generic form of
+//! RFC 3597 section 5 (`\# <length> <hex>`). The TTL of a set is the smallest TTL of its records.
+//! Left out: the SOA record (a server the records are linked to answers with its own) and
+//! records outside every zone, which the mock does not answer.
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::fmt::Write as _;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::hmac;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+use crate::changes::{ChangeSource, Changes, Origin, Published};
 
 /// Type code of TXT (RFC 1035 section 3.2.2).
 pub const TYPE_TXT: u16 = 16;
@@ -114,6 +129,10 @@ pub const TYPE_SOA: u16 = 6;
 pub const TYPE_MX: u16 = 15;
 /// Type code of PTR (RFC 1035 section 3.2.2).
 const TYPE_PTR: u16 = 12;
+/// Type code of AAAA (RFC 3596 section 2.1).
+const TYPE_AAAA: u16 = 28;
+/// Type code of CAA (RFC 8659 section 4).
+const TYPE_CAA: u16 = 257;
 const TYPE_TSIG: u16 = 250;
 /// Type code ANY (RFC 1035 section 3.2.3).
 pub const TYPE_ANY: u16 = 255;
@@ -494,9 +513,38 @@ struct State {
 pub struct Control {
     seed: Arc<Seed>,
     state: Arc<Mutex<State>>,
+    changes: Changes,
 }
 
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed to the records served, with
+    /// `origin`.
+    fn change_as<R>(&self, origin: Origin, f: impl FnOnce(&mut State) -> R) -> R {
+        let mut state = lock(&self.state);
+        let before = published(&self.seed, &state.records);
+        let out = f(&mut state);
+        self.changes
+            .emit_diff(&before, &published(&self.seed, &state.records), origin);
+        out
+    }
+
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        self.change_as(Origin::Control, f)
+    }
+
+    /// Returns the server to the seed it was started with: the seed's records, no requests
+    /// recorded, no pending faults, queries answered and no clock skew. Reports the removal of
+    /// every rrset that is not in the seed and the return of every seeded rrset that was changed.
+    pub fn reset(&self) {
+        self.change(|state| {
+            *state = State {
+                records: self.seed.records.clone(),
+                ..State::default()
+            };
+        });
+    }
+
     /// The decoded TXT values at `name` (character-strings concatenated, lossy UTF-8), sorted.
     pub fn txt(&self, name: &str) -> Vec<String> {
         let mut values: Vec<String> = self
@@ -556,7 +604,7 @@ impl Control {
 
     /// Adds a record as given.
     pub fn add_record(&self, record: MockRecord) {
-        lock(&self.state).records.push(record);
+        self.change(|state| state.records.push(record));
     }
 
     /// Every request received so far.
@@ -633,6 +681,22 @@ pub struct Rfc2136Mock {
 impl Rfc2136Mock {
     /// Starts the server on `127.0.0.1` with an ephemeral port, the same number for TCP and UDP.
     pub async fn start(seed: Seed) -> Rfc2136Mock {
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the server on `addr`, TCP and UDP on the same port: for example `0.0.0.0:5353`, so
+    /// that a client in another container can reach it. Port 0 takes an ephemeral port;
+    /// [`Rfc2136Mock::addr`] reports the one bound. After a bind to a wildcard address that
+    /// address is no destination: the caller forms the client's `server` setting from the host
+    /// name or address its clients use, with the bound port.
+    ///
+    /// A bind to an address other than loopback exposes the server to every host that can reach
+    /// this one. It is meant for an isolated test network.
+    ///
+    /// # Panics
+    ///
+    /// If the address cannot be bound for TCP and UDP.
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Rfc2136Mock {
         let state = State {
             records: seed.records.clone(),
             ..State::default()
@@ -640,20 +704,24 @@ impl Rfc2136Mock {
         let control = Control {
             seed: Arc::new(seed),
             state: Arc::new(Mutex::new(state)),
+            changes: Changes::new(),
         };
-        // The ephemeral TCP port may be taken for UDP by another process: try another one.
+        // The ephemeral TCP port may be taken for UDP by another process: try another one. A
+        // port given by the caller is tried once.
+        let attempts = if addr.port() == 0 { 32 } else { 1 };
         let mut bound = None;
-        for _ in 0..32 {
-            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        for _ in 0..attempts {
+            let listener = TcpListener::bind(addr)
                 .await
-                .expect("bind 127.0.0.1:0");
-            let addr = listener.local_addr().expect("local address");
-            if let Ok(socket) = UdpSocket::bind(addr).await {
-                bound = Some((listener, socket, addr));
+                .unwrap_or_else(|err| panic!("bind {addr}: {err}"));
+            let local = listener.local_addr().expect("local address");
+            if let Ok(socket) = UdpSocket::bind(local).await {
+                bound = Some((listener, socket, local));
                 break;
             }
         }
-        let (listener, socket, addr) = bound.expect("bind TCP and UDP on one port of 127.0.0.1");
+        let (listener, socket, addr) =
+            bound.unwrap_or_else(|| panic!("bind TCP and UDP on one port of {}", addr.ip()));
         let (tx, mut rx) = tokio::sync::watch::channel(());
         let mut udp_rx = rx.clone();
         let accept_control = control.clone();
@@ -697,6 +765,166 @@ impl Rfc2136Mock {
     pub fn control(&self) -> &Control {
         &self.control
     }
+}
+
+impl ChangeSource for Rfc2136Mock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        published(&self.control.seed, &lock(&self.control.state).records)
+    }
+}
+
+/// What the server answers for its zones, in the form of [`Published`] (module documentation).
+fn published(seed: &Seed, records: &[MockRecord]) -> Published {
+    let mut out = Published::new();
+    for zone in &seed.zones {
+        out.zone(zone);
+    }
+    for record in records {
+        if record.rtype == TYPE_SOA {
+            continue;
+        }
+        let Some(zone) = seed
+            .zones
+            .iter()
+            .filter(|z| in_zone(&record.name, z))
+            .max_by_key(|z| z.len())
+        else {
+            continue;
+        };
+        out.record(
+            zone,
+            &record.name,
+            &type_mnemonic(record.rtype),
+            Some(record.ttl),
+            rdata_text(record.rtype, &record.rdata),
+        );
+    }
+    out
+}
+
+/// The mnemonic of a type code (RFC 3597 section 5 for a type without one here).
+fn type_mnemonic(rtype: u16) -> String {
+    match rtype {
+        TYPE_A => "A".to_owned(),
+        TYPE_NS => "NS".to_owned(),
+        TYPE_CNAME => "CNAME".to_owned(),
+        TYPE_SOA => "SOA".to_owned(),
+        TYPE_PTR => "PTR".to_owned(),
+        TYPE_MX => "MX".to_owned(),
+        TYPE_TXT => "TXT".to_owned(),
+        TYPE_AAAA => "AAAA".to_owned(),
+        TYPE_CAA => "CAA".to_owned(),
+        other => format!("TYPE{other}"),
+    }
+}
+
+/// `bytes` as the inside of a quoted character-string: `"` and `\` escaped, any octet outside
+/// printable ASCII as `\DDD` (RFC 1035 section 5.1).
+fn escaped(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in bytes {
+        match b {
+            b'"' | b'\\' => {
+                out.push('\\');
+                out.push(char::from(b));
+            }
+            0x20..=0x7e => out.push(char::from(b)),
+            _ => {
+                let _ = write!(out, "\\{b:03}");
+            }
+        }
+    }
+    out
+}
+
+/// An uncompressed wire-format name as text with the trailing dot; `None` when malformed or
+/// when octets follow it.
+fn name_text(wire: &[u8]) -> Option<String> {
+    let mut out = String::new();
+    let mut i = 0;
+    loop {
+        let len = usize::from(*wire.get(i)?);
+        if len == 0 {
+            if out.is_empty() {
+                out.push('.');
+            }
+            return (i + 1 == wire.len()).then_some(out);
+        }
+        for &b in wire.get(i + 1..i + 1 + len)? {
+            match b {
+                b'.' | b'\\' => {
+                    out.push('\\');
+                    out.push(char::from(b));
+                }
+                0x21..=0x7e => out.push(char::from(b.to_ascii_lowercase())),
+                _ => {
+                    let _ = write!(out, "\\{b:03}");
+                }
+            }
+        }
+        out.push('.');
+        i += 1 + len;
+    }
+}
+
+/// RDATA in zone-file text (module documentation); the generic form of RFC 3597 section 5 for a
+/// type it does not convert or RDATA that does not read as its type.
+fn rdata_text(rtype: u16, rdata: &[u8]) -> String {
+    let typed = match rtype {
+        TYPE_A => <[u8; 4]>::try_from(rdata)
+            .ok()
+            .map(|a| Ipv4Addr::from(a).to_string()),
+        TYPE_AAAA => <[u8; 16]>::try_from(rdata)
+            .ok()
+            .map(|a| std::net::Ipv6Addr::from(a).to_string()),
+        TYPE_NS | TYPE_CNAME | TYPE_PTR => name_text(rdata),
+        TYPE_MX => be16(rdata, 0).and_then(|preference| {
+            let exchange = name_text(rdata.get(2..)?)?;
+            Some(format!("{preference} {exchange}"))
+        }),
+        TYPE_TXT => {
+            let mut strings = Vec::new();
+            let mut i = 0;
+            let mut valid = !rdata.is_empty();
+            while i < rdata.len() {
+                let n = usize::from(rdata[i]);
+                match rdata.get(i + 1..i + 1 + n) {
+                    Some(s) => strings.push(format!("\"{}\"", escaped(s))),
+                    None => {
+                        valid = false;
+                        break;
+                    }
+                }
+                i += 1 + n;
+            }
+            valid.then(|| strings.join(" "))
+        }
+        TYPE_CAA => {
+            let flags = rdata.first();
+            let tag_len = rdata.get(1).map(|n| usize::from(*n));
+            match (flags, tag_len) {
+                (Some(flags), Some(n)) => rdata.get(2..2 + n).and_then(|tag| {
+                    let value = rdata.get(2 + n..)?;
+                    let tag = std::str::from_utf8(tag).ok()?;
+                    Some(format!("{flags} {tag} \"{}\"", escaped(value)))
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    typed.unwrap_or_else(|| {
+        let hex: String = rdata.iter().map(|b| format!("{b:02x}")).collect();
+        if hex.is_empty() {
+            "\\# 0".to_owned()
+        } else {
+            format!("\\# {} {hex}", rdata.len())
+        }
+    })
 }
 
 async fn serve_udp(socket: UdpSocket, control: Control) {
@@ -1081,9 +1309,11 @@ async fn handle_on(b: &[u8], control: &Control, transport: Transport) -> Reply {
         tokio::time::sleep(fault.delay).await;
     }
     if let Some((name, rtype)) = &fault.foreign_delete {
-        lock(&control.state)
-            .records
-            .retain(|r| !(&r.name == name && r.rtype == *rtype));
+        control.change(|state| {
+            state
+                .records
+                .retain(|r| !(&r.name == name && r.rtype == *rtype));
+        });
     }
     if let Some(record) = &fault.foreign {
         control.add_record(record.clone());
@@ -1361,7 +1591,18 @@ fn process(req: &Request, control: &Control, refuse_queries: bool) -> Outcome {
                 authority,
             }
         }
-        5 => Outcome::rcode(update(req, zones, &mut state.records)),
+        5 => {
+            let before = published(&control.seed, &state.records);
+            let rcode = update(req, zones, &mut state.records);
+            if rcode == NOERROR {
+                control.changes.emit_diff(
+                    &before,
+                    &published(&control.seed, &state.records),
+                    Origin::Api,
+                );
+            }
+            Outcome::rcode(rcode)
+        }
         _ => Outcome::rcode(NOTIMP),
     }
 }
@@ -1746,6 +1987,52 @@ fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rdata_reads_as_zone_file_text() {
+        assert_eq!(rdata_text(TYPE_A, &[192, 0, 2, 1]), "192.0.2.1");
+        let mut v6 = [0u8; 16];
+        v6[..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
+        v6[15] = 1;
+        assert_eq!(rdata_text(TYPE_AAAA, &v6), "2001:db8::1");
+        assert_eq!(
+            rdata_text(TYPE_CNAME, &wire_name("Target.Example.net.")),
+            "target.example.net."
+        );
+        let mut mx = 10u16.to_be_bytes().to_vec();
+        mx.extend_from_slice(&wire_name("mail.example.net."));
+        assert_eq!(rdata_text(TYPE_MX, &mx), "10 mail.example.net.");
+        assert_eq!(
+            rdata_text(TYPE_TXT, b"\x03a\"b\x02\\\x01"),
+            "\"a\\\"b\" \"\\\\\\001\""
+        );
+        assert_eq!(
+            rdata_text(TYPE_CAA, b"\x00\x05issueca.example.net"),
+            "0 issue \"ca.example.net\""
+        );
+        assert_eq!(rdata_text(99, &[0xab, 0x01]), "\\# 2 ab01");
+        assert_eq!(rdata_text(TYPE_A, &[1, 2, 3]), "\\# 3 010203");
+        assert_eq!(type_mnemonic(99), "TYPE99");
+    }
+
+    #[test]
+    fn published_state_leaves_out_soa_and_names_outside_the_zones() {
+        let record = |name: &str, rtype: u16, rdata: &[u8]| MockRecord {
+            name: name.to_owned(),
+            rtype,
+            ttl: 300,
+            rdata: rdata.to_vec(),
+        };
+        let records = [
+            record("example.org.", TYPE_SOA, &[0; 22]),
+            record("www.example.org.", TYPE_A, &[192, 0, 2, 1]),
+            record("www.example.net.", TYPE_A, &[192, 0, 2, 2]),
+        ];
+        let out = published(&Seed::standard(), &records);
+        assert_eq!(out.zones, ["example.org"]);
+        assert_eq!(out.rrsets.len(), 1);
+        assert_eq!(out.rrsets[0].name, "www.example.org");
+    }
 
     /// Builds a signed request the way RFC 8945 describes it, independently of the client.
     fn signed(unsigned: &[u8], key: &MockKey, time: u64) -> (Vec<u8>, Vec<u8>) {

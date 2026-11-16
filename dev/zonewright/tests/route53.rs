@@ -3316,3 +3316,101 @@ async fn live_route53_record_round_trip() {
     }
     assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
 }
+
+// ---- Served over DNS ---------------------------------------------------------------------------
+
+/// What the mock holds is answered by the DNS mock through a link.
+#[cfg(feature = "inspector")]
+mod served_over_dns {
+    use zonewright::{Expect, Provider, RecordType, RrSet};
+    use zonewright_mock::changes::ChangeSource as _;
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+
+    use super::common::dn;
+    use super::common::link::{NAME, ZONE, ask, is_absent, rd, txt, txt_round_trip, values};
+    use super::{ZID, setup};
+
+    /// The private zone of the standard seed with the same name as the public one.
+    const PRIVATE: &str = "ZPRIVATE0000000001";
+
+    /// A TXT value goes to DNS and away again. Of the sets the API holds, only the simple sets
+    /// of the public zone are answered: not an alias set, not a routing-policy set, not a set of
+    /// the private zone of the same name. An MX written through `set_rrset` is answered with its
+    /// exchange fully qualified.
+    #[tokio::test]
+    async fn route53_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = txt_round_trip(&mock, &client, &dns).await;
+
+        let control = mock.control();
+        control.insert_rrset(ZID, "plain.example.org", "A", 300, &["192.0.2.1"]);
+        control.insert_alias(ZID, "alias.example.org", "A", "d111111abcdef8.example.net.");
+        control.insert_policy_set(
+            ZID,
+            "weighted.example.org",
+            "A",
+            Some("eu"),
+            "<Weight>5</Weight>",
+            60,
+            &["192.0.2.2"],
+        );
+        control.insert_rrset(PRIVATE, "inside.example.org", "A", 300, &["192.0.2.3"]);
+        let mx = rd(RecordType::MX, "10 mail.example.net.");
+        let set = RrSet::new(dn(ZONE), RecordType::MX, None, [mx.clone()]).unwrap();
+        client
+            .set_rrset(&dn(ZONE), &set, Expect::Any)
+            .await
+            .unwrap();
+        link.settled().await;
+
+        assert_eq!(
+            values(ask(dns.addr(), "plain.example.org", RecordType::A).await),
+            [rd(RecordType::A, "192.0.2.1")]
+        );
+        assert_eq!(values(ask(dns.addr(), ZONE, RecordType::MX).await), [mx]);
+        for name in [
+            "alias.example.org",
+            "weighted.example.org",
+            "inside.example.org",
+        ] {
+            let answer = ask(dns.addr(), name, RecordType::A).await;
+            assert!(is_absent(&answer), "{name}: {answer:?}");
+        }
+        assert_eq!(link.skipped(), 0);
+    }
+
+    /// A reset returns the mock to its seed: the record written through the client is gone from
+    /// the mock and from DNS, the request log and the batches are empty, and the client works
+    /// again.
+    #[tokio::test]
+    async fn route53_reset_returns_to_the_seed() {
+        let (mock, client) = setup().await;
+        let seeded = mock.control().rrsets();
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        let mut stream = mock.changes().subscribe();
+        super::add(&client, "before-reset").await.unwrap();
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("before-reset")]
+        );
+        assert!(stream.try_next().is_some());
+
+        mock.control().reset();
+        let removal = stream.try_next().unwrap();
+        assert_eq!((removal.name.as_str(), removal.rrset), (NAME, None));
+        assert!(stream.try_next().is_none());
+        assert_eq!(mock.control().rrsets(), seeded);
+        assert!(mock.control().batches().is_empty());
+        assert!(mock.log().is_empty());
+        link.settled().await;
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+
+        super::add(&client, "after-reset").await.unwrap();
+        assert_eq!(mock.control().txt_values(NAME), ["after-reset"]);
+    }
+}
