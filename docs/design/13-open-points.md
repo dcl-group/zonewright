@@ -231,9 +231,11 @@ reads the same; host names in `target` are absolute, written with the dot; CAA a
 `0 issue "letsencrypt.org"` and TLSA as `3 1 1 <hex>` are accepted and read back equal; TTL 60 and
 86400 (the client's bounds) are accepted and a PUT with `target`, `ttl` and `subDomain` changes the
 TTL; a refresh of a zone without staged changes succeeds; an add repeated at once finds the value
-(no listing lag after a create). Not covered: that the record endpoints report the staged state
-(everything rests on it; a lookup at the zone's name servers is outside the test); what `ttl` `0`
-and `null` mean on read and the served TTL of a record created with `0` or without `ttl` next to
+(no listing lag after a create). Not covered: that a refresh sent after the answer to a record write
+publishes that write (lego and the Terraform provider assume the same), and whether a write that
+timed out can still be applied after a later refresh; that the record endpoints report the staged
+state (everything rests on it; a lookup at the zone's name servers is outside the test); what `ttl`
+`0` and `null` mean on read and the served TTL of a record created with `0` or without `ttl` next to
 such records; whether a PUT without `ttl` leaves the TTL; whether SPF, DKIM and DMARC records are
 served as TXT; the status and `class` of an unknown zone and of the signature, key and timestamp
 failures; how long a refreshed zone takes to be served (60 s assumed); when a new record becomes

@@ -1143,11 +1143,11 @@ async fn ovh_failed_refresh_then_failed_delete_expectation_publishes() {
 async fn ovh_dropped_operation_is_published_by_the_next_one() {
     let (mock, client) = setup().await;
     // The operation's refresh is held, and not applied while the test looks; the operation is
-    // dropped once the refresh has reached the mock.
-    let refresh = mock.control().hold_refreshes(1);
+    // dropped once the refresh has reached the mock. Both holds live to the end of the test.
+    let first = mock.control().hold_refreshes(1);
     tokio::select! {
         _ = add(&client, "AAA") => panic!("the operation was not dropped"),
-        () = held(&refresh, 1) => {}
+        () = held(&first, 1) => {}
     }
     assert_eq!(mock.control().txt_values(NAME), ["\"AAA\""]);
     assert!(!settled(&mock));
@@ -1165,10 +1165,10 @@ async fn ovh_dropped_operation_is_published_by_the_next_one() {
     client.list_rrsets(&zone()).await.unwrap();
     assert_eq!(refreshes(&mock), before + 1);
 
-    let refresh = mock.control().hold_refreshes(1);
+    let second = mock.control().hold_refreshes(1);
     tokio::select! {
         _ = add(&client, "BBB") => panic!("the operation was not dropped"),
-        () = held(&refresh, 1) => {}
+        () = held(&second, 1) => {}
     }
     assert!(!settled(&mock));
     let e = add(&client, "two words").await.unwrap_err();
@@ -1221,8 +1221,10 @@ async fn ovh_refresh_does_not_cover_a_write_in_flight() {
 }
 
 /// An operation dropped while its record write is in flight, after another operation's refresh
-/// succeeded meanwhile: the write stays owed, and the next operation in the zone refreshes. Once
-/// that refresh succeeded nothing is owed: the dropped write no longer counts as in flight.
+/// succeeded meanwhile: the write stays owed, and the next operation in the zone refreshes. A
+/// write ended by a dropped future may still be applied later, so it is owed once more, and the
+/// operation after that refreshes again; then nothing is owed: the dropped write no longer counts
+/// as in flight.
 #[tokio::test]
 async fn ovh_write_dropped_in_flight_stays_owed() {
     let (mock, client) = setup().await;
@@ -1246,12 +1248,15 @@ async fn ovh_write_dropped_in_flight_stays_owed() {
         .unwrap();
     assert_eq!(refreshes(&mock), before + 1);
     client.list_rrsets(&zone()).await.unwrap();
-    assert_eq!(refreshes(&mock), before + 1);
+    assert_eq!(refreshes(&mock), before + 2);
+    client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(refreshes(&mock), before + 2);
 }
 
 /// Three operations in one zone. B's record write is held; meanwhile C writes at another name and
 /// refreshes, and A reads. C's refresh covers C's write, not B's, so A's read refreshes again.
-/// B is then dropped: the next operation refreshes once more, and after it nothing is owed.
+/// B is then dropped: the next two operations refresh (a write ended by a dropped future is owed
+/// once more), and after them nothing is owed.
 #[tokio::test]
 async fn ovh_refresh_of_a_finished_write_does_not_cover_one_in_flight() {
     let (mock, client) = setup().await;
@@ -1288,7 +1293,158 @@ async fn ovh_refresh_of_a_finished_write_does_not_cover_one_in_flight() {
         .unwrap();
     assert_eq!(refreshes(&mock), before + 1);
     client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(refreshes(&mock), before + 2);
+    client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(refreshes(&mock), before + 2);
+}
+
+/// Adds `value` at `_acme-challenge.www.example.org`, a name other than [`NAME`].
+async fn add_other(client: &impl Provider, value: &str) -> Result<AddOutcome, Error> {
+    client
+        .add_txt_value(
+            &zone(),
+            &dn("_acme-challenge.www.example.org"),
+            &txt(value),
+            None,
+        )
+        .await
+}
+
+/// The conservative direction: X's refresh is taken (and held) before Y's record write starts;
+/// Y's write is answered and Y is dropped while its own refresh is in flight. X's refresh then
+/// succeeds after Y's write was stored, so the zone is in fact published, but it does not cover
+/// Y's write: it costs exactly one more refresh, then none.
+#[tokio::test]
+async fn ovh_write_after_a_refresh_was_sent_stays_owed() {
+    let (mock, client) = setup().await;
+    let first = mock.control().hold_refreshes(1);
+    let x = add(&client, "AAA");
+    tokio::pin!(x);
+    tokio::select! {
+        _ = &mut x => panic!("X ended while its refresh was held"),
+        () = held(&first, 1) => {}
+    }
+    let second = mock.control().hold_refreshes(1);
+    tokio::select! {
+        _ = add_other(&client, "CCC") => panic!("the operation was not dropped"),
+        () = held(&second, 1) => {}
+    }
+    assert_eq!(writes(&mock), 2);
+    first.release();
+    assert_eq!(x.await.unwrap(), AddOutcome::Created);
+    assert!(settled(&mock));
+    let before = refreshes(&mock);
+    client
+        .get_rrset(&zone(), &name(), RecordType::TXT)
+        .await
+        .unwrap();
     assert_eq!(refreshes(&mock), before + 1);
+    client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(refreshes(&mock), before + 1);
+    drop(second);
+}
+
+/// A record write that ends by a transport failure (the connection closed without an answer)
+/// while another operation's refresh is in flight: that refresh, which succeeds afterwards, does
+/// not cover the write, and the write's own refresh, sent right after the failure, does not
+/// settle it either, since the provider may still apply it later. The next operation in the
+/// zone refreshes once more; then nothing is owed.
+#[tokio::test]
+async fn ovh_write_with_an_unknown_outcome_is_owed_once_more() {
+    let (mock, client) = setup().await;
+    // A's refresh is held; it was sent after A's write was answered and before B's write.
+    let refresh = mock.control().hold_refreshes(1);
+    let a = add_other(&client, "CCC");
+    tokio::pin!(a);
+    tokio::select! {
+        _ = &mut a => panic!("A ended while its refresh was held"),
+        () = held(&refresh, 1) => {}
+    }
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).drop_connection());
+    let before = refreshes(&mock);
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    // B refreshed on its way out, and that refresh succeeded.
+    assert_eq!(refreshes(&mock), before + 1);
+    refresh.release();
+    assert_eq!(a.await.unwrap(), AddOutcome::Created);
+    assert!(settled(&mock));
+    let before = refreshes(&mock);
+    client
+        .get_rrset(&zone(), &name(), RecordType::TXT)
+        .await
+        .unwrap();
+    assert_eq!(refreshes(&mock), before + 1);
+    client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(refreshes(&mock), before + 1);
+}
+
+/// One operation alone: a write the provider refused is certain and costs no further refresh
+/// after the operation's own; a write that failed without an answer, or with a `5xx`, costs one
+/// more, sent by the next operation in the zone, and then none.
+#[tokio::test]
+async fn ovh_only_writes_with_an_unknown_outcome_are_owed_once_more() {
+    let (mock, client) = setup().await;
+    let read = || async {
+        client
+            .get_rrset(&zone(), &name(), RecordType::TXT)
+            .await
+            .unwrap()
+    };
+    mock.faults().push(
+        Fault::on("POST", RECORDS).respond(400, r#"{"class":"Client::BadRequest","message":"x"}"#),
+    );
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(refreshes(&mock), 1);
+    read().await;
+    assert_eq!(refreshes(&mock), 1);
+
+    for fault in [
+        Fault::on("POST", RECORDS).drop_connection(),
+        Fault::on("POST", RECORDS).status(503),
+    ] {
+        mock.faults().push(fault);
+        let before = refreshes(&mock);
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+        assert_eq!(refreshes(&mock), before + 1);
+        read().await;
+        assert_eq!(refreshes(&mock), before + 2);
+        read().await;
+        assert_eq!(refreshes(&mock), before + 2);
+    }
+}
+
+/// Two refreshes in flight complete in the reverse order of their sending: the later one, which
+/// covers both writes, succeeds first; the earlier one, which covers only the first write,
+/// succeeds last and does not take back what the later one covered. Nothing is owed.
+#[tokio::test]
+async fn ovh_refreshes_completing_out_of_order_keep_the_larger_cover() {
+    let (mock, client) = setup().await;
+    let first = mock.control().hold_refreshes(1);
+    let x = add(&client, "AAA");
+    tokio::pin!(x);
+    tokio::select! {
+        _ = &mut x => panic!("X ended while its refresh was held"),
+        () = held(&first, 1) => {}
+    }
+    let second = mock.control().hold_refreshes(1);
+    let y = add_other(&client, "CCC");
+    tokio::pin!(y);
+    tokio::select! {
+        _ = &mut y => panic!("Y ended while its refresh was held"),
+        () = held(&second, 1) => {}
+    }
+    second.release();
+    assert_eq!(y.await.unwrap(), AddOutcome::Created);
+    first.release();
+    assert_eq!(x.await.unwrap(), AddOutcome::Created);
+    assert!(settled(&mock));
+    let before = refreshes(&mock);
+    client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(refreshes(&mock), before);
 }
 
 /// The application secret, which is never sent, is still withheld when an answer states it, in

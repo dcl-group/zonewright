@@ -438,6 +438,7 @@ async fn hold_at(state: &Shared, pick: fn(&Inner) -> &Option<Arc<Gate>>) {
 /// closes the connection meanwhile, whether the server still processes the request on release is
 /// up to the HTTP server; a test must not rely on either.
 #[derive(Debug)]
+#[must_use = "dropping the hold releases it"]
 pub struct Hold {
     gate: Arc<Gate>,
 }

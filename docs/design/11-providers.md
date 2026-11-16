@@ -603,28 +603,32 @@ Behavior that the design fixes because the generic sections cannot:
   covers only the writes that had ended when it was sent; a write still in flight stays owed); while
   one is owed, every write operation refreshes on every exit and `get_rrset` and `list_rrsets`
   refresh before reading (as nic.ru settles its own staged changes before a read), failing with the
-  refresh's error if it fails. A dropped operation is thus published by the client's next operation
-  in the zone; once the client is gone, by the next write operation in the zone in any process, and
-  not by a read elsewhere. A failed refresh after a successful operation is its error, prefixed
-  "stored ... but not published" where the kind has a text (`RateLimited` has none); nothing is
-  undone. The refresh runs after the name lock is released; the writes of one replacement are
-  published together unless another refresh of the zone runs between them. Reads list identifiers
-  with `fieldType` and, except at the apex or for a name with a backslash, `subDomain` (pattern
-  filters, LIKE and ILIKE; assumed never to leave out an exact match), then read each record (N + 1
-  requests; at the apex every record of the type; at most 1000 records, else `Protocol`), and
-  compare type and name exactly. TXT reads and writes cover `fieldType` TXT only: records of the
-  types SPF, DKIM and DMARC at a name are not part of its TXT rrset, and whether the name servers
-  serve them as TXT is not established. A listed record whose read answers 404 is read again (pauses
-  of `read_retry_ms` doubling; Terraform retries such reads for a minute) while the listing still
-  holds it, then `Transient`; one the listing no longer holds is left out. A 404 is `ZoneNotFound`
-  only when `GET /domain/zone` no longer lists the zone; a 404 to an update is `Conflict` when a new
-  read no longer finds the record, else the refusal; a 404 to a delete follows the per-record rule.
-  The create answer is not read (it may lack the `id`, Terraform). Updates send `target` and `ttl`,
-  and `subDomain` when not empty, as read unless they change. A record's `ttl` of `0` or `null`
-  reads as no TTL (`ProviderDefaultTtl::Absent`); a record created next to such records gets their
-  form (`0`, or no `ttl` member; Terraform sends `0` when unset), not the `ttl` setting. The error
-  `class` is the provider code. Lego deletes the record by the id it remembered from its create;
-  this client deletes only records that hold the value, found by a read.
+  refresh's error if it fails. A write that ended without a certain outcome (no answer, a 5xx, or
+  its future dropped in flight) stays owed until a second refresh succeeds, so the client's next
+  operation in the zone refreshes once more. If the provider applies such a write only after that,
+  no refresh of this client publishes it; the next write operation in the zone does. A dropped
+  operation is thus published by the client's next operation in the zone; once the client is gone,
+  by the next write operation in the zone in any process, and not by a read elsewhere. A failed
+  refresh after a successful operation is its error, prefixed "stored ... but not published" where
+  the kind has a text (`RateLimited` has none); nothing is undone. The refresh runs after the name
+  lock is released; the writes of one replacement are published together unless another refresh of
+  the zone runs between them. Reads list identifiers with `fieldType` and, except at the apex or for
+  a name with a backslash, `subDomain` (pattern filters, LIKE and ILIKE; assumed never to leave out
+  an exact match), then read each record (N + 1 requests; at the apex every record of the type; at
+  most 1000 records, else `Protocol`), and compare type and name exactly. TXT reads and writes cover
+  `fieldType` TXT only: records of the types SPF, DKIM and DMARC at a name are not part of its TXT
+  rrset, and whether the name servers serve them as TXT is not established. A listed record whose
+  read answers 404 is read again (pauses of `read_retry_ms` doubling; Terraform retries such reads
+  for a minute) while the listing still holds it, then `Transient`; one the listing no longer holds
+  is left out. A 404 is `ZoneNotFound` only when `GET /domain/zone` no longer lists the zone; a 404
+  to an update is `Conflict` when a new read no longer finds the record, else the refusal; a 404 to
+  a delete follows the per-record rule. The create answer is not read (it may lack the `id`,
+  Terraform). Updates send `target` and `ttl`, and `subDomain` when not empty, as read unless they
+  change. A record's `ttl` of `0` or `null` reads as no TTL (`ProviderDefaultTtl::Absent`); a record
+  created next to such records gets their form (`0`, or no `ttl` member; Terraform sends `0` when
+  unset), not the `ttl` setting. The error `class` is the provider code. Lego deletes the record by
+  the id it remembered from its create; this client deletes only records that hold the value, found
+  by a read.
 - `porkbun`. Writes (`POST`) carry the keys as `apikey` and `secretapikey`, the first members of the
   JSON body, and no key header: the request schemas of the writes list them as required, the
   description calls the body "the standard method", and lego and dns-update do the same; the delete

@@ -31,7 +31,10 @@ All notable changes to this crate are recorded in this file. The format follows
 - `ovh`: a zone refresh sent while another record write of the same client was in flight counted
   that write as published. When that write's operation was then dropped, or its own refresh failed,
   the record stayed stored but not published and no refresh was owed, until the next write in the
-  zone. A refresh now covers only the writes that had ended when it was sent.
+  zone. A refresh now covers only the writes that had ended when it was sent. A record write that
+  ended without a certain outcome (no answer, a 5xx, or its operation dropped while it was in
+  flight) is now refreshed once more by the client's next operation in the zone, since the provider
+  may still apply it after the operation's own refresh.
 - `dnsimple`: `list_zones` answers `Protocol` when the provider lists a zone without a name, where
   it left that zone out before.
 

@@ -62,10 +62,12 @@ use super::records::Unstated;
 /// The API stages every record change; a change is served only after a refresh of the zone,
 /// `POST /domain/zone/{zone}/refresh`, which publishes every staged change of the zone at once,
 /// including changes staged by anyone else, and has no counterpart that discards them.
-/// Everything below rests on one assumption, not documented and not observed against the live
+/// Everything below rests on two assumptions, neither documented nor observed against the live
 /// API: that the record endpoints read the staged state, so that a change that is stored but
 /// not published reads as present (the schema says only that a change "applies after the zone
-/// is refreshed"). The rules:
+/// is refreshed"); and that a refresh sent after the answer to a record write was received
+/// publishes that write. The second is also what lego and the Terraform provider rely on: they
+/// send the write, wait for its answer, then send the refresh. The rules:
 ///
 /// - Every write operation that reaches the provider (sends at least one request about the
 ///   zone) ends with a refresh of the zone, whatever its outcome: also when it found nothing to
@@ -88,7 +90,15 @@ use super::records::Unstated;
 ///   A write whose future was dropped after it was sent thus is published by the client's next
 ///   operation in the zone. A refresh sent while another record write of this client is in
 ///   flight does not cover that write: it stays owed until a refresh sent after it ended
-///   succeeds.
+///   succeeds. While writes of this client in the zone overlap without a gap, a refresh therefore
+///   stays owed and every read in the zone refreshes first.
+/// - A record write that ended without a certain outcome (no answer: a timeout or a connection
+///   broken after it was established; a `5xx`; an answer that cannot be read; or its future
+///   dropped while it was in flight) may still be applied by the provider later, also after the
+///   refresh its own operation sends on its way out. Such a write stays owed until a second
+///   refresh succeeds, sent after the first one succeeded: the client's next operation in the
+///   zone refreshes once more. A write the provider refused, or one the transport is certain it
+///   never sent, costs nothing extra.
 ///
 /// What is not guaranteed: the mark lives in the client and is lost with it or with the process.
 /// A change staged by a dropped future or a failed refresh and then forgotten that way is published
@@ -96,8 +106,10 @@ use super::records::Unstated;
 /// anyone else's refresh (the control panel's included); a read in another client does not
 /// publish it and reports it as present. Publication of a refreshed zone by the name servers
 /// takes a time the documentation does not state; the default propagation timeout is lego's. A
-/// request of a dropped future that the provider processes only after this client's later
-/// refresh is not covered by that refresh either; the client cannot see it.
+/// record write that ended without an answer (a timeout, a broken connection) or whose future was
+/// dropped may still be applied by the provider later. If that happens after the second refresh
+/// described above succeeded, no refresh of this client published it and the client owes
+/// nothing: the client cannot see it. The next write operation in the zone publishes it.
 ///
 /// # Reads
 ///

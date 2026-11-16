@@ -76,7 +76,7 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::crypto::{hex_lower, sha1};
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
 use crate::http::request::sensitive_value;
 use crate::http::url::UrlBuilder;
 use crate::http::{Endpoint, Finish, Http, Outgoing, Request, Response};
@@ -321,35 +321,76 @@ impl Finish for Signer {
 
 /// What this client did in one zone, for the refresh rule of the client (see the client's
 /// documentation, "Staged changes and the refresh").
+///
+/// The counts are not tied to particular writes. `writes - in_flight` is the number of writes
+/// that have ended; it only grows. `writes == published` holds exactly when every write started
+/// so far had ended before a refresh that succeeded was sent.
 #[derive(Clone, Copy, Debug, Default)]
 struct Marks {
     /// Record writes started (counted right before they are sent).
     writes: u64,
     /// Record writes sent and not yet ended (answered, failed or dropped).
     in_flight: u64,
-    /// The number of record writes that had ended when the last successful refresh was sent:
-    /// every write counted up to it is published. A write still in flight at that moment is not
-    /// counted, whatever the order in which the two requests reach the provider.
+    /// The largest number of ended record writes seen when a refresh that succeeded was sent.
+    /// A write still in flight at that moment is not counted, whatever the order in which the
+    /// two requests reach the provider.
     published: u64,
+    /// Record writes that ended with an outcome the client cannot know ([`unknown_outcome`],
+    /// or the future dropped while the write was in flight): the provider may still apply them
+    /// later, also after a refresh sent right after they ended.
+    unsure: u64,
+    /// The largest value of `unsure` seen when a refresh that succeeded was sent.
+    unsure_refreshed: u64,
+    /// The largest value of `unsure_refreshed` seen when a refresh that succeeded was sent.
+    /// `unsure == unsure_settled` holds exactly when every unsure write so far was followed by
+    /// two refreshes that succeeded, the second sent after the first had succeeded.
+    unsure_settled: u64,
     /// Requests about the zone started (reads, writes and refreshes).
     contacts: u64,
 }
 
+impl Marks {
+    /// A refresh is owed (see [`Api::owed`]).
+    fn owed(&self) -> bool {
+        self.writes > self.published || self.unsure > self.unsure_settled
+    }
+}
+
 /// One record write in flight in `zone`, counted in [`Marks::in_flight`] for as long as this
 /// value lives: it is dropped when the write is answered, when it fails, and when its future is
-/// dropped at any await.
+/// dropped at any await. `unsure` says how the write ended; it stays true unless the write ended
+/// with an answer or a failure that is certain, so a dropped future counts as unsure.
 struct Flight<'a> {
     api: &'a Api,
     zone: &'a DomainName,
+    unsure: bool,
 }
 
 impl Drop for Flight<'_> {
     fn drop(&mut self) {
+        let unsure = self.unsure;
         // `with_marks` recovers a poisoned mutex, so this cannot panic.
         self.api.with_marks(self.zone, |m| {
             m.in_flight = m.in_flight.saturating_sub(1);
+            if unsure {
+                m.unsure = m.unsure.saturating_add(1);
+            }
         });
     }
+}
+
+/// True when a record write that failed may still have been applied, or be applied later, by
+/// the provider: `unsent` is false (the transport is not certain that nothing was sent, see
+/// `SendError::certainly_unsent` of the transport), and `kind` is not the provider's refusal
+/// (`401`, `403`, `429`, or a `3xx` the transport mapped to `Rejected`). A timeout, a connection
+/// broken after it was established, a `5xx` and an answer that cannot be read are such failures.
+/// The same reading as the `acme_dns` client's.
+fn unknown_outcome(unsent: bool, kind: ErrorKind) -> bool {
+    !unsent
+        && !matches!(
+            kind,
+            ErrorKind::Auth | ErrorKind::Forbidden | ErrorKind::RateLimited | ErrorKind::Rejected
+        )
 }
 
 /// A snapshot of the counters of one zone, taken when an operation starts.
@@ -418,10 +459,12 @@ impl Api {
     }
 
     /// A refresh of `zone` is owed: this client started a record write there that no successful
-    /// refresh has published yet (its outcome may be unknown, or its operation dropped), or one
-    /// that was still in flight when the last successful refresh was sent.
+    /// refresh has covered yet: none was sent after the write ended, or every one sent since
+    /// then failed or was dropped. A write that ended with an unknown outcome or by a dropped
+    /// future stays owed until a second successful refresh, sent after the first succeeded:
+    /// usually the one of the client's next operation in the zone.
     pub(super) fn owed(&self, zone: &DomainName) -> bool {
-        self.with_marks(zone, |m| m.writes > m.published)
+        self.with_marks(zone, |m| m.owed())
     }
 
     /// `GET /auth/time`: the server's clock, in seconds since the Unix epoch. Not signed.
@@ -480,17 +523,40 @@ impl Api {
         self.send(request).await
     }
 
-    /// [`Api::send_in`] for a record write, counted as one right before it is sent (after the
-    /// clock is read, so that a write that never left is not counted), and as in flight until it
-    /// ends: answered (after the transport's last attempt), failed, or dropped.
+    /// [`Api::send_in`] for a record write, counted as one and as in flight once the server's
+    /// clock is known, and as in flight until it ends: answered (after the transport's last
+    /// attempt), failed, or dropped. A write whose first read of the clock fails is not counted;
+    /// one that fails later, even before any byte left (a second read of the clock, the
+    /// signature, the connection), is counted and costs a refresh. A write that ends with an
+    /// unknown outcome ([`unknown_outcome`]) or by a dropped future is counted as unsure.
     async fn send_write(&self, zone: &DomainName, request: Request) -> Result<Response, Error> {
         self.ensure_clock().await?;
         self.with_marks(zone, |m| {
             m.writes = m.writes.saturating_add(1);
             m.in_flight = m.in_flight.saturating_add(1);
         });
-        let _flight = Flight { api: self, zone };
-        self.send_in(zone, request).await
+        let mut flight = Flight {
+            api: self,
+            zone,
+            unsure: true,
+        };
+        // As `send_in` and `send`, with the transport's word on whether anything was sent.
+        if let Err(e) = self.ensure_clock().await {
+            // Nothing of this request was sent: the clock is read by another request.
+            flight.unsure = false;
+            return Err(e);
+        }
+        self.with_marks(zone, |m| m.contacts = m.contacts.saturating_add(1));
+        let result = self
+            .http
+            .try_send(&request.finish_with(self.signer.clone()))
+            .await;
+        flight.unsure = result
+            .as_ref()
+            .err()
+            .is_some_and(|e| unknown_outcome(e.certainly_unsent(), e.error().kind()));
+        drop(flight);
+        Ok(result?)
     }
 
     /// `/domain/zone/{zone}` with the zone's name without its trailing dot (lego and dns-update
@@ -689,17 +755,27 @@ impl Api {
     /// Idempotent: a repeat publishes the same staged state, so the transport may retry it. A
     /// success marks as published every record write this client had started in the zone and
     /// that had ended (answered, failed or dropped) when the refresh was sent; a write still in
-    /// flight stays owed. Only a success changes the marks, so a refresh that fails or is
-    /// dropped leaves owed what it would have covered.
+    /// flight stays owed. A write that ended with an unknown outcome or by a dropped future is
+    /// marked only by a second success, of a refresh sent after the first one succeeded. Only
+    /// a success changes the marks, so a refresh that fails or is dropped leaves owed what it
+    /// would have covered.
     // Source: Schema, `refreshZone` ("Applies the pending record changes to the zone", 200,
     // void, no body); lego and Terraform call it after every write. Assumption (not documented,
     // not observed against the live API): that a refresh of a zone without staged changes
     // succeeds.
     pub(super) async fn refresh(&self, zone: &DomainName) -> Result<(), Error> {
         let url = self.zone_url(zone).path("/refresh").build()?;
-        // Taken before the request is sent, so it counts only writes that had ended by then
-        // (a write that ends in between is left owed, which costs one more refresh at most).
-        let covered = self.with_marks(zone, |m| m.writes.saturating_sub(m.in_flight));
+        // Taken before the request is sent, so it counts only writes that had ended by then. A
+        // write that ends in between is left owed and costs one more refresh once no write of
+        // this client is in flight in the zone; while writes overlap without a gap, every
+        // operation in the zone refreshes.
+        let (covered, unsure, unsure_refreshed) = self.with_marks(zone, |m| {
+            (
+                m.writes.saturating_sub(m.in_flight),
+                m.unsure,
+                m.unsure_refreshed,
+            )
+        });
         let response = self
             .send_in(zone, Request::new(Method::POST, url).idempotent())
             .await?;
@@ -710,7 +786,11 @@ impl Api {
         if !response.is_success() {
             return Err(self.refusal(&response));
         }
-        self.with_marks(zone, |m| m.published = m.published.max(covered));
+        self.with_marks(zone, |m| {
+            m.published = m.published.max(covered);
+            m.unsure_refreshed = m.unsure_refreshed.max(unsure);
+            m.unsure_settled = m.unsure_settled.max(unsure_refreshed);
+        });
         Ok(())
     }
 
