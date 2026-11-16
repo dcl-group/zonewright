@@ -66,13 +66,22 @@
 //! mock.faults().push(Fault::on("POST", "/domains/v2/zones/*/rrset").status(500));
 //! // ... drive the client against mock.base_url() and mock.auth_url() ...
 //! assert_eq!(mock.control().txt_values("_acme-challenge.example.org"), ["v1"]);
+//! // Requests the API received, and tokens the identity service issued:
+//! assert_eq!(mock.log().count(Some("POST"), "/domains/v2/zones/*/rrset"), 2);
+//! assert_eq!(mock.control().tokens_issued(), 1);
 //! ```
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records (records
+//! that are not disabled, in every zone of every project) through [`SelectelV2Mock::changes`],
+//! and a [`link`](crate::link::link) serves them over DNS. The `disabled` flag of a zone does not
+//! change what is published. [`Control::reset`] returns the mock to its seed.
 
 // Handlers return finished HTTP answers as their error values and hand them straight to axum;
 // boxing them would only add noise.
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -86,7 +95,8 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::MockServer;
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, MockServer, RequestLog};
 
 /// Path of the DNS API below the server's base URL.
 pub const API_PATH: &str = "/domains/v2";
@@ -221,15 +231,76 @@ struct IssuedToken {
 
 #[derive(Debug)]
 struct Inner {
+    /// The seed the mock was started with, for [`Control::reset`].
+    original: Seed,
+    /// The seed in force; [`Control::set_token_ttl`] changes it.
     seed: Seed,
     zones: Vec<Zone>,
     rrsets: Vec<Rrset>,
     tokens: HashMap<String, IssuedToken>,
     issued: Vec<String>,
     next_id: u64,
+    changes: Changes,
 }
 
 impl Inner {
+    /// The state of a mock started with `seed`.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        let mut inner = Inner {
+            original: seed.clone(),
+            seed: seed.clone(),
+            zones: Vec::new(),
+            rrsets: Vec::new(),
+            tokens: HashMap::new(),
+            issued: Vec::new(),
+            next_id: 0,
+            changes,
+        };
+        for zone in &seed.zones {
+            let id = inner.new_id();
+            inner.zones.push(Zone {
+                id,
+                name: fqdn(&zone.name),
+                project_id: zone.project_id.clone(),
+                disabled: false,
+            });
+        }
+        inner
+    }
+
+    /// What a DNS server for the mock's zones would answer: the records that are not disabled.
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        for zone in &self.zones {
+            out.zone(&zone.name);
+        }
+        for rrset in &self.rrsets {
+            let Some(zone) = self.zone(&rrset.zone_id) else {
+                continue;
+            };
+            let values = rrset
+                .records
+                .iter()
+                .filter(|r| !r.disabled)
+                .map(|r| r.content.clone())
+                .collect();
+            out.rrset(
+                &zone.name,
+                &rrset.name,
+                &rrset.rtype,
+                Some(rrset.ttl),
+                values,
+            );
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+
     /// A new identifier in the UUID form the provider uses.
     fn new_id(&mut self) -> String {
         self.next_id += 1;
@@ -261,6 +332,9 @@ pub struct SelectelV2Mock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for SelectelV2Mock {
@@ -272,26 +346,15 @@ impl Deref for SelectelV2Mock {
 }
 
 impl SelectelV2Mock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let mut inner = Inner {
-            seed: seed.clone(),
-            zones: Vec::new(),
-            rrsets: Vec::new(),
-            tokens: HashMap::new(),
-            issued: Vec::new(),
-            next_id: 0,
-        };
-        for zone in &seed.zones {
-            let id = inner.new_id();
-            inner.zones.push(Zone {
-                id,
-                name: fqdn(&zone.name),
-                project_id: zone.project_id.clone(),
-                disabled: false,
-            });
-        }
-        let state = Arc::new(Mutex::new(inner));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new()
             .route("/identity/v3/auth/tokens", post(keystone))
             .route("/domains/v2/zones", get(zones_list))
@@ -305,10 +368,14 @@ impl SelectelV2Mock {
                 get(rrset_get).patch(rrset_update).delete(rrset_delete),
             )
             .with_state(state.clone());
-        Self {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The DNS API endpoint, for the client's `base_url`.
@@ -327,7 +394,38 @@ impl SelectelV2Mock {
     }
 }
 
+impl ChangeSource for SelectelV2Mock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its zones under their first
+    /// identifiers, no rrsets, no issued tokens, the token lifetime of the seed, an empty request
+    /// log and no pending faults. Reports the removal of every rrset that was published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.original.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// Every zone.
     pub fn zones(&self) -> Vec<Zone> {
         lock(&self.state).zones.clone()
@@ -430,25 +528,26 @@ impl Control {
         contents: &[&str],
     ) -> String {
         let zone_id = self.zone_id(zone);
-        let mut inner = lock(&self.state);
-        let id = inner.new_id();
-        inner.rrsets.push(Rrset {
-            id: id.clone(),
-            zone_id,
-            name: fqdn(name),
-            rtype: rtype.to_owned(),
-            ttl,
-            comment: None,
-            managed_by: None,
-            records: contents
-                .iter()
-                .map(|content| Record {
-                    content: (*content).to_owned(),
-                    disabled: false,
-                })
-                .collect(),
-        });
-        id
+        self.change(|inner| {
+            let id = inner.new_id();
+            inner.rrsets.push(Rrset {
+                id: id.clone(),
+                zone_id,
+                name: fqdn(name),
+                rtype: rtype.to_owned(),
+                ttl,
+                comment: None,
+                managed_by: None,
+                records: contents
+                    .iter()
+                    .map(|content| Record {
+                        content: (*content).to_owned(),
+                        disabled: false,
+                    })
+                    .collect(),
+            });
+            id
+        })
     }
 
     /// Sets the comment of the rrset of `name` and `rtype`.
@@ -478,41 +577,47 @@ impl Control {
     /// Deletes the rrset of `name` and `rtype` directly, as another writer would.
     pub fn delete_rrset(&self, name: &str, rtype: &str) {
         let name = fqdn(name);
-        lock(&self.state)
-            .rrsets
-            .retain(|r| !(r.name == name && r.rtype == rtype));
+        self.change(|inner| {
+            inner
+                .rrsets
+                .retain(|r| !(r.name == name && r.rtype == rtype));
+        });
     }
 
     /// Disables or enables the TXT records of `name` whose unquoted content is `value`.
     pub fn set_txt_disabled(&self, name: &str, value: &str, disabled: bool) {
         let name = fqdn(name);
-        for rrset in lock(&self.state)
-            .rrsets
-            .iter_mut()
-            .filter(|r| r.name == name && r.rtype == "TXT")
-        {
-            for record in rrset
-                .records
+        self.change(|inner| {
+            for rrset in inner
+                .rrsets
                 .iter_mut()
-                .filter(|r| unquoted(&r.content) == value)
+                .filter(|r| r.name == name && r.rtype == "TXT")
             {
-                record.disabled = disabled;
+                for record in rrset
+                    .records
+                    .iter_mut()
+                    .filter(|r| unquoted(&r.content) == value)
+                {
+                    record.disabled = disabled;
+                }
             }
-        }
+        });
     }
 
     /// Disables or enables the records of `name` and `rtype` whose content is `content`.
     pub fn set_disabled(&self, name: &str, rtype: &str, content: &str, disabled: bool) {
         let name = fqdn(name);
-        for rrset in lock(&self.state)
-            .rrsets
-            .iter_mut()
-            .filter(|r| r.name == name && r.rtype == rtype)
-        {
-            for record in rrset.records.iter_mut().filter(|r| r.content == content) {
-                record.disabled = disabled;
+        self.change(|inner| {
+            for rrset in inner
+                .rrsets
+                .iter_mut()
+                .filter(|r| r.name == name && r.rtype == rtype)
+            {
+                for record in rrset.records.iter_mut().filter(|r| r.content == content) {
+                    record.disabled = disabled;
+                }
             }
-        }
+        });
     }
 
     /// The contents of the records of `name` and `rtype`, in rrset order, each with its
@@ -1020,7 +1125,9 @@ async fn rrset_create(
         managed_by: None,
         records,
     };
+    let before = inner.published();
     inner.rrsets.push(rrset.clone());
+    inner.report(&before, Origin::Api);
     axum::Json(rrset).into_response()
 }
 
@@ -1082,12 +1189,14 @@ async fn rrset_update(
         Err(response) => return response,
     };
     let mut inner = lock(&state);
+    let before = inner.published();
     if let Some(rrset) = inner.rrsets.iter_mut().find(|r| r.id == rrset_id) {
         rrset.ttl = ttl;
         rrset.records = records;
         rrset.comment = comment;
         rrset.managed_by = managed_by;
     }
+    inner.report(&before, Origin::Api);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1141,6 +1250,7 @@ async fn rrset_delete(
     {
         return validation("this record set cannot be deleted");
     }
+    let published = inner.published();
     let before = inner.rrsets.len();
     inner
         .rrsets
@@ -1148,6 +1258,7 @@ async fn rrset_delete(
     if inner.rrsets.len() == before {
         return error(StatusCode::NOT_FOUND, "rrset not found", None);
     }
+    inner.report(&published, Origin::Api);
     StatusCode::NO_CONTENT.into_response()
 }
 

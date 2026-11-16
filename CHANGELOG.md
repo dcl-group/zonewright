@@ -6,6 +6,21 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
+### Added
+
+- `zonewright-mock`: provider mocks report every change of their published records as one type,
+  `changes::Change`, through a `changes::Changes` hub (`subscribe`) and the `changes::ChangeSource`
+  trait: the complete rrset of a name and type after the change, in zone-file text, whatever the
+  shape of the provider's API.
+- `zonewright-mock`: `link::link` makes a `dns::DnsMock` serve what a provider mock holds, now and
+  as it changes, with `Link::settled`, `Link::hold` / `Link::release` and an optional delay
+  (`LinkOptions`). A test of an application that issues certificates over DNS-01 can point its ACME
+  server at the `DnsMock`.
+- `zonewright-mock`: `start_on(addr, …)` for `MockServer`, `dns::DnsMock` and the provider mocks, to
+  listen on an address other than loopback (for an isolated test network shared with an ACME
+  server), and `Control::reset()` to return a provider mock to its seed.
+- `zonewright-mock`: `dns::Data::caa` and `dns::DnsMock::set_authoritative_answers`.
+
 ### Changed
 
 - SVCB and HTTPS data in service mode (priority not 0) must be self-consistent (RFC 9460 section

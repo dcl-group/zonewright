@@ -1,7 +1,8 @@
-//! A loopback DNS server (UDP and TCP) for the inspector tests.
+//! A DNS server (UDP and TCP) for the inspector tests and for the tests of an application.
 //!
-//! One [`DnsMock`] listens on `127.0.0.1` with an ephemeral port, the same port for UDP and TCP,
-//! and stops when dropped. It plays one of two roles:
+//! One [`DnsMock`] listens on `127.0.0.1` with an ephemeral port ([`DnsMock::start`]) or on an
+//! address the test gives ([`DnsMock::start_on`]), the same port for UDP and TCP, and stops when
+//! dropped. It plays one of two roles:
 //!
 //! - [`Role::Authoritative`]: answers with the AA flag for the zones it serves
 //!   ([`DnsMock::serve_zone`]), refuses names outside them, answers a referral (no AA, NS in the
@@ -21,8 +22,9 @@
 //! answers carry the SOA in the authority section) and RFC 6604 (the response code of a CNAME
 //! chain describes its last name).
 //!
-//! Behavior is changed through [`Fault`]s (consumed per matching query), and through
-//! [`DnsMock::set_delay`] and [`DnsMock::set_silent`] for every query. Every query received is
+//! Behavior is changed through [`Fault`]s (consumed per matching query), through
+//! [`DnsMock::set_delay`] and [`DnsMock::set_silent`] for every query, and through
+//! [`DnsMock::set_authoritative_answers`] for every query into one zone. Every query received is
 //! in [`DnsMock::log`].
 //!
 //! ```text
@@ -33,6 +35,28 @@
 //! // ... query mock.addr() ...
 //! assert_eq!(mock.log().len(), 2); // UDP, then TCP
 //! ```
+//!
+//! Common setups of a test of an application:
+//!
+//! ```text
+//! // NS of the zone and the address of the name server (glue).
+//! mock.add("example.test", TYPE_NS, 300, Data::name("ns1.example.test"));
+//! mock.add("ns1.example.test", TYPE_A, 300, Data::a([192, 0, 2, 53]));
+//! // A delegation: queries below it get a referral with this glue.
+//! mock.add("sub.example.test", TYPE_NS, 300, Data::name("ns.sub.example.test"));
+//! mock.add("ns.sub.example.test", TYPE_A, 300, Data::a([192, 0, 2, 54]));
+//! // A CNAME into a zone that another DnsMock serves: this server answers the CNAME only.
+//! mock.add("_acme-challenge.example.test", TYPE_CNAME, 300, Data::name("x.other.test"));
+//! // CAA without hand-encoded RDATA.
+//! mock.add("example.test", TYPE_CAA, 300, Data::caa(0, "issue", "ca.example.net"));
+//! // SERVFAIL for one name, every time.
+//! mock.push(Fault::new(Action::Rcode(SERVFAIL)).name("www.example.test").always());
+//! // A lame server: answers for the zone without the AA flag.
+//! mock.set_authoritative_answers("example.test", false);
+//! ```
+//!
+//! What a provider mock holds can be served by a [`DnsMock`] through a
+//! [`link`](crate::link::link).
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -155,6 +179,15 @@ impl Data {
     /// A name record (NS, CNAME, PTR).
     pub fn name(target: &str) -> Data {
         Data::Name(target.to_owned())
+    }
+
+    /// A CAA record (RFC 8659 section 4.1): flags, the tag (at most 255 octets) and the value,
+    /// which is written as its octets, without quotes.
+    pub fn caa(flags: u8, tag: &str, value: &str) -> Data {
+        let mut out = vec![flags, u8::try_from(tag.len()).unwrap_or(u8::MAX)];
+        out.extend_from_slice(tag.as_bytes());
+        out.extend_from_slice(value.as_bytes());
+        Data::Raw(out)
     }
 }
 
@@ -394,6 +427,8 @@ struct State {
     delay: Option<Duration>,
     silent: bool,
     udp_limit: Option<usize>,
+    /// Served zones answered without the AA flag.
+    lame: Vec<String>,
 }
 
 /// The handle of one running server. Dropping it stops the server.
@@ -415,20 +450,36 @@ impl Drop for DnsMock {
 impl DnsMock {
     /// Starts a server on `127.0.0.1` with an ephemeral port, UDP and TCP on the same port.
     pub async fn start(role: Role) -> DnsMock {
-        // The OS may hand out a UDP port whose TCP twin is taken; try a few times.
+        DnsMock::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), role).await
+    }
+
+    /// Starts a server on `addr`, UDP and TCP on the same port: for example `0.0.0.0:8053`, so
+    /// that a server in another container (an ACME server such as Pebble) can query it. Port 0
+    /// takes an ephemeral port; [`DnsMock::addr`] reports the one bound.
+    ///
+    /// A bind to an address other than loopback exposes the server to every host that can reach
+    /// this one. It is meant for an isolated test network.
+    ///
+    /// # Panics
+    ///
+    /// If the address cannot be bound for UDP and TCP.
+    pub async fn start_on(addr: SocketAddr, role: Role) -> DnsMock {
+        // With port 0 the OS may hand out a UDP port whose TCP twin is taken; try a few times.
         let mut attempt = 0;
         let (udp, tcp) = loop {
             attempt += 1;
-            let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            let udp = UdpSocket::bind(addr)
                 .await
-                .unwrap_or_else(|err| panic!("mock DNS: UDP bind failed: {err}"));
+                .unwrap_or_else(|err| panic!("mock DNS: UDP bind of {addr} failed: {err}"));
             let port = udp
                 .local_addr()
                 .unwrap_or_else(|err| panic!("mock DNS: local address: {err}"))
                 .port();
-            match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+            match TcpListener::bind((addr.ip(), port)).await {
                 Ok(tcp) => break (udp, tcp),
-                Err(err) if attempt >= 20 => panic!("mock DNS: TCP bind failed: {err}"),
+                Err(err) if attempt >= 20 || addr.port() != 0 => {
+                    panic!("mock DNS: TCP bind of {}:{port} failed: {err}", addr.ip())
+                }
                 Err(_) => continue,
             }
         };
@@ -444,6 +495,7 @@ impl DnsMock {
             delay: None,
             silent: false,
             udp_limit: None,
+            lame: Vec::new(),
         }));
         let udp = Arc::new(udp);
         let udp_task = tokio::spawn(serve_udp(udp, state.clone()));
@@ -455,9 +507,16 @@ impl DnsMock {
         }
     }
 
-    /// The address queries go to.
+    /// The address the server is bound to. After a bind to a wildcard address (`0.0.0.0`,
+    /// `::`) this is the wildcard address with the bound port; a query is sent to an address of
+    /// the host, such as `127.0.0.1` with that port.
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Shared access to the server's data; a [`link`](crate::link::link) writes through it.
+    pub(crate) fn handle(&self) -> Handle {
+        Handle(self.state.clone())
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -478,18 +537,18 @@ impl DnsMock {
 
     /// Replaces the rrset of `owner` and `rtype` with these values; an empty list removes it.
     pub fn set(&self, owner: &str, rtype: u16, ttl: u32, values: Vec<Data>) {
-        let owner = canonical(owner);
+        self.handle().set(owner, rtype, ttl, values);
+    }
+
+    /// Answers every query into served zone `zone` with the AA flag (`true`, the default) or
+    /// without it (`false`, a lame server). The answers are otherwise unchanged. A zone that is
+    /// not served is unaffected.
+    pub fn set_authoritative_answers(&self, zone: &str, authoritative: bool) {
+        let zone = canonical(zone);
         let mut state = self.state();
-        state
-            .records
-            .retain(|record| !(record.owner == owner && record.rtype == rtype));
-        for data in values {
-            state.records.push(Record {
-                owner: owner.clone(),
-                rtype,
-                ttl,
-                data,
-            });
+        state.lame.retain(|z| *z != zone);
+        if !authoritative {
+            state.lame.push(zone);
         }
     }
 
@@ -539,6 +598,54 @@ impl DnsMock {
             .iter()
             .filter(|query| query.name == name && query.rtype == rtype)
             .count()
+    }
+}
+
+/// Shared access to the data of a running [`DnsMock`], for the link.
+#[derive(Clone, Debug)]
+pub(crate) struct Handle(Arc<Mutex<State>>);
+
+impl Handle {
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Serves `zone`, unless it is served already.
+    pub(crate) fn ensure_zone(&self, zone: &str) {
+        let zone = canonical(zone);
+        let mut state = self.state();
+        if !state.zones.contains(&zone) {
+            state.zones.push(zone);
+        }
+    }
+
+    /// Replaces the rrset of `owner` and `rtype` with these values; an empty list removes it.
+    pub(crate) fn set(&self, owner: &str, rtype: u16, ttl: u32, values: Vec<Data>) {
+        let owner = canonical(owner);
+        let mut state = self.state();
+        state
+            .records
+            .retain(|record| !(record.owner == owner && record.rtype == rtype));
+        for data in values {
+            state.records.push(Record {
+                owner: owner.clone(),
+                rtype,
+                ttl,
+                data,
+            });
+        }
+    }
+
+    /// The records of `owner` and `rtype`.
+    #[cfg(test)]
+    pub(crate) fn rrset(&self, owner: &str, rtype: u16) -> Vec<Record> {
+        self.state().rrset(&canonical(owner), rtype)
+    }
+
+    /// Whether `zone` is served.
+    #[cfg(test)]
+    pub(crate) fn serves(&self, zone: &str) -> bool {
+        self.state().zones.contains(&canonical(zone))
     }
 }
 
@@ -818,7 +925,15 @@ fn plan(state: &Arc<Mutex<State>>, octets: &[u8], proto: Proto, source: SocketAd
     let action = state.take_fault(&request, proto);
     let recursive = state.role == Role::Recursive;
     let mut resolution = if request.has_question && request.class == CLASS_IN {
-        state.resolve(&request.name, request.rtype)
+        let mut resolution = state.resolve(&request.name, request.rtype);
+        if state.role == Role::Authoritative
+            && state
+                .zone_of(&request.name)
+                .is_some_and(|zone| state.lame.contains(&zone))
+        {
+            resolution.authoritative = false;
+        }
+        resolution
     } else {
         Resolution {
             rcode: FORMERR,
@@ -1406,5 +1521,149 @@ mod tests {
         assert_eq!(answer.metadata.response_code, ResponseCode::ServFail);
         let answer = udp(mock.addr(), &octets).await;
         assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+    }
+
+    #[tokio::test]
+    async fn servfail_for_one_name() {
+        let mock = DnsMock::start(Role::Authoritative).await;
+        mock.serve_zone("example.test");
+        mock.add("a.example.test", TYPE_A, 60, Data::a([192, 0, 2, 7]));
+        mock.add("b.example.test", TYPE_A, 60, Data::a([192, 0, 2, 8]));
+        mock.push(
+            Fault::new(Action::Rcode(SERVFAIL))
+                .name("a.example.test")
+                .always(),
+        );
+        let (octets, _) = query("a.example.test.", RecordType::A, false);
+        for _ in 0..2 {
+            let answer = udp(mock.addr(), &octets).await;
+            assert_eq!(answer.metadata.response_code, ResponseCode::ServFail);
+        }
+        let (octets, _) = query("b.example.test.", RecordType::A, false);
+        let answer = udp(mock.addr(), &octets).await;
+        assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_bind_answers_on_loopback() {
+        let mock = DnsMock::start_on(
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            Role::Authoritative,
+        )
+        .await;
+        assert!(mock.addr().ip().is_unspecified());
+        assert_ne!(mock.addr().port(), 0);
+        mock.serve_zone("example.test");
+        mock.add("a.example.test", TYPE_A, 60, Data::a([192, 0, 2, 7]));
+        let server = SocketAddr::from((Ipv4Addr::LOCALHOST, mock.addr().port()));
+        let (octets, _) = query("a.example.test.", RecordType::A, false);
+        assert_eq!(udp(server, &octets).await.answers.len(), 1);
+        assert_eq!(tcp(server, &octets).await.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn caa_is_encoded_from_its_fields() {
+        let mock = DnsMock::start(Role::Authoritative).await;
+        mock.serve_zone("example.test");
+        mock.add(
+            "example.test",
+            TYPE_CAA,
+            60,
+            Data::caa(128, "issue", "ca.example.net; account=1"),
+        );
+        let (octets, _) = query("example.test.", RecordType::CAA, false);
+        let answer = udp(mock.addr(), &octets).await;
+        match &answer.answers[0].data {
+            RData::CAA(caa) => {
+                assert!(caa.issuer_critical);
+                assert_eq!(caa.tag, "issue");
+                assert_eq!(caa.value, b"ca.example.net; account=1");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zone_can_be_answered_without_aa() {
+        let mock = DnsMock::start(Role::Authoritative).await;
+        mock.serve_zone("example.test");
+        mock.serve_zone("other.test");
+        mock.add("a.example.test", TYPE_A, 60, Data::a([192, 0, 2, 7]));
+        mock.add("a.other.test", TYPE_A, 60, Data::a([192, 0, 2, 8]));
+        mock.set_authoritative_answers("example.test.", false);
+        let (octets, _) = query("a.example.test.", RecordType::A, false);
+        let answer = udp(mock.addr(), &octets).await;
+        assert!(!answer.metadata.authoritative);
+        assert_eq!(answer.answers.len(), 1);
+        let (other, _) = query("a.other.test.", RecordType::A, false);
+        assert!(udp(mock.addr(), &other).await.metadata.authoritative);
+        mock.set_authoritative_answers("example.test", true);
+        assert!(udp(mock.addr(), &octets).await.metadata.authoritative);
+    }
+
+    #[tokio::test]
+    async fn ns_glue_and_delegations() {
+        let mock = DnsMock::start(Role::Authoritative).await;
+        mock.serve_zone("example.test");
+        mock.add("example.test", TYPE_NS, 300, Data::name("ns1.example.test"));
+        mock.add("ns1.example.test", TYPE_A, 300, Data::a([192, 0, 2, 53]));
+        mock.add(
+            "sub.example.test",
+            TYPE_NS,
+            300,
+            Data::name("ns.sub.example.test"),
+        );
+        mock.add("ns.sub.example.test", TYPE_A, 300, Data::a([192, 0, 2, 54]));
+
+        let (octets, _) = query("example.test.", RecordType::NS, false);
+        let answer = udp(mock.addr(), &octets).await;
+        assert!(answer.metadata.authoritative);
+        match &answer.answers[0].data {
+            RData::NS(ns) => assert_eq!(ns.0.to_ascii(), "ns1.example.test."),
+            other => panic!("unexpected {other:?}"),
+        }
+        let (octets, _) = query("ns1.example.test.", RecordType::A, false);
+        assert_eq!(udp(mock.addr(), &octets).await.answers.len(), 1);
+
+        let (octets, _) = query("x.sub.example.test.", RecordType::TXT, false);
+        let answer = udp(mock.addr(), &octets).await;
+        assert!(!answer.metadata.authoritative);
+        assert!(answer.answers.is_empty());
+        assert_eq!(answer.authorities.len(), 1);
+        match &answer.additionals[0].data {
+            RData::A(a) => assert_eq!(a.0, Ipv4Addr::new(192, 0, 2, 54)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cname_into_a_zone_of_another_server() {
+        let first = DnsMock::start(Role::Authoritative).await;
+        first.serve_zone("example.test");
+        first.add(
+            "_acme-challenge.example.test",
+            TYPE_CNAME,
+            300,
+            Data::name("x.other.test"),
+        );
+        let second = DnsMock::start(Role::Authoritative).await;
+        second.serve_zone("other.test");
+        second.add("x.other.test", TYPE_TXT, 60, Data::txt(&[b"token"]));
+
+        let (octets, _) = query("_acme-challenge.example.test.", RecordType::TXT, false);
+        let answer = udp(first.addr(), &octets).await;
+        assert!(answer.metadata.authoritative);
+        assert_eq!(answer.answers.len(), 1);
+        match &answer.answers[0].data {
+            RData::CNAME(target) => assert_eq!(target.0.to_ascii(), "x.other.test."),
+            other => panic!("unexpected {other:?}"),
+        }
+        let (octets, _) = query("x.other.test.", RecordType::TXT, false);
+        let answer = udp(second.addr(), &octets).await;
+        assert!(answer.metadata.authoritative);
+        match &answer.answers[0].data {
+            RData::TXT(txt) => assert_eq!(txt.txt_data[0].as_ref(), b"token"),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

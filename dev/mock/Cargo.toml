@@ -20,6 +20,10 @@ base64 = "0.23.1"
 roxmltree = "0.21.2"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 
+[dev-dependencies]
+# `test-util` for the link's tests under a paused clock.
+tokio = { version = "1.54.1", features = ["test-util"] }
+
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"

@@ -3,6 +3,10 @@
 //! (RFC 1035 section 4.2.1). The client under test speaks TCP only; UDP serves the tests that
 //! cross-check the mock with independent tools, which use UDP by default.
 //!
+//! The mock answers queries for its zones itself, with the AA flag, so an ACME server such as
+//! Pebble can be pointed at it as its DNS server directly; no [`link`](crate::link::link) to a
+//! [`DnsMock`](crate::dns::DnsMock) is needed.
+//!
 //! The parser, the signer and the verifier here are written for the mock and share nothing with
 //! the client under test; the HMAC comes from `aws-lc-rs` directly. The behavior follows these
 //! sources:

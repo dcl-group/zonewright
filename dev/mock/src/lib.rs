@@ -21,6 +21,74 @@
 //!   Basic proxy authentication, for the tests of the transport's proxy setting.
 //! - [`socks::SocksServer`]: a SOCKS5 proxy (RFC 1928 `CONNECT`) with optional username/password
 //!   authentication (RFC 1929), for the same tests.
+//! - [`dns::DnsMock`]: an authoritative or recursive DNS server over UDP and TCP.
+//! - [`changes`]: the record changes of a provider mock in one form for every provider
+//!   ([`changes::Change`]), and the subscription to them ([`changes::Changes::subscribe`]).
+//! - [`link::link`]: makes a [`dns::DnsMock`] serve what a provider mock holds, so that an ACME
+//!   server pointed at the `DnsMock` sees the challenge records an application wrote through the
+//!   provider API.
+//!
+//! Every server listens on `127.0.0.1` with an ephemeral port when started with `start`, and on
+//! an address the test gives with `start_on` ([`MockServer::start_on`],
+//! [`dns::DnsMock::start_on`], and the `start_on` of each provider mock), for example `0.0.0.0`
+//! with a fixed port, so that an application or an ACME server in another container can reach
+//! it. A bind to an address other than loopback is meant for an isolated test network.
+//!
+//! # Testing an ACME application
+//!
+//! Start a provider mock and a [`dns::DnsMock`], link them, point the application's provider
+//! client at the mock and the ACME server's DNS resolver at the `DnsMock`:
+//!
+//! ```text
+//! let provider = SelectelV2Mock::start(Seed::standard()).await;
+//! let dns = DnsMock::start(Role::Authoritative).await;
+//! let link = link(&provider, &dns, LinkOptions::new());
+//! // Pebble: `pebble -dnsserver 127.0.0.1:<dns.addr().port()>`.
+//! // ... the application writes the challenge TXT through provider.base_url() ...
+//! link.settled().await; // what was written is answered now
+//! ```
+//!
+//! [`link::Link::hold`] and [`link::Link::release`] keep changes from DNS for as long as a test
+//! needs, and [`link::LinkOptions::delay`] makes each change visible only after a delay. Faults of
+//! the DNS side (SERVFAIL for a name, answers without AA, delays, silence) are set on the
+//! `DnsMock` itself.
+//!
+//! # Reporting changes
+//!
+//! A provider mock reports every change of the records it publishes to a [`changes::Changes`]
+//! hub and implements [`changes::ChangeSource`]. The pattern, as in [`selectel_v2`] and
+//! [`cloudflare`]:
+//!
+//! 1. The state (`Inner`, behind the mock's mutex) holds a clone of the hub; the control handle
+//!    holds another, which `ChangeSource::changes` returns.
+//! 2. One method computes the published state from the mock's state:
+//!    `fn published(&self) -> Published`. It adds every zone ([`changes::Published::zone`]) and
+//!    every record a DNS server would answer — [`changes::Published::rrset`] for an API of rrsets,
+//!    [`changes::Published::record`] for an API of single records — in zone-file text form with
+//!    names fully qualified. Disabled or uncommitted records are left out.
+//!    `ChangeSource::published` locks the state and calls it.
+//! 3. Every path that can change published records takes `before = inner.published()` under the
+//!    lock, changes the state, and then calls
+//!    `inner.changes.emit_diff(&before, &inner.published(), origin)` before the lock is released:
+//!    [`changes::Origin::Api`] in a request handler, [`changes::Origin::Control`] in the control
+//!    handle (which wraps this in one helper, `Control::change`). The hub compares the two states
+//!    and emits one [`changes::Change`] per rrset that differs, so a path that changed nothing
+//!    published emits nothing.
+//! 4. `start_on(addr, seed)` next to `start(seed)`, and `Control::reset()`, which rebuilds the
+//!    state from the seed the mock was started with inside the same helper, so that the reset
+//!    reports what it removed, and clears the request log and the fault queue.
+//!
+//! A test reads the changes with [`changes::Changes::subscribe`], or serves them over DNS with
+//! [`link::link`].
+//!
+//! # Stability
+//!
+//! Stable within a minor version: starting a mock (`start`, `start_on`), the seeds, the control
+//! handles' methods, faults ([`Fault`], [`dns::Fault`]), the request log ([`RequestLog`]),
+//! [`changes::Change`] and the subscription to it, and the link ([`link`]). Everything else — the
+//! routes a mock serves beyond those the client uses, error texts, and the exact answers of a
+//! mock where the provider's documentation leaves room — may change in a patch release. Every
+//! incompatible change of the mock is listed in the changelog.
 //!
 //! # Writing a provider mock
 //!
@@ -89,9 +157,11 @@
 //! # }
 //! ```
 
+pub mod changes;
 mod conn;
 pub mod echo;
 mod fault;
+pub mod link;
 mod log;
 
 pub mod dns;
@@ -138,7 +208,7 @@ use fault::{Action, Plan};
 /// Largest request body the harness reads. Anything a client sends is far below it.
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
-/// A running mock HTTP server on `127.0.0.1` with an ephemeral port.
+/// A running mock HTTP server, by default on `127.0.0.1` with an ephemeral port.
 ///
 /// The server stops accepting connections when this value is dropped; open connections are closed
 /// once their current request finishes.
@@ -176,9 +246,27 @@ impl MockServer {
     ///
     /// If the loopback socket cannot be bound.
     pub async fn start(router: Router) -> Self {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        Self::start_on(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)), router).await
+    }
+
+    /// Like [`start`](Self::start), on `addr`: for example `0.0.0.0:8080`, so that an
+    /// application in another container can reach the mock. Port 0 takes an ephemeral port;
+    /// [`addr`](Self::addr) reports the one bound.
+    ///
+    /// [`base_url`](Self::base_url) and [`url`](Self::url) are built from the bound address. After
+    /// a bind to a wildcard address (`0.0.0.0`, `::`) that address is no destination: the caller
+    /// forms the URL from the host name or address its clients use, with the bound port.
+    ///
+    /// A bind to an address other than loopback exposes the mock to every host that can reach
+    /// this one. It is meant for an isolated test network.
+    ///
+    /// # Panics
+    ///
+    /// If the address cannot be bound.
+    pub async fn start_on(addr: SocketAddr, router: Router) -> Self {
+        let listener = tokio::net::TcpListener::bind(addr)
             .await
-            .expect("bind 127.0.0.1:0");
+            .unwrap_or_else(|err| panic!("bind {addr}: {err}"));
         let addr = listener
             .local_addr()
             .expect("local address of the listener");
@@ -215,7 +303,8 @@ impl MockServer {
         self.addr
     }
 
-    /// `http://127.0.0.1:<port>`, without a trailing slash.
+    /// `http://<address>:<port>` of the bound address (`http://127.0.0.1:<port>` after
+    /// [`start`](Self::start)), without a trailing slash.
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
     }

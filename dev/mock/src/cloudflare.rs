@@ -67,12 +67,22 @@
 //! // ... drive the client against mock.base_url() ...
 //! assert_eq!(mock.control().txt_values("_acme-challenge.example.org"), ["v1"]);
 //! ```
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`CloudflareMock::changes`], each record of a name and type grouped into one rrset, and a
+//! [`link`](crate::link::link) serves them over DNS. The published form of a record: its
+//! `content`, a host name with the trailing dot added (CNAME, NS, PTR), MX as
+//! `<priority> <host>.`, SRV as `<priority> <weight> <port> <target>.`; the TTL of the set is the
+//! smallest TTL of its records, none when every record's TTL is automatic (`1`). A proxied
+//! record is published with its own content (the mock has no proxy addresses), and the status of
+//! a zone does not change what is published. [`Control::reset`] returns the mock to its seed.
 
 // Handlers return finished HTTP answers as their error values and hand them straight to axum;
 // boxing them would only add noise.
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -83,7 +93,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde_json::{Value, json};
 
-use crate::MockServer;
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, MockServer, RequestLog};
 
 /// Path of the API below the server's base URL.
 pub const API_PATH: &str = "/client/v4";
@@ -169,6 +180,30 @@ impl Record {
         }
     }
 
+    /// The record's value in zone-file form (module documentation).
+    fn published_value(&self) -> String {
+        let host = |name: &str| format!("{}.", name.trim_end_matches('.'));
+        match self.rtype.as_str() {
+            "CNAME" | "NS" | "PTR" => host(&self.content),
+            "MX" => format!("{} {}", self.priority.unwrap_or(0), host(&self.content)),
+            "SRV" => {
+                let field = |key: &str| self.data.as_ref().and_then(|d| d.get(key)).cloned();
+                let number = |key: &str| field(key).and_then(|v| v.as_u64()).unwrap_or(0);
+                let target = field("target")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                format!(
+                    "{} {} {} {}",
+                    number("priority"),
+                    number("weight"),
+                    number("port"),
+                    host(&target)
+                )
+            }
+            _ => self.content.clone(),
+        }
+    }
+
     /// The record as the API lists it.
     fn to_json(&self) -> Value {
         let mut out = json!({
@@ -199,6 +234,9 @@ impl Record {
 
 #[derive(Debug)]
 struct Inner {
+    /// The seed the mock was started with, for [`Control::reset`].
+    seed: Seed,
+    changes: Changes,
     token: String,
     zones: Vec<Zone>,
     records: Vec<Record>,
@@ -210,6 +248,57 @@ struct Inner {
 }
 
 impl Inner {
+    /// The state of a mock started with `seed`.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        let mut inner = Inner {
+            seed: seed.clone(),
+            changes,
+            token: seed.token.clone(),
+            zones: Vec::new(),
+            records: Vec::new(),
+            next_id: 0,
+            page_cap: None,
+            ignore_filters: false,
+        };
+        for name in &seed.zones {
+            let id = inner.new_id();
+            inner.zones.push(Zone {
+                id,
+                name: normalize(name),
+                status: "active".into(),
+            });
+        }
+        inner
+    }
+
+    /// What a DNS server for the mock's zones would answer (module documentation).
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        for zone in &self.zones {
+            out.zone(&zone.name);
+        }
+        for record in &self.records {
+            let Some(zone) = self.zone(&record.zone_id) else {
+                continue;
+            };
+            let ttl = (record.ttl != 1).then_some(record.ttl);
+            out.record(
+                &zone.name,
+                &record.name,
+                &record.rtype,
+                ttl,
+                record.published_value(),
+            );
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+
     /// A new identifier in the 32-character form the provider uses.
     fn new_id(&mut self) -> String {
         self.next_id += 1;
@@ -241,6 +330,9 @@ pub struct CloudflareMock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for CloudflareMock {
@@ -252,25 +344,15 @@ impl Deref for CloudflareMock {
 }
 
 impl CloudflareMock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let mut inner = Inner {
-            token: seed.token.clone(),
-            zones: Vec::new(),
-            records: Vec::new(),
-            next_id: 0,
-            page_cap: None,
-            ignore_filters: false,
-        };
-        for name in &seed.zones {
-            let id = inner.new_id();
-            inner.zones.push(Zone {
-                id,
-                name: normalize(name),
-                status: "active".into(),
-            });
-        }
-        let state = Arc::new(Mutex::new(inner));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new()
             .route("/client/v4/zones", get(zones_list))
             .route(
@@ -282,10 +364,14 @@ impl CloudflareMock {
                 axum::routing::delete(record_delete).patch(record_update),
             )
             .with_state(state.clone());
-        Self {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The API endpoint, for the client's `base_url`.
@@ -299,7 +385,38 @@ impl CloudflareMock {
     }
 }
 
+impl ChangeSource for CloudflareMock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its token, its zones under their
+    /// first identifiers, no records, no page cap, the record filters honored, an empty request
+    /// log and no pending faults. Reports the removal of every rrset that was published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.seed.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// Every zone.
     pub fn zones(&self) -> Vec<Zone> {
         lock(&self.state).zones.clone()
@@ -424,18 +541,19 @@ impl Control {
         ttl: u32,
     ) -> String {
         let zone_id = self.zone_id(zone);
-        let mut inner = lock(&self.state);
-        let id = inner.new_id();
-        inner.records.push(Record {
-            id: id.clone(),
-            zone_id,
-            name: normalize(name),
-            rtype: rtype.to_owned(),
-            content: content.to_owned(),
-            ttl,
-            ..Record::bare()
-        });
-        id
+        self.change(|inner| {
+            let id = inner.new_id();
+            inner.records.push(Record {
+                id: id.clone(),
+                zone_id,
+                name: normalize(name),
+                rtype: rtype.to_owned(),
+                content: content.to_owned(),
+                ttl,
+                ..Record::bare()
+            });
+            id
+        })
     }
 
     /// Creates a record in zone `zone` directly from a JSON object in the API's form (`type`,
@@ -448,7 +566,10 @@ impl Control {
     /// If there is no such zone, or `type` or `name` is missing.
     pub fn insert_json(&self, zone: &str, record: &Value) -> String {
         let zone_id = self.zone_id(zone);
-        let mut inner = lock(&self.state);
+        self.change(|inner| Self::push_json(inner, zone_id, record))
+    }
+
+    fn push_json(inner: &mut Inner, zone_id: String, record: &Value) -> String {
         let id = inner.new_id();
         let rtype = record["type"].as_str().expect("type").to_owned();
         let data = record.get("data").cloned();
@@ -490,9 +611,11 @@ impl Control {
     /// Deletes the records of `name` and `rtype`, as another writer would.
     pub fn delete_records(&self, name: &str, rtype: &str) {
         let name = normalize(name);
-        lock(&self.state)
-            .records
-            .retain(|r| !(r.name == name && r.rtype == rtype));
+        self.change(|inner| {
+            inner
+                .records
+                .retain(|r| !(r.name == name && r.rtype == rtype));
+        });
     }
 }
 
@@ -936,7 +1059,9 @@ async fn record_create(
     }
     record.id = inner.new_id();
     let answer = record.to_json();
+    let before = inner.published();
     inner.records.push(record);
+    inner.report(&before, Origin::Api);
     success(answer, None)
 }
 
@@ -983,7 +1108,9 @@ async fn record_update(
         return response;
     }
     let answer = record.to_json();
+    let before = inner.published();
     inner.records[index] = record;
+    inner.report(&before, Origin::Api);
     success(answer, None)
 }
 
@@ -999,6 +1126,7 @@ async fn record_delete(
     if inner.zone(&zone).is_none() {
         return unknown_zone();
     }
+    let published = inner.published();
     let before = inner.records.len();
     inner
         .records
@@ -1006,5 +1134,6 @@ async fn record_delete(
     if inner.records.len() == before {
         return failure(StatusCode::NOT_FOUND, 81044, "Record does not exist.");
     }
+    inner.report(&published, Origin::Api);
     success(json!({"id": record}), None)
 }
