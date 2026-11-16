@@ -19,24 +19,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::SecretString;
-use zonewright::inspector::{
-    Answer, Condition, Expectation, Inspector, InspectorConfig, NameServer, NsDiscovery, Question,
-    WaitOptions,
-};
+use zonewright::inspector::{Condition, Expectation, Question, WaitOptions};
 use zonewright::providers::cloudflare::{Cloudflare, CloudflareConfig, CloudflareCredentials};
 use zonewright::providers::selectel_v2::{SelectelV2, SelectelV2Config, SelectelV2Credentials};
-use zonewright::{Expect, Provider, RecordData, RecordType, RrSet, Txt};
+use zonewright::{Expect, Provider, RecordType, RrSet, Txt};
 use zonewright_mock::changes::{Change, ChangeSource, Origin};
 use zonewright_mock::cloudflare::CloudflareMock;
 use zonewright_mock::dns::{DnsMock, Role, TYPE_TXT};
-use zonewright_mock::link::{Link, LinkOptions, link};
+use zonewright_mock::link::{LinkOptions, link};
 use zonewright_mock::selectel_v2::SelectelV2Mock;
 use zonewright_mock::{cloudflare, selectel_v2};
 
+use common::link::{NAME, ZONE, ask, inspector, is_absent, rd, txt, txt_round_trip, values};
 use common::{context, dn};
-
-const ZONE: &str = "example.org";
-const NAME: &str = "_acme-challenge.example.org";
 
 // ---- Helpers -------------------------------------------------------------------------------
 
@@ -55,69 +50,6 @@ fn cloudflare_client(mock: &CloudflareMock) -> Cloudflare {
     config.base_url = mock.base_url();
     let credentials = CloudflareCredentials::new(SecretString::from("cf-test-token".to_owned()));
     Cloudflare::new(config, credentials, &context()).unwrap()
-}
-
-/// An inspector that asks `dns` only.
-fn inspector(dns: SocketAddr) -> Inspector {
-    let mut config = InspectorConfig::default();
-    config.resolvers = Vec::new();
-    config.discovery = NsDiscovery::Static(vec![NameServer::new(None, dns)]);
-    config.query_timeout = Duration::from_secs(2);
-    Inspector::new(config).unwrap()
-}
-
-fn rd(rtype: RecordType, text: &str) -> RecordData {
-    RecordData::parse(rtype, text).unwrap()
-}
-
-fn txt(value: &str) -> RecordData {
-    rd(RecordType::TXT, &format!("\"{value}\""))
-}
-
-/// What `server` answers, with the AA flag required, for `rtype` at `name`.
-async fn ask(server: SocketAddr, name: &str, rtype: RecordType) -> Answer {
-    inspector(server)
-        .query_server(server, &Question::new(dn(name), rtype))
-        .await
-}
-
-/// The values of an authoritative answer; panics on any other answer.
-fn values(answer: Answer) -> Vec<RecordData> {
-    match answer {
-        Answer::Records { records, .. } => records,
-        other => panic!("expected records, got {other:?}"),
-    }
-}
-
-fn is_absent(answer: &Answer) -> bool {
-    matches!(answer, Answer::NxDomain | Answer::NoData)
-}
-
-/// Adds a TXT value at [`NAME`] through `client`, sees it answered by `dns` with the AA flag
-/// through a link from `mock`, removes it and sees it gone. Leaves the link in place.
-async fn txt_round_trip(mock: &impl ChangeSource, client: &impl Provider, dns: &DnsMock) -> Link {
-    let link = link(mock, dns, LinkOptions::new());
-    let value = format!("token-{}", dns.addr().port());
-    let zone = dn(ZONE);
-    let name = dn(NAME);
-    client
-        .add_txt_value(&zone, &name, &Txt::new(value.as_str()).unwrap(), None)
-        .await
-        .unwrap();
-    link.settled().await;
-    assert_eq!(
-        values(ask(dns.addr(), NAME, RecordType::TXT).await),
-        [txt(&value)]
-    );
-    client
-        .remove_txt_value(&zone, &name, &Txt::new(value.as_str()).unwrap())
-        .await
-        .unwrap();
-    link.settled().await;
-    let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
-    assert!(is_absent(&answer), "{answer:?}");
-    assert_eq!(link.skipped(), 0);
-    link
 }
 
 /// Every change waiting in `stream`, as (name, type, values, origin).

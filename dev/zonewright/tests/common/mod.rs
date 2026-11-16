@@ -4,6 +4,8 @@
 #![allow(dead_code)]
 
 pub mod echo;
+#[cfg(feature = "inspector")]
+pub mod link;
 
 use secrecy::SecretString;
 use zonewright::{AnyProvider, Context, ContextOptions, DomainName, Error, ProviderId};
