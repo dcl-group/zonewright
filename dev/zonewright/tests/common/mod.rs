@@ -4,6 +4,8 @@
 #![allow(dead_code)]
 
 pub mod echo;
+#[cfg(any(feature = "edgecenter", feature = "gcore"))]
+pub mod gcore_shared;
 #[cfg(feature = "inspector")]
 pub mod link;
 
@@ -66,6 +68,14 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
         ),
         ProviderId::DigitalOcean => (
             r#"{"base_url":"http://127.0.0.1:9/v2"}"#,
+            r#"{"api_token":"test-only-token"}"#,
+        ),
+        ProviderId::EdgeCenter => (
+            r#"{"base_url":"http://127.0.0.1:9/dns"}"#,
+            r#"{"api_token":"test-only-token"}"#,
+        ),
+        ProviderId::Gcore => (
+            r#"{"base_url":"http://127.0.0.1:9/dns"}"#,
             r#"{"api_token":"test-only-token"}"#,
         ),
         ProviderId::VkCloud => (

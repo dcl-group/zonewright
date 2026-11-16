@@ -24,6 +24,8 @@ pub use rrset::RrSet;
 #[cfg(any(
     feature = "selectel_v2",
     feature = "digitalocean",
+    feature = "edgecenter",
+    feature = "gcore",
     feature = "cloudflare",
     feature = "yandex_cloud",
     feature = "hetzner",

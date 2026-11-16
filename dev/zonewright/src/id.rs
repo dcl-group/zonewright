@@ -24,6 +24,10 @@ pub enum ProviderId {
     Cloudflare,
     /// DigitalOcean (`digitalocean`).
     DigitalOcean,
+    /// EdgeCenter (`edgecenter`).
+    EdgeCenter,
+    /// Gcore (`gcore`).
+    Gcore,
     /// Hetzner (`hetzner`).
     Hetzner,
     /// nic.ru (`nicru`).
@@ -54,6 +58,8 @@ impl ProviderId {
         ProviderId::CloudRu,
         ProviderId::Cloudflare,
         ProviderId::DigitalOcean,
+        ProviderId::EdgeCenter,
+        ProviderId::Gcore,
         ProviderId::Hetzner,
         ProviderId::Nicru,
         ProviderId::Regru,
@@ -78,6 +84,8 @@ impl ProviderId {
             ProviderId::CloudRu => "cloud_ru",
             ProviderId::Cloudflare => "cloudflare",
             ProviderId::DigitalOcean => "digitalocean",
+            ProviderId::EdgeCenter => "edgecenter",
+            ProviderId::Gcore => "gcore",
             ProviderId::Hetzner => "hetzner",
             ProviderId::Nicru => "nicru",
             ProviderId::Regru => "regru",
@@ -100,6 +108,8 @@ impl ProviderId {
             "cloud_ru" => ProviderId::CloudRu,
             "cloudflare" => ProviderId::Cloudflare,
             "digitalocean" => ProviderId::DigitalOcean,
+            "edgecenter" => ProviderId::EdgeCenter,
+            "gcore" => ProviderId::Gcore,
             "hetzner" => ProviderId::Hetzner,
             "nicru" => ProviderId::Nicru,
             "regru" => ProviderId::Regru,
@@ -125,6 +135,8 @@ impl ProviderId {
             ProviderId::CloudRu => cfg!(feature = "cloud_ru"),
             ProviderId::Cloudflare => cfg!(feature = "cloudflare"),
             ProviderId::DigitalOcean => cfg!(feature = "digitalocean"),
+            ProviderId::EdgeCenter => cfg!(feature = "edgecenter"),
+            ProviderId::Gcore => cfg!(feature = "gcore"),
             ProviderId::Hetzner => cfg!(feature = "hetzner"),
             ProviderId::Nicru => cfg!(feature = "nicru"),
             ProviderId::Regru => cfg!(feature = "regru"),

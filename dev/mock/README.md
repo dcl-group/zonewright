@@ -152,6 +152,8 @@ server of its own subscribes to the changes instead and mirrors them itself.
 | `cloud_ru`      | Cloud.ru      | `CloudRuMock`      |
 | `cloudflare`    | Cloudflare    | `CloudflareMock`   |
 | `digitalocean`  | DigitalOcean  | `DigitalOceanMock` |
+| `edgecenter`    | EdgeCenter    | `EdgeCenterMock`   |
+| `gcore`         | Gcore         | `GcoreMock`        |
 | `hetzner`       | Hetzner       | `HetznerMock`      |
 | `nicru`         | nic.ru        | `NicruMock`        |
 | `regru`         | reg.ru        | `RegruMock`        |

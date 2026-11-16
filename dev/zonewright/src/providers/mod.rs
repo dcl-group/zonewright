@@ -23,6 +23,12 @@ pub mod beget;
 pub mod cloud_ru;
 pub mod cloudflare;
 pub mod digitalocean;
+pub mod edgecenter;
+pub mod gcore;
+// The DNS API v2 that Gcore serves and EdgeCenter serves in a fork of its own: the code both
+// clients share.
+#[cfg(any(feature = "edgecenter", feature = "gcore"))]
+mod gcore_shared;
 pub mod hetzner;
 pub mod nicru;
 pub mod regru;
@@ -42,6 +48,8 @@ pub(crate) fn meta_of(id: ProviderId) -> &'static ProviderMeta {
         ProviderId::CloudRu => &cloud_ru::meta::META,
         ProviderId::Cloudflare => &cloudflare::meta::META,
         ProviderId::DigitalOcean => &digitalocean::meta::META,
+        ProviderId::EdgeCenter => &edgecenter::meta::META,
+        ProviderId::Gcore => &gcore::meta::META,
         ProviderId::Hetzner => &hetzner::meta::META,
         ProviderId::Nicru => &nicru::meta::META,
         ProviderId::Regru => &regru::meta::META,
@@ -80,6 +88,12 @@ pub enum AnyProvider {
     /// The DigitalOcean client (`digitalocean`).
     #[cfg(feature = "digitalocean")]
     DigitalOcean(digitalocean::DigitalOcean),
+    /// The EdgeCenter client (`edgecenter`).
+    #[cfg(feature = "edgecenter")]
+    EdgeCenter(edgecenter::EdgeCenter),
+    /// The Gcore client (`gcore`).
+    #[cfg(feature = "gcore")]
+    Gcore(gcore::Gcore),
     /// The Hetzner client (`hetzner`).
     #[cfg(feature = "hetzner")]
     Hetzner(hetzner::Hetzner),
@@ -127,6 +141,10 @@ macro_rules! forward {
             AnyProvider::Cloudflare(ref $client) => $body,
             #[cfg(feature = "digitalocean")]
             AnyProvider::DigitalOcean(ref $client) => $body,
+            #[cfg(feature = "edgecenter")]
+            AnyProvider::EdgeCenter(ref $client) => $body,
+            #[cfg(feature = "gcore")]
+            AnyProvider::Gcore(ref $client) => $body,
             #[cfg(feature = "hetzner")]
             AnyProvider::Hetzner(ref $client) => $body,
             #[cfg(feature = "nicru")]
@@ -168,6 +186,8 @@ impl AnyProvider {
             feature = "cloud_ru",
             feature = "cloudflare",
             feature = "digitalocean",
+            feature = "edgecenter",
+            feature = "gcore",
             feature = "hetzner",
             feature = "nicru",
             feature = "regru",
@@ -188,6 +208,8 @@ impl AnyProvider {
             feature = "cloud_ru",
             feature = "cloudflare",
             feature = "digitalocean",
+            feature = "edgecenter",
+            feature = "gcore",
             feature = "hetzner",
             feature = "nicru",
             feature = "regru",
@@ -231,6 +253,15 @@ impl AnyProvider {
                 #[cfg(feature = "digitalocean")]
                 return digitalocean::from_json(settings, credentials, ctx)
                     .map(AnyProvider::DigitalOcean);
+            }
+            ProviderId::EdgeCenter => {
+                #[cfg(feature = "edgecenter")]
+                return edgecenter::from_json(settings, credentials, ctx)
+                    .map(AnyProvider::EdgeCenter);
+            }
+            ProviderId::Gcore => {
+                #[cfg(feature = "gcore")]
+                return gcore::from_json(settings, credentials, ctx).map(AnyProvider::Gcore);
             }
             ProviderId::Hetzner => {
                 #[cfg(feature = "hetzner")]
@@ -289,6 +320,8 @@ impl AnyProvider {
         feature = "cloud_ru",
         feature = "cloudflare",
         feature = "digitalocean",
+        feature = "edgecenter",
+        feature = "gcore",
         feature = "hetzner",
         feature = "nicru",
         feature = "regru",
@@ -402,6 +435,20 @@ impl From<cloudflare::Cloudflare> for AnyProvider {
 impl From<digitalocean::DigitalOcean> for AnyProvider {
     fn from(client: digitalocean::DigitalOcean) -> AnyProvider {
         AnyProvider::DigitalOcean(client)
+    }
+}
+
+#[cfg(feature = "edgecenter")]
+impl From<edgecenter::EdgeCenter> for AnyProvider {
+    fn from(client: edgecenter::EdgeCenter) -> AnyProvider {
+        AnyProvider::EdgeCenter(client)
+    }
+}
+
+#[cfg(feature = "gcore")]
+impl From<gcore::Gcore> for AnyProvider {
+    fn from(client: gcore::Gcore) -> AnyProvider {
+        AnyProvider::Gcore(client)
     }
 }
 

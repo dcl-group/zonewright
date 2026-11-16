@@ -81,6 +81,8 @@ mod redact;
     feature = "cloud_ru",
     feature = "cloudflare",
     feature = "digitalocean",
+    feature = "edgecenter",
+    feature = "gcore",
     feature = "hetzner",
     feature = "nicru",
     feature = "regru",
@@ -101,6 +103,8 @@ mod values;
     feature = "cloud_ru",
     feature = "cloudflare",
     feature = "digitalocean",
+    feature = "edgecenter",
+    feature = "gcore",
     feature = "hetzner",
     feature = "nicru",
     feature = "regru",
@@ -129,7 +133,9 @@ mod operation;
     feature = "nicru",
     feature = "route53",
     feature = "rfc2136",
-    feature = "cloud_ru"
+    feature = "cloud_ru",
+    feature = "gcore",
+    feature = "edgecenter"
 ))]
 mod rrsets;
 

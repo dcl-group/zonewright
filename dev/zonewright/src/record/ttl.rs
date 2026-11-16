@@ -35,6 +35,8 @@ impl Ttl {
             feature = "cloud_ru",
             feature = "cloudflare",
             feature = "digitalocean",
+            feature = "edgecenter",
+            feature = "gcore",
             feature = "hetzner",
             feature = "nicru",
             feature = "rfc2136",

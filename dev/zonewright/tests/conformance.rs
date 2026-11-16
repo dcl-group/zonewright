@@ -28,6 +28,8 @@ const IDS: &[(ProviderId, &str)] = &[
     (ProviderId::CloudRu, "cloud_ru"),
     (ProviderId::Cloudflare, "cloudflare"),
     (ProviderId::DigitalOcean, "digitalocean"),
+    (ProviderId::EdgeCenter, "edgecenter"),
+    (ProviderId::Gcore, "gcore"),
     (ProviderId::Hetzner, "hetzner"),
     (ProviderId::Nicru, "nicru"),
     (ProviderId::Regru, "regru"),
@@ -106,6 +108,8 @@ fn available_follows_the_features() {
         (ProviderId::CloudRu, cfg!(feature = "cloud_ru")),
         (ProviderId::Cloudflare, cfg!(feature = "cloudflare")),
         (ProviderId::DigitalOcean, cfg!(feature = "digitalocean")),
+        (ProviderId::EdgeCenter, cfg!(feature = "edgecenter")),
+        (ProviderId::Gcore, cfg!(feature = "gcore")),
         (ProviderId::Hetzner, cfg!(feature = "hetzner")),
         (ProviderId::Nicru, cfg!(feature = "nicru")),
         (ProviderId::Regru, cfg!(feature = "regru")),
@@ -356,6 +360,9 @@ const ATOMIC_RRSET_WRITE: &[(ProviderId, bool)] = &[
     // Individual records: a replacement is several requests.
     (ProviderId::Cloudflare, false),
     (ProviderId::DigitalOcean, false),
+    // An rrset addressed by zone, name and type, created by one POST or replaced by one PUT.
+    (ProviderId::EdgeCenter, true),
+    (ProviderId::Gcore, true),
     // `set_records` replaces the records of an rrset in one request and `POST …/rrsets` creates
     // it with its records, but a replacement that also changes the TTL of an existing rrset is
     // `set_records` and then `change_ttl`: two requests.
@@ -403,6 +410,9 @@ const PROVIDER_DEFAULT_TTL: &[(ProviderId, ProviderDefaultTtl)] = &[
     (ProviderId::Cloudflare, ProviderDefaultTtl::Requestable),
     // Every record carries a TTL in the documented answers.
     (ProviderId::DigitalOcean, ProviderDefaultTtl::Absent),
+    // An rrset written without `ttl` gets 300, which a read shows as a number.
+    (ProviderId::EdgeCenter, ProviderDefaultTtl::Absent),
+    (ProviderId::Gcore, ProviderDefaultTtl::Absent),
     // An rrset's `ttl` may be `null`: the zone's default applies; a create without `ttl` and a
     // `change_ttl` with `null` ask for it.
     (ProviderId::Hetzner, ProviderDefaultTtl::Requestable),
@@ -562,6 +572,10 @@ fn config_type_object(
         ProviderId::Cloudflare => Some(keys::<cloudflare::CloudflareConfig>(settings)),
         #[cfg(feature = "digitalocean")]
         ProviderId::DigitalOcean => Some(keys::<digitalocean::DigitalOceanConfig>(settings)),
+        #[cfg(feature = "edgecenter")]
+        ProviderId::EdgeCenter => Some(keys::<edgecenter::EdgeCenterConfig>(settings)),
+        #[cfg(feature = "gcore")]
+        ProviderId::Gcore => Some(keys::<gcore::GcoreConfig>(settings)),
         #[cfg(feature = "hetzner")]
         ProviderId::Hetzner => Some(keys::<hetzner::HetznerConfig>(settings)),
         #[cfg(feature = "nicru")]
@@ -827,6 +841,10 @@ fn config_deserializes(
         ProviderId::Cloudflare => parses::<cloudflare::CloudflareConfig>(settings),
         #[cfg(feature = "digitalocean")]
         ProviderId::DigitalOcean => parses::<digitalocean::DigitalOceanConfig>(settings),
+        #[cfg(feature = "edgecenter")]
+        ProviderId::EdgeCenter => parses::<edgecenter::EdgeCenterConfig>(settings),
+        #[cfg(feature = "gcore")]
+        ProviderId::Gcore => parses::<gcore::GcoreConfig>(settings),
         #[cfg(feature = "hetzner")]
         ProviderId::Hetzner => parses::<hetzner::HetznerConfig>(settings),
         #[cfg(feature = "nicru")]

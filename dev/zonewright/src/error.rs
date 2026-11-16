@@ -376,6 +376,8 @@ impl Error {
         feature = "cloud_ru",
         feature = "cloudflare",
         feature = "digitalocean",
+        feature = "edgecenter",
+        feature = "gcore",
         feature = "hetzner",
         feature = "nicru",
         feature = "regru",

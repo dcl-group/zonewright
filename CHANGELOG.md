@@ -6,7 +6,11 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- Gcore (`gcore`) and EdgeCenter (`edgecenter`) clients: TXT value and record-level operations over
+  the DNS API v2 that the two providers share, with the mocks `GcoreMock` and `EdgeCenterMock`. Not
+  verified against the live APIs.
 
 ## 0.2.2 - 2026-11-16
 
