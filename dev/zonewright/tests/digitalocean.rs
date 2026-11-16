@@ -1757,7 +1757,7 @@ async fn digitalocean_record_refusals_send_nothing() {
         "example.org",
         RecordType::SOA,
         None,
-        &["ns1.digitalocean.com. hostmaster.example.org. 1 10800 3600 604800 1800"],
+        &["ns1.digitalocean.test. hostmaster.example.org. 1 10800 3600 604800 1800"],
     );
     let e = client
         .set_rrset(&zone(), &soa, Expect::Any)
@@ -1972,7 +1972,7 @@ async fn digitalocean_listing_reports_skipped_sets() {
     );
     let ns = get("example.org", RecordType::NS).unwrap();
     assert_eq!(ns.records().len(), 3);
-    assert_eq!(ns.records()[0].as_str(), "ns1.digitalocean.com.");
+    assert_eq!(ns.records()[0].as_str(), "ns1.digitalocean.test.");
     let soa = get("example.org", RecordType::SOA).unwrap();
     assert!(!soa.records()[0].is_canonical());
     let odd = get("odd.example.org", RecordType::A).unwrap();

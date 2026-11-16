@@ -66,7 +66,9 @@
 //! - creating a record equal to an existing one is accepted (no source says otherwise);
 //! - `PUT`, `DELETE` and the refresh answer `200` with the JSON body `null`; the refresh of a zone
 //!   without staged changes succeeds;
-//! - no rate limit, no paging, no rate-limit headers.
+//! - no rate limit, no paging, no rate-limit headers;
+//! - a zone's `nameServers` are `dns10.ovh.test` and `ns10.ovh.test`, names under `.test`,
+//!   never the provider's real hosts.
 //!
 //! Error texts are invented.
 //!
@@ -923,7 +925,7 @@ async fn zone_get(
         return not_found("This service does not exist");
     }
     axum::Json(json!({
-        "name": zone, "nameServers": ["dns10.ovh.net", "ns10.ovh.net"], "lastUpdate": null,
+        "name": zone, "nameServers": ["dns10.ovh.test", "ns10.ovh.test"], "lastUpdate": null,
         "dnssecSupported": true, "hasDnsAnycast": false
     }))
     .into_response()

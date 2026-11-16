@@ -29,7 +29,8 @@
 //!   OpenAPI `ZoneRecordType`; the regions of `ZoneRecordRegion`.
 //! - System records: OpenAPI `ZoneRecord.system_record` ("not modifiable") and the documented
 //!   listing, whose SOA record and four apex NS records are system records
-//!   ([`Control::insert_zone_defaults`] seeds that listing's records).
+//!   ([`Control::insert_zone_defaults`] seeds that listing's records, with the host names moved
+//!   under `.test`: `ns1.dnsimple-edge.test` to `ns4.dnsimple-edge.test`, `admin.dnsimple.test`).
 //! - TXT: <https://support.dnsimple.com/articles/txt-record-format/>: content of at most 1000
 //!   characters; an unquoted value is published wrapped in quotes, a quoted one as it is.
 //!
@@ -544,15 +545,15 @@ impl Control {
             zone,
             "",
             "SOA",
-            "ns1.dnsimple-edge.com admin.dnsimple.com 1458642070 86400 7200 604800 300",
+            "ns1.dnsimple-edge.test admin.dnsimple.test 1458642070 86400 7200 604800 300",
             3600,
             system.clone(),
         );
         for ns in [
-            "ns1.dnsimple-edge.com",
-            "ns2.dnsimple-edge.net",
-            "ns3.dnsimple-edge.io",
-            "ns4.dnsimple-edge.org",
+            "ns1.dnsimple-edge.test",
+            "ns2.dnsimple-edge.test",
+            "ns3.dnsimple-edge.test",
+            "ns4.dnsimple-edge.test",
         ] {
             self.insert_record_with(zone, "", "NS", ns, 3600, system.clone());
         }

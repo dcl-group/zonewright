@@ -2196,9 +2196,9 @@ async fn yandex_cloud_dotless_names_inside_values_are_non_canonical() {
         ("SRV", "0 5 443 @", None, "0 5 443 example.org."),
         (
             "ANAME",
-            "example.org.website.yandexcloud.net",
-            Some("example.org.website.yandexcloud.net."),
-            "example.org.website.yandexcloud.net.example.org.",
+            "example.org.website.yandexcloud.test",
+            Some("example.org.website.yandexcloud.test."),
+            "example.org.website.yandexcloud.test.example.org.",
         ),
         ("ANAME", "www", Some("www."), "www.example.org."),
         ("ANAME", "@", None, "example.org."),
@@ -2265,7 +2265,7 @@ async fn yandex_cloud_dotless_names_inside_values_are_non_canonical() {
         ("MX", "10 mx.example.org."),
         ("NS", "ns1.example.net."),
         ("SRV", "0 5 443 host.example.org."),
-        ("ANAME", "example.org.website.yandexcloud.net."),
+        ("ANAME", "example.org.website.yandexcloud.test."),
     ] {
         let (mock, client) = setup().await;
         mock.control()
@@ -2685,14 +2685,14 @@ async fn yandex_cloud_delete_rrset_expectations() {
 async fn yandex_cloud_protected_sets_send_nothing() {
     let (mock, client) = setup().await;
     let control = mock.control();
-    let soa_text = "ns1.yandexcloud.net. mx.cloud.yandex.net. 1 10800 900 604800 86400";
+    let soa_text = "ns1.yandexcloud.test. mx.cloud.yandex.test. 1 10800 900 604800 86400";
     control.insert_rrset(ZONE, ZONE, "SOA", "3600", &[soa_text]);
     control.insert_rrset(
         ZONE,
         ZONE,
         "NS",
         "3600",
-        &["ns1.yandexcloud.net.", "ns2.yandexcloud.net."],
+        &["ns1.yandexcloud.test.", "ns2.yandexcloud.test."],
     );
     let soa = rrset(ZONE, RecordType::SOA, None, &[soa_text]);
     let apex_ns = rrset(ZONE, RecordType::NS, None, &["ns.example.com."]);
@@ -2905,9 +2905,9 @@ async fn yandex_cloud_listing_reports_skipped_sets() {
     let (capture, _guard) = LogCapture::install();
     let (mock, client) = setup().await;
     let control = mock.control();
-    let soa_text = "ns1.yandexcloud.net. mx.cloud.yandex.net. 1 10800 900 604800 86400";
+    let soa_text = "ns1.yandexcloud.test. mx.cloud.yandex.test. 1 10800 900 604800 86400";
     control.insert_rrset(ZONE, ZONE, "SOA", "3600", &[soa_text]);
-    control.insert_rrset(ZONE, ZONE, "NS", "3600", &["ns1.yandexcloud.net."]);
+    control.insert_rrset(ZONE, ZONE, "NS", "3600", &["ns1.yandexcloud.test."]);
     control.insert_rrset(ZONE, REC, "A", "600", &["192.0.2.1"]);
     control.insert_rrset(ZONE, REC, "TXT", "600", &["\"v=spf1 -all\""]);
     control.insert_rrset(ZONE, "_25._tcp.example.org", "TLSA", "600", &["3 1 1 0A1B"]);

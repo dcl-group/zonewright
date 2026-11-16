@@ -530,15 +530,15 @@ impl Control {
 
     /// Seeds the provider's default NS records at the apex of `domain`: published, but not in
     /// the API's listing and not editable through it. The host names are those of the spec's
-    /// example of a `warnings` text.
+    /// example of a `warnings` text, moved under `.test` (`maceio.ns.porkbun.test` and three more).
     pub fn insert_zone_defaults(&self, domain: &str) {
         let domain = domain.to_lowercase();
         self.change(|inner| {
             for ns in [
-                "maceio.ns.porkbun.com",
-                "curitiba.ns.porkbun.com",
-                "salvador.ns.porkbun.com",
-                "fortaleza.ns.porkbun.com",
+                "maceio.ns.porkbun.test",
+                "curitiba.ns.porkbun.test",
+                "salvador.ns.porkbun.test",
+                "fortaleza.ns.porkbun.test",
             ] {
                 inner.next_id += 1;
                 let id = inner.next_id;

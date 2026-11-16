@@ -52,7 +52,9 @@
 //!   (`{"records": […]}`, `{"non_field_errors": […]}`) for a refused rrset; error texts are
 //!   invented;
 //! - a new domain gets an apex NS rrset with [`Seed::apex_ns`] (the documentation says deSEC's
-//!   name servers are set up for a new domain, without the values), TTL 3600;
+//!   name servers are set up for a new domain, without the values), TTL 3600; the standard
+//!   seed's names are under `.test` (`ns1.desec.test.`, `ns2.desec.test.`), never the
+//!   provider's real hosts;
 //! - the cursors are `p<offset>`; [`Control::set_paging`] makes the listing page in ways the
 //!   documentation does not exclude ([`Paging`]), for tests of a client's end rule, among
 //!   them the `Link` header as one field line per link.
@@ -154,14 +156,14 @@ pub struct Seed {
 
 impl Seed {
     /// The token `test-only-token`, the domain `example.org` with an apex NS rrset of
-    /// `ns1.desec.io.` and `ns2.desec.org.`, pages of 500, a minimum TTL of 3600.
+    /// `ns1.desec.test.` and `ns2.desec.test.`, pages of 500, a minimum TTL of 3600.
     pub fn standard() -> Self {
         Self {
             tokens: vec!["test-only-token".into()],
             zones: vec!["example.org".into()],
             page_size: 500,
             minimum_ttl: 3600,
-            apex_ns: vec!["ns1.desec.io.".into(), "ns2.desec.org.".into()],
+            apex_ns: vec!["ns1.desec.test.".into(), "ns2.desec.test.".into()],
         }
     }
 }
@@ -1322,7 +1324,7 @@ mod tests {
             ("A", "192.0.2.1", "192.0.2.1"),
             ("AAAA", "0:0000::1", "::1"),
             ("CNAME", "Target.example.net.", "target.example.net."),
-            ("MX", "10  mail.a4a.de.", "10 mail.a4a.de."),
+            ("MX", "10  mail.desec.test.", "10 mail.desec.test."),
             (
                 "SRV",
                 "10 20 5060 sip.example.org.",

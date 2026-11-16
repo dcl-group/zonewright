@@ -16,6 +16,15 @@ All notable changes to this crate are recorded in this file. The format follows
 
 - `rfc2136`: the `DEBUG` event of each DNS exchange and of each zone transfer attempt carries the
   field `attempt`, as the HTTP event does.
+- `zonewright-mock`: the default data of five mocks names hosts under `.test` instead of the
+  providers' real hosts. A test that asserts a mock's default name servers sees the new names. deSEC
+  `Seed::standard()` name servers: `ns1.desec.test.`, `ns2.desec.test.` (were `ns1.desec.io.`,
+  `ns2.desec.org.`). DNSimple zone defaults: `ns1` to `ns4.dnsimple-edge.test` and the SOA
+  `ns1.dnsimple-edge.test admin.dnsimple.test` (were under `dnsimple-edge.com`, `.net`, `.io`,
+  `.org` and `admin.dnsimple.com`). DigitalOcean zone defaults: `ns1` to `ns3.digitalocean.test`
+  (were `.com`). Porkbun default name servers: `maceio`, `curitiba`, `salvador` and
+  `fortaleza.ns.porkbun.test` (were `.com`). OVHcloud zone `nameServers`: `dns10.ovh.test`,
+  `ns10.ovh.test` (were `.net`).
 
 ### Fixed
 

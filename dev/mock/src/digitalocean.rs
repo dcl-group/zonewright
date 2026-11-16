@@ -59,7 +59,8 @@
 //!   DigitalOcean's Terraform provider expects (`digitalocean/domain/resource_record.go`, the
 //!   read, at commit `5c5eea1`); the reference shows no example of it;
 //! - [`Control::insert_zone_defaults`] seeds an SOA record whose `data` is `1800` and three NS
-//!   records at the apex; the SOA's `data` form is not documented;
+//!   records at the apex (`ns1.digitalocean.test` to `ns3.digitalocean.test`, names under
+//!   `.test`, never the provider's real hosts); the SOA's `data` form is not documented;
 //! - a `per_page` outside 1 to 200 or a `page` below 1 is refused with `422`;
 //! - the `ratelimit-*` headers are not sent.
 //!
@@ -484,9 +485,9 @@ impl Control {
     pub fn insert_zone_defaults(&self, domain: &str) {
         self.insert_record(domain, "@", "SOA", "1800", 1800);
         for ns in [
-            "ns1.digitalocean.com",
-            "ns2.digitalocean.com",
-            "ns3.digitalocean.com",
+            "ns1.digitalocean.test",
+            "ns2.digitalocean.test",
+            "ns3.digitalocean.test",
         ] {
             self.insert_record(domain, "@", "NS", ns, 1800);
         }

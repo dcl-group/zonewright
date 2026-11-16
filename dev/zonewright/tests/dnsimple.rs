@@ -2145,7 +2145,7 @@ async fn dnsimple_listing_reports_skipped_sets() {
     );
     let ns = get("example.org", RecordType::NS).unwrap();
     assert_eq!(ns.records().len(), 4);
-    assert_eq!(ns.records()[0].as_str(), "ns1.dnsimple-edge.com.");
+    assert_eq!(ns.records()[0].as_str(), "ns1.dnsimple-edge.test.");
     let soa = get("example.org", RecordType::SOA).unwrap();
     assert!(soa.records()[0].is_canonical());
     let odd = get("odd.example.org", RecordType::A).unwrap();

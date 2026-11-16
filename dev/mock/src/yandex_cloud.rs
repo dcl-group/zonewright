@@ -1426,7 +1426,7 @@ mod tests {
             ("A", "192.0.2.1"),
             ("AAAA", "2001:db8::1"),
             ("CNAME", "host.example.com."),
-            ("ANAME", "example.com.website.yandexcloud.net"),
+            ("ANAME", "example.com.website.yandexcloud.test"),
             ("MX", "10 mx-primary.example.com."),
             ("SRV", "10 70 8080 host.example.com."),
             ("SRV", "0 0 0 ."),
@@ -1442,7 +1442,7 @@ mod tests {
             ("TXT", "plain"),
             (
                 "SOA",
-                "ns1.yandexcloud.net. mx.cloud.yandex.net. 1 10800 900 604800 86400",
+                "ns1.yandexcloud.test. mx.cloud.yandex.test. 1 10800 900 604800 86400",
             ),
         ] {
             assert_eq!(check_data(rtype, text), Ok(()), "{rtype} {text}");

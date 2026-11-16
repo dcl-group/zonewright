@@ -908,7 +908,7 @@ async fn desec_listing_reports_skipped_sets() {
             "example.org",
             RecordType::NS,
             Some(3600),
-            &["ns1.desec.io.", "ns2.desec.org."]
+            &["ns1.desec.test.", "ns2.desec.test."]
         )
     );
     let dotless = find("dotless.example.org", RecordType::MX);
