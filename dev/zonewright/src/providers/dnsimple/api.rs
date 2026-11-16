@@ -131,8 +131,9 @@ impl Record {
 /// A zone as `GET /{account}/zones` and `GET /{account}/zones/{zone}` return it; other members
 /// are ignored.
 // Source: OpenAPI `Zone`: `name`, `active` ("If false, DNS services are disabled and DNS records
-// will not be resolved"), `secondary` ("Returns true for a secondary zone"). Only `name` is
-// required here: the get request already names the zone, and the flags only add a warning.
+// will not be resolved"), `secondary` ("Returns true for a secondary zone"). No member is
+// required by the parse: the get request already names the zone, and the flags only add a
+// warning. A listing whose zone has no name is refused by the caller (`list_zones`).
 #[derive(Debug, Deserialize)]
 pub(super) struct Zone {
     /// The zone's name, without a trailing dot.

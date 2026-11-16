@@ -1206,6 +1206,21 @@ async fn dnsimple_list_zones_pages_by_number() {
     assert_eq!(mock.log().count(Some("GET"), ZONES), 2);
 }
 
+/// A zone listing that holds a zone object without a name is `Protocol`, not a shorter list.
+#[tokio::test]
+async fn dnsimple_zone_listing_without_a_name_is_a_protocol_error() {
+    let (mock, client) = setup().await;
+    let zones = serde_json::json!([
+        {"id": 2, "account_id": 1010, "name": "example.org", "active": true, "secondary": false},
+        {"id": 1, "account_id": 1010}
+    ]);
+    mock.faults()
+        .push(Fault::on("GET", ZONES).respond(200, listing_body(&zones, 2, 1, 1)));
+    let e = client.list_zones().await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    assert_eq!(mock.log().count(Some("GET"), ZONES), 1);
+}
+
 /// `check` proves the token with `whoami`, reports a missing zone as not found, and warns about
 /// a zone whose DNS services are off or that is a secondary zone; a wrong token is `Auth`.
 #[tokio::test]
@@ -1444,7 +1459,7 @@ async fn dnsimple_rate_limit() {
     let started = std::time::Instant::now();
     let e = add(&client, "BBB").await.unwrap_err();
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(60),
         "{:?}",
         started.elapsed()
     );

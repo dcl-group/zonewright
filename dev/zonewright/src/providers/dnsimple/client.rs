@@ -169,10 +169,16 @@ impl Provider for Dnsimple {
     async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
         Call::list_zones()
             .observe(self, async {
-                let names: BTreeSet<DomainName> = self
-                    .api
-                    .zones()
-                    .await?
+                let zones = self.api.zones().await?;
+                // A listed zone carries its name; one without it cannot be told apart and would
+                // drop out of the list unnoticed. A name that does not parse is left out, as in
+                // the other clients.
+                if zones.iter().any(|zone| zone.name.is_none()) {
+                    return Err(Error::Protocol {
+                        detail: Detail::constant("the provider listed a zone without a name"),
+                    });
+                }
+                let names: BTreeSet<DomainName> = zones
                     .iter()
                     .filter_map(|zone| zone.name.as_deref())
                     .filter_map(|name| DomainName::parse(name).ok())

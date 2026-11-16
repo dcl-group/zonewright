@@ -18,6 +18,8 @@ All notable changes to this crate are recorded in this file. The format follows
   that write as published. When that write's operation was then dropped, or its own refresh failed,
   the record stayed stored but not published and no refresh was owed, until the next write in the
   zone. A refresh now covers only the writes that had ended when it was sent.
+- `dnsimple`: `list_zones` answers `Protocol` when the provider lists a zone without a name, where
+  it left that zone out before.
 
 ## 0.2.3 - 2026-11-16
 
