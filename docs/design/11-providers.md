@@ -137,20 +137,24 @@ Behavior that the design fixes because the generic sections cannot:
   nothing but TXT. An outside writer's A or MX record added between the client's read and its write
   is lost; this is part of open point 14. A name holds at most 10 TXT records, the API's limit per
   type; a larger set is `InvalidInput`. Credentials go in the POST body, never in the query string.
+  An answer whose `records` key is missing or `null` is `Error::Protocol` with nothing written,
+  although lego's test answer for an empty name has no such key (open point 29).
 - `cloud_ru`. More than one TXT record for a name is `Error::Protocol`. A record marked read-only is
-  `Error::Rejected`. A list field absent from a listing page is an empty page (the provider's API
-  description does not mark it required, and Proto3 JSON omits empty repeated fields); a list given
-  as `null` or as a non-array, or a non-string page token, is `Error::Protocol`. A record name
-  without a trailing dot that can be read both as relative to the zone and as a full name inside it
-  is `Error::Protocol` when either reading is the requested name: the form the API uses is not
-  documented, and the client does not guess. Two zones with one name, and a listed record of another
-  zone, are `Error::Protocol`. A record with GSLB links answers from its links, not from its values:
-  it is not an rrset (section 3.4), a listing skips it, and every record-level operation and TXT
-  value operation at its name and type is `Error::Rejected` after the read. The read again before
-  every write (section 3.5) is the layers' `reread_before_write`. In the record layer the refusal of
-  a read-only record, which needs the read, and that of a wildcard NS record are made before that
-  second read (`WholeSet::check_write`); in the TXT value operations a read-only record is refused
-  at the write, after it.
+  `Error::Rejected`. A zone marked read-only is left out of `list_zones`, is reported by `check` as
+  not found with a detail, and every operation on it, reads included, is `Error::Rejected`. A list
+  field absent from a listing page is an empty page (the provider's API description does not mark it
+  required, and Proto3 JSON omits empty repeated fields); a list given as `null` or as a non-array,
+  or a non-string page token, is `Error::Protocol`. A record name without a trailing dot that can be
+  read both as relative to the zone and as a full name inside it is `Error::Protocol` when either
+  reading is the requested name: the form the API uses is not documented, and the client does not
+  guess. Two zones with one name, and a listed record of another zone, are `Error::Protocol`. A
+  record with GSLB links answers from its links, not from its values: it is not an rrset (section
+  3.4), a listing skips it, and every record-level operation and TXT value operation at its name and
+  type is `Error::Rejected` after the read. The read again before every write (section 3.5) is the
+  layers' `reread_before_write`. In the record layer the refusal of a read-only record, which needs
+  the read, and that of a wildcard NS record are made before that second read
+  (`WholeSet::check_write`); in the TXT value operations a read-only record is refused at the write,
+  after it.
 - `hetzner`. Only zones in primary mode are usable; a secondary zone is reported by `check` as not
   found with a detail, and operations on it are `Error::Rejected`. Values are removed using exactly
   the text the API returned. An rrset with `ttl: null` ("If not set, the Zone's Default TTL is

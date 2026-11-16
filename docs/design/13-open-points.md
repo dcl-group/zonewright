@@ -50,6 +50,8 @@ numbers never change.
 | 26   | Yandex Cloud TXT without quotes               | Open: live run | Yandex Cloud                 |
 | 27   | Yandex 360 name form                          | Open: live run | Yandex 360                   |
 | 28   | Timeweb Cloud names in a subdomain listing    | Open: live run | Timeweb Cloud                |
+| 29   | Beget answer for a name without records       | Open: live run | Beget                        |
+| 30   | reg.ru TXT text alphabet                      | Open: live run | reg.ru                       |
 
 #### Open: needs a live run
 
@@ -128,6 +130,22 @@ it.
 **28.** **Timeweb Cloud names in a subdomain's listing.** The client reads a relative `subdomain` in
 the listing of a subdomain as relative to the zone, by the wording of the `v2` schema (section
 11.3). A live run settles whether it is relative to the zone or to that subdomain.
+
+**29.** **Beget answer for a name without records.** The client accepts a name without records only
+when `getData` states `records` as an empty list (an assumption: what an empty PHP array encodes to)
+or as an object of placeholders (the DNS page's example). lego's test answer `getData_empty.json`,
+for an `_acme-challenge` name, has no `records` key; nothing shows whether it was observed. The
+client refuses that answer (`Error::Protocol`, nothing written), because the write that follows
+replaces the records of the name and a missing key may be an incomplete answer. If the live API
+answers a fresh name that way, adding the first TXT value at a fresh name, the usual DNS-01 case,
+fails. One `getData` for a name that holds no records settles the shape; the client then accepts
+exactly that shape. Item 8 comes first.
+
+**30.** **reg.ru TXT text alphabet.** The documentation allows only alphanumeric ASCII characters in
+the text of a TXT record and names the refusal `TEXT_CONTAINS_INVALID_CHARACTERS`. A DNS-01 value is
+base64url text and usually contains `-` or `_`. The client sends such a value as it is and reports
+the API's refusal as `Error::InvalidInput`. If the live API enforces the documented alphabet, most
+DNS-01 values cannot be added at reg.ru. One add of a value with `-` and `_` settles it.
 
 #### Open: needs the maintainer's decision
 
