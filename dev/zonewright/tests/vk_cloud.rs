@@ -2729,7 +2729,7 @@ async fn vk_cloud_cname_is_changed_in_place() {
     }
 }
 
-/// Replacing a CNAME never leaves the name without it (the reviewer's case: the old target
+/// Replacing a CNAME never leaves the name without it (for example the old target
 /// replaced by a one-label target the API refuses). A target that breaks the documented
 /// structure of `content-cname` is refused before any write; a change the API refuses is one
 /// request, after which the old record is as it was; a TTL change, which the update cannot

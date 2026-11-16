@@ -2804,7 +2804,7 @@ async fn nicru_unknown_first_edit_is_rolled_back() {
     assert_eq!(published(&mock, "www", "A"), ["192.0.2.1"]);
 }
 
-/// Critic 6, probe A: a staging answered 502 without being applied, and the listing that
+/// A staging answered 502 without being applied, and the listing that
 /// should settle it fails as well, leave an unconfirmed rollback mark on a clean zone. A foreign
 /// edit staged afterwards is never rolled back: reads and writes refuse the zone. Once the zone
 /// is clean again the mark goes, and a later foreign edit is refused as foreign.
@@ -2870,7 +2870,7 @@ async fn nicru_unconfirmed_rollback_mark_is_not_acted_on() {
     assert_eq!((commits(&mock), rollbacks(&mock)), (0, 0));
 }
 
-/// Critic 6, probe B: every commit attempt is applied with its answer lost, and the listing
+/// Every commit attempt is applied with its answer lost, and the listing
 /// after the last attempt fails as well, so the zone is clean but keeps an unconfirmed commit
 /// mark. Another writer then stages the deletion of a published TXT record: neither a read nor
 /// a write commits it. Covered for a TXT value operation and for a record-level write.
