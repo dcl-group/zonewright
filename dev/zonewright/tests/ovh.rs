@@ -68,7 +68,7 @@ fn txt(value: &str) -> Txt {
 
 /// Settings pointed at `base_url`.
 fn settings(base_url: String) -> OvhConfig {
-    let mut config = OvhConfig::new(AK);
+    let mut config = OvhConfig::new(AK.to_owned());
     config.base_url = Some(base_url);
     // Reads of a record that is not readable yet are repeated without a noticeable wait.
     config.read_retry_ms = 1;
@@ -1674,7 +1674,7 @@ fn ovh_minimal_configuration_builds() {
     )
     .unwrap();
     assert_eq!(client.id(), ProviderId::Ovh);
-    let config = OvhConfig::new("k");
+    let config = OvhConfig::new("k".to_owned());
     assert_eq!(config.endpoint, "ovh-eu");
     assert_eq!(config.base_url, None);
     assert_eq!(config.ttl, RrsetTtl::from_secs(120).unwrap());

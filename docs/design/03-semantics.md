@@ -240,13 +240,15 @@ Rules common to all of them:
   operation's read, nothing of it was overwritten, and the result is `Error::Conflict`; otherwise
   the refusal is the error.
 - Each row of the table corresponds to a value of `Capabilities::txt_values`: `PerValue` for the
-  first two rows and for RFC 2136, `Conditional` for Route 53 and Yandex Cloud, `ReadThenWrite` for
-  Selectel v2, Beget and Cloud.ru, `Rotating` for acme-dns. At the three `ReadThenWrite` providers
-  hard rule 2 ("someone else's value is never deleted") holds against this process and every other
-  user of the same `Context`, but not against a writer outside it; no client code can change that,
-  because their APIs offer neither a per-value call nor a condition. An application for which that
-  is not acceptable reads the capability and does not share such names with other writers (open
-  point 14).
+  first two rows and for RFC 2136 (thirteen clients: Cloudflare, DigitalOcean, DNSimple, Gandi,
+  Hetzner, nic.ru, OVHcloud, Porkbun, reg.ru, RFC 2136, Timeweb Cloud, VK Cloud and Yandex 360),
+  `Conditional` for Route 53, Yandex Cloud, Google Cloud DNS and Azure DNS, `ReadThenWrite` for
+  Selectel v2, Beget, Cloud.ru, deSEC, Gcore and EdgeCenter, `Rotating` for acme-dns. At the six
+  `ReadThenWrite` providers hard rule 2 ("someone else's value is never deleted") holds against this
+  process and every other user of the same `Context`, but not against a writer outside it; no client
+  code can change that, because their APIs offer neither a per-value call nor a condition. An
+  application for which that is not acceptable reads the capability and does not share such names
+  with other writers (open point 14).
 - `Conflict` is retryable: the next attempt reads the new state. On a conditional-write provider the
   client itself repeats the read-and-write once before returning `Conflict`; this is the one place a
   client repeats a write, and it is safe because the rejected write did not happen.

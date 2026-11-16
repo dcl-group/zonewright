@@ -11,27 +11,29 @@ No feature is enabled by default (decision 6).
 | Feature                | Enables                                              | Optional dependencies it turns on                                                    |
 | ---------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | one per provider (2.4) | that provider's client and its `AnyProvider` variant | see the `[features]` table of the manifest                                           |
-| `all-providers`        | all fifteen provider features                        | their union                                                                          |
+| `all-providers`        | all twenty-four provider features                    | their union                                                                          |
 | `inspector`            | `zonewright::inspector`                              | `hickory-proto`, `futures-util`, `fastrand`, `tracing`; `tokio/net`, `tokio/io-util` |
 | `socks`                | SOCKS5 proxies in `ContextOptions::proxy` (5.1)      | none; `reqwest`'s `socks` feature, when `reqwest` is in the build                    |
 | `platform-verifier`    | `TrustRoots::Platform` (5.1)                         | `rustls-platform-verifier`                                                           |
 
-Provider feature names are the provider IDs, underscores included: `acme_dns`, `cloud_ru`,
-`selectel_v2`, `timeweb_cloud`, `vk_cloud`, `yandex_360`, `yandex_cloud` and the eight one-word IDs.
-A provider then has one spelling everywhere: the persisted ID, the feature, the module, the test
-file. `all-providers`, `inspector`, `socks` and `platform-verifier` are the only other public
-features. `socks` and `platform-verifier` are enabled by no other feature, `all-providers` included
-(decided by the maintainer on 2026-11-16, section 13.3); without an HTTP provider they compile and
-change nothing.
+Provider feature names are the provider IDs, underscores included: `acme_dns`, `azure_dns`,
+`cloud_ru`, `google_cloud`, `selectel_v2`, `timeweb_cloud`, `vk_cloud`, `yandex_360`, `yandex_cloud`
+and the fifteen IDs of one word (`beget`, `cloudflare`, `desec`, `digitalocean`, `dnsimple`,
+`edgecenter`, `gandi`, `gcore`, `hetzner`, `nicru`, `ovh`, `porkbun`, `regru`, `rfc2136`,
+`route53`). A provider then has one spelling everywhere: the persisted ID, the feature, the module,
+the test file. `all-providers`, `inspector`, `socks` and `platform-verifier` are the only other
+public features. `socks` and `platform-verifier` are enabled by no other feature, `all-providers`
+included (decided by the maintainer on 2026-11-16, section 13.3); without an HTTP provider they
+compile and change nothing.
 
 Three private features group optional dependencies. Their names start with two underscores, they are
 documented as internal, and they are not part of the SemVer surface:
 
-| Private feature | Dependencies                                                                                                  | Used by                              |
-| --------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
-| `__http`        | `reqwest`, `rustls`, `rustls-pki-types`, `webpki-roots`, `bytes`, `jiff`, `fastrand`, `serde_json`, `tracing` | every provider except `rfc2136`      |
-| `__crypto`      | `aws-lc-rs`                                                                                                   | `rfc2136`, `route53`, `yandex_cloud` |
-| `__xml`         | `roxmltree`                                                                                                   | `route53`, `nicru`                   |
+| Private feature | Dependencies                                                                                                  | Used by                                                     |
+| --------------- | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `__http`        | `reqwest`, `rustls`, `rustls-pki-types`, `webpki-roots`, `bytes`, `jiff`, `fastrand`, `serde_json`, `tracing` | every provider except `rfc2136`                             |
+| `__crypto`      | `aws-lc-rs`                                                                                                   | `google_cloud`, `ovh`, `rfc2136`, `route53`, `yandex_cloud` |
+| `__xml`         | `roxmltree`                                                                                                   | `route53`, `nicru`                                          |
 
 The feature table is the `[features]` table of `dev/zonewright/Cargo.toml`: `default` is empty,
 `all-providers`, `inspector`, `socks` and `platform-verifier` are listed first, then one entry per
@@ -40,7 +42,7 @@ provider, then the three private features.
 ### 9.2 What compiles with no features
 
 Names, the record model with normalization and the typed records, `Ttl`, errors and `Detail`,
-`ProviderId`, metadata and capabilities of all fifteen providers, the `Provider` trait,
+`ProviderId`, metadata and capabilities of all twenty-four providers, the `Provider` trait,
 `AnyProvider` (with no variants), `Context` (options and locks only), and `dns01`. The TXT value
 layer (`values.rs`) comes with any provider feature, the record-level layer (`rrsets.rs`) with any
 provider except `acme_dns` and `beget`, and the scrubber (`redact/scrub.rs`) with `__http`.

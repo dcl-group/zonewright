@@ -126,7 +126,7 @@ provider's test file defines the required test names of sections 12.2 and 12.3, 
 provider's capabilities (and, for `stale_zone_id`, from whether its sources use the zone-ID cache),
 with one explicit exception: `rfc2136` has its own secret test instead of `secret_echo`. It reports
 every missing name of every provider at once. The scan is what keeps "tests cover this for every
-client" true when a sixteenth provider is added.
+client" true when a provider is added.
 
 Four of these checks compare the crate with files of the repository: the comparisons with
 `PROVIDERS.md` (identifiers, names, verified flags) and the one that the license texts in the crate
@@ -143,28 +143,93 @@ Section 12.4, on carrying over the tests of the earlier implementations, is in
 
 ### 12.5 Live tests
 
-Live tests are `#[ignore]`, live in the provider's test file with names starting `live_`, and are
-run only by the maintainer. They read:
+Live tests are `#[ignore]` and are run only by the maintainer. Most live in the provider's test file
+under `tests/`; two live inside the crate (below). Their names come in two forms, `live_<id>_<what>`
+(`live_hetzner_add_and_remove`) and `<id>_live_<what>` (`ovh_live_assumptions`); both exist, and
+nothing, neither the conformance scan of section 12.6 nor a filter in any script, depends on the
+form. The tests of Gcore and EdgeCenter are written once in `tests/common/gcore_shared.rs` and take
+their environment prefix from the provider.
+
+Every live test reads:
 
 - `ZONEWRIGHT_LIVE_<ID>_SETTINGS`: the settings JSON;
 - `ZONEWRIGHT_LIVE_<ID>_CREDENTIALS`: the credentials JSON;
 - `ZONEWRIGHT_LIVE_<ID>_ZONE`: a zone the test may write to;
 
-with `<ID>` the provider ID in upper case (`ZONEWRIGHT_LIVE_SELECTEL_V2_ZONE`). A missing variable
-fails the test with a message naming it. The inspector has no live test.
+with `<ID>` the provider ID in upper case (`ZONEWRIGHT_LIVE_SELECTEL_V2_ZONE`). The assumptions
+tests and the two tests inside the crate also read `ZONEWRIGHT_LIVE_<ID>_PREFIX`: the label prefix
+under which they create their names (`<prefix>-<random>`). The deSEC assumptions test reads two
+more, both optional and skipped when unset: `ZONEWRIGHT_LIVE_DESEC_SCOPED_CREDENTIALS`, the
+credentials JSON of a second token whose policies restrict writes, and
+`ZONEWRIGHT_LIVE_DESEC_SCOPED_NAME`, the name that token's policy allows. A missing required
+variable fails the test with a message naming it. The inspector has no live test.
 
-A live test works only under labels it generates (`_zw-live-<random>` or `zw-live-<random>` below
-the zone). It runs its body as a separate task and afterwards, whether the body returned or
-panicked, cleans up: a TXT value test (`live_<id>_add_and_remove`) removes exactly the values it
-added, with the value operations; a record-level test (`live_<id>_record_round_trip`, or a
-record-level part of the TXT value test) deletes only the rrsets of its own generated name. Nothing
-is listed and deleted by pattern. acme-dns is the exception: it writes at the registration's own
-name and has no delete, so its test needs a registration set aside for testing.
+Four kinds of live test exist:
 
-Every provider has a TXT value live test (`live_acme_dns_add` for acme-dns), and every provider with
-record-level operations has `live_<id>_record_round_trip`; the TXT value tests of Cloud.ru and
-reg.ru also carry a record-level part, and those of Selectel v2 and Cloud.ru a probe of two
-concurrent creates.
+- **Add and remove**, `live_<id>_add_and_remove` (`live_acme_dns_add` for acme-dns): adds values
+  under a generated label with the value operations and removes exactly those.
+- **Record round trip**, `live_<id>_record_round_trip`: create, read, replace, unchanged repeat,
+  list and delete of an rrset of a generated name. The TXT value tests of Cloud.ru and reg.ru also
+  carry a record-level part, and those of Selectel v2 and Cloud.ru a probe of two concurrent
+  creates.
+- **Assumptions**, `<id>_live_assumptions` (`live_<id>_assumptions` for Gcore and EdgeCenter), for
+  the newer clients: it exercises what the provider's documentation leaves open and the client's
+  code marks as an assumption (answer forms of names and TXT values, bounds of the TTL, the apex,
+  filters, paging, the answer to a create that meets a concurrent one), reads each result back and
+  states in its documentation what it does not cover.
+- **Conditions of a write**, in the crate rather than in `tests/` because they call the client's
+  low-level operations, which the public API never lets a caller use with a wrong condition:
+  `src/providers/google_cloud/live.rs` (`live_google_cloud_change_semantics`) sends changes whose
+  deletion differs from the stored rrset, that add an existing rrset, or that combine a valid
+  addition with a deletion matching nothing, and shows that the service refuses each and applies
+  nothing; `src/providers/azure_dns/live.rs` (`azure_dns_live_conditions_are_enforced`) shows that
+  the service enforces the `If-Match` and `If-None-Match` conditions every write of the client
+  carries, including a stale ETag, which no public operation can produce since each reads first.
+
+Which client has which:
+
+| Provider        | Add and remove | Round trip | Assumptions | Conditions of a write |
+| --------------- | :------------: | :--------: | :---------: | :-------------------: |
+| `acme_dns`      |      yes       |     -      |      -      |           -           |
+| `azure_dns`     |       -        |     -      |     yes     |          yes          |
+| `beget`         |      yes       |     -      |      -      |           -           |
+| `cloud_ru`      |      yes       |    yes     |      -      |           -           |
+| `cloudflare`    |      yes       |    yes     |      -      |           -           |
+| `desec`         |      yes       |    yes     |     yes     |           -           |
+| `digitalocean`  |      yes       |    yes     |      -      |           -           |
+| `dnsimple`      |      yes       |     -      |     yes     |           -           |
+| `edgecenter`    |      yes       |    yes     |     yes     |           -           |
+| `gandi`         |      yes       |    yes     |     yes     |           -           |
+| `gcore`         |      yes       |    yes     |     yes     |           -           |
+| `google_cloud`  |      yes       |    yes     |     yes     |          yes          |
+| `hetzner`       |      yes       |    yes     |      -      |           -           |
+| `nicru`         |      yes       |    yes     |      -      |           -           |
+| `ovh`           |      yes       |     -      |     yes     |           -           |
+| `porkbun`       |      yes       |     -      |     yes     |           -           |
+| `regru`         |      yes       |    yes     |      -      |           -           |
+| `rfc2136`       |      yes       |    yes     |      -      |           -           |
+| `route53`       |      yes       |    yes     |      -      |           -           |
+| `selectel_v2`   |      yes       |    yes     |      -      |           -           |
+| `timeweb_cloud` |      yes       |    yes     |      -      |           -           |
+| `vk_cloud`      |      yes       |    yes     |      -      |           -           |
+| `yandex_360`    |      yes       |    yes     |      -      |           -           |
+| `yandex_cloud`  |      yes       |    yes     |      -      |           -           |
+
+The rules that hold for all of them. A live test works only under names it generates
+(`_zw-live-<random>` or `zw-live-<random>` below the zone, or `<prefix>-<random>`). It runs its body
+as a separate task and afterwards, whether the body returned or panicked, cleans up: it removes
+exactly the values it added, with the value operations, and deletes only the rrsets of its own
+generated names, by name and type; what the cleanup could not remove is listed in the failure.
+Nothing is listed and deleted by pattern, and a test touches no record it did not create. acme-dns
+is the exception: it writes at the registration's own name and has no delete, so its test needs a
+registration set aside for testing.
+
+Two clients need care with the zone. For OVHcloud every write refreshes the zone, which publishes
+whatever else is staged in it, so the zone given to the tests should have nothing staged. The deSEC
+tests pace themselves under the provider's rate limits (a write every 4.1 seconds, a throttled
+operation waited out, each cleanup with a budget of its own), so the assumptions test takes minutes
+and the three tests together stay under the limit of 100 writes per hour per domain only when run
+once an hour.
 
 A provider moves to "Verified against the live API" in `PROVIDERS.md`, and its `verified` flag turns
 true, only by the maintainer's commit after these tests passed.

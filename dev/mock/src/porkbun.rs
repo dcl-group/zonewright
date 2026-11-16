@@ -146,6 +146,7 @@ impl Seed {
 
 /// How `/domain/listAll` pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Paging {
     /// As documented: `start` is the offset of the page.
     Documented,
@@ -155,6 +156,7 @@ pub enum Paging {
 
 /// Where the DNS writes take the keys from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WriteAuth {
     /// From the JSON body only, as the writes' request schemas require (the default).
     Body,

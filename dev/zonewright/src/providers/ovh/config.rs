@@ -95,9 +95,9 @@ fn default_ttl() -> RrsetTtl {
 impl OvhConfig {
     /// Settings with the application key and every other key at its default.
     #[must_use]
-    pub fn new(application_key: &str) -> OvhConfig {
+    pub fn new(application_key: String) -> OvhConfig {
         OvhConfig {
-            application_key: application_key.to_owned(),
+            application_key,
             endpoint: default_endpoint(),
             base_url: None,
             ttl: default_ttl(),
@@ -245,12 +245,12 @@ mod tests {
             ("ovh-ca", "https://api.ca.ovhcloud.com/1.0"),
             ("ovh-us", "https://api.us.ovhcloud.com/1.0"),
         ] {
-            let mut config = OvhConfig::new("k");
+            let mut config = OvhConfig::new("k".to_owned());
             config.endpoint = name.to_owned();
             let settings = config.validate(&ctx).unwrap();
             assert_eq!(settings.api.as_url().as_str(), url);
         }
-        let mut config = OvhConfig::new("k");
+        let mut config = OvhConfig::new("k".to_owned());
         config.endpoint = "kimsufi-eu".to_owned();
         assert!(config.validate(&ctx).is_err());
         config.base_url = Some("https://example.net/api/1.0".to_owned());

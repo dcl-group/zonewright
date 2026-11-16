@@ -15,7 +15,8 @@ All notable changes to this crate are recorded in this file. The format follows
   CAA, CNAME, DNAME, HTTPS, MX, NS, PTR, SRV, SSHFP, SVCB, TLSA and TXT, with the mock `DesecMock`.
   Not verified against the live API.
 - DNSimple (`dnsimple`) client: TXT value and record-level operations over the DNSimple API v2, with
-  the mock `DnsimpleMock`. Not verified against the live API.
+  the mock `DnsimpleMock`. The wait of an exceeded quota (`retry_after` of `Error::RateLimited`) is
+  read from the API's `X-RateLimit-Reset` header. Not verified against the live API.
 - Gandi (`gandi`) client: TXT value operations with the API's per-value `PATCH` and record-level
   operations over Gandi LiveDNS (API v5) with a personal access token, with the mock `GandiMock`.
   Not verified against the live API.
@@ -37,9 +38,6 @@ All notable changes to this crate are recorded in this file. The format follows
   CAA, CNAME, MX, NS, PTR, SRV and TXT (SOA read only) and TXT value operations, every write
   conditional on the record set's etag, with the mock `AzureDnsMock`. Not verified against the live
   API.
-- The HTTP transport takes a per-client classifier of answers that carry a rate-limit status but are
-  a permanent refusal (`HttpBuilder::not_rate_limit`, crate-internal); Google Cloud DNS uses it for
-  `quotaExceeded`.
 - `zonewright-mock`: mocks for the nine new providers (`GcoreMock`, `EdgeCenterMock`, `DesecMock`,
   `DnsimpleMock`, `GandiMock`, `PorkbunMock`, `OvhMock`, `GoogleCloudMock`, `AzureDnsMock`), each
   with change reporting, `start_on` and `reset`.
