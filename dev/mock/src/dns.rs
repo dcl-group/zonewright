@@ -7,14 +7,21 @@
 //! - [`Role::Authoritative`]: answers with the AA flag for the zones it serves
 //!   ([`DnsMock::serve_zone`]), refuses names outside them, answers a referral (no AA, NS in the
 //!   authority section, glue in the additional section) for names below a delegation, follows a
-//!   CNAME chain inside its own zone, and answers NXDOMAIN or NODATA (with the zone's SOA, when
-//!   it has one) otherwise.
+//!   CNAME chain inside its own zone, and answers NXDOMAIN or NODATA otherwise, with the zone's
+//!   SOA in the authority section when the zone has one (its TTL the smaller of the record's TTL
+//!   and its MINIMUM, RFC 2308 section 3).
 //! - [`Role::Recursive`]: a resolver over the same data, without zones: no AA, RA set, CNAME
-//!   chains followed across all of its data.
+//!   chains followed across all of its data; negative answers carry no SOA.
+//!
+//! A CNAME chain is followed for at most 16 records; a longer chain, or a loop, is answered with
+//! the first 16 records, NOERROR and nothing in the authority section.
 //!
 //! Requests are decoded with `hickory-proto`; answers are written by this module's own encoder,
 //! so that names can be compressed (also inside MX, SRV, NS, CNAME and SOA data), RDATA is sent
 //! exactly as a test gives it, and malformed or oversized messages can be produced.
+//! [`DnsMock::add`], [`DnsMock::set`] and [`Data::txt`] refuse, with a panic that names the
+//! limit, a name or TXT string that cannot be encoded; a [`Record`] given to a fault and [`Data::Raw`] are sent as given. An answer over
+//! 65 535 octets is sent over TCP as a truncated message (the TC flag, no records).
 //!
 //! Wire facts come from RFC 1035 (section 4.1 message layout, 4.1.4 compression, 4.2.1 the
 //! 512-octet UDP limit and the TC bit, 4.2.2 the TCP length prefix), RFC 6891 (EDNS OPT record,
@@ -112,7 +119,8 @@ const TYPE_OPT: u16 = 41;
 const CLASS_IN: u16 = 1;
 /// The payload size this server advertises in its OPT record.
 const SERVER_PAYLOAD: u16 = 1232;
-/// Longest CNAME chain the server follows inside one answer.
+/// The number of CNAME records the server follows inside one answer; a longer chain, or a loop,
+/// is answered with the first 16 and nothing else.
 const CHAIN_MAX: usize = 16;
 
 /// What the server is.
@@ -167,10 +175,22 @@ impl Data {
     }
 
     /// A TXT record of these character-strings, each at most 255 octets.
+    ///
+    /// # Panics
+    ///
+    /// If a string is longer than 255 octets.
     pub fn txt(strings: &[&[u8]]) -> Data {
         let mut out = Vec::new();
         for string in strings {
-            out.push(u8::try_from(string.len()).unwrap_or(u8::MAX));
+            // RFC 1035 section 3.3: a character-string is a length octet and that many octets.
+            let Ok(len) = u8::try_from(string.len()) else {
+                panic!(
+                    "Data::txt: a character-string of {} octets; the limit is 255 (split the value \
+                     into several strings)",
+                    string.len()
+                );
+            };
+            out.push(len);
             out.extend_from_slice(string);
         }
         Data::Raw(out)
@@ -531,14 +551,29 @@ impl DnsMock {
     }
 
     /// Adds one record.
+    ///
+    /// # Panics
+    ///
+    /// If the owner, or a name inside `data`, has a label over 63 octets or is over 255 octets
+    /// on the wire.
     pub fn add(&self, owner: &str, rtype: u16, ttl: u32, data: Data) {
+        check_record(owner, &data);
         self.state()
             .records
             .push(Record::new(owner, rtype, ttl, data));
     }
 
     /// Replaces the rrset of `owner` and `rtype` with these values; an empty list removes it.
+    ///
+    /// # Panics
+    ///
+    /// If the owner, or a name inside one of the values, has a label over 63 octets or is over
+    /// 255 octets on the wire.
     pub fn set(&self, owner: &str, rtype: u16, ttl: u32, values: Vec<Data>) {
+        check_name("owner", owner);
+        for data in &values {
+            check_record(owner, data);
+        }
         self.handle().set(owner, rtype, ttl, values);
     }
 
@@ -661,6 +696,63 @@ fn canonical(name: &str) -> String {
     format!("{trimmed}.")
 }
 
+/// Why a name cannot be written on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameFault {
+    /// A label of this many octets; the limit is 63 (RFC 1035 section 2.3.4).
+    Label(usize),
+    /// This many octets on the wire; the limit is 255 (RFC 1035 section 2.3.4).
+    Length(usize),
+}
+
+/// What keeps `name` from being written on the wire, if anything. The labels are split the way
+/// [`Writer::name`] splits them: lowercased, empty labels dropped.
+fn name_fault(name: &str) -> Option<NameFault> {
+    let canonical = canonical(name);
+    let mut wire = 1; // the root label
+    for label in canonical.split('.').filter(|label| !label.is_empty()) {
+        if label.len() > 63 {
+            return Some(NameFault::Label(label.len()));
+        }
+        wire += label.len() + 1;
+    }
+    (wire > 255).then_some(NameFault::Length(wire))
+}
+
+/// Whether `name` can be written on the wire.
+pub(crate) fn encodable(name: &str) -> bool {
+    name_fault(name).is_none()
+}
+
+/// Panics, naming the limit, when `name` cannot be written on the wire.
+fn check_name(what: &str, name: &str) {
+    match name_fault(name) {
+        Some(NameFault::Label(n)) => {
+            panic!("DnsMock: {what} {name:?} has a label of {n} octets; the limit is 63")
+        }
+        Some(NameFault::Length(n)) => {
+            panic!("DnsMock: {what} {name:?} is {n} octets on the wire; the limit is 255")
+        }
+        None => {}
+    }
+}
+
+/// Panics, naming the limit, when the owner or a name inside `data` cannot be written on the
+/// wire. [`Data::Raw`] is not looked into.
+fn check_record(owner: &str, data: &Data) {
+    check_name("owner", owner);
+    match data {
+        Data::Raw(_) => {}
+        Data::Name(target) => check_name("target", target),
+        Data::Mx(_, exchange) => check_name("MX exchange", exchange),
+        Data::Srv(_, _, _, target) => check_name("SRV target", target),
+        Data::Soa { mname, rname, .. } => {
+            check_name("SOA mname", mname);
+            check_name("SOA rname", rname);
+        }
+    }
+}
+
 /// `name` equals `zone` or lies below it (both canonical).
 fn within(name: &str, zone: &str) -> bool {
     zone == "." || name == zone || name.ends_with(&format!(".{zone}"))
@@ -770,7 +862,10 @@ impl State {
         let authoritative = zone.is_some();
         let mut answers = Vec::new();
         let mut current = name.to_owned();
-        for _ in 0..CHAIN_MAX {
+        // The asked type is looked up at every name reached, also at the one the last followed
+        // CNAME points to; every round either returns, leaves the loop or follows one more CNAME.
+        let mut links = 0;
+        loop {
             let exact = self.rrset(&current, rtype);
             if !exact.is_empty() {
                 answers.extend(exact);
@@ -790,6 +885,17 @@ impl State {
             let Data::Name(target) = &cname.data else {
                 break;
             };
+            if links == CHAIN_MAX {
+                // A longer chain, or a loop: the records followed so far and no negative
+                // statement, as at the edge of the zone below.
+                return Resolution {
+                    rcode: NOERROR,
+                    authoritative,
+                    answers,
+                    ..Resolution::default()
+                };
+            }
+            links += 1;
             let target = canonical(target);
             answers.push(cname);
             if let Some(zone) = &zone
@@ -810,9 +916,19 @@ impl State {
         } else {
             NXDOMAIN
         };
+        // RFC 2308 section 3: the SOA of a negative answer carries the smaller of its own TTL
+        // and its MINIMUM field. A SOA given as `Data::Raw` is sent as stored.
         let authority = zone
             .as_ref()
-            .map(|zone| self.rrset(zone, TYPE_SOA))
+            .map(|zone| {
+                let mut soa = self.rrset(zone, TYPE_SOA);
+                for record in &mut soa {
+                    if let Data::Soa { minimum, .. } = record.data {
+                        record.ttl = record.ttl.min(minimum);
+                    }
+                }
+                soa
+            })
             .unwrap_or_default();
         Resolution {
             rcode,
@@ -943,7 +1059,8 @@ fn plan(state: &Arc<Mutex<State>>, octets: &[u8], proto: Proto, source: SocketAd
         }
     };
     let limit = match (proto, request.edns_payload) {
-        (Proto::Tcp, _) => usize::MAX,
+        // RFC 1035 section 4.2.2: the TCP length prefix is two octets.
+        (Proto::Tcp, _) => usize::from(u16::MAX),
         (Proto::Udp, Some(payload)) => usize::from(payload.max(512)),
         (Proto::Udp, None) => 512,
     };
@@ -1667,5 +1784,257 @@ mod tests {
             RData::TXT(txt) => assert_eq!(txt.txt_data[0].as_ref(), b"token"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    fn soa(minimum: u32) -> Data {
+        Data::Soa {
+            mname: "ns1.example.test".into(),
+            rname: "hostmaster.example.test".into(),
+            serial: 1,
+            refresh: 3600,
+            retry: 600,
+            expire: 86_400,
+            minimum,
+        }
+    }
+
+    /// The TTLs of the SOA records in the authority section of the answer to `name` and `rtype`.
+    async fn negative_soa_ttls(mock: &DnsMock, name: &str, rtype: RecordType) -> Vec<u32> {
+        let (octets, _) = query(name, rtype, false);
+        let answer = udp(mock.addr(), &octets).await;
+        assert!(answer.answers.is_empty(), "{name}: {:?}", answer.answers);
+        answer
+            .authorities
+            .iter()
+            .map(|record| {
+                assert_eq!(record.record_type(), RecordType::SOA);
+                record.ttl
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_negative_answer_carries_the_soa_with_the_clamped_ttl() {
+        let mock = DnsMock::start(Role::Authoritative).await;
+        mock.serve_zone("example.test");
+        mock.add("example.test", TYPE_SOA, 3600, soa(60));
+        mock.add("www.example.test", TYPE_A, 60, Data::a([192, 0, 2, 1]));
+
+        let (octets, _) = query("nope.example.test.", RecordType::A, false);
+        let answer = udp(mock.addr(), &octets).await;
+        assert_eq!(answer.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(
+            negative_soa_ttls(&mock, "nope.example.test.", RecordType::A).await,
+            [60]
+        );
+        // NODATA.
+        assert_eq!(
+            negative_soa_ttls(&mock, "www.example.test.", RecordType::TXT).await,
+            [60]
+        );
+        // A query for the SOA itself answers the stored TTL.
+        let (octets, _) = query("example.test.", RecordType::SOA, false);
+        let answer = udp(mock.addr(), &octets).await;
+        assert_eq!(answer.answers.len(), 1);
+        assert_eq!(answer.answers[0].ttl, 3600);
+
+        mock.set("example.test", TYPE_SOA, 30, vec![soa(300)]);
+        assert_eq!(
+            negative_soa_ttls(&mock, "nope.example.test.", RecordType::A).await,
+            [30]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zone_without_soa_answers_with_an_empty_authority_section() {
+        let mock = DnsMock::start(Role::Authoritative).await;
+        mock.serve_zone("example.test");
+        mock.add("www.example.test", TYPE_A, 60, Data::a([192, 0, 2, 1]));
+        let (octets, _) = query("nope.example.test.", RecordType::A, false);
+        let answer = udp(mock.addr(), &octets).await;
+        assert_eq!(answer.metadata.response_code, ResponseCode::NXDomain);
+        assert!(answer.authorities.is_empty());
+        let (octets, _) = query("www.example.test.", RecordType::TXT, false);
+        let answer = udp(mock.addr(), &octets).await;
+        assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+        assert!(answer.answers.is_empty());
+        assert!(answer.authorities.is_empty());
+    }
+
+    /// `c0.example.test` CNAME `c1.example.test` and so on, `links` records in all; the last
+    /// name holds an A record.
+    fn chain(mock: &DnsMock, links: usize) {
+        for k in 0..links {
+            mock.add(
+                &format!("c{k}.example.test"),
+                TYPE_CNAME,
+                60,
+                Data::name(&format!("c{}.example.test", k + 1)),
+            );
+        }
+        mock.add(
+            &format!("c{links}.example.test"),
+            TYPE_A,
+            60,
+            Data::a([192, 0, 2, 1]),
+        );
+    }
+
+    fn cname_count(answer: &Message) -> usize {
+        answer
+            .answers
+            .iter()
+            .filter(|record| record.record_type() == RecordType::CNAME)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_chain_of_16_cnames_is_followed_to_its_end() {
+        for role in [Role::Authoritative, Role::Recursive] {
+            let mock = DnsMock::start(role).await;
+            mock.serve_zone("example.test");
+            mock.add("example.test", TYPE_SOA, 3600, soa(60));
+            chain(&mock, CHAIN_MAX);
+            let (octets, _) = query("c0.example.test.", RecordType::A, false);
+            let answer = tcp(mock.addr(), &octets).await;
+            assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+            assert_eq!(cname_count(&answer), 16, "{role:?}");
+            assert_eq!(answer.answers.len(), 17, "{role:?}");
+            assert_eq!(answer.answers[16].record_type(), RecordType::A);
+            assert!(answer.authorities.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_longer_chain_is_cut_without_a_negative_answer() {
+        for role in [Role::Authoritative, Role::Recursive] {
+            let mock = DnsMock::start(role).await;
+            mock.serve_zone("example.test");
+            mock.add("example.test", TYPE_SOA, 3600, soa(60));
+            chain(&mock, CHAIN_MAX + 1);
+            mock.add(
+                "loop1.example.test",
+                TYPE_CNAME,
+                60,
+                Data::name("loop2.example.test"),
+            );
+            mock.add(
+                "loop2.example.test",
+                TYPE_CNAME,
+                60,
+                Data::name("loop1.example.test"),
+            );
+            for name in ["c0.example.test.", "loop1.example.test."] {
+                let (octets, _) = query(name, RecordType::A, false);
+                let answer = tcp(mock.addr(), &octets).await;
+                assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+                assert_eq!(answer.answers.len(), 16, "{role:?} {name}");
+                assert_eq!(cname_count(&answer), 16, "{role:?} {name}");
+                assert!(answer.authorities.is_empty(), "{role:?} {name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chain_out_of_the_zone_still_ends_at_its_edge() {
+        let mock = DnsMock::start(Role::Authoritative).await;
+        mock.serve_zone("example.test");
+        mock.add("example.test", TYPE_SOA, 3600, soa(60));
+        mock.add(
+            "a.example.test",
+            TYPE_CNAME,
+            60,
+            Data::name("b.example.test"),
+        );
+        mock.add("b.example.test", TYPE_CNAME, 60, Data::name("x.other.test"));
+        let (octets, _) = query("a.example.test.", RecordType::A, false);
+        let answer = udp(mock.addr(), &octets).await;
+        assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+        assert!(answer.metadata.authoritative);
+        assert_eq!(cname_count(&answer), 2);
+        assert!(answer.authorities.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "limit is 255")]
+    fn txt_refuses_a_string_over_255_octets() {
+        let _ = Data::txt(&[&[b'x'; 256]]);
+    }
+
+    #[test]
+    fn txt_takes_a_string_of_255_octets() {
+        assert_eq!(Data::txt(&[&[b'x'; 255]]), {
+            let mut raw = vec![255];
+            raw.extend_from_slice(&[b'x'; 255]);
+            Data::Raw(raw)
+        });
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "limit is 63")]
+    async fn add_refuses_a_label_over_63_octets() {
+        let mock = DnsMock::start(Role::Authoritative).await;
+        let target = format!("{}.example.test", "a".repeat(64));
+        mock.add("www.example.test", TYPE_CNAME, 60, Data::name(&target));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "limit is 255")]
+    async fn set_refuses_a_name_over_255_octets_on_the_wire() {
+        let mock = DnsMock::start(Role::Authoritative).await;
+        // Four labels of 63 octets: 4 * 64 + 1 = 257 octets on the wire.
+        let label = "a".repeat(63);
+        let owner = format!("{label}.{label}.{label}.{label}");
+        mock.set(&owner, TYPE_A, 60, vec![Data::a([192, 0, 2, 1])]);
+    }
+
+    #[test]
+    fn a_name_of_255_octets_on_the_wire_is_encodable() {
+        // 63 + 63 + 63 + 61 octets of labels, 4 length octets, the root: 255.
+        let label = "a".repeat(63);
+        let name = format!("{label}.{label}.{label}.{}.", "b".repeat(61));
+        assert!(encodable(&name));
+        let name = format!("{label}.{label}.{label}.{}.", "b".repeat(62));
+        assert!(!encodable(&name));
+        assert!(encodable("."));
+        assert!(encodable("a..example.test"));
+    }
+
+    #[tokio::test]
+    async fn a_tcp_answer_over_65535_octets_is_truncated() {
+        let mock = DnsMock::start(Role::Authoritative).await;
+        mock.serve_zone("example.test");
+        // Each record is 16 octets with a compressed owner: 80 000 octets in all.
+        mock.set(
+            "big.example.test",
+            TYPE_A,
+            60,
+            vec![Data::a([192, 0, 2, 1]); 5000],
+        );
+        let (octets, id) = query("big.example.test.", RecordType::A, false);
+        let answer = tcp(mock.addr(), &octets).await;
+        assert_eq!(answer.metadata.id, id);
+        assert!(answer.metadata.truncation);
+        assert!(answer.answers.is_empty());
+        // An answer that fits is complete.
+        mock.set(
+            "big.example.test",
+            TYPE_A,
+            60,
+            vec![Data::a([192, 0, 2, 1]); 4000],
+        );
+        let answer = tcp(mock.addr(), &octets).await;
+        assert!(!answer.metadata.truncation);
+        assert_eq!(answer.answers.len(), 4000);
+    }
+
+    #[test]
+    fn caa_cuts_a_tag_over_255_octets() {
+        let Data::Raw(octets) = Data::caa(0, &"a".repeat(300), "v") else {
+            panic!("CAA is raw data");
+        };
+        assert_eq!(octets.len(), 2 + 255 + 1);
+        assert_eq!(octets[1], 255);
+        assert_eq!(octets.last(), Some(&b'v'));
     }
 }

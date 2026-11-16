@@ -23,9 +23,15 @@
 //!
 //! The types converted from zone-file text to wire form are A, AAAA, TXT, CNAME, NS, MX and CAA;
 //! a name inside a value must be fully qualified, with the trailing dot. A change of another type
-//! is skipped, and so is a value that cannot be read; both are counted in [`Link::skipped`]. The
-//! other values of a set are applied. The TTL of the records is the set's TTL, or
+//! is skipped, and so is a value that cannot be read or whose wire form would be over 65 535
+//! octets; both are counted in [`Link::skipped`]. The other values of a set are applied. An rrset
+//! whose owner name cannot be written on the wire (a label over 63 octets, or over 255 octets in
+//! all) is skipped as a whole and counted once. The TTL of the records is the set's TTL, or
 //! [`DEFAULT_TTL`] when the provider has none.
+//!
+//! A linked zone has no SOA record, so its negative answers have an empty authority section; a
+//! test that needs one adds it with `DnsMock::add(zone, TYPE_SOA, ttl, Data::Soa { .. })`. The
+//! link never touches it.
 //!
 //! The link is deterministic for tests without sleeps: [`Link::settled`] waits until what was
 //! written has reached the [`DnsMock`], and [`Link::hold`] keeps changes back until
@@ -40,13 +46,22 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::changes::{Change, ChangeSource, Changes};
+use crate::changes::{Change, ChangeSource, Changes, Published};
 use crate::dns::{
     Data, DnsMock, Handle, TYPE_A, TYPE_AAAA, TYPE_CAA, TYPE_CNAME, TYPE_MX, TYPE_NS, TYPE_TXT,
+    encodable,
 };
 
 /// The TTL of linked records whose provider holds none for their set.
 pub const DEFAULT_TTL: u32 = 60;
+
+/// How many times [`link`] reads a source that keeps changing while the link is being made.
+const START_ATTEMPTS: usize = 8;
+
+/// The delay used when the one given is too long to add to the current time: roughly thirty
+/// years, the bound `tokio::time` itself puts on long durations (`safe_delay` in
+/// `tokio/src/time/mod.rs`, tokio 1.54).
+const FAR: Duration = Duration::from_secs(86_400 * 365 * 30);
 
 /// How a [`Link`] behaves.
 #[derive(Clone, Debug, Default)]
@@ -131,13 +146,17 @@ impl Drop for Link {
 /// Makes `dns` serve what `source` holds, now and as it changes.
 ///
 /// Must be called inside a Tokio runtime; the link runs as a task on it. The state at the call is
-/// served when the call returns.
+/// served when the call returns. A source that changes while the link is being made is read
+/// again until its state and the subscription agree.
+///
+/// The link writes whole rrsets. When two links into one [`DnsMock`], or a link and the test's
+/// own [`DnsMock::add`], [`DnsMock::set`] or [`DnsMock::remove`], write the same name and type,
+/// the later write replaces the earlier one. One source can be linked to several `DnsMock`s.
 pub fn link(source: &impl ChangeSource, dns: &DnsMock, options: LinkOptions) -> Link {
     let changes = source.changes().clone();
-    // Subscribe before reading the state: a change made in between is in both, and applying it
-    // twice ends in the same records.
-    let (start, rx) = changes.subscribe_at();
-    let published = source.published();
+    // The state served at once is the one after change number `start`; the task gets exactly
+    // the changes after it, so none is replayed over a state that already holds it.
+    let (start, rx, published) = start(source, &changes);
     let handle = dns.handle();
     for zone in &published.zones {
         handle.ensure_zone(zone);
@@ -167,6 +186,35 @@ pub fn link(source: &impl ChangeSource, dns: &DnsMock, options: LinkOptions) -> 
     }
 }
 
+/// Subscribes to `source` and reads its state so that the two agree: the state is the one after
+/// change number `start`, and the receiver gets every later change. A source that changes
+/// meanwhile is read again, at most [`START_ATTEMPTS`] times; after the last attempt the state may
+/// already hold some of the changes the receiver gets, which applied again end in the same
+/// records.
+///
+/// A mock emits its changes while it holds the lock that guards its state, and
+/// [`ChangeSource::published`] takes that lock. So when the hub's count after reading the state
+/// still equals the count at the subscription, no change was made in between and the state is
+/// exactly the one after change number `start`. The hub's lock is never held while the state is
+/// read (the lock order of a mock is its state, then the hub).
+fn start(
+    source: &impl ChangeSource,
+    changes: &Changes,
+) -> (u64, mpsc::UnboundedReceiver<(u64, Change)>, Published) {
+    let mut attempt = 1;
+    loop {
+        let (start, rx) = changes.subscribe_at();
+        let published = source.published();
+        if changes.emitted() == start || attempt >= START_ATTEMPTS {
+            return (start, rx, published);
+        }
+        // The receiver is dropped here; the hub forgets it at the next subscription or emit,
+        // and nothing sent to it reaches the link.
+        drop(rx);
+        attempt += 1;
+    }
+}
+
 impl Link {
     /// Stops changes from reaching DNS: from now on they queue up in the link.
     pub fn hold(&self) {
@@ -188,6 +236,9 @@ impl Link {
     /// test can check what DNS answers before the release; it returns at once if the link is
     /// held when it is called and the changes have arrived.
     ///
+    /// A change the link skips, wholly or in part ([`Link::skipped`]), counts as applied; check
+    /// `skipped()` when a test needs every value in DNS.
+    ///
     /// Call it on the runtime the link was made on: the link's task lives there, and once that
     /// runtime is gone nothing is applied any more and this never returns.
     pub async fn settled(&self) {
@@ -206,8 +257,9 @@ impl Link {
         }
     }
 
-    /// How many changes (of a type the link does not convert) and values (that could not be
-    /// read) were skipped so far.
+    /// How many changes (of a type the link does not convert, or whose owner name cannot be
+    /// written on the wire) and values (that could not be read, or would be over 65 535 octets on
+    /// the wire) were skipped so far.
     pub fn skipped(&self) -> usize {
         self.shared.state().skipped
     }
@@ -233,7 +285,13 @@ async fn run(
         tokio::select! {
             received = rx.recv(), if open => match received {
                 Some((seq, change)) => {
-                    let due = Instant::now() + delay.unwrap_or_default();
+                    // A delay too long to add to the current time means "never" in practice;
+                    // adding it unchecked would panic and end the task.
+                    let now = Instant::now();
+                    let due = now
+                        .checked_add(delay.unwrap_or_default())
+                        .or_else(|| now.checked_add(FAR))
+                        .unwrap_or(now);
                     let mut state = shared.state();
                     state.received = seq;
                     state.queue.push_back(Pending { seq, due, change });
@@ -277,6 +335,10 @@ fn apply(dns: &Handle, change: &Change) -> usize {
         dns.set(&change.name, rtype, DEFAULT_TTL, Vec::new());
         return 0;
     };
+    if !encodable(&change.name) {
+        // No query can name it, and the DNS mock could not write it.
+        return 1;
+    }
     let mut skipped = 0;
     let mut values = Vec::new();
     for value in &rrset.values {
@@ -308,8 +370,19 @@ fn type_code(rtype: &str) -> Option<u16> {
     })
 }
 
-/// The RDATA of `text`, a value of type `rtype` in zone-file form; `None` when it cannot be read.
+/// The RDATA of `text`, a value of type `rtype` in zone-file form; `None` when it cannot be read
+/// or is over 65 535 octets, the most the RDLENGTH field of a record can say (RFC 1035 section
+/// 3.2.1).
 fn data(rtype: u16, text: &str) -> Option<Data> {
+    let data = read(rtype, text)?;
+    match &data {
+        Data::Raw(octets) if octets.len() > usize::from(u16::MAX) => None,
+        _ => Some(data),
+    }
+}
+
+/// The RDATA of `text`, a value of type `rtype` in zone-file form; `None` when it cannot be read.
+fn read(rtype: u16, text: &str) -> Option<Data> {
     let text = text.trim();
     match rtype {
         TYPE_A => text.parse::<Ipv4Addr>().ok().map(|a| Data::a(a.octets())),
@@ -631,6 +704,148 @@ mod tests {
         link.settled().await;
         assert!(start.elapsed() >= delay);
         assert_eq!(handle.rrset("a.example.test", TYPE_A).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delay_too_long_to_add_keeps_the_link_alive() {
+        let (source, dns, link) = setup(LinkOptions::new().delay(Duration::MAX)).await;
+        source
+            .changes
+            .emit(set("a.example.test", "TXT", None, &["\"v\""]));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!link.task.is_finished());
+        assert_eq!(link.shared.state().received, 1);
+        assert!(dns.handle().rrset("a.example.test", TYPE_TXT).is_empty());
+    }
+
+    /// A source whose `published()` emits two changes of `a.example.test` TXT before it reads
+    /// its state: on the first call only, or on every call.
+    struct Racing {
+        changes: Changes,
+        every_call: bool,
+        calls: Mutex<u32>,
+    }
+
+    impl Racing {
+        fn new(every_call: bool) -> Racing {
+            Racing {
+                changes: Changes::new(),
+                every_call,
+                calls: Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl ChangeSource for Racing {
+        fn changes(&self) -> &Changes {
+            &self.changes
+        }
+
+        fn published(&self) -> Published {
+            // Held while emitting and reading, like a mock's state lock.
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 || self.every_call {
+                let last = 2 * *calls;
+                for value in [last - 1, last] {
+                    let value = format!("\"{value}\"");
+                    self.changes
+                        .emit(set("a.example.test", "TXT", None, &[value.as_str()]));
+                }
+            }
+            let value = if self.every_call { 2 * *calls } else { 2 };
+            let mut published = Published::new();
+            published.rrset(
+                "example.test",
+                "a.example.test",
+                "TXT",
+                None,
+                vec![format!("\"{value}\"")],
+            );
+            published
+        }
+    }
+
+    fn txt_value(dns: &DnsMock) -> Vec<Data> {
+        dns.handle()
+            .rrset("a.example.test", TYPE_TXT)
+            .into_iter()
+            .map(|record| record.data)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_link_starts_from_a_state_that_matches_its_subscription() {
+        let source = Racing::new(false);
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&source, &dns, LinkOptions::new().held(true));
+        link.settled().await;
+        assert!(link.shared.state().queue.is_empty());
+        assert_eq!(source.calls(), 2);
+        assert_eq!(txt_value(&dns), [Data::txt(&[b"2"])]);
+        // The subscription given up is gone from the hub.
+        assert!(format!("{:?}", source.changes).contains("subscribers: 1"));
+    }
+
+    #[tokio::test]
+    async fn a_source_that_keeps_changing_is_read_a_bounded_number_of_times() {
+        let source = Racing::new(true);
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&source, &dns, LinkOptions::new());
+        assert_eq!(source.calls(), u32::try_from(START_ATTEMPTS).unwrap());
+        link.settled().await;
+        assert_eq!(txt_value(&dns), [Data::txt(&[b"16"])]);
+        assert!(format!("{:?}", source.changes).contains("subscribers: 1"));
+        // The link goes on receiving.
+        source
+            .changes
+            .emit(set("a.example.test", "TXT", None, &["\"17\""]));
+        link.settled().await;
+        assert_eq!(txt_value(&dns), [Data::txt(&[b"17"])]);
+    }
+
+    #[test]
+    fn an_absolute_name_is_at_most_255_octets_on_the_wire() {
+        let label = "a".repeat(63);
+        // 63 * 3 + 61 characters of labels and four dots: 254 characters, 255 octets on the wire.
+        let name = format!("{label}.{label}.{label}.{}.", "b".repeat(61));
+        assert_eq!(name.len(), 254);
+        assert_eq!(absolute(&name), Some(name.as_str()));
+        let name = format!("{label}.{label}.{label}.{}.", "b".repeat(62));
+        assert_eq!(absolute(&name), None);
+        assert_eq!(absolute(&format!("{}.test.", "a".repeat(64))), None);
+    }
+
+    #[tokio::test]
+    async fn data_the_dns_mock_could_not_write_is_skipped() {
+        let (source, dns, link) = setup(LinkOptions::new()).await;
+        // An owner with a label of 64 octets.
+        let owner = format!("{}.example.test", "a".repeat(64));
+        source
+            .changes
+            .emit(set(&owner, "TXT", None, &["\"x\"", "\"y\""]));
+        // TXT and CAA values whose RDATA would be over 65 535 octets.
+        let strings = vec![format!("\"{}\"", "x".repeat(255)); 300].join(" ");
+        let caa = format!("0 issue \"{}\"", "x".repeat(70_000));
+        source.changes.emit(set(
+            "b.example.test",
+            "TXT",
+            None,
+            &[strings.as_str(), "\"ok\""],
+        ));
+        source
+            .changes
+            .emit(set("b.example.test", "CAA", None, &[caa.as_str()]));
+        link.settled().await;
+        assert_eq!(link.skipped(), 3);
+        let handle = dns.handle();
+        assert!(handle.rrset(&owner, TYPE_TXT).is_empty());
+        assert_eq!(handle.rrset("b.example.test", TYPE_TXT).len(), 1);
+        assert!(handle.rrset("b.example.test", TYPE_CAA).is_empty());
     }
 
     #[tokio::test]

@@ -6,12 +6,29 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
-Nothing yet.
+### Fixed
+
+- `zonewright-mock`: a link with a delay too long to add to the current time no longer stops
+  applying changes.
+- `zonewright-mock`: `link::link` no longer replays a change made while the link was being set up,
+  which could briefly answer an older value.
+- `zonewright-mock`: the SOA in the authority section of a negative answer of `dns::DnsMock` carries
+  the smaller of its TTL and its MINIMUM (RFC 2308 section 3).
+- `zonewright-mock`: `dns::Data::txt`, `DnsMock::add` and `DnsMock::set` panic on a TXT string over
+  255 octets and on a name with a label over 63 octets or over 255 octets in all, instead of sending
+  a message that cannot be decoded; a TCP answer over 65 535 octets is sent truncated (TC) instead
+  of with a wrong length prefix. A link skips, and counts in `Link::skipped`, an rrset whose owner
+  name cannot be encoded and a value whose RDATA would be over 65 535 octets.
+- `zonewright-mock`: `dns::DnsMock` follows a chain of 16 CNAME records to its final record, and
+  answers a longer chain or a loop with the first 16 records and no SOA.
 
 ## 0.2.0 - 2026-11-16
 
 Incompatible with 0.1 in three places, each described under "Changed": the default trust anchors of
-HTTPS, SOCKS5 proxies, and SVCB/HTTPS data that is not self-consistent.
+HTTPS, SOCKS5 proxies, and SVCB/HTTPS data that is not self-consistent. Several entries under
+"Fixed" also change what an application observes where 0.1 was wrong: the error kind in some failure
+situations of RFC 2136, Route 53, Hetzner and reg.ru, new refusals by the TXT value operations of
+nic.ru and Route 53, and the deserialization of a `raw` member of an `RrSet`.
 
 ### Added
 

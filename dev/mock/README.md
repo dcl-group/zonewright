@@ -139,8 +139,9 @@ link.settled().await; // everything written so far is being answered
 The `DnsMock` serves every zone and record the provider mock holds, with the AA flag, and follows
 every later change. `Link::settled` replaces sleeping; `Link::hold` and `Link::release`, or
 `LinkOptions::delay`, model propagation that has not happened yet. The link converts A, AAAA, TXT,
-CNAME, NS, MX and CAA; other types are skipped and counted (`Link::skipped`). An application that
-keeps a DNS server of its own subscribes to the changes instead and mirrors them itself.
+CNAME, NS, MX and CAA; other types, values that cannot be read or encoded, and rrsets whose owner
+name cannot be encoded are skipped and counted (`Link::skipped`). An application that keeps a DNS
+server of its own subscribes to the changes instead and mirrors them itself.
 
 ## Mocks
 

@@ -59,6 +59,8 @@ pub struct ChangedRrset {
     pub ttl: Option<u32>,
     /// Every value of the set, in zone-file text form (RFC 1035 section 5.1): a TXT value as its
     /// quoted character-strings, a name inside a value fully qualified with the trailing dot.
+    /// In the order the provider mock holds them; a write that only reorders the values is
+    /// reported as a change.
     pub values: Vec<String>,
 }
 
@@ -205,9 +207,12 @@ impl Changes {
 
     /// Subscribes and returns the number of changes emitted before the subscription, read in
     /// the same step: every change with a higher sequence number reaches the receiver.
+    /// Subscribers that went away are forgotten here as well as at the next emit, so that a
+    /// subscription given up at once does not stay in the hub.
     pub(crate) fn subscribe_at(&self) -> (u64, mpsc::UnboundedReceiver<(u64, Change)>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut hub = self.hub();
+        hub.subscribers.retain(|tx| !tx.is_closed());
         hub.subscribers.push(tx);
         (hub.emitted, rx)
     }
@@ -377,6 +382,15 @@ mod tests {
         assert_eq!(values(second.try_next().unwrap()), ["\"3\""]);
         drop(changes);
         assert!(second.next().await.is_none());
+    }
+
+    #[test]
+    fn a_subscription_given_up_is_forgotten_at_the_next_subscription() {
+        let changes = Changes::new();
+        let (_, first) = changes.subscribe_at();
+        drop(first);
+        let (_, _second) = changes.subscribe_at();
+        assert_eq!(changes.hub().subscribers.len(), 1);
     }
 
     #[test]
