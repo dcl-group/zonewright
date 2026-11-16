@@ -581,7 +581,9 @@ fn links(header: &str) -> Option<Vec<Link<'_>>> {
 /// takes the strings of the body.
 // Source: nrdcg `errors.go` (`NotFoundError{Detail string json:"detail"}`);
 // https://desec.readthedocs.io/en/latest/auth/account.html shows error bodies with `detail` and
-// with field keys; RRsets, "Input validation" (a list of errors for a bulk request).
+// with field keys; RRsets, "Input validation" (a list of errors for a bulk request). None of these
+// sources has a machine-readable error code beside the message, so the client registers none and
+// its errors carry no provider code.
 pub(super) fn error_message(body: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct ErrorBody {

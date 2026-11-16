@@ -22,6 +22,11 @@ of providers, with the state of each client and the definition of "verified". Ea
 its capabilities at run time (`Provider::capabilities`), and a client answers an operation it does
 not support with an `Unsupported` error rather than failing in some other way.
 
+For `rfc2136`, `list_rrsets` reads the zone by zone transfer (AXFR over TCP, signed with the TSIG
+key), so the key must be allowed to transfer the zone. An application that lists records wherever
+`Capabilities::list_rrsets` is true sends AXFR queries to such a server, which some name servers log
+as refused transfers. The details are in `PROVIDERS.md`.
+
 ## Installation
 
 ```toml

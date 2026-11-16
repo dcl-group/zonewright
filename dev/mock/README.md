@@ -173,7 +173,11 @@ server of its own subscribes to the changes instead and mirrors them itself.
 | `yandex_cloud`  | Yandex Cloud     | `YandexCloudMock`  |
 
 The RFC 2136 mock is a DNS server that accepts signed dynamic updates, on TCP and UDP, not an HTTP
-server.
+server. It also answers zone transfers (AXFR, over TCP, signed with the TSIG key of the request), so
+that `list_rrsets` of the `rfc2136` client can be tested: `Control::transfer_records_per_message`
+and `Control::transfer_sign_every` shape the transfer, `Control::refuse_transfers` makes the server
+refuse it, and the faults `transfer_corrupt_mac`, `transfer_unsigned_last`, `transfer_cut_after`,
+`transfer_serial_change` and `transfer_oversized_length` produce a damaged or inconsistent one.
 
 Further servers, for tests that are not about one provider:
 

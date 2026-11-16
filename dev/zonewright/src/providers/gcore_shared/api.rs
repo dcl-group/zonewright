@@ -592,7 +592,8 @@ fn next_offset(offset: u64, received: usize, total: Option<u64>) -> Result<Optio
 /// The provider's error message: `error`, a string.
 // Source: lego `internal/types.go` (`APIError`, `json:"error"`) and the SDK `client_dto.go`
 // (the same); both take the raw body as the message when it is not that JSON, which the
-// transport's fallback does too.
+// transport's fallback does too. Neither source has a machine-readable error code beside the
+// message, so the clients register none and their errors carry no provider code.
 pub(crate) fn error_message(body: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct ErrorBody {
