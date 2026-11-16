@@ -51,7 +51,7 @@ this table is a guess about such an API.
 | `hetzner`       | yes; plain values      | list, get, set, delete (a TTL change of an existing set is a second request)            | A, AAAA, CNAME, MX, NS, PTR, SOA (read only), SRV, TLSA, TXT                                          | 60                    | 120 s                       | Auto / Presentation                                                                                          | Hetzner Cloud API reference, lego, hcloud-go schema                                       |
 | `nicru`         | yes; plain values      | list, get, set, delete; one commit per operation                                        | A, AAAA, CNAME, DNAME, MX, NS, PTR, SOA (read only), SRV, TXT                                         | 30                    | 1200 s                      | Raw / Raw                                                                                                    | the provider's request description (2013, read in the Internet Archive copy), lego        |
 | `regru`         | yes; plain values      | list, get, set, delete for A, AAAA, TXT (several requests per set)                      | A, AAAA, TXT                                                                                          | not settable          | —                           | Auto / Raw                                                                                                   | reg.ru API 2 documentation, lego. Earlier version proven live                             |
-| `rfc2136`       | yes                    | get, set, delete with server-checked prerequisites; listing by zone transfer (AXFR)     | any type with a wire form; SOA read only                                                              | 60                    | —                           | wire format                                                                                                  | RFC 2136, RFC 8945, RFC 7766, RFC 1035                                                    |
+| `rfc2136`       | yes                    | list by zone transfer (AXFR), get, set, delete with server-checked prerequisites        | any type with a wire form; SOA read only                                                              | 60                    | —                           | wire format                                                                                                  | RFC 2136, RFC 8945, RFC 5936, RFC 7766, RFC 1035                                          |
 | `route53`       | yes; plain values      | list, get, set, delete; alias and routing-policy sets are skipped and refused           | A, AAAA, CAA, CNAME, DS, HTTPS, MX, NAPTR, NS, PTR, SOA (read only), SPF, SRV, SSHFP, SVCB, TLSA, TXT | 60                    | 120 s                       | Auto / Presentation                                                                                          | Amazon Route 53 API reference, lego                                                       |
 | `selectel_v2`   | yes; plain values      | list, get, set, delete                                                                  | A, AAAA, ALIAS, CAA, CNAME, MX, NS, SOA (read only), SRV, SSHFP, TXT                                  | 60                    | —                           | Presentation, quoted content only / Presentation                                                             | Selectel DNS API v2 and authorization documentation                                       |
 | `timeweb_cloud` | yes; plain values      | list, get, set, delete (several requests per set)                                       | A, AAAA, CNAME, MX, TXT                                                                               | `provider_default`    | —                           | Auto / Raw                                                                                                   | the public API description (OpenAPI document), lego                                       |
@@ -217,18 +217,25 @@ Behavior that the design fixes because the generic sections cannot:
     get at most 3 attempts with the back-off of section 5.3; `SERVFAIL` counts as a transient
     failure. Record-level updates, which carry value-dependent prerequisites, are sent once.
   - Listing. `list_rrsets` makes one zone transfer (AXFR, RFC 5936) over TCP, signed with the
-    client's key; the key needs the server's permission to transfer the zone, and REFUSED is
-    `Forbidden`. Every message is verified (RFC 8945 section 5.3.1): the first and the last must be
-    signed, at most 99 in a row may be unsigned, each signed one over the prior MAC; a message that
-    fails ends the listing with `Protocol`, and nothing of the transfer is returned. The transfer
-    begins and ends with the same SOA; another serial at the end is `Transient`, as are a cut
-    connection and SERVFAIL, repeated as a query is. Each message read has `request_timeout`; a
-    transfer is bounded at 64 MiB and 100 000 messages, and reaching either is `Protocol` naming the
-    limit. Values are read as `get_rrset` reads them, so a listed set written back is `Unchanged`;
-    SOA and the apex NS set are listed. DNSKEY, RRSIG, NSEC, NSEC3, NSEC3PARAM and query or meta
-    types are skipped as `NotPlainRecords` (`get_rrset` still reads such a type when asked for it by
-    name). The prior MAC is digested with its length, as the request MAC is; RFC 8945 does not spell
-    this out, and it is not observed against a real server.
+    client's key. Every message is verified (RFC 8945 section 5.3.1): the first and the last must be
+    signed, at most 99 in a row may be unsigned, each signed one over the prior MAC with its length,
+    the unsigned messages since and its timers, as BIND 9, Knot DNS and PowerDNS compute it (their
+    source read on 2026-11-16); `dig` 9.10.6 verified the mock's transfers on 2026-11-16, and a
+    transfer from a real name server is still to be checked. Records of unsigned messages are taken
+    only after the next signed message verifies; a failure is `Protocol`, is not repeated, and
+    returns nothing. A signed REFUSED is `Forbidden`, a signed NOTAUTH `ZoneNotFound`; a server that
+    answers a denied transfer unsigned (Knot DNS, by its source: NOTAUTH without TSIG) gives
+    `Protocol`, since an unsigned error is not believed. The transfer begins and ends with the same
+    SOA; another serial in a signed closing message is `Transient`, as are a cut connection,
+    SERVFAIL, a read timeout and the deadline, repeated as a query is. Section 3.7 sets no overall
+    deadline because every part of an operation is bounded; a transfer has up to 100 000 parts, so
+    one attempt is bounded at 20 times `request_timeout`. Each attempt is also bounded at 64 MiB on
+    the wire, 100 000 messages and 256 MiB of records held once decoded; reaching one is `Protocol`
+    naming it. Values are read as `get_rrset` reads them, so a listed set the record-level
+    operations can address is `Unchanged` when written back; glue and occluded sets are listed but
+    answer `Rejected`, and SOA and apex NS are listed but not writable. DNSKEY, RRSIG, NSEC, NSEC3,
+    NSEC3PARAM and query or meta types are skipped as `NotPlainRecords`; CDS, CDNSKEY, ZONEMD and
+    private types are listed.
   - `ContextOptions::loopback_only`: a `server` that is not a loopback IP literal is `Error::Config`
     at construction. Host names are refused in that mode, since classifying one would need a lookup.
   - A response whose TSIG does not verify against the request is `Error::Protocol` whatever its

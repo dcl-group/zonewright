@@ -336,6 +336,17 @@ pub struct Call {
 /// fixed RCODE without applying the request ([`Fault::rcode`]), or normal processing; then the
 /// changes to the answer; then how it is written ([`Fault::truncate`], [`Fault::short_length`],
 /// [`Fault::drop_reply`]).
+///
+/// A zone transfer that is answered (an AXFR query over TCP that the mock serves) takes only
+/// [`Fault::delay`], [`Fault::foreign_txt`], [`Fault::foreign_record`],
+/// [`Fault::foreign_delete`], [`Fault::close`], [`Fault::rcode`] (which answers with that RCODE
+/// in one message instead), [`Fault::drop_reply`], [`Fault::time_offset`],
+/// [`Fault::extra_answer`] and the `transfer_*` methods. The faults that change or break a
+/// single answer ([`Fault::unsigned`], [`Fault::corrupt_mac`], [`Fault::wrong_id`],
+/// [`Fault::wrong_question`], [`Fault::omit_question`], [`Fault::clear_qr`],
+/// [`Fault::set_tc`], [`Fault::clear_aa`], [`Fault::other_key`], [`Fault::tsig_error`],
+/// [`Fault::truncate`], [`Fault::short_length`]) do not apply to the messages of a transfer;
+/// with [`Fault::rcode`] the one answer is built as for any other request, and they apply to it.
 #[derive(Clone, Debug, Default)]
 pub struct Fault {
     op: Option<Op>,

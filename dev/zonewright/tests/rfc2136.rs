@@ -3047,8 +3047,11 @@ fn transfers(mock: &Rfc2136Mock) -> usize {
 /// delegation, a wildcard, an IDN owner and a long TXT value, written through the client, is
 /// listed with exactly those sets plus the SOA and the apex NS set, with their TTLs. Whether
 /// the transfer comes in one message or in one message per record, every message signed or
-/// only the first, every hundredth and the last: the same listing. Every listed set is what
-/// `get_rrset` reads for it, and a `set_rrset` of it is `Unchanged` without an update.
+/// only the first, every hundredth and the last: the same listing. Every listed set the
+/// record-level operations can address is what `get_rrset` reads for it, and a `set_rrset` of it
+/// is `Unchanged` without an update. A glue record below the delegation is listed, but a
+/// record-level read or write of its name is `Rejected` (the server answers with a referral);
+/// SOA and the apex NS set are read but not written.
 #[tokio::test]
 async fn rfc2136_listing_returns_every_set_as_get_reads_it() {
     let (mock, client) = setup().await;
@@ -3182,6 +3185,21 @@ async fn rfc2136_listing_returns_every_set_as_get_reads_it() {
             RrsetTtl::from_secs(ttl.unwrap_or(DEFAULT_TTL)).unwrap(),
         )));
     }
+    // Glue below the delegation: written by another party, since the client refuses names at or
+    // below a zone cut.
+    control.add_record(mock_record(
+        "ns1.child.example.org",
+        RecordType::A,
+        300,
+        "192.0.2.53",
+    ));
+    let glue = rrset(
+        "ns1.child.example.org",
+        RecordType::A,
+        Some(300),
+        &["192.0.2.53"],
+    );
+    expected.push(glue.clone());
     let expected = ZoneListing::new(expected, Vec::new()).rrsets;
     let mut listing = None;
     for (per_message, sign_every) in [(0, 1), (1, 1), (1, 100), (3, 2), (2, 1000)] {
@@ -3198,9 +3216,25 @@ async fn rfc2136_listing_returns_every_set_as_get_reads_it() {
         );
         listing = Some(listed);
     }
+    // The transfers were signed with the client's key.
+    assert_eq!(transfers(&mock), 5);
+    assert!(
+        control
+            .calls()
+            .iter()
+            .filter(|c| c.qtype == TYPE_AXFR)
+            .all(|c| !c.request_mac.is_empty())
+    );
     control.clear_calls();
     for listed in &listing.unwrap().rrsets {
         let name = listed.name().as_str();
+        if *listed == glue {
+            let err = get(&client, name, RecordType::A).await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Rejected, "{err:?}");
+            let err = set(&client, listed, Expect::Any).await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Rejected, "{err:?}");
+            continue;
+        }
         let read = get(&client, name, listed.rtype()).await.unwrap();
         assert_eq!(read.as_ref(), Some(listed), "{name} {}", listed.rtype());
         if listed.rtype() == RecordType::SOA
@@ -3215,9 +3249,8 @@ async fn rfc2136_listing_returns_every_set_as_get_reads_it() {
             listed.rtype()
         );
     }
+    // Nothing was written.
     assert_eq!(updates(&mock), 0);
-    // The transfers were signed with the client's key and nothing was written.
-    assert!(control.calls().iter().all(|c| !c.request_mac.is_empty()));
 }
 
 /// The records a DNSSEC signer keeps (DNSKEY at the apex, RRSIG and NSEC at a name), a meta type
@@ -3396,6 +3429,8 @@ async fn rfc2136_listing_failures() {
     }
     let z = zone();
 
+    // One record per message from here on: the cut and the corrupted MAC below need a transfer
+    // of many messages.
     // The boundary of RFC 8945 section 5.3.1: 99 unsigned messages in a row pass, 100 do not.
     control.transfer_records_per_message(1);
     control.transfer_sign_every(100);
@@ -3496,7 +3531,10 @@ async fn rfc2136_listing_failures() {
     secrets.extend(mac_spellings(&control.calls()));
     control.reset();
     let k = ErrorKind::Transient;
-    failing(&mock, &good, &z, k, 3, "no soa", &mut texts).await;
+    // The mock answers SERVFAIL for a zone it holds no SOA for (its own invention); the client's
+    // check that a transfer begins with the SOA is tested in `axfr.rs`.
+    let label = "mock without an soa answers servfail";
+    failing(&mock, &good, &z, k, 3, label, &mut texts).await;
     secrets.extend(mac_spellings(&control.calls()));
     for (label, text) in &texts {
         assert_no_spelling(label, text, &secrets);

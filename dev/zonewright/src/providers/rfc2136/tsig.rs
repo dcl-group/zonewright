@@ -16,9 +16,23 @@
 //!   MAC of the last signed message, the unsigned messages since it and this message, followed
 //!   by its timers (Time Signed and Fudge) instead of all TSIG variables. The same checks apply
 //!   to each signed message, in the same order. The section names the "Prior MAC" as the first
-//!   component without repeating the layout; it is digested as the request MAC is (section
-//!   4.3.1: MAC size, then MAC data), which the section's place of the request MAC suggests.
-//!   RFC 8945 publishes no test vector for this digest.
+//!   component without repeating its layout; it is digested as the request MAC is (section
+//!   4.3.1: MAC size as a 16-bit integer, then the MAC octets). RFC 8945 publishes no test vector
+//!   for this digest. Three published implementations digest the prior MAC the same way, with
+//!   its length, read in their source on 2026-11-16 (default branches):
+//!   - BIND 9, `lib/dns/tsig.c`
+//!     (<https://gitlab.isc.org/isc-projects/bind9/-/blob/main/lib/dns/tsig.c>): `dns_tsig_sign`
+//!     puts `querytsig.siglen` as 16 bits and then the signature into the digest and, for a TCP
+//!     continuation, only Time Signed and Fudge of the TSIG fields; `tsig_verify_tcp` digests the
+//!     length of the previous signature and then its octets.
+//!   - Knot DNS, `src/libknot/tsig-op.c`
+//!     (<https://gitlab.nic.cz/knot/knot-dns/-/blob/master/src/libknot/tsig-op.c>):
+//!     `knot_tsig_sign_next` writes the previous digest length as 16 bits, the previous digest,
+//!     the message, then the timers.
+//!   - PowerDNS, `pdns/dnssecinfra.cc`
+//!     (<https://github.com/PowerDNS/pdns/blob/master/pdns/dnssecinfra.cc>): `makeTSIGPayload`
+//!     prepends the 16-bit length and the previous MAC, and with `timersonly` writes only time
+//!     and fudge.
 //!
 //! Algorithms: `hmac-sha256`, `hmac-sha384` and `hmac-sha512` (section 6, table 3: `hmac-sha256`
 //! is mandatory to implement, the other two optional; each MAC is the full hash output, 32, 48
@@ -478,7 +492,11 @@ pub(super) struct Stream<'k> {
     key: &'k Key,
     /// The MAC of the last signed message; the request MAC before the first message.
     prior_mac: Vec<u8>,
-    /// The unsigned messages since the last signed one, as received, concatenated.
+    /// The unsigned messages since the last signed one, as received, concatenated. The digest
+    /// covers this concatenation, not the boundaries between the messages; that an attacker
+    /// cannot merge an unsigned message into the one before it (and so drop its records while the
+    /// digest still matches) rests on the framing and on `wire::parse` refusing octets after the
+    /// last record of a message.
     unsigned: Vec<u8>,
     /// How many there are.
     unsigned_count: usize,
@@ -582,6 +600,48 @@ pub(super) fn error_text(error: u16) -> &'static str {
         BADTRUNC => "TSIG BADTRUNC: the server refused the MAC length",
         _ => "TSIG error: the server did not accept the signature",
     }
+}
+
+/// Signs a response message `msg` (ID set, no TSIG record) as a server does: the first message
+/// of an answer over `prior` (the request MAC) with all TSIG variables, a later one over `prior`,
+/// `unsigned` and its timers (RFC 8945 sections 5.3 and 5.3.1). Returns the MAC. For tests of
+/// the transfer, which need answers the client did not build.
+#[cfg(test)]
+pub(super) fn sign_response(
+    msg: &mut Vec<u8>,
+    key: &Key,
+    prior: &[u8],
+    unsigned: &[u8],
+    time: u64,
+    first: bool,
+) -> Vec<u8> {
+    let id = [msg[0], msg[1]];
+    let mut data = (prior.len() as u16).to_be_bytes().to_vec();
+    data.extend_from_slice(prior);
+    data.extend_from_slice(unsigned);
+    data.extend_from_slice(msg);
+    if first {
+        data.extend_from_slice(&variables(key, time, FUDGE, 0, &[]).unwrap());
+    } else {
+        data.extend_from_slice(&timers(time, FUDGE).unwrap());
+    }
+    let mac = key.algorithm.mac(key.secret.expose_secret(), &data);
+    let mut rd = key.algorithm.wire_name().to_vec();
+    rd.extend_from_slice(&time.to_be_bytes()[2..]);
+    rd.extend_from_slice(&FUDGE.to_be_bytes());
+    rd.extend_from_slice(&(mac.len() as u16).to_be_bytes());
+    rd.extend_from_slice(&mac);
+    rd.extend_from_slice(&id);
+    rd.extend_from_slice(&[0, 0, 0, 0]);
+    wire::put_name(msg, &key.name);
+    msg.extend_from_slice(&TYPE_TSIG.to_be_bytes());
+    msg.extend_from_slice(&CLASS_ANY.to_be_bytes());
+    msg.extend_from_slice(&0u32.to_be_bytes());
+    msg.extend_from_slice(&(rd.len() as u16).to_be_bytes());
+    msg.extend_from_slice(&rd);
+    let arcount = wire::be16(msg, ARCOUNT_AT).unwrap() + 1;
+    msg[ARCOUNT_AT..ARCOUNT_AT + 2].copy_from_slice(&arcount.to_be_bytes());
+    mac
 }
 
 #[cfg(test)]

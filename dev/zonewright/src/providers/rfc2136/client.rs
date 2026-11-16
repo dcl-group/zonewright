@@ -42,9 +42,14 @@ use super::wire::{Builder, TYPE_SOA, rcode};
 ///
 /// `list_rrsets` transfers the zone (AXFR, RFC 5936) with the same key, so the key needs the
 /// server's permission to transfer the zone. The listing holds every rrset in the form
-/// `get_rrset` reads it; the records a DNSSEC signer keeps (DNSKEY, RRSIG, NSEC, NSEC3,
-/// NSEC3PARAM) are reported in `ZoneListing::skipped`. A transfer is bounded at 64 MiB and
-/// 100 000 messages.
+/// `get_rrset` reads it. Sets below a delegation other than its NS set (glue, occluded records)
+/// are listed too, but the record-level operations cannot address them (`Error::Rejected`), and
+/// SOA and the apex NS set are listed but not writable. The records a DNSSEC signer keeps
+/// (DNSKEY, RRSIG, NSEC, NSEC3, NSEC3PARAM) are reported in `ZoneListing::skipped`; CDS,
+/// CDNSKEY, ZONEMD and private types are listed as plain sets, even where a signer maintains
+/// them. One attempt of a transfer is bounded at 64 MiB on the wire, 100 000 messages,
+/// 256 MiB of records held once decoded, `request_timeout` per message and 20 times
+/// `request_timeout` as a whole; up to 3 attempts are made for a transient failure.
 ///
 /// When the server lets the key update but refuses its queries, the TXT value operations send
 /// their change without reading first and report `AddOutcome::Accepted` or
@@ -224,7 +229,10 @@ impl Provider for Rfc2136 {
 
     /// One zone transfer (AXFR, RFC 5936) of `zone`, signed with the client's key; every
     /// message of the answer is verified (RFC 8945 section 5.3.1) before any record counts.
-    /// A server that does not let the key transfer the zone answers REFUSED: `Error::Forbidden`.
+    /// A server that refuses the transfer with a signed REFUSED (BIND does) gives
+    /// `Error::Forbidden`; a server that answers a denied transfer without a signature (Knot
+    /// DNS answers NOTAUTH without TSIG) gives `Error::Protocol`, since an unsigned error is not
+    /// believed.
     async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
         Call::list_rrsets(zone)
             .observe(self, self.list_zone(zone))

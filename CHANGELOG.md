@@ -9,11 +9,14 @@ All notable changes to this crate are recorded in this file. The format follows
 ### Added
 
 - `rfc2136`: `list_rrsets` by zone transfer (AXFR, RFC 5936) over TCP, signed with the client's TSIG
-  key. The key must be allowed by the server to transfer the zone. Every message of the answer is
-  verified (RFC 8945 section 5.3.1), and nothing of a transfer that fails is returned. A transfer is
-  bounded at 64 MiB and 100 000 messages. The records a DNSSEC signer keeps (DNSKEY, RRSIG, NSEC,
-  NSEC3, NSEC3PARAM) are reported in `skipped`. `Capabilities::list_rrsets` is now true for
-  `rfc2136`; the call answered `Unsupported` before.
+  key; every message is verified (RFC 8945 section 5.3.1) and records of unsigned messages are read
+  only once a signed message covers them. One attempt is bounded at 64 MiB on the wire, 100 000
+  messages, 256 MiB of records held once decoded, `request_timeout` per message and 20 times
+  `request_timeout` as a whole; up to 3 attempts for a transient failure. A signed REFUSED is
+  `Forbidden`; an unsigned refusal is `Protocol`. DNSKEY, RRSIG, NSEC, NSEC3 and NSEC3PARAM are
+  reported in `skipped`. `Capabilities::list_rrsets` is true for `rfc2136`, where the call answered
+  `Unsupported` before: an application that lists wherever the capability allows now sends AXFR
+  queries, which some name servers log as refused transfers.
 - `zonewright-mock`: the RFC 2136 mock answers AXFR over TCP;
   `Control::transfer_records_per_message`, `Control::transfer_sign_every`,
   `Control::refuse_transfers`, the faults `transfer_corrupt_mac`, `transfer_unsigned_last`,

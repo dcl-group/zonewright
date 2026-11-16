@@ -5,11 +5,16 @@
 //!   it (`records::data_of`): canonical `RecordData` through `RecordData::from_wire`, which has a
 //!   canonical form for every type with a code (the generic form of RFC 3597 for a type without
 //!   its own), and RDATA that is not valid for its type as non-canonical data in the generic
-//!   form (design section 4.9). A listed set is therefore exactly what `get_rrset` returns for
-//!   it, and a `set_rrset` of it is `Unchanged`. The TTL of a set is the smallest TTL of its
-//!   records, as at the record level.
+//!   form (design section 4.9). The TTL of a set is the smallest TTL of its records, read as at
+//!   the record level. For a set the record-level operations can address, a listed set is
+//!   therefore exactly what `get_rrset` returns for it, and a `set_rrset` of it is `Unchanged`.
+//!   That does not hold for the sets below a delegation other than its NS set (glue and occluded
+//!   records): they are listed, but a record-level read of their name gets a referral and is
+//!   `Error::Rejected`, and so is a write. SOA and the apex NS set are listed and read, but not
+//!   writable (design section 3.4).
 //! - Duplicates: an RR received twice (same owner, type and RDATA) counts once (RFC 5936
-//!   section 2.2: "AXFR clients MUST ignore any duplicate RRs received").
+//!   section 2.2: "AXFR clients MUST ignore any duplicate RRs received"); of duplicates with
+//!   different TTLs the smallest counts.
 //! - SOA and the apex NS rrset are listed like every other set, as every client lists them
 //!   (design section 3.4); the SOA is the one that opened the transfer. Delegation NS sets and
 //!   glue below them are part of the zone (RFC 5936 sections 3.2 and 3.3) and are listed too.
@@ -19,7 +24,11 @@
 //!   application reconciles: `SkipReason::NotPlainRecords`. So are a query or meta type and a
 //!   set the model cannot hold (two records of a singleton type), as `Listing::push` decides; an
 //!   owner name that is not a valid `DomainName` or not within the zone is
-//!   `SkipReason::UnsupportedName` under the zone's name.
+//!   `SkipReason::UnsupportedName` under the zone's name. Other records a signer or the server
+//!   may keep, CDS, CDNSKEY (RFC 7344), ZONEMD (RFC 8976) and private types such as a signer's
+//!   state records, are listed as plain sets, since an operator may also write them; an
+//!   application that reconciles a signed zone has to leave them alone itself. A listing with
+//!   skipped sets logs one `WARN` event per call (`Listing::finish`).
 
 use std::collections::BTreeMap;
 
@@ -55,13 +64,17 @@ type Members = Vec<(Vec<u8>, u32)>;
 fn build(zone: &DomainName, records: Vec<Transferred>) -> Result<ZoneListing, Error> {
     let mut groups: BTreeMap<(String, u16), Members> = BTreeMap::new();
     for record in records {
-        let members = groups.entry((record.name, record.rtype)).or_default();
-        if !members.iter().any(|(rdata, _)| *rdata == record.rdata) {
-            members.push((record.rdata, record.ttl));
-        }
+        groups
+            .entry((record.name, record.rtype))
+            .or_default()
+            .push((record.rdata, record.ttl));
     }
     let mut listing = Listing::new(zone);
-    for ((owner, code), members) in groups {
+    for ((owner, code), mut members) in groups {
+        // Duplicates out, in O(n log n): sorted by RDATA, then TTL, the first of equal RDATA has
+        // the smallest TTL.
+        members.sort_unstable();
+        members.dedup_by(|later, kept| later.0 == kept.0);
         let rtype = RecordType::from_code(code);
         let type_name = rtype.to_string();
         let name = DomainName::parse(&owner).ok();
@@ -74,9 +87,9 @@ fn build(zone: &DomainName, records: Vec<Transferred>) -> Result<ZoneListing, Er
         }
         let ttl = members
             .iter()
-            .map(|(_, ttl)| *ttl)
+            .map(|(_, ttl)| ttl_of(*ttl))
             .min()
-            .map(|ttl| RrsetTtl::Explicit(ttl_of(ttl)));
+            .map(RrsetTtl::Explicit);
         let data = members
             .iter()
             .map(|(rdata, _)| data_of(rtype, rdata))
@@ -98,6 +111,51 @@ mod tests {
             ttl,
             rdata: rdata.to_vec(),
         }
+    }
+
+    /// A TTL with the most significant bit set reads as 0 before the smallest is taken, as at
+    /// the record level (RFC 2181 section 8); and many values at one name are grouped in
+    /// O(n log n): 100 000 distinct values, half of them twice.
+    #[test]
+    fn ttls_are_read_before_the_minimum_and_grouping_scales() {
+        let zone = DomainName::parse("example.org").unwrap();
+        let listing = build(
+            &zone,
+            vec![
+                record("a.example.org.", 1, 100, &[192, 0, 2, 1]),
+                record("a.example.org.", 1, 0x8000_0001, &[192, 0, 2, 2]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            listing.rrsets[0].ttl(),
+            Some(RrsetTtl::from_secs(0).unwrap())
+        );
+        let mut many = Vec::new();
+        for i in 0..100_000u32 {
+            many.push(record(
+                "t.example.org.",
+                16,
+                60,
+                &[&[4u8][..], &i.to_be_bytes()].concat(),
+            ));
+        }
+        for i in 0..50_000u32 {
+            many.push(record(
+                "t.example.org.",
+                16,
+                30,
+                &[&[4u8][..], &i.to_be_bytes()].concat(),
+            ));
+        }
+        let started = std::time::Instant::now();
+        let listing = build(&zone, many).unwrap();
+        assert_eq!(listing.rrsets[0].records().len(), 100_000);
+        assert_eq!(
+            listing.rrsets[0].ttl(),
+            Some(RrsetTtl::from_secs(30).unwrap())
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
     }
 
     /// Records in any order and duplicates become sets with the smallest TTL; signer records,

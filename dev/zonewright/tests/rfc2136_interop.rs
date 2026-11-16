@@ -1428,9 +1428,11 @@ async fn client_handles_multi_string_values_written_by_nsupdate() {
 // ---- Zone transfer -----------------------------------------------------------------------------
 
 /// `dig` transfers the zone from the mock (RFC 5936) and verifies every TSIG of the
-/// multi-message answer (RFC 8945 section 5.3.1), with every message signed and with only the
-/// first, every third and the last signed; what it prints is what the client lists. This checks
-/// the mock's reading of the multi-message digest, which the client shares, against BIND's.
+/// multi-message answer (RFC 8945 section 5.3.1): in one message, one record per message with
+/// every message signed, two records per message with the first, every third and the last
+/// signed, and one record per message with only the first and the last signed. What it prints
+/// is what the client lists. This checks the mock's reading of the multi-message digest, which
+/// the client shares, against BIND's.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs BIND nsupdate and dig at /usr/bin; run with --ignored"]
 async fn dig_transfers_the_zone_the_client_lists() {
@@ -1448,7 +1450,7 @@ async fn dig_transfers_the_zone_the_client_lists() {
     }
     for key in lab.keys() {
         let client = lab.client(key);
-        for (per_message, sign_every) in [(0, 1), (1, 1), (2, 3)] {
+        for (per_message, sign_every) in [(0, 1), (1, 1), (2, 3), (1, 100)] {
             control.transfer_records_per_message(per_message);
             control.transfer_sign_every(sign_every);
             let file = lab.key_file(key);

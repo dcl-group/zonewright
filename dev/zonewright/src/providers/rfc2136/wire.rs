@@ -487,7 +487,10 @@ impl Response {
     }
 }
 
-/// Parses a whole message. Trailing octets are an error.
+/// Parses a whole message. Trailing octets are an error. A zone transfer depends on this: the
+/// MAC of a later signed message covers the unsigned messages before it as one concatenation,
+/// not their boundaries, so a message must be exactly what its counts describe; two messages
+/// sent under one length prefix are refused here rather than read as the first alone.
 pub(super) fn parse(buf: &[u8]) -> Result<Response, ParseError> {
     let mut r = Reader::new(buf, 0);
     let id = r.u16()?;
