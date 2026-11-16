@@ -73,7 +73,7 @@ use crate::rrsets::{Current, Found, Member, RrsetBase, SetTtl, Stored, WholeRead
 
 use super::client::Rfc2136;
 use super::transport::Answer;
-use super::txt::rcode_error;
+use super::txt::{rcode_code, rcode_error};
 use super::wire::{self, Builder, CLASS_IN, HEADER_LEN, MAX_MESSAGE, TYPE_CNAME, TYPE_NS, rcode};
 
 /// The most a TSIG record adds to a message (RFC 8945 section 4.2): the key name (at most 255
@@ -307,7 +307,7 @@ impl Rfc2136 {
             }),
             // Only the "name is not in use" prerequisite of a new CNAME answers YXDOMAIN.
             rcode::YXDOMAIN => Err(Error::Rejected {
-                code: None,
+                code: rcode_code(rcode::YXDOMAIN),
                 status: None,
                 detail: Detail::constant(
                     "the name holds other records (YXDOMAIN): a server ignores a CNAME added \

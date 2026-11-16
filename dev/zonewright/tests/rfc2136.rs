@@ -1330,6 +1330,54 @@ async fn rfc2136_foreign_zone() {
     assert!(mock.control().txt(NAME_DOT).is_empty());
 }
 
+/// A refusal the server decided by its RCODE carries the RCODE's mnemonic (RFC 2136 section 2.2)
+/// as the provider code, or its decimal number where that table names none; the kind does not
+/// change. A refusal mapped to another kind (REFUSED is `Forbidden`, a TSIG error `Auth`) and a
+/// refusal the client decides from its own read carry none.
+#[tokio::test]
+async fn rfc2136_refusal_carries_the_rcode() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let code = |err: &Error| err.provider_code().map(|c| c.as_str().to_owned());
+    for (rcode, expected) in [(FORMERR, "FORMERR"), (4, "NOTIMP"), (11, "11"), (15, "15")] {
+        control.push(Fault::on(Op::Update).rcode(rcode));
+        let err = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Rejected, "{rcode}: {err:?}");
+        assert_eq!(code(&err).as_deref(), Some(expected), "{rcode}: {err:?}");
+    }
+    // REFUSED is `Forbidden`, and a TSIG error `Auth`: neither carries a code.
+    control.push(Fault::on(Op::Update).rcode(REFUSED));
+    let err = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Forbidden, "{err:?}");
+    assert_eq!(code(&err), None);
+    control.push(Fault::on(Op::Update).rcode(NOTAUTH).tsig_error(BADSIG));
+    let err = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Auth, "{err:?}");
+    assert_eq!(code(&err), None);
+    // The CNAME guard of create fails with YXRRSET.
+    control.add_record(MockRecord {
+        name: NAME_DOT.to_owned(),
+        rtype: TYPE_CNAME,
+        ttl: 300,
+        rdata: b"\x06target\x07example\x03org\x00".to_vec(),
+    });
+    control.refuse_queries(true);
+    let err = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Rejected, "{err:?}");
+    assert_eq!(code(&err).as_deref(), Some("YXRRSET"), "{err:?}");
+    control.refuse_queries(false);
+    // The same CNAME seen by the read of a record-level write: the client's own refusal.
+    let err = set(
+        &client,
+        &rrset(NAME, RecordType::TXT, None, &["\"x\""]),
+        Expect::Any,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Rejected, "{err:?}");
+    assert_eq!(code(&err), None, "{err:?}");
+}
+
 // ---- Connections -------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2414,6 +2462,7 @@ async fn rfc2136_record_cname_rules() {
     let cname = rrset(e, RecordType::CNAME, None, &["target.example.org."]);
     let err = set(&client, &cname, Expect::Any).await.unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Rejected, "{err:?}");
+    assert_eq!(err.provider_code().map(|c| c.as_str()), Some("YXDOMAIN"));
     assert_eq!(updates(&mock), 1);
     let prereqs: Vec<(u16, u16)> = update_calls(&mock)[0]
         .prereqs

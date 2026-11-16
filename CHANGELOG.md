@@ -11,8 +11,9 @@ All notable changes to this crate are recorded in this file. The format follows
 - `ProviderCode` and `Error::provider_code()`: `Error::Rejected` and `Error::InvalidInput` carry the
   provider's own machine-readable code for a refusal, when it gave one, in a new field `code`.
   Clients that read one: acme-dns, Beget, Cloud.ru, Cloudflare, DigitalOcean, Hetzner, nic.ru,
-  reg.ru, Route 53, Timeweb Cloud, Yandex 360, Yandex Cloud. A code is kept or dropped, never
-  altered, and never carries a credential.
+  reg.ru, RFC 2136 (the RCODE mnemonic of RFC 2136 section 2.2, or its number), Route 53, Timeweb
+  Cloud, Yandex 360, Yandex Cloud. A code is kept or dropped, never altered, and never carries a
+  credential.
 - `rfc2136`: TSIG algorithm `hmac-sha384` (RFC 8945 section 6), next to `hmac-sha256` and
   `hmac-sha512`.
 - `zonewright-mock`: the RFC 2136 mock verifies and signs `hmac-sha384`; `Seed::standard()` gains

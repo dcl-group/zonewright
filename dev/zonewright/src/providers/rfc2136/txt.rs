@@ -38,7 +38,7 @@
 //! a server may then apply it to the whole RRset (RFC 2136 section 3.4.2.2), and the outcome is
 //! `Accepted`.
 
-use crate::error::Error;
+use crate::error::{Error, ProviderCode};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::meta::Capabilities;
@@ -199,7 +199,7 @@ impl Rfc2136 {
             rcode::NOTZONE => Err(Error::name_outside_zone(name.clone(), zone.clone())),
             // Only the CNAME guard of create is a prerequisite that can fail this way.
             rcode::YXRRSET => Err(Error::Rejected {
-                code: None,
+                code: rcode_code(rcode::YXRRSET),
                 status: None,
                 detail: Detail::constant(
                     "the name holds a CNAME (YXRRSET): a server ignores a TXT record added next \
@@ -219,10 +219,33 @@ pub(super) fn rcode_error(code: u8) -> Error {
         };
     }
     Error::Rejected {
-        code: None,
+        code: rcode_code(code),
         status: None,
         detail: Detail::constant(rcode_text(code)),
     }
+}
+
+/// The provider code of a refusal the server decided by its RCODE: the RCODE's mnemonic, from
+/// the table of RFC 2136 section 2.2 (which lists the values 0 to 5 of RFC 1035 section 4.1.1
+/// with their mnemonics, and adds 6 to 10), or the decimal number of an RCODE that table does
+/// not name. The text is the crate's own, chosen by the number on the wire; nothing the server
+/// sent enters it.
+pub(super) fn rcode_code(code: u8) -> Option<ProviderCode> {
+    let mnemonic = match code {
+        rcode::NOERROR => "NOERROR",
+        rcode::FORMERR => "FORMERR",
+        rcode::SERVFAIL => "SERVFAIL",
+        rcode::NXDOMAIN => "NXDOMAIN",
+        rcode::NOTIMP => "NOTIMP",
+        rcode::REFUSED => "REFUSED",
+        rcode::YXDOMAIN => "YXDOMAIN",
+        rcode::YXRRSET => "YXRRSET",
+        rcode::NXRRSET => "NXRRSET",
+        rcode::NOTAUTH => "NOTAUTH",
+        rcode::NOTZONE => "NOTZONE",
+        other => return ProviderCode::new(&other.to_string()),
+    };
+    ProviderCode::new(mnemonic)
 }
 
 /// What an RCODE says (RFC 1035 section 4.1.1, RFC 2136 section 2.2).
