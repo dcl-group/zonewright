@@ -413,6 +413,44 @@ async fn an_off_topic_tcp_answer_fails_the_question() {
     assert!(matches!(answer, Answer::Failed(detail) if detail.contains("TCP")));
 }
 
+/// An HTTPS record in service mode (priority not 0) must be self-consistent, RFC 9460 section
+/// 2.4.3: `no-default-alpn` without `alpn` is refused, so the answer for that question at that
+/// server is `Failed`. In alias mode (priority 0) the parameters are ignored and the record is
+/// read as records.
+#[tokio::test]
+async fn an_inconsistent_https_record_fails_the_question_in_service_mode_only() {
+    let mock = authoritative().await;
+    // Priority 1, target ".", no-default-alpn (key 2, length 0) and no alpn.
+    mock.add(
+        "svc.example.test",
+        TYPE_HTTPS,
+        60,
+        Data::Raw(vec![0, 1, 0, 0, 2, 0, 0]),
+    );
+    // The same parameter at priority 0 (alias mode).
+    mock.add(
+        "alias.example.test",
+        TYPE_HTTPS,
+        60,
+        Data::Raw(vec![0, 0, 0, 0, 2, 0, 0]),
+    );
+    let inspector = static_inspector(&[mock.addr()]);
+    let service = inspector
+        .query_server(
+            mock.addr(),
+            &question("svc.example.test", RecordType::HTTPS),
+        )
+        .await;
+    assert!(matches!(service, Answer::Failed(_)), "{service:?}");
+    let alias = inspector
+        .query_server(
+            mock.addr(),
+            &question("alias.example.test", RecordType::HTTPS),
+        )
+        .await;
+    assert_eq!(records(&alias).len(), 1, "{alias:?}");
+}
+
 #[tokio::test]
 async fn malformed_and_oversized_answers_fail_the_question() {
     let mock = authoritative().await;
