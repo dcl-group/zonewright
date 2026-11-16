@@ -27,11 +27,15 @@ const IDS: &[(ProviderId, &str)] = &[
     (ProviderId::Beget, "beget"),
     (ProviderId::CloudRu, "cloud_ru"),
     (ProviderId::Cloudflare, "cloudflare"),
+    (ProviderId::Desec, "desec"),
     (ProviderId::DigitalOcean, "digitalocean"),
+    (ProviderId::Dnsimple, "dnsimple"),
     (ProviderId::EdgeCenter, "edgecenter"),
+    (ProviderId::Gandi, "gandi"),
     (ProviderId::Gcore, "gcore"),
     (ProviderId::Hetzner, "hetzner"),
     (ProviderId::Nicru, "nicru"),
+    (ProviderId::Porkbun, "porkbun"),
     (ProviderId::Regru, "regru"),
     (ProviderId::Rfc2136, "rfc2136"),
     (ProviderId::Route53, "route53"),
@@ -107,11 +111,15 @@ fn available_follows_the_features() {
         (ProviderId::Beget, cfg!(feature = "beget")),
         (ProviderId::CloudRu, cfg!(feature = "cloud_ru")),
         (ProviderId::Cloudflare, cfg!(feature = "cloudflare")),
+        (ProviderId::Desec, cfg!(feature = "desec")),
         (ProviderId::DigitalOcean, cfg!(feature = "digitalocean")),
+        (ProviderId::Dnsimple, cfg!(feature = "dnsimple")),
         (ProviderId::EdgeCenter, cfg!(feature = "edgecenter")),
+        (ProviderId::Gandi, cfg!(feature = "gandi")),
         (ProviderId::Gcore, cfg!(feature = "gcore")),
         (ProviderId::Hetzner, cfg!(feature = "hetzner")),
         (ProviderId::Nicru, cfg!(feature = "nicru")),
+        (ProviderId::Porkbun, cfg!(feature = "porkbun")),
         (ProviderId::Regru, cfg!(feature = "regru")),
         (ProviderId::Rfc2136, cfg!(feature = "rfc2136")),
         (ProviderId::Route53, cfg!(feature = "route53")),
@@ -359,9 +367,17 @@ const ATOMIC_RRSET_WRITE: &[(ProviderId, bool)] = &[
     (ProviderId::CloudRu, true),
     // Individual records: a replacement is several requests.
     (ProviderId::Cloudflare, false),
+    // One POST (create) or PATCH (change) carries the whole rrset with its TTL.
+    (ProviderId::Desec, true),
     (ProviderId::DigitalOcean, false),
+    // Individual records with IDs: a replacement is several requests (the batch endpoint is not
+    // used).
+    (ProviderId::Dnsimple, false),
     // An rrset addressed by zone, name and type, created by one POST or replaced by one PUT.
     (ProviderId::EdgeCenter, true),
+    // An rrset addressed by domain, name and type, created by one POST or replaced by one PUT,
+    // each carrying the values and the TTL.
+    (ProviderId::Gandi, true),
     (ProviderId::Gcore, true),
     // `set_records` replaces the records of an rrset in one request and `POST …/rrsets` creates
     // it with its records, but a replacement that also changes the TTL of an existing rrset is
@@ -369,6 +385,8 @@ const ATOMIC_RRSET_WRITE: &[(ProviderId, bool)] = &[
     (ProviderId::Hetzner, false),
     // Individual records, staged and committed: several requests.
     (ProviderId::Nicru, false),
+    // Individual records with IDs: a replacement is several requests (creates, then deletes).
+    (ProviderId::Porkbun, false),
     (ProviderId::Regru, false),
     // One UPDATE deletes the RRset and adds the new RRs as one transaction (RFC 2136).
     (ProviderId::Rfc2136, true),
@@ -408,10 +426,17 @@ const PROVIDER_DEFAULT_TTL: &[(ProviderId, ProviderDefaultTtl)] = &[
     (ProviderId::CloudRu, ProviderDefaultTtl::Absent),
     // `1` means automatic, on a create and on a PATCH alike.
     (ProviderId::Cloudflare, ProviderDefaultTtl::Requestable),
+    // `ttl` is mandatory on every rrset: there is no TTL of the provider's own to ask for.
+    (ProviderId::Desec, ProviderDefaultTtl::Absent),
     // Every record carries a TTL in the documented answers.
     (ProviderId::DigitalOcean, ProviderDefaultTtl::Absent),
+    // `ttl` is a required member of every record in an answer (OpenAPI `ZoneRecord`).
+    (ProviderId::Dnsimple, ProviderDefaultTtl::Absent),
     // An rrset written without `ttl` gets 300, which a read shows as a number.
     (ProviderId::EdgeCenter, ProviderDefaultTtl::Absent),
+    // What an rrset written without `rrset_ttl` gets is not documented; the client always sends
+    // a number, and an rrset read without one reads with no TTL stated.
+    (ProviderId::Gandi, ProviderDefaultTtl::Absent),
     (ProviderId::Gcore, ProviderDefaultTtl::Absent),
     // An rrset's `ttl` may be `null`: the zone's default applies; a create without `ttl` and a
     // `change_ttl` with `null` ask for it.
@@ -419,6 +444,9 @@ const PROVIDER_DEFAULT_TTL: &[(ProviderId, ProviderDefaultTtl)] = &[
     // A record's `ttl` is optional; without one the zone's default applies (Docs 4.6). A TTL
     // change stages the record again, with or without `<ttl>`.
     (ProviderId::Nicru, ProviderDefaultTtl::Requestable),
+    // A record created without `ttl` gets the account's minimum, which a read shows as a
+    // number.
+    (ProviderId::Porkbun, ProviderDefaultTtl::Absent),
     // No TTL can be set, and the listing states none: the provider's is the only one.
     (ProviderId::Regru, ProviderDefaultTtl::Requestable),
     // Every RR carries a TTL on the wire.
@@ -570,16 +598,24 @@ fn config_type_object(
         ProviderId::CloudRu => Some(keys::<cloud_ru::CloudRuConfig>(settings)),
         #[cfg(feature = "cloudflare")]
         ProviderId::Cloudflare => Some(keys::<cloudflare::CloudflareConfig>(settings)),
+        #[cfg(feature = "desec")]
+        ProviderId::Desec => Some(keys::<desec::DesecConfig>(settings)),
         #[cfg(feature = "digitalocean")]
         ProviderId::DigitalOcean => Some(keys::<digitalocean::DigitalOceanConfig>(settings)),
+        #[cfg(feature = "dnsimple")]
+        ProviderId::Dnsimple => Some(keys::<dnsimple::DnsimpleConfig>(settings)),
         #[cfg(feature = "edgecenter")]
         ProviderId::EdgeCenter => Some(keys::<edgecenter::EdgeCenterConfig>(settings)),
+        #[cfg(feature = "gandi")]
+        ProviderId::Gandi => Some(keys::<gandi::GandiConfig>(settings)),
         #[cfg(feature = "gcore")]
         ProviderId::Gcore => Some(keys::<gcore::GcoreConfig>(settings)),
         #[cfg(feature = "hetzner")]
         ProviderId::Hetzner => Some(keys::<hetzner::HetznerConfig>(settings)),
         #[cfg(feature = "nicru")]
         ProviderId::Nicru => Some(keys::<nicru::NicruConfig>(settings)),
+        #[cfg(feature = "porkbun")]
+        ProviderId::Porkbun => Some(keys::<porkbun::PorkbunConfig>(settings)),
         #[cfg(feature = "regru")]
         ProviderId::Regru => Some(keys::<regru::RegruConfig>(settings)),
         #[cfg(feature = "rfc2136")]
@@ -839,16 +875,24 @@ fn config_deserializes(
         ProviderId::CloudRu => parses::<cloud_ru::CloudRuConfig>(settings),
         #[cfg(feature = "cloudflare")]
         ProviderId::Cloudflare => parses::<cloudflare::CloudflareConfig>(settings),
+        #[cfg(feature = "desec")]
+        ProviderId::Desec => parses::<desec::DesecConfig>(settings),
         #[cfg(feature = "digitalocean")]
         ProviderId::DigitalOcean => parses::<digitalocean::DigitalOceanConfig>(settings),
+        #[cfg(feature = "dnsimple")]
+        ProviderId::Dnsimple => parses::<dnsimple::DnsimpleConfig>(settings),
         #[cfg(feature = "edgecenter")]
         ProviderId::EdgeCenter => parses::<edgecenter::EdgeCenterConfig>(settings),
+        #[cfg(feature = "gandi")]
+        ProviderId::Gandi => parses::<gandi::GandiConfig>(settings),
         #[cfg(feature = "gcore")]
         ProviderId::Gcore => parses::<gcore::GcoreConfig>(settings),
         #[cfg(feature = "hetzner")]
         ProviderId::Hetzner => parses::<hetzner::HetznerConfig>(settings),
         #[cfg(feature = "nicru")]
         ProviderId::Nicru => parses::<nicru::NicruConfig>(settings),
+        #[cfg(feature = "porkbun")]
+        ProviderId::Porkbun => parses::<porkbun::PorkbunConfig>(settings),
         #[cfg(feature = "regru")]
         ProviderId::Regru => parses::<regru::RegruConfig>(settings),
         #[cfg(feature = "rfc2136")]

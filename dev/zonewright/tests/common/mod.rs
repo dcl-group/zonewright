@@ -118,6 +118,22 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
             r#"{"username":"123/NIC-REG","base_url":"http://127.0.0.1:9/dns-master","token_url":"http://127.0.0.1:9/oauth/token"}"#,
             r#"{"password":"test-only-password","client_id":"test-only-client-id","client_secret":"test-only-secret"}"#,
         ),
+        ProviderId::Desec => (
+            r#"{"base_url":"http://127.0.0.1:9"}"#,
+            r#"{"api_token":"test-only-token"}"#,
+        ),
+        ProviderId::Dnsimple => (
+            r#"{"base_url":"http://127.0.0.1:9/v2"}"#,
+            r#"{"api_token":"test-only-token"}"#,
+        ),
+        ProviderId::Gandi => (
+            r#"{"base_url":"http://127.0.0.1:9/v5/livedns"}"#,
+            r#"{"personal_access_token":"test-only-token"}"#,
+        ),
+        ProviderId::Porkbun => (
+            r#"{"base_url":"http://127.0.0.1:9/api/json/v3"}"#,
+            r#"{"api_key":"pk1_test-only-key","secret_api_key":"sk1_test-only-secret"}"#,
+        ),
         _ => panic!("no sample configuration for {id}"),
     }
 }

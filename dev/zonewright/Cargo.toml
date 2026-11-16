@@ -16,8 +16,8 @@ all-features = true
 [features]
 default = []
 all-providers = [
-    "acme_dns", "beget", "cloud_ru", "cloudflare", "digitalocean", "edgecenter", "gcore", "hetzner",
-    "nicru", "regru", "rfc2136", "route53", "selectel_v2", "timeweb_cloud", "vk_cloud", "yandex_360",
+    "acme_dns", "beget", "cloud_ru", "cloudflare", "desec", "digitalocean", "dnsimple", "edgecenter", "gandi", "gcore", "hetzner",
+    "nicru", "porkbun", "regru", "rfc2136", "route53", "selectel_v2", "timeweb_cloud", "vk_cloud", "yandex_360",
     "yandex_cloud",
 ]
 inspector = [
@@ -35,11 +35,15 @@ acme_dns = ["__http"]
 beget = ["__http"]
 cloud_ru = ["__http"]
 cloudflare = ["__http"]
+desec = ["__http"]
 digitalocean = ["__http"]
+dnsimple = ["__http"]
 edgecenter = ["__http"]
+gandi = ["__http"]
 gcore = ["__http"]
 hetzner = ["__http"]
 nicru = ["__http", "__xml"]
+porkbun = ["__http"]
 regru = ["__http"]
 rfc2136 = ["__crypto", "dep:fastrand", "dep:serde_json", "dep:tracing", "tokio/net", "tokio/io-util"]
 route53 = ["__http", "__crypto", "__xml"]

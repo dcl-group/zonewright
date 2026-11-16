@@ -11,6 +11,16 @@ All notable changes to this crate are recorded in this file. The format follows
 - Gcore (`gcore`) and EdgeCenter (`edgecenter`) clients: TXT value and record-level operations over
   the DNS API v2 that the two providers share, with the mocks `GcoreMock` and `EdgeCenterMock`. Not
   verified against the live APIs.
+- deSEC (`desec`) client: TXT value operations on any value and record-level operations for A, AAAA,
+  CAA, CNAME, DNAME, HTTPS, MX, NS, PTR, SRV, SSHFP, SVCB, TLSA and TXT, with the mock `DesecMock`.
+  Not verified against the live API.
+- DNSimple (`dnsimple`) client: TXT value and record-level operations over the DNSimple API v2, with
+  the mock `DnsimpleMock`. Not verified against the live API.
+- Gandi (`gandi`) client: TXT value operations with the API's per-value `PATCH` and record-level
+  operations over Gandi LiveDNS (API v5) with a personal access token, with the mock `GandiMock`.
+  Not verified against the live API.
+- Porkbun (`porkbun`) client: TXT value and record-level operations over the Porkbun API v3, with
+  the mock `PorkbunMock`. Not verified against the live API.
 
 ## 0.2.2 - 2026-11-16
 

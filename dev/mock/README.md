@@ -151,11 +151,15 @@ server of its own subscribes to the changes instead and mirrors them itself.
 | `beget`         | Beget         | `BegetMock`        |
 | `cloud_ru`      | Cloud.ru      | `CloudRuMock`      |
 | `cloudflare`    | Cloudflare    | `CloudflareMock`   |
+| `desec`         | deSEC         | `DesecMock`        |
 | `digitalocean`  | DigitalOcean  | `DigitalOceanMock` |
+| `dnsimple`      | DNSimple      | `DnsimpleMock`     |
 | `edgecenter`    | EdgeCenter    | `EdgeCenterMock`   |
+| `gandi`         | Gandi         | `GandiMock`        |
 | `gcore`         | Gcore         | `GcoreMock`        |
 | `hetzner`       | Hetzner       | `HetznerMock`      |
 | `nicru`         | nic.ru        | `NicruMock`        |
+| `porkbun`       | Porkbun       | `PorkbunMock`      |
 | `regru`         | reg.ru        | `RegruMock`        |
 | `rfc2136`       | RFC 2136      | `Rfc2136Mock`      |
 | `route53`       | Route 53      | `Route53Mock`      |

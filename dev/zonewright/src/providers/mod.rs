@@ -22,8 +22,11 @@ pub mod acme_dns;
 pub mod beget;
 pub mod cloud_ru;
 pub mod cloudflare;
+pub mod desec;
 pub mod digitalocean;
+pub mod dnsimple;
 pub mod edgecenter;
+pub mod gandi;
 pub mod gcore;
 // The DNS API v2 that Gcore serves and EdgeCenter serves in a fork of its own: the code both
 // clients share.
@@ -31,6 +34,7 @@ pub mod gcore;
 mod gcore_shared;
 pub mod hetzner;
 pub mod nicru;
+pub mod porkbun;
 pub mod regru;
 pub mod rfc2136;
 pub mod route53;
@@ -47,11 +51,15 @@ pub(crate) fn meta_of(id: ProviderId) -> &'static ProviderMeta {
         ProviderId::Beget => &beget::meta::META,
         ProviderId::CloudRu => &cloud_ru::meta::META,
         ProviderId::Cloudflare => &cloudflare::meta::META,
+        ProviderId::Desec => &desec::meta::META,
         ProviderId::DigitalOcean => &digitalocean::meta::META,
+        ProviderId::Dnsimple => &dnsimple::meta::META,
         ProviderId::EdgeCenter => &edgecenter::meta::META,
+        ProviderId::Gandi => &gandi::meta::META,
         ProviderId::Gcore => &gcore::meta::META,
         ProviderId::Hetzner => &hetzner::meta::META,
         ProviderId::Nicru => &nicru::meta::META,
+        ProviderId::Porkbun => &porkbun::meta::META,
         ProviderId::Regru => &regru::meta::META,
         ProviderId::Rfc2136 => &rfc2136::meta::META,
         ProviderId::Route53 => &route53::meta::META,
@@ -85,12 +93,21 @@ pub enum AnyProvider {
     /// The Cloudflare client (`cloudflare`).
     #[cfg(feature = "cloudflare")]
     Cloudflare(cloudflare::Cloudflare),
+    /// The deSEC client (`desec`).
+    #[cfg(feature = "desec")]
+    Desec(desec::Desec),
     /// The DigitalOcean client (`digitalocean`).
     #[cfg(feature = "digitalocean")]
     DigitalOcean(digitalocean::DigitalOcean),
+    /// The DNSimple client (`dnsimple`).
+    #[cfg(feature = "dnsimple")]
+    Dnsimple(dnsimple::Dnsimple),
     /// The EdgeCenter client (`edgecenter`).
     #[cfg(feature = "edgecenter")]
     EdgeCenter(edgecenter::EdgeCenter),
+    /// The Gandi client (`gandi`).
+    #[cfg(feature = "gandi")]
+    Gandi(gandi::Gandi),
     /// The Gcore client (`gcore`).
     #[cfg(feature = "gcore")]
     Gcore(gcore::Gcore),
@@ -100,6 +117,9 @@ pub enum AnyProvider {
     /// The nic.ru client (`nicru`).
     #[cfg(feature = "nicru")]
     Nicru(nicru::Nicru),
+    /// The Porkbun client (`porkbun`).
+    #[cfg(feature = "porkbun")]
+    Porkbun(porkbun::Porkbun),
     /// The reg.ru client (`regru`).
     #[cfg(feature = "regru")]
     Regru(regru::Regru),
@@ -139,16 +159,24 @@ macro_rules! forward {
             AnyProvider::CloudRu(ref $client) => $body,
             #[cfg(feature = "cloudflare")]
             AnyProvider::Cloudflare(ref $client) => $body,
+            #[cfg(feature = "desec")]
+            AnyProvider::Desec(ref $client) => $body,
             #[cfg(feature = "digitalocean")]
             AnyProvider::DigitalOcean(ref $client) => $body,
+            #[cfg(feature = "dnsimple")]
+            AnyProvider::Dnsimple(ref $client) => $body,
             #[cfg(feature = "edgecenter")]
             AnyProvider::EdgeCenter(ref $client) => $body,
+            #[cfg(feature = "gandi")]
+            AnyProvider::Gandi(ref $client) => $body,
             #[cfg(feature = "gcore")]
             AnyProvider::Gcore(ref $client) => $body,
             #[cfg(feature = "hetzner")]
             AnyProvider::Hetzner(ref $client) => $body,
             #[cfg(feature = "nicru")]
             AnyProvider::Nicru(ref $client) => $body,
+            #[cfg(feature = "porkbun")]
+            AnyProvider::Porkbun(ref $client) => $body,
             #[cfg(feature = "regru")]
             AnyProvider::Regru(ref $client) => $body,
             #[cfg(feature = "rfc2136")]
@@ -185,11 +213,15 @@ impl AnyProvider {
             feature = "beget",
             feature = "cloud_ru",
             feature = "cloudflare",
+            feature = "desec",
             feature = "digitalocean",
+            feature = "dnsimple",
             feature = "edgecenter",
+            feature = "gandi",
             feature = "gcore",
             feature = "hetzner",
             feature = "nicru",
+            feature = "porkbun",
             feature = "regru",
             feature = "rfc2136",
             feature = "route53",
@@ -207,11 +239,15 @@ impl AnyProvider {
             feature = "beget",
             feature = "cloud_ru",
             feature = "cloudflare",
+            feature = "desec",
             feature = "digitalocean",
+            feature = "dnsimple",
             feature = "edgecenter",
+            feature = "gandi",
             feature = "gcore",
             feature = "hetzner",
             feature = "nicru",
+            feature = "porkbun",
             feature = "regru",
             feature = "rfc2136",
             feature = "route53",
@@ -249,15 +285,27 @@ impl AnyProvider {
                 return cloudflare::from_json(settings, credentials, ctx)
                     .map(AnyProvider::Cloudflare);
             }
+            ProviderId::Desec => {
+                #[cfg(feature = "desec")]
+                return desec::from_json(settings, credentials, ctx).map(AnyProvider::Desec);
+            }
             ProviderId::DigitalOcean => {
                 #[cfg(feature = "digitalocean")]
                 return digitalocean::from_json(settings, credentials, ctx)
                     .map(AnyProvider::DigitalOcean);
             }
+            ProviderId::Dnsimple => {
+                #[cfg(feature = "dnsimple")]
+                return dnsimple::from_json(settings, credentials, ctx).map(AnyProvider::Dnsimple);
+            }
             ProviderId::EdgeCenter => {
                 #[cfg(feature = "edgecenter")]
                 return edgecenter::from_json(settings, credentials, ctx)
                     .map(AnyProvider::EdgeCenter);
+            }
+            ProviderId::Gandi => {
+                #[cfg(feature = "gandi")]
+                return gandi::from_json(settings, credentials, ctx).map(AnyProvider::Gandi);
             }
             ProviderId::Gcore => {
                 #[cfg(feature = "gcore")]
@@ -270,6 +318,10 @@ impl AnyProvider {
             ProviderId::Nicru => {
                 #[cfg(feature = "nicru")]
                 return nicru::from_json(settings, credentials, ctx).map(AnyProvider::Nicru);
+            }
+            ProviderId::Porkbun => {
+                #[cfg(feature = "porkbun")]
+                return porkbun::from_json(settings, credentials, ctx).map(AnyProvider::Porkbun);
             }
             ProviderId::Regru => {
                 #[cfg(feature = "regru")]
@@ -319,11 +371,15 @@ impl AnyProvider {
         feature = "beget",
         feature = "cloud_ru",
         feature = "cloudflare",
+        feature = "desec",
         feature = "digitalocean",
+        feature = "dnsimple",
         feature = "edgecenter",
+        feature = "gandi",
         feature = "gcore",
         feature = "hetzner",
         feature = "nicru",
+        feature = "porkbun",
         feature = "regru",
         feature = "rfc2136",
         feature = "route53",
@@ -431,6 +487,13 @@ impl From<cloudflare::Cloudflare> for AnyProvider {
     }
 }
 
+#[cfg(feature = "desec")]
+impl From<desec::Desec> for AnyProvider {
+    fn from(client: desec::Desec) -> AnyProvider {
+        AnyProvider::Desec(client)
+    }
+}
+
 #[cfg(feature = "digitalocean")]
 impl From<digitalocean::DigitalOcean> for AnyProvider {
     fn from(client: digitalocean::DigitalOcean) -> AnyProvider {
@@ -438,10 +501,24 @@ impl From<digitalocean::DigitalOcean> for AnyProvider {
     }
 }
 
+#[cfg(feature = "dnsimple")]
+impl From<dnsimple::Dnsimple> for AnyProvider {
+    fn from(client: dnsimple::Dnsimple) -> AnyProvider {
+        AnyProvider::Dnsimple(client)
+    }
+}
+
 #[cfg(feature = "edgecenter")]
 impl From<edgecenter::EdgeCenter> for AnyProvider {
     fn from(client: edgecenter::EdgeCenter) -> AnyProvider {
         AnyProvider::EdgeCenter(client)
+    }
+}
+
+#[cfg(feature = "gandi")]
+impl From<gandi::Gandi> for AnyProvider {
+    fn from(client: gandi::Gandi) -> AnyProvider {
+        AnyProvider::Gandi(client)
     }
 }
 
@@ -463,6 +540,13 @@ impl From<hetzner::Hetzner> for AnyProvider {
 impl From<nicru::Nicru> for AnyProvider {
     fn from(client: nicru::Nicru) -> AnyProvider {
         AnyProvider::Nicru(client)
+    }
+}
+
+#[cfg(feature = "porkbun")]
+impl From<porkbun::Porkbun> for AnyProvider {
+    fn from(client: porkbun::Porkbun) -> AnyProvider {
+        AnyProvider::Porkbun(client)
     }
 }
 

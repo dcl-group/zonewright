@@ -22,16 +22,24 @@ pub enum ProviderId {
     CloudRu,
     /// Cloudflare (`cloudflare`).
     Cloudflare,
+    /// deSEC (`desec`).
+    Desec,
     /// DigitalOcean (`digitalocean`).
     DigitalOcean,
+    /// DNSimple (`dnsimple`).
+    Dnsimple,
     /// EdgeCenter (`edgecenter`).
     EdgeCenter,
+    /// Gandi (`gandi`).
+    Gandi,
     /// Gcore (`gcore`).
     Gcore,
     /// Hetzner (`hetzner`).
     Hetzner,
     /// nic.ru (`nicru`).
     Nicru,
+    /// Porkbun (`porkbun`).
+    Porkbun,
     /// reg.ru (`regru`).
     Regru,
     /// RFC 2136 dynamic update (`rfc2136`).
@@ -57,11 +65,15 @@ impl ProviderId {
         ProviderId::Beget,
         ProviderId::CloudRu,
         ProviderId::Cloudflare,
+        ProviderId::Desec,
         ProviderId::DigitalOcean,
+        ProviderId::Dnsimple,
         ProviderId::EdgeCenter,
+        ProviderId::Gandi,
         ProviderId::Gcore,
         ProviderId::Hetzner,
         ProviderId::Nicru,
+        ProviderId::Porkbun,
         ProviderId::Regru,
         ProviderId::Rfc2136,
         ProviderId::Route53,
@@ -83,11 +95,15 @@ impl ProviderId {
             ProviderId::Beget => "beget",
             ProviderId::CloudRu => "cloud_ru",
             ProviderId::Cloudflare => "cloudflare",
+            ProviderId::Desec => "desec",
             ProviderId::DigitalOcean => "digitalocean",
+            ProviderId::Dnsimple => "dnsimple",
             ProviderId::EdgeCenter => "edgecenter",
+            ProviderId::Gandi => "gandi",
             ProviderId::Gcore => "gcore",
             ProviderId::Hetzner => "hetzner",
             ProviderId::Nicru => "nicru",
+            ProviderId::Porkbun => "porkbun",
             ProviderId::Regru => "regru",
             ProviderId::Rfc2136 => "rfc2136",
             ProviderId::Route53 => "route53",
@@ -107,11 +123,15 @@ impl ProviderId {
             "beget" => ProviderId::Beget,
             "cloud_ru" => ProviderId::CloudRu,
             "cloudflare" => ProviderId::Cloudflare,
+            "desec" => ProviderId::Desec,
             "digitalocean" => ProviderId::DigitalOcean,
+            "dnsimple" => ProviderId::Dnsimple,
             "edgecenter" => ProviderId::EdgeCenter,
+            "gandi" => ProviderId::Gandi,
             "gcore" => ProviderId::Gcore,
             "hetzner" => ProviderId::Hetzner,
             "nicru" => ProviderId::Nicru,
+            "porkbun" => ProviderId::Porkbun,
             "regru" => ProviderId::Regru,
             "rfc2136" => ProviderId::Rfc2136,
             "route53" => ProviderId::Route53,
@@ -134,11 +154,15 @@ impl ProviderId {
             ProviderId::Beget => cfg!(feature = "beget"),
             ProviderId::CloudRu => cfg!(feature = "cloud_ru"),
             ProviderId::Cloudflare => cfg!(feature = "cloudflare"),
+            ProviderId::Desec => cfg!(feature = "desec"),
             ProviderId::DigitalOcean => cfg!(feature = "digitalocean"),
+            ProviderId::Dnsimple => cfg!(feature = "dnsimple"),
             ProviderId::EdgeCenter => cfg!(feature = "edgecenter"),
+            ProviderId::Gandi => cfg!(feature = "gandi"),
             ProviderId::Gcore => cfg!(feature = "gcore"),
             ProviderId::Hetzner => cfg!(feature = "hetzner"),
             ProviderId::Nicru => cfg!(feature = "nicru"),
+            ProviderId::Porkbun => cfg!(feature = "porkbun"),
             ProviderId::Regru => cfg!(feature = "regru"),
             ProviderId::Rfc2136 => cfg!(feature = "rfc2136"),
             ProviderId::Route53 => cfg!(feature = "route53"),
