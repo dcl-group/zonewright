@@ -447,7 +447,7 @@ mod tests {
                 "one identifier for two records"
             );
         }
-        // The reviewer's case: an A and a TXT record at `www`, both with the identifier 7.
+        // An A and a TXT record at `www`, both with the identifier 7.
         assert_eq!(
             kinds(vec![
                 full_record(7, "A", "www", "192.0.2.1", None, 60),
