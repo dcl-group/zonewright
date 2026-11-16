@@ -199,7 +199,8 @@ impl Rfc2136 {
             rcode::YXRRSET => Err(Error::Rejected {
                 status: None,
                 detail: Detail::constant(
-                    "the name holds a CNAME (YXRRSET): a server ignores a TXT record added next                      to a CNAME (RFC 2136 section 3.4.2.2)",
+                    "the name holds a CNAME (YXRRSET): a server ignores a TXT record added next \
+                     to a CNAME (RFC 2136 section 3.4.2.2)",
                 ),
             }),
             other => Err(rcode_error(other)),

@@ -17,6 +17,7 @@ All notable changes to this crate are recorded in this file. The format follows
   request; otherwise it is `Error::Protocol`.
 - `zonewright-mock`: the RFC 2136 mock's BADTIME answer carries the client's time in Time Signed, as
   RFC 8945 section 5.2.3 requires.
+- RFC 2136: the refusal text for a name that holds a CNAME no longer contains a run of spaces.
 
 ## 0.1.0 - 2026-11-16
 
