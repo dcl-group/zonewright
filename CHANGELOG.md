@@ -6,6 +6,12 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.1 - 2026-11-16
+
+Compatible with 0.2.0.
+
 ### Added
 
 - `ProviderCode` and `Error::provider_code()`: `Error::Rejected` and `Error::InvalidInput` carry the
