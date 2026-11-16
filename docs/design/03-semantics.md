@@ -126,6 +126,10 @@ of `rrset`. How it is carried out depends on the provider's native unit:
   process between them is overwritten and not detected. To keep that window at one round trip, the
   transport does not repeat such a write on its own (section 5.3): a failed write is the operation's
   error, and the caller's repeat starts with a fresh read.
+- At a whole-set API (both kinds above), a name that holds several published records of a singleton
+  type, which such an API should not return, is `Error::Protocol` for `get_rrset`, `set_rrset` and
+  `delete_rrset` alike, and nothing is written: the client does not write over a set it cannot
+  represent, and the name has to be repaired at the provider.
 - Per-record APIs (Cloudflare, DigitalOcean, nic.ru, reg.ru, Timeweb Cloud, VK Cloud, Yandex 360):
   the client computes the difference between the records read and the records wanted, creates the
   missing ones and deletes the extra ones by their identifiers. Records present in both are not

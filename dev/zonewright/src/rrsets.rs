@@ -47,7 +47,9 @@
 //! surplus records are deleted first and the number of published records only goes down until
 //! one is left. A record that holds the requested value is the one kept (the first of them in
 //! the order of the read); otherwise the last record is changed in place where the API can. A
-//! record whose value an earlier record of the read already holds is surplus as well.
+//! record whose value an earlier record of the read already holds is surplus as well. A whole-set
+//! provider that returns such a set is not repaired: `get_rrset`, `set_rrset` and `delete_rrset`
+//! all answer `Error::Protocol` and write nothing.
 //!
 //! # A CNAME and other data at one name
 //!
@@ -702,7 +704,8 @@ pub(crate) fn check_list<B: RrsetBase>(backend: &B, zone: &DomainName) -> Result
 
 /// The published rrset: the enabled records, with `ttl`. `None` when no record is enabled. A set
 /// the model cannot hold (two records of a singleton type) is `Error::Protocol`; a per-record
-/// write sees it through [`published_for_write`] instead.
+/// write sees it through [`published_for_write`] instead and repairs it; a whole-set read or
+/// write ends here.
 pub(crate) fn published<H>(
     name: &DomainName,
     rtype: RecordType,
@@ -3845,6 +3848,11 @@ mod tests {
             let wanted = set(RecordType::CNAME, None, &["c.example.net."]);
             assert_eq!(
                 kind(shape.set(&wanted, Expect::Any).await),
+                ErrorKind::Protocol,
+                "{label}"
+            );
+            assert_eq!(
+                kind(shape.delete(&name(), RecordType::CNAME, Expect::Any).await),
                 ErrorKind::Protocol,
                 "{label}"
             );
