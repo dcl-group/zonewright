@@ -427,8 +427,8 @@ async fn rfc2136_secret_not_in_errors() {
 }
 
 /// A `tracing` capture at every level through a success, a TSIG failure and SERVFAIL holds the
-/// client's events with the operation, the RCODE and the duration, and no spelling of the
-/// secret or of a MAC.
+/// client's events with the operation, the attempt, the RCODE and the duration, and no spelling
+/// of the secret or of a MAC.
 #[tokio::test(flavor = "current_thread")]
 async fn rfc2136_no_secret_in_logs() {
     let (capture, _guard) = LogCapture::install();
@@ -465,13 +465,16 @@ async fn rfc2136_no_secret_in_logs() {
     for event in &events {
         let mut names = event.names();
         names.sort_unstable();
-        let allowed = ["elapsed_ms", "message", "op", "rcode"];
+        let allowed = ["attempt", "elapsed_ms", "message", "op", "rcode"];
         assert!(
             names.iter().all(|n| allowed.contains(n)),
             "unexpected field in {event}"
         );
         assert!(event.field("op").is_some() && event.field("elapsed_ms").is_some());
+        assert!(event.field("attempt").is_some(), "no attempt in {event}");
     }
+    // The add that met three SERVFAIL answers was tried three times.
+    assert!(events.iter().any(|e| e.field("attempt") == Some("3")));
     assert!(events.iter().any(|e| e.field("rcode") == Some("2")));
     assert!(events.iter().any(|e| e.field("rcode") == Some("0")));
     assert!(events.iter().any(|e| e.field("op") == Some("transfer")));

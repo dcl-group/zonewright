@@ -57,9 +57,12 @@
 //! - Repeats: a transfer is a read. A transient failure (connection, timeout, a cut stream,
 //!   SERVFAIL, a changed serial) is repeated as the transport repeats a query: up to 3 attempts
 //!   with the back-off of design section 5.3, each with a new ID and signature (RFC 5936 section
-//!   2.3: no endless cycle of retries).
+//!   2.3: no endless cycle of retries). In the worst case a listing therefore takes three times
+//!   [`DEADLINE_FACTOR`] times `ContextOptions::request_timeout`, plus the connects and the
+//!   back-off: about 30 minutes at the default of 30 s.
 //! - Tracing: one `DEBUG` event per attempt, target `zonewright::rfc2136`, with the operation
-//!   `transfer`, the RCODE of the first message when its TSIG verified, and the duration.
+//!   `transfer`, the attempt, the RCODE of the first message when its TSIG verified, and the
+//!   duration.
 
 use std::mem::size_of;
 use std::time::Duration;
@@ -160,12 +163,21 @@ pub(super) async fn transfer(
         let result = transfer_once(transport, zone, &request, &mut first_rcode).await;
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match first_rcode {
-            Some(rcode) => {
-                tracing::debug!(target: TARGET, op = "transfer", rcode, elapsed_ms, "provider request");
-            }
-            None => {
-                tracing::debug!(target: TARGET, op = "transfer", elapsed_ms, "provider request")
-            }
+            Some(rcode) => tracing::debug!(
+                target: TARGET,
+                op = "transfer",
+                attempt,
+                rcode,
+                elapsed_ms,
+                "provider request"
+            ),
+            None => tracing::debug!(
+                target: TARGET,
+                op = "transfer",
+                attempt,
+                elapsed_ms,
+                "provider request"
+            ),
         }
         if !matches!(result, Err(Error::Transient { .. })) || attempt >= MAX_ATTEMPTS {
             return result;

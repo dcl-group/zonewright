@@ -391,8 +391,8 @@ The transport emits one event per HTTP attempt at `DEBUG`, target `zonewright::h
 fields `provider` (the ID), `method`, `path` (URL path, no query string), `status` (absent when
 there was no answer), `attempt` and `elapsed_ms`. Nothing else in an HTTP provider client logs a
 request. The RFC 2136 client emits its own event per DNS exchange at `DEBUG`, target
-`zonewright::rfc2136`, with the fields `op` (the operation), `rcode` (absent when there was no
-answer) and `elapsed_ms`.
+`zonewright::rfc2136`, with the fields `op` (the operation), `attempt`, `rcode` (absent when there
+was no answer) and `elapsed_ms`.
 
 Never written to `tracing`, at any level: request or response bodies, any header, query strings,
 `Detail` text (it is derived from a body), TXT values. The proxy setting adds nothing to the event:

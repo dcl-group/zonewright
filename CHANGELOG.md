@@ -12,6 +12,11 @@ All notable changes to this crate are recorded in this file. The format follows
   writes or refreshes until the returned `ovh::Hold` is released, to force the order of concurrent
   requests in tests.
 
+### Changed
+
+- `rfc2136`: the `DEBUG` event of each DNS exchange and of each zone transfer attempt carries the
+  field `attempt`, as the HTTP event does.
+
 ### Fixed
 
 - `ovh`: a zone refresh sent while another record write of the same client was in flight counted

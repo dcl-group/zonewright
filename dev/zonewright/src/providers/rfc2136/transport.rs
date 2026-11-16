@@ -28,7 +28,8 @@
 //!   record-level operations: a repeat of one that was applied but whose answer was lost would
 //!   fail its own prerequisite and misreport the outcome, so they are sent exactly once.
 //! - Tracing: one `DEBUG` event per attempt, target `zonewright::rfc2136`, with the operation,
-//!   the RCODE when an answer was read, and the duration. No message content, no key, no MAC.
+//!   the attempt, the RCODE when an answer was read, and the duration. No message content, no
+//!   key, no MAC.
 
 use std::io::ErrorKind as IoErrorKind;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -142,11 +143,14 @@ impl Transport {
                 Ok(answer) => tracing::debug!(
                     target: TARGET,
                     op,
+                    attempt,
                     rcode = answer.rcode(),
                     elapsed_ms,
                     "provider request"
                 ),
-                Err(_) => tracing::debug!(target: TARGET, op, elapsed_ms, "provider request"),
+                Err(_) => {
+                    tracing::debug!(target: TARGET, op, attempt, elapsed_ms, "provider request")
+                }
             }
             let repeat = match &result {
                 Err(Error::Transient { .. }) => true,
