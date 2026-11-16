@@ -486,6 +486,56 @@ mod tests {
         assert!(CryptoProvider::get_default().is_none());
     }
 
+    /// `rustls` keeps a trust anchor without its validity dates (design section 5.1): a root
+    /// whose own dates are long past still verifies a certificate that is valid at the time asked.
+    /// The documentation of `russian_trusted_root` states this; if a later `rustls` starts to
+    /// enforce anchor dates, this test fails and the documentation is revisited.
+    #[test]
+    fn a_trust_anchor_past_its_dates_still_verifies() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+            KeyPair, KeyUsagePurpose,
+        };
+
+        // A root valid from 1970-01-01 to 2001-01-01.
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "zonewright expired test root");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        ca_params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+        ca_params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        // A leaf for `example.test` with rcgen's default validity (1975 to 4096).
+        let mut leaf_params = CertificateParams::new(vec!["example.test".to_owned()]).unwrap();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "example.test");
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let leaf = leaf_params
+            .signed_by(&KeyPair::generate().unwrap(), &issuer)
+            .unwrap();
+
+        let mut store = RootCertStore::empty();
+        store.add(ca.der().clone()).unwrap();
+        let verifier =
+            WebPkiServerVerifier::builder_with_provider(Arc::new(store), crypto_provider())
+                .build()
+                .unwrap();
+        // 2020-01-01 00:00:00 UTC, 19 years after the root's `notAfter`.
+        let now = rustls_pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+            1_577_836_800,
+        ));
+        let name = rustls_pki_types::ServerName::try_from("example.test").unwrap();
+        let verified = verifier.verify_server_cert(leaf.der(), &[], &name, &[], now);
+        assert!(verified.is_ok(), "{verified:?}");
+    }
+
     #[test]
     fn client_identity_from_pem() {
         let (_, _, cert_pem, key_pem) = crate::http::testing::client_cert();

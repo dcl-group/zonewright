@@ -48,7 +48,9 @@ helper used by three clients and nine hand-written variants of it.)
     HTTPS request fails with `Error::Config` whose detail says that no CA certificates are
     available. The condition is permanent for the process, so it is not reported as retryable.
     Without the feature, `TrustRoots::Platform` is `Error::Config` from `Context::new`, naming the
-    feature. `TrustRoots` has its three variants in every build.
+    feature. `TrustRoots` has its three variants in every build. Not available on Android:
+    `rustls-platform-verifier` has no constructor there that takes additional roots, and the crate
+    does not compile for Android with the `platform-verifier` feature.
   - The Russian Trusted Root CA is compiled in (`dev/zonewright/roots/`, read by the private module
     `http/roots.rs`); only the root, no intermediate certificate, because `rustls` makes every
     certificate in a root store a trust anchor of its own, and a server sends its intermediates
@@ -68,7 +70,10 @@ helper used by three clients and nine hand-written variants of it.)
   Costs. A corporate intercepting proxy, or an internal authority known only to the system store,
   needs the feature and `TrustRoots::Platform`, or its root in `extra_root_certificates`. Mozilla's
   set changes with a dependency update (`webpki-roots`), not with the operating system's updates: a
-  root that Mozilla removes stays trusted until the application updates its dependencies.
+  root that Mozilla removes stays trusted until the application updates its dependencies. The same
+  holds for the compiled-in Russian root and for `extra_root_certificates`: `rustls` keeps a trust
+  anchor without its validity dates, so an expired root stays trusted until a release of the crate
+  (or the application, for its own roots) removes it.
 
   What the dependency tree shows. Without `platform-verifier` the crate's own code never builds a
   platform verifier. The tree still contains `rustls-platform-verifier` (and, on Unix-like targets

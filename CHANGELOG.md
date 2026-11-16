@@ -6,6 +6,17 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
+### Changed
+
+- Documentation: `ContextOptions::russian_trusted_root` and `extra_root_certificates` now state that
+  the validity dates of a trust anchor are not enforced with `TrustRoots::Mozilla` and
+  `TrustRoots::None`; the Russian Trusted Root CA stays trusted after 2032-02-27 until a release
+  replaces it.
+- Documentation: `TrustRoots::Platform` is not available on Android; with the `platform-verifier`
+  feature the crate does not compile for that target.
+- The summary paragraph of the 0.2.0 section below names the behavior changes that its "Fixed" list
+  holds.
+
 ### Fixed
 
 - `zonewright-mock`: a link with a delay too long to add to the current time no longer stops

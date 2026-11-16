@@ -14,7 +14,8 @@ desired-state diffing, no scheduling, no audit and no metrics.
 ## Status
 
 Version 0.2.0. The provider clients are implemented and tested against mocks. One client, Selectel
-v2, is verified against the live API; the others are not yet.
+v2, is verified against the live API for TXT values, zone listing and the connection check; its
+record operations and the other clients are not yet.
 
 [`PROVIDERS.md`](https://github.com/dcl-group/zonewright/blob/main/PROVIDERS.md) is the single list
 of providers, with the state of each client and the definition of "verified". Each provider reports
@@ -210,6 +211,10 @@ provider's API and a mock DNS server. Together they stand in for both sides of a
 provider API the application writes to, and the DNS server the ACME server reads from.
 
 ```text
+use zonewright_mock::dns::{DnsMock, Role};
+use zonewright_mock::link::{LinkOptions, link};
+use zonewright_mock::selectel_v2::{Seed, SelectelV2Mock};
+
 let provider = SelectelV2Mock::start(Seed::standard()).await;
 let dns = DnsMock::start(Role::Authoritative).await;
 let link = link(&provider, &dns, LinkOptions::new());
@@ -240,9 +245,10 @@ operating system's trust store is not read. With the `platform-verifier` feature
 `TrustRoots::None` trusts only the certificates the options add, for an application that must trust
 a fixed set. `ContextOptions::russian_trusted_root` adds the Russian Trusted Root CA, which the
 crate carries and which neither Mozilla's list nor a typical system store has; it is off by default,
-because every additional authority can issue certificates for any provider's host. DER-encoded
-certificates in `ContextOptions::extra_root_certificates` are trusted in addition to all of these.
-With `TrustRoots::Mozilla` and `TrustRoots::None` certificate revocation is not checked.
+because every additional authority can issue certificates for any provider's host. The crate does
+not enforce that root's expiry date (2032-02-27); a later release replaces or removes it.
+DER-encoded certificates in `ContextOptions::extra_root_certificates` are trusted in addition to all
+of these. With `TrustRoots::Mozilla` and `TrustRoots::None` certificate revocation is not checked.
 
 ```rust
 use zonewright::{Context, ContextOptions, TrustRoots};
@@ -262,9 +268,11 @@ or, with the `socks` feature, a SOCKS5 proxy (`socks5://`, `socks5h://`; without
 `Context::new` refuses such a URL); the provider's certificate is verified as without it, and the
 hosts listed in `HttpProxy::exclusions` are reached directly. With an `http://` or SOCKS5 proxy the
 proxy credentials travel to the proxy unencrypted; the provider traffic stays inside TLS. A proxy
-that refuses its credentials gives `Error::ProxyAuth`. `ring`, OpenSSL and `native-tls` are not in
-the dependency tree. Building needs a C compiler (for `aws-lc-rs`) when an HTTP provider or
-`rfc2136` is enabled.
+that refuses its credentials gives `Error::ProxyAuth`. `ring`, OpenSSL and `native-tls` are never
+built: no feature of the crate enables them, and `cargo deny` bans them from the resolved dependency
+graph. `Cargo.lock` still names `ring`, because `rustls-webpki` and `hickory-proto` declare it as an
+optional dependency; nothing enables it. Building needs a C compiler (for `aws-lc-rs`) when an HTTP
+provider or `rfc2136` is enabled.
 
 ## Secrets and logging
 

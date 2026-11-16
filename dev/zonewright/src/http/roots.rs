@@ -9,8 +9,11 @@
 //!   Communications, CN=Russian Trusted Root CA`, serial number `0x1000`, valid from 2022-03-01 to
 //!   2032-02-27, SHA-256 fingerprint of the DER certificate
 //!   `D2:6D:2D:02:31:B7:C3:9F:92:CC:73:85:12:BA:54:10:35:19:E4:40:5D:68:B5:BD:70:3E:97:88:CA:8E:CF:31`.
-//!   `roots/README.md` records where it comes from and how to replace it. After 2032-02-27 it
-//!   verifies nothing, and the file must be replaced by a newer root before that date.
+//!   `roots/README.md` records where it comes from and how to replace it. The expiry is not
+//!   enforced: `rustls` keeps a trust anchor as subject, public key and name constraints, without
+//!   its validity dates, and checks `notBefore` and `notAfter` only for the certificates a server
+//!   sends. A build that carries this file therefore keeps trusting the root after 2032-02-27. The
+//!   file must be replaced by the authority's next root, or removed, in a release before that date.
 //!
 //! Only the root certificate is compiled in, no intermediate certificate: `rustls` turns every
 //! certificate added to a root store into a trust anchor of its own, so an intermediate there

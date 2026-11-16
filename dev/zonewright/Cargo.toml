@@ -26,7 +26,8 @@ inspector = [
 # feature; `reqwest` is built with its `socks` feature only when this one is on.
 socks = ["reqwest?/socks"]
 # `TrustRoots::Platform`: the operating system's trust store through `rustls-platform-verifier`.
-# Enabled by no other feature.
+# Enabled by no other feature. Does not compile for Android (no `Verifier::new_with_extra_roots`
+# there in 0.7.1).
 platform-verifier = ["dep:rustls-platform-verifier"]
 
 acme_dns = ["__http"]

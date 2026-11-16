@@ -242,5 +242,12 @@ Added after review:
     Section 5.1. Cargo unifies features, so `reqwest`'s `socks` enabled unconditionally would reach
     every `reqwest` client of the application. Without the feature a `socks5://` or `socks5h://`
     proxy is `Error::Config`; `HttpProxy` is the same in every build.
+68. **The compiled-in Russian root is not gated by its expiry date.** Section 5.1. `rustls` keeps no
+    dates for a trust anchor, so the root stays trusted after 2032-02-27 in a build that carries it,
+    as a root Mozilla removed stays trusted until `webpki-roots` is updated. Enforcing the date
+    needs a certificate verifier of the crate's own in front of two `rustls` verifiers, judged at
+    each handshake; that is more verification code than a date which a release has to act on anyway
+    justifies. The documentation states the fact, and `roots/README.md` requires the replacement
+    release.
 
 Section 13.4, the open points, is in [`13-open-points.md`](./13-open-points.md).

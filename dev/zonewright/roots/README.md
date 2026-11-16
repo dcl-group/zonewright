@@ -41,6 +41,13 @@ line break).
   accepted as a trust anchor, its subject, its SHA-256 fingerprint, and that it is not among
   Mozilla's roots. They do not compare its expiry with the current date.
 
+### Expiry
+
+The certificate is valid until 2032-02-27 21:04:15 UTC. The crate does not enforce that date:
+`rustls` keeps a trust anchor without its validity dates, so a build that carries this file trusts
+the root for as long as `ContextOptions::russian_trusted_root` is set. A release with the
+authority's next root, or without this file, must come out before that date.
+
 ### Replacing it
 
 Before 2032-02-27, or when the authority publishes a new root:

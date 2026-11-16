@@ -149,6 +149,12 @@ pub struct ContextOptions {
     /// valid until 2032-02-27). Neither Mozilla's list nor a typical operating system's store has
     /// it.
     ///
+    /// The crate does not enforce that date. With [`TrustRoots::Mozilla`] and [`TrustRoots::None`]
+    /// the verifier keeps a trust anchor without its validity dates, so a build of this version
+    /// keeps trusting the root after 2032-02-27; with [`TrustRoots::Platform`] the operating
+    /// system decides. The certificates a server sends are checked for validity in every case. The
+    /// root is replaced or removed only by a later release of the crate.
+    ///
     /// Every additional authority can issue a certificate the context accepts for any host, the
     /// hosts of other providers included. An application that needs this root for some
     /// providers only builds two contexts.
@@ -156,6 +162,11 @@ pub struct ContextOptions {
     /// DER-encoded certificates trusted in addition to the set
     /// [`trust_roots`](ContextOptions::trust_roots) selects (and to the Russian root when
     /// [`russian_trusted_root`](ContextOptions::russian_trusted_root) is set). Default empty.
+    ///
+    /// Each certificate is used as a trust anchor as given: with [`TrustRoots::Mozilla`] and
+    /// [`TrustRoots::None`] its own validity dates are not checked, so an expired certificate here
+    /// stays trusted until the application removes it; with [`TrustRoots::Platform`] the
+    /// operating system decides.
     pub extra_root_certificates: Vec<Vec<u8>>,
     /// Refuse to connect to anything but loopback addresses. For tests. Default false.
     ///
@@ -208,15 +219,20 @@ pub enum TrustRoots {
     #[default]
     Mozilla,
     /// The operating system's trust store, through its certificate verifier. Needs the cargo
-    /// feature `platform-verifier`; without it, building the `Context` fails with `Error::Config`.
+    /// feature `platform-verifier`; without it, building the `Context` fails with `Error::Config`
+    /// (in a build with an HTTP provider, the only kind that uses the trust settings).
     ///
     /// The Russian root and the extra roots of the options are passed to the platform verifier
     /// as additional roots. Revocation is checked as far as the platform checks it. On a
     /// Unix-like system without CA certificates the context still builds, with a warning, and
     /// every HTTPS request fails with `Error::Config`.
+    ///
+    /// Not available on Android: `rustls-platform-verifier` has no constructor there that takes
+    /// additional roots, and the crate does not compile for Android with the `platform-verifier`
+    /// feature.
     Platform,
     /// No built-in set: only the roots the options add. Building the `Context` fails with
-    /// `Error::Config` when they add none.
+    /// `Error::Config` when they add none (in a build with an HTTP provider).
     None,
 }
 
