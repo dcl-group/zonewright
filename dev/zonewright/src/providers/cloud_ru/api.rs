@@ -49,7 +49,7 @@ use serde::de::{self, DeserializeOwned, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::error::Error;
+use crate::error::{Error, ProviderCode};
 use crate::http::pager::{self, Page};
 use crate::http::{
     Endpoint, Http, PollStep, Poller, Request, Response, Token, TokenAuth, TokenSource, path_id,
@@ -456,7 +456,7 @@ impl Api {
             }
             let response = self.send(&Request::get(url.build()?)).await?;
             if !response.is_success() {
-                return Err(self.http.reject(&response));
+                return Err(self.refuse(&response));
             }
             page_of(&response, "zones")
         })
@@ -490,7 +490,7 @@ impl Api {
                 return Err(Error::zone_not_found(zone.clone()));
             }
             if !response.is_success() {
-                return Err(self.http.reject(&response));
+                return Err(self.refuse(&response));
             }
             page_of(&response, "records")
         })
@@ -551,7 +551,7 @@ impl Api {
             return Ok(Written::NotFound);
         }
         if !response.is_success() {
-            return Ok(Written::Refused(self.http.reject(response)));
+            return Ok(Written::Refused(self.refuse(response)));
         }
         let operation: Operation = response
             .json("the provider's operation is not in the expected form")
@@ -584,13 +584,31 @@ impl Api {
             .await
     }
 
+    /// `Error::Rejected` for an error answer of the DNS API: the transport's refusal with the
+    /// `code` of the `rpcStatus` body as the provider code.
+    // Source: the OpenAPI, `rpcStatus.code` (an integer, google.rpc.Code), the documented error
+    // answer of every DNS path. The token service documents no error body, so its refusals carry
+    // no code.
+    fn refuse(&self, response: &Response) -> Error {
+        let code = serde_json::from_slice::<Status>(response.body())
+            .ok()
+            .and_then(|status| status.code)
+            .and_then(|code| self.rpc_code(code));
+        self.http.reject(response).with_code(code)
+    }
+
+    /// An `rpcStatus` code as a provider code, in decimal.
+    fn rpc_code(&self, code: i64) -> Option<ProviderCode> {
+        self.http.scrubber().code(&code.to_string())
+    }
+
     /// One look at operation `id`.
     // Source: the OpenAPI, `GET /v1/operations/{operationId}` (200 with a `dnsv1Operation`).
     async fn operation(&self, id: &str) -> Result<Operation, Error> {
         let url = self.dns.url().path("/v1/operations").id(id).build()?;
         let response = self.send(&Request::get(url)).await?;
         if !response.is_success() {
-            return Err(self.http.reject(&response));
+            return Err(self.refuse(&response));
         }
         response.json("the provider's operation is not in the expected form")
     }
@@ -617,6 +635,7 @@ impl Api {
                     Some(message) => self.http.detail(&message),
                     None => Detail::constant("the provider's operation failed"),
                 },
+                code: status.code.and_then(|code| self.rpc_code(code)),
             }),
         }
     }

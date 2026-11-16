@@ -1191,6 +1191,44 @@ async fn nicru_dropped_operation_leaves_the_zone_refused() {
     assert!(control.published_txt("foreign-edit").is_empty());
 }
 
+/// A refusal carries the `code` attribute of the first `error` element, with status 200 and with
+/// an HTTP error status; the kind does not change.
+#[tokio::test]
+async fn nicru_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    for status in [200, 400] {
+        mock.faults()
+            .push(Fault::on("PUT", RECORDS).respond(status, fail_body("4004", "refused")));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{status}: {e:?}");
+        assert_eq!(e.provider_code().map(|c| c.as_str()), Some("4004"));
+    }
+    mock.faults().push(Fault::on("PUT", RECORDS).respond(
+        200,
+        "<response><status>fail</status><errors><error>refused</error></errors></response>",
+    ));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+}
+
+/// A code that echoes a credential is not carried, and the credential appears nowhere in the
+/// error. The three credentials fit the code's alphabet, so only the scrubber keeps them out.
+#[tokio::test]
+async fn nicru_provider_code_never_carries_a_credential() {
+    let (mock, client) = setup().await;
+    let seed = Seed::standard();
+    for secret in [&seed.password, &seed.client_id, &seed.client_secret] {
+        mock.faults()
+            .push(Fault::on("PUT", RECORDS).respond(200, fail_body(secret, "refused")));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+        assert_eq!(e.provider_code(), None, "{secret}");
+        let text = format!("{e} | {e:?}");
+        assert!(!text.contains(secret.as_str()), "{text}");
+    }
+}
+
 /// A zone found without staged changes clears a stale mark: an edit that was refused, and so
 /// staged nothing, must not make a later foreign edit look like ours.
 #[tokio::test]

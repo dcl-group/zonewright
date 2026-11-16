@@ -91,6 +91,7 @@ impl Yandex360 {
             // The token as given is registered too, whether or not it was trimmed.
             .secret(raw)
             .message(api::error_message)
+            .code(api::error_code)
             .build()?;
         Ok(Yandex360 {
             api: Api::new(http, settings.api, settings.org_id),

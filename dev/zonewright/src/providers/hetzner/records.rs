@@ -183,6 +183,7 @@ fn refuse_protected(prior: &Rrset) -> Result<(), Error> {
                 "the rrset has change protection enabled at the provider and cannot be changed \
                  or deleted",
             ),
+            code: None,
         });
     }
     Ok(())
@@ -233,6 +234,7 @@ impl WholeSet for Hetzner {
                         detail: Detail::constant(
                             "the provider's encoding of this record data is not established",
                         ),
+                        code: None,
                     })?,
                     comment: None,
                 }),

@@ -25,7 +25,7 @@ use crate::provider::{AddOutcome, CheckReport, Provider, ZoneCheck};
 use crate::record::{RrsetTtl, Txt};
 use crate::redact::Detail;
 
-use super::api::Api;
+use super::api::{self, Api};
 use super::config::{self, AcmeDnsConfig, AcmeDnsCredentials, Registration};
 use super::state::{Outcome, State};
 
@@ -90,7 +90,9 @@ impl AcmeDns {
     ) -> Result<AcmeDns, Error> {
         let endpoint = config.validate(ctx)?;
         let registrations = credentials.parse_registrations()?;
-        let mut http = Http::builder(ctx, ProviderId::AcmeDns).endpoint(&endpoint);
+        let mut http = Http::builder(ctx, ProviderId::AcmeDns)
+            .endpoint(&endpoint)
+            .code(api::error_code);
         for registration in &registrations {
             http = http
                 .secret(registration.username.expose_secret())
@@ -146,6 +148,7 @@ fn refused(error: &SendError) -> bool {
 fn invalid(text: &'static str) -> Error {
     Error::InvalidInput {
         detail: Detail::constant(text),
+        code: None,
     }
 }
 
@@ -324,6 +327,7 @@ mod tests {
         let rejected = SendError::answered(Error::Rejected {
             status: Some(400),
             detail: Detail::constant("bad value"),
+            code: None,
         });
         assert!(refused(&rejected));
         let local = SendError::before_send(Error::Transient {
@@ -346,6 +350,7 @@ mod tests {
         assert!(refused(&SendError::before_send(certificate())));
         let build = || Error::InvalidInput {
             detail: Detail::constant("the HTTP request could not be built"),
+            code: None,
         };
         assert!(!refused(&SendError::answered(build())));
         assert!(refused(&SendError::before_send(build())));

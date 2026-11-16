@@ -117,3 +117,27 @@ impl Api {
         }
     }
 }
+
+/// The provider's error code: the `error` string of an error body, such as `bad_txt`.
+// Source: the server source named in the module documentation: every refusal of `POST /update`
+// is written as `{"error": "<code>"}` with a fixed code (`forbidden`, `bad_subdomain`,
+// `bad_txt`, `db_error`).
+pub(super) fn error_code(body: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    body.get("error")?.as_str().map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_code;
+
+    #[test]
+    fn error_codes_are_the_error_string() {
+        assert_eq!(
+            error_code(r#"{"error": "bad_txt"}"#).as_deref(),
+            Some("bad_txt")
+        );
+        assert_eq!(error_code(r#"{"error": 7}"#), None);
+        assert_eq!(error_code("bad_txt"), None);
+    }
+}

@@ -153,6 +153,9 @@ struct Operation {
 
 #[derive(Debug, Deserialize)]
 struct Status {
+    /// The gRPC code (Errors: `code`, an integer).
+    #[serde(default)]
+    code: Option<i64>,
     #[serde(default)]
     message: Option<String>,
 }
@@ -236,6 +239,7 @@ impl Signer {
         };
         let fail = || Error::InvalidInput {
             detail: Detail::constant("the JWT could not be encoded"),
+            code: None,
         };
         let header = Zeroizing::new(serde_json::to_vec(&header).map_err(|_| fail())?);
         let claims = Zeroizing::new(serde_json::to_vec(&claims).map_err(|_| fail())?);
@@ -608,6 +612,9 @@ impl Api {
                         Some(message) => self.http.detail(&message),
                         None => Detail::constant("the provider's operation failed"),
                     },
+                    code: status
+                        .code
+                        .and_then(|code| self.http.scrubber().code(&code.to_string())),
                 },
                 not_found: false,
             },
@@ -657,9 +664,27 @@ pub(super) fn error_message(body: &str) -> Option<String> {
         .filter(|m| !m.is_empty())
 }
 
+/// The provider's error code: the gRPC `code` of the error body, in decimal (`3` is
+/// `INVALID_ARGUMENT`).
+// Source: Errors (`Status`: `code`, `message`, `details`; the table of gRPC codes).
+pub(super) fn error_code(body: &str) -> Option<String> {
+    let status: Status = serde_json::from_str(body).ok()?;
+    status.code.map(|code| code.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::error_message;
+    use super::{error_code, error_message};
+
+    #[test]
+    fn error_codes_are_the_grpc_code() {
+        assert_eq!(
+            error_code(r#"{"code":3,"message":"m","details":[]}"#).as_deref(),
+            Some("3")
+        );
+        assert_eq!(error_code(r#"{"message":"m"}"#), None);
+        assert_eq!(error_code("<html>oops</html>"), None);
+    }
 
     #[test]
     fn error_messages_are_read_from_message() {

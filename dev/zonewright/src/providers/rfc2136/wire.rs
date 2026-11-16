@@ -78,6 +78,7 @@ pub(super) mod rcode {
 
 fn invalid(text: &'static str) -> Error {
     Error::InvalidInput {
+        code: None,
         detail: Detail::constant(text),
     }
 }

@@ -1211,6 +1211,55 @@ async fn hetzner_failed_action_message_is_scrubbed() {
     assert_clean("failed action", &text, &[CANARY_TOKEN]);
 }
 
+/// A refusal carries the `code` of the documented error body, and a failed action the `code` of
+/// its `error`; the kinds do not change.
+#[tokio::test]
+async fn hetzner_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    mock.faults().push(Fault::on("POST", ADD).respond(
+        422,
+        r#"{"error":{"code":"invalid_input","message":"invalid input in field 'records'","details":{}}}"#,
+    ));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code().map(|c| c.as_str()), Some("invalid_input"));
+
+    mock.control()
+        .fail_next_action("action_failed", "the zone could not be updated");
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code().map(|c| c.as_str()), Some("action_failed"));
+
+    // `locked` and `conflict` keep their kinds and carry no code.
+    mock.faults().push(Fault::on("POST", ADD).respond(
+        409,
+        r#"{"error":{"code":"conflict","message":"changed","details":{}}}"#,
+    ));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+}
+
+/// A code that echoes the token is not carried, in an error body or in a failed action, and the
+/// token appears nowhere in the error. The token fits the code's alphabet, so only the scrubber
+/// keeps it out.
+#[tokio::test]
+async fn hetzner_provider_code_never_carries_a_credential() {
+    let (mock, client) = setup().await;
+    let body = serde_json::json!({"error": {"code": TOKEN, "message": "m", "details": {}}});
+    mock.faults()
+        .push(Fault::on("POST", ADD).respond(422, body.to_string()));
+    let refused = add(&client, "AAA").await.unwrap_err();
+    mock.control().fail_next_action(TOKEN, "m");
+    let failed = add(&client, "AAA").await.unwrap_err();
+    for e in [refused, failed] {
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+        assert_eq!(e.provider_code(), None);
+        let text = format!("{e} | {e:?}");
+        assert!(!text.contains(TOKEN), "{text}");
+    }
+}
+
 /// A look at the action that fails, or answers something the client cannot read, ends the wait:
 /// the write was accepted and its outcome is unknown (`Transient`, design section 3.7). The same
 /// holds for the action the write itself returned, and for a write answered without an action.

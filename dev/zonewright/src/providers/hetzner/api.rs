@@ -717,11 +717,14 @@ impl Api {
                     .error
                     .map(|e| (e.code, e.message))
                     .unwrap_or_default();
+                // The action's `code` is its machine-readable code (the reference, Actions).
+                let provider_code = self.http.scrubber().code(&code);
                 PollStep::Failed(Error::Rejected {
                     status: None,
                     detail: self
                         .http
                         .detail(&format!("the action failed: {code}: {message}")),
+                    code: provider_code,
                 })
             }
             _ => {
@@ -826,10 +829,11 @@ struct ErrorInfo {
     message: Option<String>,
 }
 
-/// The `code` of the documented error body.
+/// The `code` of the documented error body. It is also the provider code of a refusal
+/// (`HttpBuilder::code`).
 // Source: the reference, Errors: "The error response contains the following keys: `code`,
 // `message`, `details`"; lego types.go:8 to 16.
-fn error_code(body: &str) -> Option<String> {
+pub(super) fn error_code(body: &str) -> Option<String> {
     serde_json::from_str::<ErrorBody>(body).ok()?.error.code
 }
 

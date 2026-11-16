@@ -671,11 +671,34 @@ pub(super) fn error_message(body: &str) -> Option<String> {
     })
 }
 
+/// The provider's error code: the `error_code` of the documented error body, such as
+/// `bad_request`.
+// Source: the error schema (`status_code`, `error_code`, `message`, `response_id`).
+pub(super) fn error_code(body: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        #[serde(default)]
+        error_code: Option<String>,
+    }
+    serde_json::from_str::<ErrorBody>(body).ok()?.error_code
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{error_message, whole};
+    use super::{error_code, error_message, whole};
+
+    #[test]
+    fn error_codes_are_the_error_code() {
+        assert_eq!(
+            error_code(r#"{"status_code":400,"error_code":"bad_request","message":"m"}"#)
+                .as_deref(),
+            Some("bad_request")
+        );
+        assert_eq!(error_code(r#"{"message":"m"}"#), None);
+        assert_eq!(error_code("<html>oops</html>"), None);
+    }
 
     #[test]
     fn error_messages_join_code_and_message() {

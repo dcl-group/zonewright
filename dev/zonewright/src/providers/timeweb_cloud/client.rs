@@ -93,6 +93,7 @@ impl TimewebCloud {
             // The token as given is registered too, whether or not it was trimmed.
             .secret(raw)
             .message(api::error_message)
+            .code(api::error_code)
             .build()?;
         Ok(TimewebCloud {
             api: Api::new(http, settings.api),

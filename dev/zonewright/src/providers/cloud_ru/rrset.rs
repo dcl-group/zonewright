@@ -335,6 +335,7 @@ pub(super) fn writable(record: &Record) -> Result<(), Error> {
         return Err(Error::Rejected {
             status: None,
             detail: Detail::constant("the record is read-only at the provider"),
+            code: None,
         });
     }
     Ok(())

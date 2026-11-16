@@ -320,6 +320,7 @@ impl Finish for Signer {
     fn finish(&self, attempt: &Outgoing<'_>) -> Result<Vec<(HeaderName, HeaderValue)>, Error> {
         let unsigned = || Error::InvalidInput {
             detail: Detail::constant("the request could not be signed"),
+            code: None,
         };
         let host = host_header(attempt.url).ok_or_else(unsigned)?;
         // Every path the client builds consists of unreserved characters and `/`, for which
@@ -431,6 +432,7 @@ impl Api {
         if url.query().unwrap_or("") != canonical {
             return Err(Error::InvalidInput {
                 detail: Detail::constant("the request URL does not carry the signed query string"),
+                code: None,
             });
         }
         Ok(url)
@@ -602,14 +604,7 @@ impl Api {
             Attempt::Stale => Attempt::Stale,
             Attempt::Done(Lookup::Absent) => Attempt::Done(None),
             Attempt::Done(Lookup::Plain(rrset)) => Attempt::Done(Some(rrset)),
-            Attempt::Done(Lookup::NotPlain) => {
-                return Err(Error::Rejected {
-                    status: None,
-                    detail: Detail::constant(
-                        "the TXT rrset uses a routing policy or is an alias; it is not changed",
-                    ),
-                });
-            }
+            Attempt::Done(Lookup::NotPlain) => return Err(not_plain()),
         })
     }
 
@@ -790,9 +785,11 @@ impl Api {
         if response.status() == 400
             && let Some(messages) = self.invalid_change_batch(&response)
         {
+            // The error's name is its code (API reference, `ChangeResourceRecordSets` errors).
             return Ok(Submitted::Invalid(Error::Rejected {
                 status: Some(400),
                 detail: messages,
+                code: self.http.scrubber().code("InvalidChangeBatch"),
             }));
         }
         if !response.is_success() {
@@ -918,14 +915,34 @@ impl Api {
             403 => Error::Forbidden { detail },
             400 if RATE_CODES.contains(&code) => Error::RateLimited { retry_after: None },
             400 if auth => Error::Auth { detail },
+            // The `Code` element is the documented error code (API reference, Common errors). It
+            // was read from the scrubbed body and goes through the scrubber's check again.
             400 | 404 | 409 => Error::Rejected {
                 status: Some(status),
                 detail,
+                code: parsed
+                    .as_ref()
+                    .and_then(|(code, _)| self.http.scrubber().code(code)),
             },
             _ => Error::Protocol {
                 detail: self.http.detail(&format!("status {status}: {detail}")),
             },
         }
+    }
+}
+
+/// The refusal of a name and type held by something other than one plain rrset: an alias, a
+/// set with a routing policy, a health check or a traffic policy, or several sets (see the
+/// module documentation of `records`). The client decides it itself, so it carries no provider
+/// code.
+pub(super) fn not_plain() -> Error {
+    Error::Rejected {
+        status: None,
+        detail: Detail::constant(
+            "the rrset is an alias, uses a routing policy, a health check or a traffic policy, or \
+             shares its name and type with other sets; it is not read or changed as an rrset",
+        ),
+        code: None,
     }
 }
 

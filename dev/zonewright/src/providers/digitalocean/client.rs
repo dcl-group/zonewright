@@ -87,6 +87,7 @@ impl DigitalOcean {
             // The token as given is registered too, whether or not it was trimmed.
             .secret(raw)
             .message(api::error_message)
+            .code(api::error_code)
             .build()?;
         Ok(DigitalOcean {
             api: Api::new(http, settings.api),

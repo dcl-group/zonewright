@@ -112,6 +112,7 @@ impl CloudRu {
             Lookup::ReadOnly => Err(Error::Rejected {
                 status: None,
                 detail: Detail::constant(ZONE_READ_ONLY),
+                code: None,
             }),
         }
     }

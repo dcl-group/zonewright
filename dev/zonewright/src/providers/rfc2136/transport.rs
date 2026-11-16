@@ -220,6 +220,7 @@ impl Transport {
         };
         let exchange = async {
             let len = u16::try_from(message.len()).map_err(|_| Error::InvalidInput {
+                code: None,
                 detail: Detail::constant("the signed DNS message would exceed 65535 octets"),
             })?;
             let mut framed = Vec::with_capacity(message.len() + 2);

@@ -219,6 +219,7 @@ impl WholeSet for SelectelV2 {
                         detail: Detail::constant(
                             "the provider's encoding of this record data is not established",
                         ),
+                        code: None,
                     })?,
                     disabled: false,
                 }),

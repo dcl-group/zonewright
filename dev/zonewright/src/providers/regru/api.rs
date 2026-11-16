@@ -380,6 +380,7 @@ impl Api {
             _ => {
                 return Err(Error::InvalidInput {
                     detail: Detail::constant("the record type has no address function"),
+                    code: None,
                 });
             }
         };
@@ -408,6 +409,7 @@ impl Api {
         if content.trim().is_empty() {
             return Err(Error::InvalidInput {
                 detail: Detail::constant("a record is removed only by a non-empty content"),
+                code: None,
             });
         }
         let mut input = Input::new(zone);
@@ -475,6 +477,7 @@ impl Api {
             Some(input) => Some(
                 serde_json::to_string(input).map_err(|_| Error::InvalidInput {
                     detail: Detail::constant("the request cannot be encoded"),
+                    code: None,
                 })?,
             ),
             None => None,
@@ -533,6 +536,9 @@ impl Api {
         text: Option<&str>,
         zone: Option<&DomainName>,
     ) -> Error {
+        // `error_code` is the documented machine-readable code (the documentation, 2.3.2 and
+        // its list of codes); the placeholder below is the client's and is never carried.
+        let provider_code = || code.and_then(|code| self.http.scrubber().code(code));
         let code = code.unwrap_or("UNKNOWN");
         let detail = || {
             self.http
@@ -543,17 +549,22 @@ impl Api {
             Class::Forbidden => Error::Forbidden { detail: detail() },
             Class::RateLimited => Error::RateLimited { retry_after: None },
             Class::Transient => Error::Transient { detail: detail() },
-            Class::InvalidInput => Error::InvalidInput { detail: detail() },
+            Class::InvalidInput => Error::InvalidInput {
+                detail: detail(),
+                code: provider_code(),
+            },
             Class::NotFound => match zone {
                 Some(zone) => Error::zone_not_found(zone.clone()),
                 None => Error::Rejected {
                     status: Some(status),
                     detail: detail(),
+                    code: provider_code(),
                 },
             },
             Class::Rejected => Error::Rejected {
                 status: Some(status),
                 detail: detail(),
+                code: provider_code(),
             },
         }
     }

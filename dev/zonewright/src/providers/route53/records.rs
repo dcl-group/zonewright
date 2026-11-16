@@ -62,7 +62,7 @@ use crate::record::{RecordData, RecordType, RrsetTtl};
 use crate::redact::Detail;
 use crate::rrsets::{self, Current, Found, Listing, Member, RrsetBase, SetTtl, Stored, WholeSet};
 
-use super::api::{Action, Change, Lookup, Rrset, Submitted};
+use super::api::{self, Action, Change, Lookup, Rrset, Submitted};
 use super::client::Route53;
 use super::content;
 use super::txt::{MAX_RECORDS, MAX_VALUE_CHARS, check_batch};
@@ -142,7 +142,7 @@ impl WholeSet for Route53 {
         let found = match lookup {
             Lookup::Absent => None,
             Lookup::Plain(rrset) => Some(found(rtype, rrset)),
-            Lookup::NotPlain => return Err(not_plain()),
+            Lookup::NotPlain => return Err(api::not_plain()),
         };
         Ok(Current {
             context: zone_id.id,
@@ -235,17 +235,20 @@ fn values(rtype: RecordType, members: &[Member<'_, String>]) -> Result<Vec<Strin
                 detail: Detail::constant(
                     "the provider's encoding of this record data is not established",
                 ),
+                code: None,
             })?,
         });
     }
     if values.len() > MAX_RECORDS {
         return Err(Error::InvalidInput {
             detail: Detail::constant("a Route 53 rrset holds at most 400 records"),
+            code: None,
         });
     }
     if values.iter().any(|v| v.chars().count() > MAX_VALUE_CHARS) {
         return Err(Error::InvalidInput {
             detail: Detail::constant("a Route 53 record value holds at most 4000 characters"),
+            code: None,
         });
     }
     Ok(values)
@@ -342,17 +345,6 @@ impl Route53 {
             listing.push(set.name, &set.rtype, ttl(rrset.ttl), records);
         }
         listing.finish(ProviderId::Route53)
-    }
-}
-
-/// An alias or routing-policy set at the name and type (see the module documentation).
-fn not_plain() -> Error {
-    Error::Rejected {
-        status: None,
-        detail: Detail::constant(
-            "the rrset is an alias, uses a routing policy, or shares its name and type with \
-             other sets; it is not read or changed as an rrset",
-        ),
     }
 }
 

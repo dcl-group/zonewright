@@ -270,6 +270,7 @@ fn data(members: &[Member<'_, String>]) -> Result<Vec<Value>, Error> {
             Member::Kept(record) => record.handle.clone(),
             Member::Added(value) => write_txt(value).ok_or(Error::InvalidInput {
                 detail: Detail::constant("the TXT value cannot be written in this dialect"),
+                code: None,
             })?,
         };
         data.push(Value::String(text));
@@ -277,6 +278,7 @@ fn data(members: &[Member<'_, String>]) -> Result<Vec<Value>, Error> {
     if data.len() > MAX_DATA {
         return Err(Error::InvalidInput {
             detail: Detail::constant("a Yandex Cloud record set holds at most 100 values"),
+            code: None,
         });
     }
     Ok(data)

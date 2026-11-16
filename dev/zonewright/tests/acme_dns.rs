@@ -861,6 +861,44 @@ async fn acme_dns_refusals_are_classified() {
     assert_eq!(updates(&mock), cases.len());
 }
 
+/// A refusal carries the server's own code, the `error` string of its body; the kind is the
+/// transport's.
+#[tokio::test]
+async fn acme_dns_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    mock.faults()
+        .push(Fault::on("POST", UPDATE).respond(400, r#"{"error": "bad_txt"}"#));
+    let e = add(&mock, &client, 0, &value('A')).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code().map(|c| c.as_str()), Some("bad_txt"));
+    // A body without the field: no code.
+    mock.faults()
+        .push(Fault::on("POST", UPDATE).respond(400, r#"{"message": "bad_txt"}"#));
+    let e = add(&mock, &client, 0, &value('A')).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+}
+
+/// A code that echoes a credential is not carried, and the credential appears nowhere in the
+/// error. Both credentials of a registration fit the code's alphabet, so only the scrubber keeps
+/// them out.
+#[tokio::test]
+async fn acme_dns_provider_code_never_carries_a_credential() {
+    let (mock, client) = setup().await;
+    let register = mock.control().register_json(0);
+    for field in ["username", "password"] {
+        let secret = register[field].as_str().unwrap().to_owned();
+        let body = serde_json::json!({ "error": secret }).to_string();
+        mock.faults()
+            .push(Fault::on("POST", UPDATE).respond(400, body));
+        let e = add(&mock, &client, 0, &value('A')).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{field}: {e:?}");
+        assert_eq!(e.provider_code(), None, "{field}");
+        let text = format!("{e} | {e:?}");
+        assert!(!text.contains(&secret), "{field}: {text}");
+    }
+}
+
 #[tokio::test]
 async fn acme_dns_bad_credentials_are_an_auth_error_without_the_secret() {
     let mock = AcmeDnsMock::start(Seed::standard()).await;

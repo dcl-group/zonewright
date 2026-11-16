@@ -420,6 +420,7 @@ impl RrsetBase for VkCloud {
 fn not_sendable() -> Error {
     Error::InvalidInput {
         detail: Detail::constant("the provider's encoding of this record data is not established"),
+        code: None,
     }
 }
 
@@ -473,6 +474,7 @@ impl PerRecord for VkCloud {
                     "the provider states an SRV owner name as a service and a protocol label \
                      (such as _sip._tcp) relative to the zone; this name does not start with them",
                 ),
+                code: None,
             });
         }
         let ttl = match ttl {
@@ -644,6 +646,7 @@ fn check_update(
                 "the provider's API cannot change the TTL of an existing record; delete the \
                  rrset and set it again with the new TTL",
             ),
+            code: None,
         });
     }
     if update.enable || update.data.is_none() || rtype != RecordType::CNAME {

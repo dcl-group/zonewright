@@ -974,6 +974,51 @@ async fn cloudflare_success_false_is_rejected() {
     assert!(mock.control().records().is_empty());
 }
 
+/// A refusal carries the `code` of the first entry of `errors`, in decimal, whether the status
+/// is 4xx or 2xx with `success: false`; the kind does not change.
+#[tokio::test]
+async fn cloudflare_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    let body = r#"{"success":false,"errors":[{"code":81058,"message":"An identical record already exists."}],"messages":[],"result":null}"#;
+    for status in [400, 200] {
+        mock.faults()
+            .push(Fault::on("POST", RECORDS).respond(status, body));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{status}: {e:?}");
+        assert_eq!(e.provider_code().map(|c| c.as_str()), Some("81058"));
+    }
+    mock.faults().push(Fault::on("GET", ZONES).respond(
+        400,
+        r#"{"success":false,"errors":[],"messages":[],"result":null}"#,
+    ));
+    let e = client.list_zones().await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+}
+
+/// A code that echoes the token is not carried, and the token appears nowhere in the error. The
+/// codes are numbers, so the token is numeric here.
+#[tokio::test]
+async fn cloudflare_provider_code_never_carries_a_credential() {
+    let token = "4455667788";
+    let mock = CloudflareMock::start(Seed {
+        token: token.into(),
+        ..Seed::standard()
+    })
+    .await;
+    let client = client_with(&mock, token, &context());
+    let body = format!(
+        r#"{{"success":false,"errors":[{{"code":{token},"message":"refused"}}],"result":null}}"#
+    );
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).respond(400, body));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+    let text = format!("{e} | {e:?}");
+    assert!(!text.contains(token), "{text}");
+}
+
 /// Records are listed page by page, and the value is found on any page.
 #[tokio::test]
 async fn cloudflare_record_listing_reads_every_page() {

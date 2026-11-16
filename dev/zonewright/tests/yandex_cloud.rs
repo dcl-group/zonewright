@@ -1012,6 +1012,57 @@ async fn yandex_cloud_add_creates_rrset() {
     assert_eq!(mock.control().txt(ZONE, ZONE), ["apex"]);
 }
 
+/// A refusal carries the gRPC `code` of the error body, in decimal, and a failed operation the
+/// `code` of its `error`; the kinds do not change.
+#[tokio::test]
+async fn yandex_cloud_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    mock.faults().push(Fault::on("POST", UPDATE).respond(
+        400,
+        r#"{"code":3,"message":"invalid record set","details":[]}"#,
+    ));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code().map(|c| c.as_str()), Some("3"));
+    // The mock's failed operation has code 9.
+    mock.control().fail_next_operation("quota exceeded");
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code().map(|c| c.as_str()), Some("9"));
+    mock.faults()
+        .push(Fault::on("POST", UPDATE).respond(400, r#"{"message":"invalid"}"#));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+}
+
+/// A code that echoes the key ID or the service account ID is not carried, in an error body or
+/// in a failed operation, and neither appears in the error. The codes are numbers, so both IDs
+/// are numeric here.
+#[tokio::test]
+async fn yandex_cloud_provider_code_never_carries_a_credential() {
+    let mut seed = Seed::standard();
+    seed.key_id = "5566778899".into();
+    seed.service_account_id = "6677889900".into();
+    let mock = YandexCloudMock::start(seed.clone()).await;
+    let client = YandexCloud::new(
+        settings(&mock),
+        credentials_from(seed.authorized_key(&test_key().private_pem)),
+        &context(),
+    )
+    .unwrap();
+    for secret in [&seed.key_id, &seed.service_account_id] {
+        let body = format!(r#"{{"code":{secret},"message":"refused","details":[]}}"#);
+        mock.faults()
+            .push(Fault::on("POST", UPDATE).respond(400, body));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+        assert_eq!(e.provider_code(), None, "{secret}");
+        let text = format!("{e} | {e:?}");
+        assert!(!text.contains(secret.as_str()), "{text}");
+    }
+}
+
 /// The operation is polled until it is done; an operation that finishes with an error is
 /// `Rejected` with the provider's message and nothing changed; a poll that keeps failing is
 /// `Transient`.

@@ -269,6 +269,7 @@ pub(super) fn check_removable(handle: &str) -> Result<(), Error> {
                 "the provider listed a record without a content, which its API cannot remove on \
                  its own; the record has to be removed at the provider",
             ),
+            code: None,
         });
     }
     Ok(())
@@ -277,6 +278,7 @@ pub(super) fn check_removable(handle: &str) -> Result<(), Error> {
 fn not_sendable() -> Error {
     Error::InvalidInput {
         detail: Detail::constant("the provider's encoding of this record data is not established"),
+        code: None,
     }
 }
 
@@ -395,6 +397,7 @@ impl PerRecord for Regru {
         // refuses a requested TTL before any request).
         Err(Error::InvalidInput {
             detail: Detail::constant("the provider's API cannot set the TTL of a record"),
+            code: None,
         })
     }
 

@@ -1440,6 +1440,54 @@ async fn regru_envelope_errors_are_classified() {
     assert_eq!(mock.log().count(Some("POST"), ADD), cases.len());
 }
 
+/// An `InvalidInput` or `Rejected` stated by the API carries its `error_code`, at the level of the
+/// domain and of the whole call; the kinds do not change.
+#[tokio::test]
+async fn regru_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    let cases = [
+        ("TEXT_CONTAINS_INVALID_CHARACTERS", ErrorKind::InvalidInput),
+        ("DOMAIN_IS_NOT_USE_REGRU_NSS", ErrorKind::Rejected),
+    ];
+    for (code, kind) in cases {
+        mock.faults()
+            .push(Fault::on("POST", ADD).respond(200, domain_error(code, "words")));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), kind, "domain {code}: {e:?}");
+        assert_eq!(e.provider_code().map(|c| c.as_str()), Some(code));
+        mock.faults()
+            .push(Fault::on("POST", READ).respond(200, top_error(code, "words")));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), kind, "top {code}: {e:?}");
+        assert_eq!(e.provider_code().map(|c| c.as_str()), Some(code));
+    }
+    // A domain entry with `result: "error"` and no code: no provider code (the client's
+    // placeholder is not one).
+    let body = json!({"result": "success", "answer": {"domains": [
+        {"dname": "example.org", "result": "error", "error_text": "words"}
+    ]}});
+    mock.faults()
+        .push(Fault::on("POST", ADD).respond(200, body.to_string()));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.provider_code(), None, "{e:?}");
+}
+
+/// A code that echoes the user name or the password is not carried, and neither appears in the
+/// error. Both fit the code's alphabet, so only the scrubber keeps them out.
+#[tokio::test]
+async fn regru_provider_code_never_carries_a_credential() {
+    let (mock, client) = setup().await;
+    for secret in [USER, PASSWORD] {
+        mock.faults()
+            .push(Fault::on("POST", ADD).respond(200, domain_error(secret, "words")));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+        assert_eq!(e.provider_code(), None, "{secret}");
+        let text = format!("{e} | {e:?}");
+        assert!(!text.contains(secret), "{text}");
+    }
+}
+
 /// An answer that is not the documented envelope is `Protocol`, and above all an add or remove
 /// is never reported as done on an answer that does not say so for the domain asked for.
 #[tokio::test]

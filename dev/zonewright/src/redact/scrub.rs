@@ -13,6 +13,7 @@ use std::sync::{Mutex, PoisonError};
 use zeroize::Zeroizing;
 
 use super::{DETAIL_MAX_BYTES, Detail, bound, is_unsafe_char};
+use crate::error::ProviderCode;
 
 /// Marker that takes the place of a removed secret.
 pub(crate) const REDACTED: &str = "[redacted]";
@@ -177,6 +178,18 @@ impl Scrubber {
             }
             Detail(out.into_boxed_str())
         })
+    }
+
+    /// A [`ProviderCode`] from the text of the field a provider defines as its error code.
+    ///
+    /// The text goes through [`Scrubber::detail`] first; if that changes it in any way (a secret
+    /// removed or withheld, a character cleaned, the text cut), there is no code. Otherwise the
+    /// alphabet and length rules of [`ProviderCode`] apply.
+    pub(crate) fn code(&self, text: &str) -> Option<ProviderCode> {
+        if self.detail(text).as_str() != text {
+            return None;
+        }
+        ProviderCode::new(text)
     }
 
     /// Runs `f` with every needle, fixed and run-time.
@@ -1007,6 +1020,22 @@ mod tests {
             scrubber.detail("a SECRET/token+1 b").as_str(),
             "a [redacted] b"
         );
+    }
+
+    #[test]
+    fn code_is_dropped_when_scrubbing_changes_it() {
+        let scrubber = Scrubber::new(["TOKEN_123"]);
+        assert_eq!(
+            scrubber.code("INVALID_ZONE").map(|c| c.to_string()),
+            Some("INVALID_ZONE".to_owned())
+        );
+        // The credential itself, embedded in a code, in an encoding the decoded check finds.
+        assert!(scrubber.code("TOKEN_123").is_none());
+        assert!(scrubber.code("E_TOKEN_123_X").is_none());
+        assert!(scrubber.code("TOKEN%5F123").is_none());
+        // Outside the alphabet or too long.
+        assert!(scrubber.code("bad code").is_none());
+        assert!(scrubber.code(&"A".repeat(65)).is_none());
     }
 
     #[test]

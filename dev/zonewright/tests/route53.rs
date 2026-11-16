@@ -1114,8 +1114,17 @@ async fn route53_second_set_of_the_name_and_type_is_refused() {
     );
     let e = add(&client, "AAA").await.unwrap_err();
     assert!(matches!(e, Error::Rejected { status: None, .. }), "{e:?}");
+    assert!(
+        matches!(&e, Error::Rejected { detail, .. } if detail.as_str().contains("shares its name and type")),
+        "{e:?}"
+    );
+    assert_eq!(e.provider_code(), None);
     let e = remove(&client, "plain").await.unwrap_err();
     assert!(matches!(e, Error::Rejected { status: None, .. }), "{e:?}");
+    assert!(
+        matches!(&e, Error::Rejected { detail, .. } if detail.as_str().contains("shares its name and type")),
+        "{e:?}"
+    );
     assert_eq!(writes(&mock), 0);
 }
 
@@ -1651,6 +1660,55 @@ async fn route53_errors_mapped() {
     assert!(mock.control().rrset(NAME, "TXT").is_none());
     add(&client, "A").await.unwrap();
     assert_eq!(mock.control().txt_values(NAME), ["A"]);
+}
+
+/// A refusal carries the `Code` element as the provider code, and a refused batch the error's
+/// name `InvalidChangeBatch`; the kinds do not change.
+#[tokio::test]
+async fn route53_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    mock.faults()
+        .push(Fault::on("GET", RRSETS).respond(400, error_body("InvalidInput", "bad name")));
+    let e = add(&client, "A").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code().map(|c| c.as_str()), Some("InvalidInput"));
+    mock.faults().push(Fault::on("POST", CHANGE).respond(
+        400,
+        invalid_change_batch_body(&["Invalid Resource Record: something else"]),
+    ));
+    let e = add(&client, "A").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(
+        e.provider_code().map(|c| c.as_str()),
+        Some("InvalidChangeBatch")
+    );
+    // `AccessDenied` is `Forbidden`, which carries no code.
+    mock.faults()
+        .push(Fault::on("POST", CHANGE).respond(403, error_body("AccessDenied", "not allowed")));
+    let e = add(&client, "A").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Forbidden, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+}
+
+/// A `Code` that echoes the secret access key or the session token is not carried, and neither
+/// appears in the error. Both fit the code's alphabet here, so only the scrubber keeps them out.
+#[tokio::test]
+async fn route53_provider_code_never_carries_a_credential() {
+    let secret = "testOnlySecretKey00000000000000000000000";
+    let token = "test-only-session-token-0000";
+    let mut seed = Seed::standard();
+    seed.secret_access_key = secret.into();
+    seed.session_token = Some(token.into());
+    let (mock, client) = setup_with(seed).await;
+    for echoed in [secret, token] {
+        mock.faults()
+            .push(Fault::on("GET", RRSETS).respond(400, error_body(echoed, "refused")));
+        let e = add(&client, "A").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+        assert_eq!(e.provider_code(), None, "{echoed}");
+        let text = format!("{e} | {e:?}");
+        assert!(!text.contains(echoed), "{text}");
+    }
 }
 
 /// Route 53 answers a refused request rate with HTTP 400 and `Throttling` or

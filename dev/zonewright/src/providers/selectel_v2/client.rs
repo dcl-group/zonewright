@@ -141,6 +141,7 @@ impl SelectelV2 {
             Lookup::Disabled => Err(Error::Rejected {
                 status: None,
                 detail: Detail::constant(ZONE_DISABLED),
+                code: None,
             }),
         }
     }

@@ -114,6 +114,7 @@ impl YandexCloud {
             .secret(key.id.expose_secret())
             .secret(key.service_account_id.expose_secret())
             .message(api::error_message)
+            .code(api::error_code)
             .build()?;
         let api = Api::new(
             http,

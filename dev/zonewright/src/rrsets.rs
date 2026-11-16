@@ -552,6 +552,7 @@ const ATOMIC_ATTEMPTS: usize = 2;
 fn invalid(text: &'static str) -> Error {
     Error::InvalidInput {
         detail: Detail::constant(text),
+        code: None,
     }
 }
 

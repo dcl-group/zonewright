@@ -513,9 +513,32 @@ pub(super) fn error_message(body: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
+/// The provider's error code: the `code` of the first entry of `errors` that has one, in
+/// decimal.
+// Source: the schema, `dns-records_messages` (`code`, an integer, required in every entry).
+pub(super) fn error_code(body: &str) -> Option<String> {
+    let envelope: Envelope<serde_json::Value> = serde_json::from_str(body).ok()?;
+    envelope
+        .errors
+        .iter()
+        .find_map(|e| e.code)
+        .map(|code| code.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::error_message;
+    use super::{error_code, error_message};
+
+    #[test]
+    fn error_codes_are_the_first_code() {
+        assert_eq!(
+            error_code(r#"{"success":false,"errors":[{"message":"x"},{"code":81057,"message":"y"},{"code":1}]}"#)
+                .as_deref(),
+            Some("81057")
+        );
+        assert_eq!(error_code(r#"{"success":false,"errors":[]}"#), None);
+        assert_eq!(error_code("<html>oops</html>"), None);
+    }
 
     #[test]
     fn error_messages_join_codes_and_texts() {

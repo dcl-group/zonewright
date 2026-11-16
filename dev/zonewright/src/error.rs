@@ -1,6 +1,7 @@
 //! The error type of provider operations (design section 2.9).
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::id::ProviderId;
@@ -13,7 +14,8 @@ use crate::redact::Detail;
 /// `Error` is `Clone + Send + Sync + 'static` and has no `source()`: the errors of the HTTP
 /// stack are not exposed, because their text can contain a URL with a query string. Every text it
 /// carries is a [`Detail`]: at most 512 bytes, no control characters, and inside the crate built
-/// either from a constant or by a scrubber that removed the client's secrets.
+/// either from a constant or by a scrubber that removed the client's secrets. The one exception
+/// is a [`ProviderCode`], which is narrower still.
 ///
 /// [`ErrorKind`] is what an application switches on and maps to its own codes.
 ///
@@ -66,6 +68,8 @@ pub enum Error {
     InvalidInput {
         /// What is wrong.
         detail: Detail,
+        /// The provider's own code for the refusal, when it gave one.
+        code: Option<ProviderCode>,
     },
 
     /// The owner name is not the zone or below it.
@@ -159,6 +163,8 @@ pub enum Error {
         status: Option<u16>,
         /// The provider's reason, scrubbed.
         detail: Detail,
+        /// The provider's own code for the refusal, when it gave one.
+        code: Option<ProviderCode>,
     },
 
     /// The provider answered with something the client cannot interpret.
@@ -213,6 +219,28 @@ impl Error {
         }
     }
 
+    /// The provider's own code for the refusal, for `Rejected` and `InvalidInput` when the
+    /// provider gave one; `None` otherwise. See [`ProviderCode`].
+    #[must_use]
+    pub fn provider_code(&self) -> Option<&ProviderCode> {
+        match self {
+            Error::Rejected { code, .. } | Error::InvalidInput { code, .. } => code.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// This error with `code` as its provider code, for `Rejected` and `InvalidInput`; any
+    /// other error is returned unchanged.
+    #[cfg_attr(not(feature = "cloud_ru"), allow(dead_code))]
+    pub(crate) fn with_code(mut self, code: Option<ProviderCode>) -> Error {
+        if let Error::Rejected { code: slot, .. } | Error::InvalidInput { code: slot, .. } =
+            &mut self
+        {
+            *slot = code;
+        }
+        self
+    }
+
     // Constructors for implementations of `Provider` outside the crate. Text arguments become a
     // `Detail` through `Detail::new`, which bounds and cleans the text and knows no secret.
     // Provider clients inside the crate never call the ones that take text (a conformance test
@@ -252,6 +280,7 @@ impl Error {
     pub fn invalid_input(detail: &str) -> Error {
         Error::InvalidInput {
             detail: Detail::new(detail),
+            code: None,
         }
     }
 
@@ -325,6 +354,7 @@ impl Error {
         Error::Rejected {
             status,
             detail: Detail::new(detail),
+            code: None,
         }
     }
 
@@ -364,6 +394,58 @@ impl Error {
                  unknown keys are refused"
             )),
         }
+    }
+}
+
+/// Longest [`ProviderCode`] in bytes.
+const PROVIDER_CODE_MAX_BYTES: usize = 64;
+
+/// A provider's own machine-readable code for a refusal, carried by [`Error::Rejected`] and
+/// [`Error::InvalidInput`] and returned by [`Error::provider_code`].
+///
+/// The value is the provider's, as its API sent it: for example reg.ru's
+/// `TEXT_CONTAINS_INVALID_CHARACTERS` or a Route 53 `InvalidChangeBatch`; a numeric code, such as
+/// Cloudflare's, is carried in decimal. It is stable only as far as the provider keeps it stable,
+/// and the same text can mean different things at different providers, so an application matches
+/// on the pair of [`ProviderId`] and code. Absence means the provider gave no code, or the crate
+/// does not read one for that provider; a refusal the client decides itself, before sending,
+/// has none.
+///
+/// A code is 1 to 64 bytes of ASCII letters, digits and `_ - . :`. The crate takes it only from
+/// the field the provider defines as its error code; a text outside these rules, or one that
+/// quotes a credential of the client, is not carried at all, never cut or altered.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ProviderCode(Arc<str>);
+
+impl ProviderCode {
+    /// A code from the provider's text; `None` when it is empty, longer than 64 bytes, or holds
+    /// a character outside the alphabet.
+    #[cfg_attr(not(feature = "__http"), allow(dead_code))]
+    pub(crate) fn new(text: &str) -> Option<ProviderCode> {
+        let valid = !text.is_empty()
+            && text.len() <= PROVIDER_CODE_MAX_BYTES
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'));
+        valid.then(|| ProviderCode(Arc::from(text)))
+    }
+
+    /// The code.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProviderCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for ProviderCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.0, f)
     }
 }
 
@@ -509,8 +591,90 @@ impl fmt::Display for Operation {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, ErrorKind};
+    use super::{Error, ErrorKind, ProviderCode};
+    use crate::redact::Detail;
     use std::time::Duration;
+
+    #[test]
+    fn provider_code_accepts_the_alphabet() {
+        for text in [
+            "TEXT_CONTAINS_INVALID_CHARACTERS",
+            "81057",
+            "-1",
+            "InvalidChangeBatch",
+            "a.b:c-d_e",
+            "x",
+        ] {
+            let code = ProviderCode::new(text).expect(text);
+            assert_eq!(code.as_str(), text);
+            assert_eq!(code.to_string(), text);
+            assert_eq!(format!("{code:?}"), format!("{text:?}"));
+            assert_eq!(code.clone(), code);
+        }
+    }
+
+    #[test]
+    fn provider_code_refuses_other_texts() {
+        for text in [
+            "",
+            " ",
+            "a b",
+            "a/b",
+            "a\nb",
+            "a\u{0}",
+            "код",
+            "a\"b",
+            "a=b",
+            "a+b",
+            "a%2F",
+            "[redacted]",
+        ] {
+            assert!(ProviderCode::new(text).is_none(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn provider_code_length_boundary() {
+        assert!(ProviderCode::new(&"a".repeat(64)).is_some());
+        assert!(ProviderCode::new(&"a".repeat(65)).is_none());
+    }
+
+    #[test]
+    fn provider_code_only_for_rejected_and_invalid_input() {
+        let code = ProviderCode::new("E1");
+        let rejected = Error::rejected(Some(400), "r").with_code(code.clone());
+        assert_eq!(rejected.provider_code(), code.as_ref());
+        assert_eq!(rejected.kind(), ErrorKind::Rejected);
+        assert_eq!(rejected.to_string(), "provider rejected the request: r");
+        let invalid = Error::invalid_input("i").with_code(code.clone());
+        assert_eq!(invalid.provider_code(), code.as_ref());
+        assert_eq!(invalid.to_string(), "invalid request: i");
+        assert_eq!(Error::rejected(None, "r").provider_code(), None);
+        assert_eq!(Error::invalid_input("i").provider_code(), None);
+        let others = [
+            Error::config("c"),
+            Error::not_compiled(crate::ProviderId::Cloudflare),
+            Error::unsupported(crate::ProviderId::Cloudflare, super::Operation::Check),
+            Error::proxy_auth(),
+            Error::auth("a"),
+            Error::forbidden("f"),
+            Error::rate_limited(None),
+            Error::precondition_failed("p"),
+            Error::conflict("c"),
+            Error::transient("t"),
+            Error::protocol("p"),
+            Error::Protocol {
+                detail: Detail::constant("p"),
+            },
+        ];
+        for error in others {
+            assert_eq!(
+                error.clone().with_code(code.clone()).provider_code(),
+                None,
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn error_is_send_sync_static_clone() {

@@ -170,6 +170,7 @@ fn records(members: &[Member<'_, Record>]) -> Result<Vec<Record>, Error> {
             None => records.push(Record {
                 content: WRITE.write(value).ok_or(Error::InvalidInput {
                     detail: Detail::constant("the TXT value cannot be written in this dialect"),
+                    code: None,
                 })?,
                 disabled: false,
             }),
@@ -178,6 +179,7 @@ fn records(members: &[Member<'_, Record>]) -> Result<Vec<Record>, Error> {
     if records.len() > MAX_RECORDS {
         return Err(Error::InvalidInput {
             detail: Detail::constant("a Selectel rrset holds at most 100 records"),
+            code: None,
         });
     }
     Ok(records)

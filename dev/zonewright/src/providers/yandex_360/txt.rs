@@ -108,6 +108,7 @@ impl PerRecord for Yandex360 {
         };
         let text = WRITE.write(value).ok_or(Error::InvalidInput {
             detail: Detail::constant("the TXT value cannot be written in this dialect"),
+            code: None,
         })?;
         let ttl = match ttl {
             WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))
@@ -169,5 +170,6 @@ pub(super) fn apex_not_written() -> Error {
             "the provider's documentation does not say how to write the name of the zone \
              itself; only names below it are written",
         ),
+        code: None,
     }
 }

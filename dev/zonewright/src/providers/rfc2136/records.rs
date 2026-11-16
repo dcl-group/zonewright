@@ -87,6 +87,7 @@ const RR_FIXED: usize = 10;
 
 fn invalid(text: &'static str) -> Error {
     Error::InvalidInput {
+        code: None,
         detail: Detail::constant(text),
     }
 }
@@ -97,6 +98,7 @@ fn too_large() -> Error {
 
 fn cname_present() -> Error {
     Error::Rejected {
+        code: None,
         status: None,
         detail: Detail::constant(
             "the name holds a CNAME: a server ignores other records added next to it (RFC 2136 \
@@ -305,6 +307,7 @@ impl Rfc2136 {
             }),
             // Only the "name is not in use" prerequisite of a new CNAME answers YXDOMAIN.
             rcode::YXDOMAIN => Err(Error::Rejected {
+                code: None,
                 status: None,
                 detail: Detail::constant(
                     "the name holds other records (YXDOMAIN): a server ignores a CNAME added \
@@ -419,6 +422,7 @@ fn referral(
         return Ok(delegation);
     }
     Err(Error::Rejected {
+        code: None,
         status: None,
         detail: Detail::constant(
             "the name is at or below a delegation to another zone: the server answers with a \

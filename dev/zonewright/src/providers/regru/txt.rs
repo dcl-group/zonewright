@@ -113,6 +113,7 @@ impl PerRecord for Regru {
         let sub = subdomain(zone, name)?;
         let text = WRITE.write(value).ok_or(Error::InvalidInput {
             detail: Detail::constant("the TXT value cannot be written in this dialect"),
+            code: None,
         })?;
         self.api.add_txt(zone, sub, &text).await
     }

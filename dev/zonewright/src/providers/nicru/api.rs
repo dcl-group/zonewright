@@ -475,9 +475,12 @@ impl Api {
         } else {
             self.http.detail(&format!("{message} (code {code})"))
         };
+        // The `code` attribute of the first `error` element is the documented error code
+        // (module documentation).
         Err(Error::Rejected {
             status: (!success).then_some(response.status()),
             detail,
+            code: self.http.scrubber().code(&code),
         })
     }
 

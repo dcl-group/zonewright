@@ -100,6 +100,7 @@ impl PerRecord for TimewebCloud {
     ) -> Result<(), Error> {
         let data = WRITE.write(value).ok_or(Error::InvalidInput {
             detail: Detail::constant("the TXT value cannot be written in this dialect"),
+            code: None,
         })?;
         // The provider's default (requested, configured or as read) is sent as no `ttl`.
         let ttl = api_ttl(ttl.resolve(self.ttl));

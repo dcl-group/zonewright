@@ -72,6 +72,7 @@ impl WholeSet for CloudRu {
                     "wildcard names are not supported by the TXT value operations of this \
                      provider",
                 ),
+                code: None,
             });
         }
         let (zone_id, record) = self.read_record(zone, name, TXT).await?;
@@ -161,6 +162,7 @@ fn values(members: &[Member<'_, String>]) -> Result<Vec<String>, Error> {
             Member::Kept(record) => Ok(record.handle.clone()),
             Member::Added(value) => WRITE.write(value).ok_or(Error::InvalidInput {
                 detail: Detail::constant("the TXT value cannot be written in this dialect"),
+                code: None,
             }),
         })
         .collect()

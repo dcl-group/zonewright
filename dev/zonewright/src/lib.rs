@@ -95,7 +95,7 @@ mod crypto;
 use rustls_platform_verifier as _;
 
 pub use context::{Context, ContextOptions, HttpProxy, TrustRoots};
-pub use error::{Error, ErrorKind, Operation};
+pub use error::{Error, ErrorKind, Operation, ProviderCode};
 pub use id::{ProviderId, UnknownProviderId};
 pub use meta::{
     Capabilities, ConfigField, FieldKind, Preconditions, ProviderDefaultTtl, ProviderMeta,

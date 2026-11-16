@@ -178,6 +178,7 @@ impl PerRecord for Op<'_> {
     ) -> Result<(), Error> {
         let text = WRITE.write(value).ok_or(Error::InvalidInput {
             detail: Detail::constant("the TXT value cannot be written in this dialect"),
+            code: None,
         })?;
         let owner = match name.relative_to(zone) {
             Some("") => "@",

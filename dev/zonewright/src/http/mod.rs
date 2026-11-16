@@ -151,7 +151,7 @@ use rustls::crypto::CryptoProvider;
 use zeroize::Zeroizing;
 
 use crate::context::{Context, ContextOptions};
-use crate::error::Error;
+use crate::error::{Error, ProviderCode};
 use crate::id::ProviderId;
 use crate::redact::{Detail, Scrubber, SecretSlot};
 
@@ -297,6 +297,9 @@ pub(crate) struct Http {
     auth: Option<(HeaderName, HeaderValue)>,
     gate: Option<RateGate>,
     message: MessageFn,
+    /// Reads the provider's own error code from an error body, for clients whose provider
+    /// documents one.
+    code: Option<MessageFn>,
     /// Marks further answers as rate-limit answers, treated like a 429.
     rate_limit: Option<RateLimitFn>,
     /// The origins of the client's endpoints: the only hosts its requests may go to.
@@ -356,12 +359,27 @@ impl Http {
         }
     }
 
+    /// The provider's own error code in a response body, through the extractor declared with
+    /// [`HttpBuilder::code`] and then [`Scrubber::code`]: `None` when the client declares no
+    /// extractor, the body has no code, scrubbing would change it, or it is not a valid
+    /// [`ProviderCode`].
+    pub(crate) fn body_code(&self, response: &Response) -> Option<ProviderCode> {
+        self.text_code(&response.text())
+    }
+
+    /// [`Http::body_code`] for a body the client already holds as text.
+    pub(crate) fn text_code(&self, body: &str) -> Option<ProviderCode> {
+        let code = (self.code?)(body)?;
+        self.scrubber.code(&code)
+    }
+
     /// The default classification of an answer the client does not expect:
-    /// `Error::Rejected` with the status and [`Http::body_detail`].
+    /// `Error::Rejected` with the status, [`Http::body_detail`] and [`Http::body_code`].
     pub(crate) fn reject(&self, response: &Response) -> Error {
         Error::Rejected {
             status: Some(response.status()),
             detail: self.body_detail(response),
+            code: self.body_code(response),
         }
     }
 }
@@ -377,6 +395,7 @@ pub(crate) struct HttpBuilder {
     gate: Option<Duration>,
     identity: Option<ClientIdentity>,
     message: MessageFn,
+    code: Option<MessageFn>,
     rate_limit: Option<RateLimitFn>,
     origins: Vec<Origin>,
     error: Option<Error>,
@@ -393,6 +412,7 @@ impl HttpBuilder {
             gate: None,
             identity: None,
             message: request::default_message,
+            code: None,
             rate_limit: None,
             origins: Vec::new(),
             error: None,
@@ -485,6 +505,14 @@ impl HttpBuilder {
         self
     }
 
+    /// Reads the provider's own error code from error bodies with `code`: the text of the field
+    /// the provider documents as its error code, a number in decimal. Without it, the client's
+    /// errors carry no code (see [`Http::body_code`]).
+    pub(crate) fn code(mut self, code: MessageFn) -> HttpBuilder {
+        self.code = Some(code);
+        self
+    }
+
     /// Declares further rate-limit answers: an answer for which `classify` is true is treated
     /// exactly like a 429 (design section 5.3), for a provider that signals a refused request
     /// rate with another status. It sees every answer that is not kept with
@@ -518,6 +546,7 @@ impl HttpBuilder {
             auth: self.auth,
             gate: self.gate.map(RateGate::new),
             message: self.message,
+            code: self.code,
             rate_limit: self.rate_limit,
             origins: self.origins,
             identity,

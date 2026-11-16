@@ -131,6 +131,7 @@ impl io::Write for Count {
 pub(crate) fn json<T: Serialize + ?Sized>(value: &T) -> Result<Bytes, Error> {
     let fail = || Error::InvalidInput {
         detail: Detail::constant("the request body could not be encoded as JSON"),
+        code: None,
     };
     let mut count = Count(0);
     serde_json::to_writer(&mut count, value).map_err(|_| fail())?;

@@ -84,7 +84,7 @@ fn as_transient(e: Error) -> Error {
     match e {
         Error::Transient { .. } => e,
         Error::Config { detail }
-        | Error::InvalidInput { detail }
+        | Error::InvalidInput { detail, .. }
         | Error::Auth { detail }
         | Error::Forbidden { detail }
         | Error::PreconditionFailed { detail }

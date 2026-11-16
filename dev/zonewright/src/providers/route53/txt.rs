@@ -256,17 +256,20 @@ fn values(members: &[Member<'_, String>]) -> Result<Vec<String>, Error> {
             Member::Kept(record) => record.handle.clone(),
             Member::Added(value) => WRITE.write(value).ok_or(Error::InvalidInput {
                 detail: Detail::constant("the TXT value cannot be written in this dialect"),
+                code: None,
             })?,
         });
     }
     if values.len() > MAX_RECORDS {
         return Err(Error::InvalidInput {
             detail: Detail::constant("a Route 53 rrset holds at most 400 records"),
+            code: None,
         });
     }
     if values.iter().any(|v| v.chars().count() > MAX_VALUE_CHARS) {
         return Err(Error::InvalidInput {
             detail: Detail::constant("a Route 53 record value holds at most 4000 characters"),
+            code: None,
         });
     }
     Ok(values)
@@ -287,6 +290,7 @@ pub(super) fn check_batch(sets: &[&Vec<String>]) -> Result<(), Error> {
             detail: Detail::constant(
                 "the change exceeds the size limits of a Route 53 change batch",
             ),
+            code: None,
         });
     }
     Ok(())

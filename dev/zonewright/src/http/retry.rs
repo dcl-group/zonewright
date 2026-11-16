@@ -394,6 +394,7 @@ impl Http {
                 Err(Failure::Build) => {
                     return Err(Error::InvalidInput {
                         detail: Detail::constant("the HTTP request could not be built"),
+                        code: None,
                     });
                 }
                 Err(Failure::Finish(error)) => return Err(error),
@@ -446,6 +447,7 @@ impl Http {
                         detail: Detail::constant(
                             "the provider answered with a redirect, which is not followed",
                         ),
+                        code: None,
                     });
                 }
                 401 => {

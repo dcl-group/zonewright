@@ -348,6 +348,45 @@ async fn yandex_360_no_secret_in_logs() {
     }
 }
 
+/// A refusal carries the `code` of the error body, in decimal; the kind does not change.
+#[tokio::test]
+async fn yandex_360_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    mock.faults().push(
+        Fault::on("POST", RECORDS)
+            .respond(400, r#"{"code":3,"message":"bad record","details":[]}"#),
+    );
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code().map(|c| c.as_str()), Some("3"));
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).respond(400, r#"{"message":"bad record"}"#));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+}
+
+/// A code that echoes the token is not carried, and the token appears nowhere in the error. The
+/// codes are numbers, so the token is numeric here.
+#[tokio::test]
+async fn yandex_360_provider_code_never_carries_a_credential() {
+    let token = "3344556677";
+    let mock = Yandex360Mock::start(Seed {
+        token: token.into(),
+        ..Seed::standard()
+    })
+    .await;
+    let client = client_with(&mock, token, &context());
+    let body = format!(r#"{{"code":{token},"message":"refused","details":[]}}"#);
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).respond(400, body));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+    let text = format!("{e} | {e:?}");
+    assert!(!text.contains(token), "{text}");
+}
+
 // ---- Invariants (design section 12.3) ----------------------------------------------------------
 
 /// A name outside the zone is refused before any request: another zone, a name that merely ends

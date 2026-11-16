@@ -122,6 +122,7 @@ pub(super) fn not_plain() -> Error {
         detail: Detail::constant(
             "the record balances between GSLB links; it is not read or changed as an rrset",
         ),
+        code: None,
     }
 }
 
@@ -167,6 +168,7 @@ impl WholeSet for CloudRu {
                     detail: Detail::constant(
                         "the provider's encoding of this record data is not established",
                     ),
+                    code: None,
                 }),
             })
             .collect::<Result<Vec<String>, Error>>()?;
@@ -220,6 +222,7 @@ impl WholeSet for CloudRu {
         {
             return Err(Error::InvalidInput {
                 detail: Detail::constant("the provider does not offer wildcard NS records"),
+                code: None,
             });
         }
         // `can_send` has accepted every added value; checked here once more so that the write
@@ -233,6 +236,7 @@ impl WholeSet for CloudRu {
                 detail: Detail::constant(
                     "the provider's encoding of this record data is not established",
                 ),
+                code: None,
             });
         }
         prior.map_or(Ok(()), writable)

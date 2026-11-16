@@ -96,6 +96,7 @@ impl Hetzner {
             .secret(raw)
             .bearer("api_token", token)
             .message(api::error_message)
+            .code(api::error_code)
             .build()?;
         Ok(Hetzner {
             api: Api::new(http, settings.api),
@@ -136,6 +137,7 @@ impl Hetzner {
             Lookup::Secondary => Err(Error::Rejected {
                 status: Some(422),
                 detail: Detail::constant(NOT_PRIMARY),
+                code: None,
             }),
         }
     }

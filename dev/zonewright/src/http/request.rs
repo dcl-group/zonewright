@@ -180,6 +180,7 @@ impl Request {
     pub(crate) fn header_text(self, name: HeaderName, value: &str) -> Result<Request, Error> {
         let value = HeaderValue::from_str(value).map_err(|_| Error::InvalidInput {
             detail: Detail::constant("a request header value contains a character it cannot carry"),
+            code: None,
         })?;
         Ok(self.header(name, value))
     }
@@ -195,6 +196,7 @@ impl Request {
     ) -> Result<Request, Error> {
         let value = sensitive_value(prefix, secret.as_bytes()).ok_or(Error::InvalidInput {
             detail: Detail::constant("a secret header value contains a character it cannot carry"),
+            code: None,
         })?;
         Ok(self.header(name, value))
     }

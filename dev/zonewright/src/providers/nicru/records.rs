@@ -380,6 +380,7 @@ pub(super) fn api_ttl(ttl: Option<RrsetTtl>) -> Option<u32> {
 fn not_sendable() -> Error {
     Error::InvalidInput {
         detail: Detail::constant("the provider's encoding of this record data is not established"),
+        code: None,
     }
 }
 
@@ -657,6 +658,7 @@ impl PerRecord for RecordOp<'_> {
                 detail: Detail::constant(
                     "the TTL of a record whose value this client cannot write cannot be changed",
                 ),
+                code: None,
             });
         }
         let renewed = SetTtl::Requested(ttl);

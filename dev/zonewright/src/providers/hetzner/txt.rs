@@ -91,6 +91,7 @@ impl ValueCalls for Hetzner {
         let rr = rr_name(zone, name)?;
         let text = WRITE.write(value).ok_or(Error::InvalidInput {
             detail: Detail::constant("the TXT value cannot be written in this dialect"),
+            code: None,
         })?;
         // A number is sent as such. The provider's default, requested for a new set or read
         // from an existing one, is sent as no TTL: "If not set, the Zone's Default TTL is used"

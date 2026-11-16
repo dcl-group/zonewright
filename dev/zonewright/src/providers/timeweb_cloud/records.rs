@@ -316,6 +316,7 @@ impl RrsetBase for TimewebCloud {
 fn not_sendable() -> Error {
     Error::InvalidInput {
         detail: Detail::constant("the provider's encoding of this record data is not established"),
+        code: None,
     }
 }
 

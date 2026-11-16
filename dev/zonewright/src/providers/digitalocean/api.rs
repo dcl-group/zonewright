@@ -559,9 +559,32 @@ pub(super) fn error_message(body: &str) -> Option<String> {
     })
 }
 
+/// The provider's error code: the `id` of the documented error body, such as `not_found` or
+/// `unprocessable_entity`.
+// Source: Domain Records, error schema (`id`: "A short identifier corresponding to the HTTP
+// status code returned"); lego types.go lines 18 to 21.
+pub(super) fn error_code(body: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        #[serde(default)]
+        id: Option<String>,
+    }
+    serde_json::from_str::<ErrorBody>(body).ok()?.id
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{error_message, normalize_name};
+    use super::{error_code, error_message, normalize_name};
+
+    #[test]
+    fn error_codes_are_the_id() {
+        assert_eq!(
+            error_code(r#"{"id":"unprocessable_entity","message":"m"}"#).as_deref(),
+            Some("unprocessable_entity")
+        );
+        assert_eq!(error_code(r#"{"message":"m"}"#), None);
+        assert_eq!(error_code("<html>oops</html>"), None);
+    }
     use crate::name::DomainName;
 
     #[test]

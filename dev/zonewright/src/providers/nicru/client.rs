@@ -451,6 +451,7 @@ pub(super) fn rejected(text: &'static str) -> Error {
     Error::Rejected {
         status: None,
         detail: Detail::constant(text),
+        code: None,
     }
 }
 

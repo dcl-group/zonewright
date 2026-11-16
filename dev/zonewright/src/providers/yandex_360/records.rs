@@ -376,6 +376,7 @@ impl RrsetBase for Yandex360 {
 fn not_sendable() -> Error {
     Error::InvalidInput {
         detail: Detail::constant("the provider's encoding of this record data is not established"),
+        code: None,
     }
 }
 
@@ -497,6 +498,7 @@ impl PerRecord for Yandex360 {
                     "the provider's edit call has no CAA fields, so the TTL of an existing CAA \
                      record cannot be changed; delete the rrset and create it again",
                 ),
+                code: None,
             });
         }
         let fields = match update.data {

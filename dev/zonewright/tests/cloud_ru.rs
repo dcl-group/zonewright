@@ -1064,6 +1064,54 @@ async fn cloud_ru_create_conflict_is_conflict() {
     }
 }
 
+/// A refusal carries the `code` of the `rpcStatus`, in decimal: in an error answer and in the
+/// `error` of a finished operation. The kinds do not change.
+#[tokio::test]
+async fn cloud_ru_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    mock.faults().push(Fault::on("POST", RECORDS).respond(
+        400,
+        r#"{"code":3,"message":"values are invalid","details":[]}"#,
+    ));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code().map(|c| c.as_str()), Some("3"));
+    // The mock's failed operation has code 9.
+    mock.control().fail_next_operation("quota exceeded");
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code().map(|c| c.as_str()), Some("9"));
+    // A listing refused without a code.
+    mock.faults()
+        .push(Fault::on("GET", ZONES).respond(400, r#"{"message":"bad"}"#));
+    let e = client.list_zones().await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+}
+
+/// A code that echoes a credential is not carried, and the credential appears nowhere in the
+/// error. The codes are numbers, so the access key's ID and secret are numeric here.
+#[tokio::test]
+async fn cloud_ru_provider_code_never_carries_a_credential() {
+    let mut seed = Seed::standard();
+    seed.key_id = "7700112233".into();
+    seed.secret = "8800445566".into();
+    let mock = CloudRuMock::start(seed.clone()).await;
+    let mut config = settings(&mock);
+    config.key_id = seed.key_id.clone();
+    let client = CloudRu::new(config, credentials(&seed.secret), &context()).unwrap();
+    for secret in [&seed.key_id, &seed.secret] {
+        let body = format!(r#"{{"code":{secret},"message":"refused","details":[]}}"#);
+        mock.faults()
+            .push(Fault::on("POST", RECORDS).respond(400, body));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+        assert_eq!(e.provider_code(), None, "{secret}");
+        let text = format!("{e} | {e:?}");
+        assert!(!text.contains(secret.as_str()), "{text}");
+    }
+}
+
 // ---- Operations (design section 3.7) -----------------------------------------------------------
 
 /// The operation is polled until it is done; an operation done in the write's answer is not

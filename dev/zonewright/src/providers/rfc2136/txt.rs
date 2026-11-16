@@ -76,6 +76,7 @@ impl TxtBase for Rfc2136 {
         let rdata = encode(value)?;
         if rdata.len() + MESSAGE_OVERHEAD > wire::MAX_MESSAGE {
             return Err(Error::InvalidInput {
+                code: None,
                 detail: Detail::constant("the TXT value is too long for one DNS message"),
             });
         }
@@ -87,6 +88,7 @@ impl TxtBase for Rfc2136 {
 fn encode(value: &Txt) -> Result<Vec<u8>, Error> {
     let mut out = Vec::with_capacity(value.as_bytes().len() + value.as_bytes().len() / 255 + 1);
     value.encode(&mut out).map_err(|_| Error::InvalidInput {
+        code: None,
         detail: Detail::constant("the TXT value cannot be encoded as RDATA"),
     })?;
     Ok(out)
@@ -197,6 +199,7 @@ impl Rfc2136 {
             rcode::NOTZONE => Err(Error::name_outside_zone(name.clone(), zone.clone())),
             // Only the CNAME guard of create is a prerequisite that can fail this way.
             rcode::YXRRSET => Err(Error::Rejected {
+                code: None,
                 status: None,
                 detail: Detail::constant(
                     "the name holds a CNAME (YXRRSET): a server ignores a TXT record added next \
@@ -216,6 +219,7 @@ pub(super) fn rcode_error(code: u8) -> Error {
         };
     }
     Error::Rejected {
+        code: None,
         status: None,
         detail: Detail::constant(rcode_text(code)),
     }

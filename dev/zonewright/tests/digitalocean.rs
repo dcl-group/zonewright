@@ -1180,6 +1180,42 @@ async fn digitalocean_refusals_are_rejected() {
     assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
 }
 
+/// A refusal carries the `id` of the error body as the provider code; the kind does not change.
+#[tokio::test]
+async fn digitalocean_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    mock.faults().push(Fault::on("POST", RECORDS).respond(
+        422,
+        r#"{"id":"unprocessable_entity","message":"ttl is too low","request_id":"r"}"#,
+    ));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(
+        e.provider_code().map(|c| c.as_str()),
+        Some("unprocessable_entity")
+    );
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).respond(422, r#"{"message":"ttl is too low"}"#));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+}
+
+/// An `id` that echoes the token is not carried, and the token appears nowhere in the error. The
+/// token fits the code's alphabet, so only the scrubber keeps it out.
+#[tokio::test]
+async fn digitalocean_provider_code_never_carries_a_credential() {
+    let (mock, client) = setup().await;
+    let body = serde_json::json!({ "id": TOKEN, "message": "refused" }).to_string();
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).respond(422, body));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+    let text = format!("{e} | {e:?}");
+    assert!(!text.contains(TOKEN), "{text}");
+}
+
 // ---- Configuration -----------------------------------------------------------------------------
 
 #[tokio::test]

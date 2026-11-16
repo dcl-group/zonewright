@@ -1580,6 +1580,43 @@ async fn timeweb_cloud_server_errors_are_retried_then_transient() {
     assert_eq!(mock.log().count(Some("GET"), ZONE_LISTING), 5);
 }
 
+/// A refusal carries the `error_code` of the error body as the provider code; the kind does not
+/// change.
+#[tokio::test]
+async fn timeweb_cloud_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    mock.faults().push(Fault::on("POST", CREATE).respond(
+        400,
+        r#"{"status_code":400,"error_code":"bad_subdomain_name","message":["subdomain is wrong"],"response_id":"r"}"#,
+    ));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(
+        e.provider_code().map(|c| c.as_str()),
+        Some("bad_subdomain_name")
+    );
+    mock.faults()
+        .push(Fault::on("POST", CREATE).respond(400, r#"{"status_code":400,"message":"wrong"}"#));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+}
+
+/// An `error_code` that echoes the token is not carried, and the token appears nowhere in the
+/// error. The token fits the code's alphabet, so only the scrubber keeps it out.
+#[tokio::test]
+async fn timeweb_cloud_provider_code_never_carries_a_credential() {
+    let (mock, client) = setup().await;
+    let body = serde_json::json!({"status_code": 400, "error_code": TOKEN, "message": "m"});
+    mock.faults()
+        .push(Fault::on("POST", CREATE).respond(400, body.to_string()));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+    let text = format!("{e} | {e:?}");
+    assert!(!text.contains(TOKEN), "{text}");
+}
+
 /// The provider's refusals are `Rejected` with the status and its message; a status the client
 /// cannot interpret is `Protocol`.
 #[tokio::test]

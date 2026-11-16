@@ -344,7 +344,7 @@ Rules that hold for every provider module:
 
 ### 2.9 Errors
 
-- `Error`, `ErrorKind`, `Operation` — `src/error.rs`.
+- `Error`, `ErrorKind`, `Operation`, `ProviderCode` — `src/error.rs`.
 - `Detail` — `src/redact.rs`.
 
 Properties:
@@ -364,6 +364,17 @@ Properties:
 - Request bodies and request headers never contribute to a `Detail`.
 - `ErrorKind::as_str` is what an application maps to its own error codes. The identifiers are part
   of the public API.
+- `Error::Rejected` and `Error::InvalidInput` carry `code: Option<ProviderCode>`, the provider's own
+  code for the refusal; `Error::provider_code()` returns it, and `None` for every other kind. A
+  `ProviderCode` is 1 to 64 bytes of ASCII letters, digits and `_ - . :`; a numeric code is written
+  in decimal. It has no public constructor, so an error built outside the crate has none. Inside the
+  crate it is taken only from the field the provider's documentation (or lego, or its client code)
+  names as the error code, and built only by `Scrubber::code`, which drops the code when scrubbing
+  would change it in any way and then applies the alphabet and length check. A code is never cut or
+  altered, only kept or dropped. The value belongs to the provider and is only as stable as the
+  provider keeps it, so an application matches on `(ProviderId, code)` and treats `ErrorKind` as the
+  primary classification. `None` means the provider gave no code, the crate does not read one for
+  that provider, or the client refused the request itself.
 - Retryability is a property of the kind. `Transient` after a write means the write may or may not
   have happened; every operation is safe to repeat (section 3.2). `PreconditionFailed` is not
   retryable and `Conflict` is: the first is the caller's expectation being wrong, the second a race

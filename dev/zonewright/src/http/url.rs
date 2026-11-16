@@ -218,6 +218,7 @@ impl UrlBuilder {
                 detail: Detail::constant(
                     "a fixed URL path contains a character that needs encoding",
                 ),
+                code: None,
             });
         }
         self
@@ -229,6 +230,7 @@ impl UrlBuilder {
         if segment.is_empty() || segment == "." || segment == ".." {
             self.fail(Error::InvalidInput {
                 detail: Detail::constant("a URL path segment is empty or a dot segment"),
+                code: None,
             });
         } else {
             self.path.push('/');

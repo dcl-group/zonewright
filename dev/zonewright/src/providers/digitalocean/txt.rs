@@ -90,6 +90,7 @@ impl PerRecord for DigitalOcean {
     ) -> Result<(), Error> {
         let data = WRITE.write(value).ok_or(Error::InvalidInput {
             detail: Detail::constant("the TXT value cannot be written in this dialect"),
+            code: None,
         })?;
         let ttl = match ttl {
             WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))

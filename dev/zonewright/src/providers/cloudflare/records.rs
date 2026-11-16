@@ -337,6 +337,7 @@ fn encode_tlsa(data: &RecordData) -> Option<Encoded> {
 fn not_sendable() -> Error {
     Error::InvalidInput {
         detail: Detail::constant("the provider's encoding of this record data is not established"),
+        code: None,
     }
 }
 
@@ -633,6 +634,7 @@ fn inherited(context: &ReadContext, ttl: SetTtl) -> Result<&Attributes, Error> {
                 "the records of the rrset differ in their proxy status, private routing or \
                  settings, so a new record cannot take them over",
             ),
+            code: None,
         });
     };
     if inherit.proxied && matches!(ttl, SetTtl::Requested(RrsetTtl::Explicit(_))) {
@@ -655,6 +657,7 @@ fn proxied_ttl() -> Error {
         detail: Detail::constant(
             "the TTL of a proxied record is automatic at the provider and cannot be set",
         ),
+        code: None,
     }
 }
 

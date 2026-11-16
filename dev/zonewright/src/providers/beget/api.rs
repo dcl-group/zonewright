@@ -219,6 +219,7 @@ impl Api {
         if txt.len() > MAX_RECORDS {
             return Err(Error::InvalidInput {
                 detail: Detail::constant("a Beget name holds at most 10 records of one type"),
+                code: None,
             });
         }
         // An empty list is how the last value is removed. Assumption (not documented): that
@@ -237,6 +238,7 @@ impl Api {
             Value::Bool(false) => Err(Error::Rejected {
                 status: None,
                 detail: Detail::constant("the provider reported that the change was not made"),
+                code: None,
             }),
             _ => Err(protocol(
                 "the provider's answer to a change is not the documented success flag",
@@ -324,9 +326,16 @@ impl Api {
         } else if has("METHOD_FAILED") {
             Error::Transient { detail }
         } else {
+            // The first code of the envelope, the call's own before the method's: the codes of
+            // the principles page are the documented machine-readable part of the answer.
+            let code = errors
+                .iter()
+                .find(|(code, _)| !code.is_empty())
+                .and_then(|(code, _)| self.http.scrubber().code(code));
             Error::Rejected {
                 status: None,
                 detail,
+                code,
             }
         }
     }
@@ -496,6 +505,7 @@ fn refused(text: &'static str) -> Error {
     Error::Rejected {
         status: None,
         detail: Detail::constant(text),
+        code: None,
     }
 }
 

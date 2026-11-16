@@ -81,6 +81,7 @@ impl Cloudflare {
             .secret(raw)
             .bearer("api_token", token)
             .message(api::error_message)
+            .code(api::error_code)
             .build()?;
         Ok(Cloudflare {
             api: Api::new(http, settings.api),
@@ -100,6 +101,7 @@ impl Cloudflare {
             Lookup::NotActive => Err(Error::Rejected {
                 status: None,
                 detail: Detail::constant(ZONE_NOT_ACTIVE),
+                code: None,
             }),
         }
     }

@@ -1563,6 +1563,7 @@ impl super::request::Finish for Stamp {
         if self.fail {
             return Err(Error::InvalidInput {
                 detail: crate::redact::Detail::constant("the request could not be signed"),
+                code: None,
             });
         }
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;

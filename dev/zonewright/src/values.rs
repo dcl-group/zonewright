@@ -298,6 +298,7 @@ fn precheck<B: TxtBase>(
     if zone.is_root() || zone.is_wildcard() {
         return Err(Error::InvalidInput {
             detail: Detail::constant("the zone must not be the root or a wildcard name"),
+            code: None,
         });
     }
     if !name.is_within(zone) {
@@ -308,6 +309,7 @@ fn precheck<B: TxtBase>(
     {
         return Err(Error::InvalidInput {
             detail: Detail::constant(ttl_refusal(caps, ttl)),
+            code: None,
         });
     }
     if caps.txt_plain_only && !value.is_plain() {
@@ -316,6 +318,7 @@ fn precheck<B: TxtBase>(
                 "the provider accepts only plain TXT values: 1 to 255 printable ASCII characters \
                  without spaces, quotes or backslashes",
             ),
+            code: None,
         });
     }
     backend.check_value(value)

@@ -1238,6 +1238,69 @@ async fn beget_errors_are_mapped() {
     assert_eq!(writes(&mock), 0);
 }
 
+/// A refusal stated in the envelope carries the first `error_code` of the envelope, the call's own
+/// before the method's; the kind does not change.
+#[tokio::test]
+async fn beget_refusal_carries_the_provider_code() {
+    let (mock, client) = setup().await;
+    let cases = [
+        (
+            json!({"status": "success", "answer": {"status": "error", "errors": [
+                {"error_code": "INVALID_DATA", "error_text": "bad priority"},
+                {"error_code": "INCORRECT_REQUEST", "error_text": "x"}]}}),
+            Some("INVALID_DATA"),
+        ),
+        (
+            json!({"status": "error", "error_code": "NO_SUCH_METHOD", "error_text": "x",
+                "answer": {"errors": [{"error_code": "INVALID_DATA"}]}}),
+            Some("NO_SUCH_METHOD"),
+        ),
+        (
+            json!({"status": "success", "answer": {"status": "error", "errors": [
+                {"error_text": "no code"}, {"error_code": "INVALID_DATA"}]}}),
+            Some("INVALID_DATA"),
+        ),
+        (
+            json!({"status": "success", "answer": {"status": "error", "errors": [
+                {"error_text": "no code"}]}}),
+            None,
+        ),
+    ];
+    for (body, code) in cases {
+        mock.faults()
+            .push(Fault::on("POST", LIST).respond(200, body.to_string()));
+        let e = client.list_zones().await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{body}: {e:?}");
+        assert_eq!(e.provider_code().map(|c| c.as_str()), code, "{body}");
+    }
+    // A refusal by something in front of the API (an HTTP status) carries none.
+    mock.faults().push(Fault::on("POST", LIST).respond(
+        400,
+        json!({"status": "error", "error_code": "INCORRECT_REQUEST"}).to_string(),
+    ));
+    let e = client.list_zones().await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert_eq!(e.provider_code(), None);
+}
+
+/// A code that echoes the login or the password is not carried, and neither appears in the
+/// error. Both fit the code's alphabet, so only the scrubber keeps them out.
+#[tokio::test]
+async fn beget_provider_code_never_carries_a_credential() {
+    let (mock, client) = setup().await;
+    for secret in [LOGIN, PASSWORD] {
+        let body = json!({"status": "success", "answer": {"status": "error", "errors": [
+            {"error_code": secret, "error_text": "x"}]}});
+        mock.faults()
+            .push(Fault::on("POST", LIST).respond(200, body.to_string()));
+        let e = client.list_zones().await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+        assert_eq!(e.provider_code(), None, "{secret}");
+        let text = format!("{e} | {e:?}");
+        assert!(!text.contains(secret), "{text}");
+    }
+}
+
 /// The domain list must be a list of objects with names; names that are not names are skipped.
 #[tokio::test]
 async fn beget_list_zones() {

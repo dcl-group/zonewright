@@ -634,9 +634,31 @@ pub(super) fn error_message(body: &str) -> Option<String> {
     body.message.filter(|text| !text.is_empty())
 }
 
+/// The provider's error code: the `code` of the documented error body, an integer, in decimal.
+// Source: Create, List, Delete: error body `{code, message, details}`, `code` an integer.
+pub(super) fn error_code(body: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        #[serde(default)]
+        code: Option<i64>,
+    }
+    let body: ErrorBody = serde_json::from_str(body).ok()?;
+    body.code.map(|code| code.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NameForm, Record, error_message, is_owner, listed_owner, write_name};
+    use super::{NameForm, Record, error_code, error_message, is_owner, listed_owner, write_name};
+
+    #[test]
+    fn error_codes_are_the_code_field() {
+        assert_eq!(
+            error_code(r#"{"code":16,"message":"not authorized","details":[]}"#).as_deref(),
+            Some("16")
+        );
+        assert_eq!(error_code(r#"{"message":"m"}"#), None);
+        assert_eq!(error_code("<html>oops</html>"), None);
+    }
     use crate::error::ErrorKind;
     use crate::name::DomainName;
 

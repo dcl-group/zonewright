@@ -225,6 +225,7 @@ pub(super) fn sign(msg: &mut Vec<u8>, key: &Key, now: u64) -> Result<Vec<u8>, Er
     msg.extend_from_slice(&rdata);
     if msg.len() > wire::MAX_MESSAGE {
         return Err(Error::InvalidInput {
+            code: None,
             detail: Detail::constant("the signed DNS message would exceed 65535 octets"),
         });
     }
@@ -408,7 +409,6 @@ mod tests {
         assert_eq!(sign(&mut msg, &k512, 1).unwrap().len(), 64);
         assert!(sign(&mut msg.clone(), &k512, MAX_TIME + 1).is_err());
         assert!(sign(&mut vec![0u8; 3], &k512, 1).is_err());
-    }
 
         let k384 = key(Algorithm::HmacSha384, &[5u8; 48]);
         let unsigned = Builder::update(&zone).finish().unwrap().with_id(11);
@@ -425,6 +425,7 @@ mod tests {
         assert_eq!(r.u48().unwrap(), 1_700_000_000);
         assert_eq!(r.u16().unwrap(), FUDGE);
         assert_eq!(usize::from(r.u16().unwrap()), 48);
+    }
 
     /// Builds a signed answer to `request_mac` the way a server does (RFC 8945 section 5.3).
     fn answer(k: &Key, request_mac: &[u8], time: u64, corrupt: bool) -> Vec<u8> {
@@ -586,7 +587,6 @@ mod tests {
             verify(&good, &parse(&good).unwrap(), &request_mac, &other_alg, now),
             Verdict::Invalid(_)
         ));
-        // Without the TSIG record.
         // The same for an `hmac-sha384` key: its answer verifies, a 24-octet MAC (the length of
         // `hmac-sha384-192`, RFC 8945 section 6, table 3) is refused because truncated MACs are
         // not accepted (section 5.2.2.1), and an `hmac-sha512` key with the same secret cannot
@@ -618,12 +618,12 @@ mod tests {
             ),
             Verdict::Invalid(_)
         ));
+        // Without the TSIG record.
         let zone = DomainName::parse("example.org").unwrap();
         let unsigned = Builder::update(&zone).finish().unwrap().with_id(5);
         assert_eq!(check(&unsigned, &request_mac, now), Verdict::Unsigned);
     }
 
-    /// The shape of a signed answer for [`answer_shaped`].
     /// Like [`answer`], with the correct MAC cut to its first `len` octets.
     fn answer_truncated(k: &Key, request_mac: &[u8], time: u64, len: usize) -> Vec<u8> {
         let full = answer(k, request_mac, time, false);
@@ -645,6 +645,7 @@ mod tests {
         out
     }
 
+    /// The shape of a signed answer for [`answer_shaped`].
     struct Shape {
         /// Records placed in the additional section before the TSIG record; the MAC covers them.
         extra: Vec<u8>,
@@ -755,13 +756,12 @@ mod tests {
             Algorithm::parse("HMAC-SHA256."),
             Some(Algorithm::HmacSha256)
         );
-        assert_eq!(Algorithm::parse("hmac-sha512"), Some(Algorithm::HmacSha512));
         assert_eq!(Algorithm::parse("hmac-sha384"), Some(Algorithm::HmacSha384));
         assert_eq!(
             Algorithm::parse(" Hmac-SHA384. "),
             Some(Algorithm::HmacSha384)
         );
-        assert_eq!(Algorithm::parse("hmac-md5.sig-alg.reg.int"), None);
+        assert_eq!(Algorithm::parse("hmac-sha512"), Some(Algorithm::HmacSha512));
         for algorithm in [
             Algorithm::HmacSha256,
             Algorithm::HmacSha384,
@@ -773,6 +773,7 @@ mod tests {
         }
         assert_eq!(Algorithm::parse("hmac-sha384-192"), None);
         assert_eq!(Algorithm::parse("hmac-sha224"), None);
+        assert_eq!(Algorithm::parse("hmac-md5.sig-alg.reg.int"), None);
         assert_eq!(Algorithm::parse("hmac-sha1"), None);
     }
 
