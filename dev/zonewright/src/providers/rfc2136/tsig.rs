@@ -11,6 +11,14 @@
 //!   5.2.3); the MAC is checked before the time (section 10.1). A verified answer that reports a
 //!   TSIG error is exempt from the time check.
 //! - Truncated MACs (section 5.2.2.1) are neither sent nor accepted.
+//! - A multi-message answer (a zone transfer, section 5.3.1) is verified message by message by
+//!   [`Stream`]: the first message as above; every later message that carries a TSIG over the
+//!   MAC of the last signed message, the unsigned messages since it and this message, followed
+//!   by its timers (Time Signed and Fudge) instead of all TSIG variables. The same checks apply
+//!   to each signed message, in the same order. The section names the "Prior MAC" as the first
+//!   component without repeating the layout; it is digested as the request MAC is (section
+//!   4.3.1: MAC size, then MAC data), which the section's place of the request MAC suggests.
+//!   RFC 8945 publishes no test vector for this digest.
 //!
 //! Algorithms: `hmac-sha256`, `hmac-sha384` and `hmac-sha512` (section 6, table 3: `hmac-sha256`
 //! is mandatory to implement, the other two optional; each MAC is the full hash output, 32, 48
@@ -261,6 +269,48 @@ pub(super) fn verify(
     key: &Key,
     now: u64,
 ) -> Verdict {
+    check(buf, response, key, now, Chain::First { request_mac }).verdict
+}
+
+/// What a response MAC covers before the message itself.
+#[derive(Clone, Copy)]
+enum Chain<'a> {
+    /// A single answer, or the first message of a multi-message answer: the request MAC with
+    /// its length (RFC 8945 section 4.3.1), then the message and all TSIG variables (sections
+    /// 4.3.3 and 5.3).
+    First { request_mac: &'a [u8] },
+    /// A later message of a multi-message answer (section 5.3.1): the MAC of the last signed
+    /// message ("Prior MAC"), digested like the request MAC, with its length; the unsigned
+    /// messages since it, as received; then this message and the TSIG timers only (Time Signed,
+    /// Fudge).
+    Next {
+        prior_mac: &'a [u8],
+        unsigned: &'a [u8],
+    },
+}
+
+/// The result of [`check`]: the verdict, and for `Verdict::Ok` the MAC and Time Signed of the
+/// message.
+struct Checked {
+    verdict: Verdict,
+    mac: Vec<u8>,
+    time: u64,
+}
+
+impl Checked {
+    fn failed(verdict: Verdict) -> Checked {
+        Checked {
+            verdict,
+            mac: Vec::new(),
+            time: 0,
+        }
+    }
+}
+
+/// Verifies the TSIG of one response message, in the order of the module documentation.
+fn check(buf: &[u8], response: &Response, key: &Key, now: u64, chain: Chain<'_>) -> Checked {
+    let fail = Checked::failed;
+    let first = matches!(chain, Chain::First { .. });
     let tsig_records = response
         .additional
         .iter()
@@ -268,12 +318,16 @@ pub(super) fn verify(
         .count();
     let Some(record) = response.additional.last().filter(|r| r.rtype == TYPE_TSIG) else {
         if tsig_records > 0 {
-            return Verdict::Invalid("the TSIG record of the response is not its last record");
+            return fail(Verdict::Invalid(
+                "the TSIG record of the response is not its last record",
+            ));
         }
-        return Verdict::Unsigned;
+        return fail(Verdict::Unsigned);
     };
     if tsig_records != 1 {
-        return Verdict::Invalid("the response has more than one TSIG record");
+        return fail(Verdict::Invalid(
+            "the response has more than one TSIG record",
+        ));
     }
     let mut r = Reader::new(buf, record.rdata.start);
     let parsed = (|| {
@@ -288,69 +342,232 @@ pub(super) fn verify(
         let other = r.bytes(other_len)?;
         Ok::<_, wire::ParseError>((algorithm, time, fudge, mac, original_id, error, other))
     })();
+    let malformed = || {
+        fail(Verdict::Invalid(
+            "the TSIG record of the response is malformed",
+        ))
+    };
     let Ok((algorithm, time, fudge, mac, original_id, error, other)) = parsed else {
-        return Verdict::Invalid("the TSIG record of the response is malformed");
+        return malformed();
     };
     if r.pos() != record.rdata.end || record.class != CLASS_ANY || record.ttl != 0 {
-        return Verdict::Invalid("the TSIG record of the response is malformed");
+        return malformed();
     }
     if record.name != key.name.as_str() || algorithm != key.algorithm.text_name() {
-        return Verdict::Invalid("the response is signed with another key or algorithm");
+        return fail(Verdict::Invalid(
+            "the response is signed with another key or algorithm",
+        ));
     }
     // RFC 8945 sections 5.2.1, 5.2.2 and 5.3.2: a BADKEY or BADSIG answer is unsigned (MAC
-    // size 0), so it cannot be verified; it is the only answer honored without a MAC.
-    if (error == BADKEY || error == BADSIG) && mac.is_empty() {
-        return Verdict::ServerError(error);
+    // size 0), so it cannot be verified; it is the only answer honored without a MAC. The
+    // server checks the key and the MAC of the request, so only the first message of an answer
+    // can be such an error.
+    if first && (error == BADKEY || error == BADSIG) && mac.is_empty() {
+        return fail(Verdict::ServerError(error));
     }
     // Every other answer, including one with another TSIG error (BADTIME must be signed, section
     // 5.2.3), must carry a full MAC that verifies (section 5.4).
     if mac.len() != key.algorithm.mac_len() {
-        return Verdict::Invalid(if error != 0 {
+        return fail(Verdict::Invalid(if error != 0 {
             "the answer reports a TSIG error that must be signed, but its MAC is missing or \
              truncated"
         } else {
             "the MAC of the response is truncated or missing"
-        });
+        }));
     }
     let Some(body) = buf.get(..record.start) else {
-        return Verdict::Invalid("the TSIG record of the response is malformed");
+        return malformed();
     };
     let mut body = body.to_vec();
     let arcount = wire::be16(&body, ARCOUNT_AT).and_then(|n| n.checked_sub(1));
     let (Some(arcount), Some(id_slot)) = (arcount, body.get_mut(0..2)) else {
-        return Verdict::Invalid("the TSIG record of the response is malformed");
+        return malformed();
     };
     id_slot.copy_from_slice(&original_id.to_be_bytes());
     if let Some(slot) = body.get_mut(ARCOUNT_AT..ARCOUNT_AT + 2) {
         slot.copy_from_slice(&arcount.to_be_bytes());
     }
-    let Ok(request_mac_len) = u16::try_from(request_mac.len()) else {
-        return Verdict::Invalid("the request MAC is too long");
+    let (before, before_body): (&[u8], &[u8]) = match chain {
+        Chain::First { request_mac } => (request_mac, &[]),
+        Chain::Next {
+            prior_mac,
+            unsigned,
+        } => (prior_mac, unsigned),
     };
-    let Some(vars) = variables(key, time, fudge, error, other) else {
-        return Verdict::Invalid("the TSIG record of the response is malformed");
+    let Ok(before_len) = u16::try_from(before.len()) else {
+        return fail(Verdict::Invalid("the request MAC is too long"));
     };
-    let mut data = Vec::with_capacity(2 + request_mac.len() + body.len() + vars.len());
-    data.extend_from_slice(&request_mac_len.to_be_bytes());
-    data.extend_from_slice(request_mac);
+    let after = if first {
+        variables(key, time, fudge, error, other)
+    } else {
+        timers(time, fudge)
+    };
+    let Some(after) = after else {
+        return malformed();
+    };
+    let mut data =
+        Vec::with_capacity(2 + before.len() + before_body.len() + body.len() + after.len());
+    data.extend_from_slice(&before_len.to_be_bytes());
+    data.extend_from_slice(before);
+    data.extend_from_slice(before_body);
     data.extend_from_slice(&body);
-    data.extend_from_slice(&vars);
+    data.extend_from_slice(&after);
     if !key.algorithm.verify(key.secret.expose_secret(), &data, mac) {
-        return Verdict::Invalid(if error != 0 {
+        return fail(Verdict::Invalid(if error != 0 {
             "the answer reports a TSIG error whose MAC does not verify"
         } else {
             "the MAC of the response does not verify"
-        });
+        }));
     }
     // A verified TSIG error is honored before the time check: for BADTIME the clocks differ by
-    // definition, and the MAC already binds the answer to this request (section 5.2.3).
+    // definition, and the MAC already binds the answer to this request (section 5.2.3). In a
+    // later message of a multi-message answer the MAC does not cover the error field (section
+    // 5.3.1 digests the timers only), and a server reports errors about the request in the first
+    // message: a later one that reports an error is refused.
     if error != 0 {
-        return Verdict::ServerError(error);
+        return fail(if first {
+            Verdict::ServerError(error)
+        } else {
+            Verdict::Invalid(
+                "a later message of the answer reports a TSIG error, which its MAC does not cover",
+            )
+        });
     }
     if now.abs_diff(time) > u64::from(fudge) {
-        return Verdict::Invalid("the time of the response is outside its fudge");
+        return fail(Verdict::Invalid(
+            "the time of the response is outside its fudge",
+        ));
     }
-    Verdict::Ok
+    Checked {
+        verdict: Verdict::Ok,
+        mac: mac.to_vec(),
+        time,
+    }
+}
+
+/// The TSIG timers (RFC 8945 section 4.3.3.1): Time Signed, then Fudge.
+fn timers(time: u64, fudge: u16) -> Option<Vec<u8>> {
+    let mut v = Vec::with_capacity(8);
+    v.extend_from_slice(time.to_be_bytes().get(2..)?);
+    v.extend_from_slice(&fudge.to_be_bytes());
+    Some(v)
+}
+
+/// Most messages in a row without TSIG that a multi-message answer may carry (RFC 8945 section
+/// 5.3.1: "MUST accept up to 99 intermediary messages without a TSIG").
+pub(super) const MAX_UNSIGNED_IN_A_ROW: usize = 99;
+
+/// How [`Stream::next`] took a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Link {
+    /// The message carries a TSIG that verifies: it, and every unsigned message before it since
+    /// the last signed one, are authenticated.
+    Signed,
+    /// An intermediate message without TSIG: authenticated only by the next signed message.
+    Unsigned,
+}
+
+/// Verifies the messages of a multi-message answer in order (RFC 8945 section 5.3.1): the first
+/// as a single answer, every later signed one over the prior MAC, the unsigned messages since
+/// and its own timers. The first message must be signed, at most
+/// [`MAX_UNSIGNED_IN_A_ROW`] messages in a row may be unsigned, and Time Signed does not
+/// decrease from one signed message to the next ("successive TSIG records in the stream will
+/// have non-decreasing Time Signed values"). Whether the last message is signed is the caller's
+/// check: only the caller knows which message is the last.
+pub(super) struct Stream<'k> {
+    key: &'k Key,
+    /// The MAC of the last signed message; the request MAC before the first message.
+    prior_mac: Vec<u8>,
+    /// The unsigned messages since the last signed one, as received, concatenated.
+    unsigned: Vec<u8>,
+    /// How many there are.
+    unsigned_count: usize,
+    /// Time Signed of the last signed message; `None` before the first message.
+    last_time: Option<u64>,
+}
+
+impl fmt::Debug for Stream<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // No MAC.
+        f.debug_struct("Stream")
+            .field("unsigned_count", &self.unsigned_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'k> Stream<'k> {
+    /// A stream of answers to a request whose MAC was `request_mac`.
+    pub(super) fn new(key: &'k Key, request_mac: Vec<u8>) -> Stream<'k> {
+        Stream {
+            key,
+            prior_mac: request_mac,
+            unsigned: Vec::new(),
+            unsigned_count: 0,
+            last_time: None,
+        }
+    }
+
+    /// Takes the next message `buf`, parsed as `response`. `now` is the Unix time in seconds.
+    /// A message that is refused gives the [`Verdict`] that says why, as [`verify`] would for a
+    /// single answer.
+    pub(super) fn next(
+        &mut self,
+        buf: &[u8],
+        response: &Response,
+        now: u64,
+    ) -> Result<Link, Verdict> {
+        let signed = response.additional.iter().any(|r| r.rtype == TYPE_TSIG);
+        let Some(last_time) = self.last_time else {
+            let checked = check(
+                buf,
+                response,
+                self.key,
+                now,
+                Chain::First {
+                    request_mac: &self.prior_mac,
+                },
+            );
+            return self.accept(checked);
+        };
+        if !signed {
+            if self.unsigned_count >= MAX_UNSIGNED_IN_A_ROW {
+                return Err(Verdict::Invalid(
+                    "more than 99 messages in a row of the answer are not signed (RFC 8945 \
+                     section 5.3.1)",
+                ));
+            }
+            self.unsigned.extend_from_slice(buf);
+            self.unsigned_count += 1;
+            return Ok(Link::Unsigned);
+        }
+        let checked = check(
+            buf,
+            response,
+            self.key,
+            now,
+            Chain::Next {
+                prior_mac: &self.prior_mac,
+                unsigned: &self.unsigned,
+            },
+        );
+        if checked.verdict == Verdict::Ok && checked.time < last_time {
+            return Err(Verdict::Invalid(
+                "the Time Signed of a message of the answer is earlier than the one before it",
+            ));
+        }
+        self.accept(checked)
+    }
+
+    fn accept(&mut self, checked: Checked) -> Result<Link, Verdict> {
+        if checked.verdict != Verdict::Ok {
+            return Err(checked.verdict);
+        }
+        self.prior_mac = checked.mac;
+        self.unsigned.clear();
+        self.unsigned_count = 0;
+        self.last_time = Some(checked.time);
+        Ok(Link::Signed)
+    }
 }
 
 /// The text of an `Error::Auth` for a TSIG error the server reported.
@@ -747,6 +964,150 @@ mod tests {
                 ..Shape::default()
             }),
             Verdict::Invalid(_)
+        ));
+    }
+
+    /// One message of a multi-message answer, ID 5, QR set, built and signed the way RFC 8945
+    /// section 5.3.1 describes a later message: over the prior MAC with its length, the unsigned
+    /// messages since, the message and its timers. `None` leaves it unsigned.
+    fn later_message(
+        k: &Key,
+        sign: Option<(&[u8], &[u8], u64, u16)>,
+        txt: &str,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let zone = DomainName::parse("example.org").unwrap();
+        let mut b = Builder::query(&zone, TYPE_TXT);
+        b.add(
+            &zone,
+            TYPE_TXT,
+            60,
+            &[&[txt.len() as u8][..], txt.as_bytes()].concat(),
+        )
+        .unwrap();
+        let mut m = b.finish().unwrap().with_id(5);
+        m[2] |= 0x80;
+        let Some((prior, unsigned, time, error)) = sign else {
+            return (m, Vec::new());
+        };
+        let mut data = (prior.len() as u16).to_be_bytes().to_vec();
+        data.extend_from_slice(prior);
+        data.extend_from_slice(unsigned);
+        data.extend_from_slice(&m);
+        data.extend_from_slice(&time.to_be_bytes()[2..]);
+        data.extend_from_slice(&FUDGE.to_be_bytes());
+        let mac = k.algorithm.mac(SECRET, &data);
+        let mut rd = k.algorithm.wire_name().to_vec();
+        rd.extend_from_slice(&time.to_be_bytes()[2..]);
+        rd.extend_from_slice(&FUDGE.to_be_bytes());
+        rd.extend_from_slice(&(mac.len() as u16).to_be_bytes());
+        rd.extend_from_slice(&mac);
+        rd.extend_from_slice(&[0, 5]);
+        rd.extend_from_slice(&error.to_be_bytes());
+        rd.extend_from_slice(&[0, 0]);
+        m.extend_from_slice(b"\x06zw-key\x00\x00\xfa\x00\xff\0\0\0\0");
+        m.extend_from_slice(&(rd.len() as u16).to_be_bytes());
+        m.extend_from_slice(&rd);
+        m[11] = 1;
+        (m, mac)
+    }
+
+    /// RFC 8945 section 5.3.1: the first message verifies over the request MAC, a later signed
+    /// one over the prior MAC, the unsigned messages since and its timers; up to 99 unsigned
+    /// messages in a row are accepted, the 100th is not; a change to an unsigned message, a
+    /// signed message that skips one, a decreasing Time Signed and a TSIG error in a later
+    /// message are refused.
+    #[test]
+    fn stream_verifies_every_message_in_order() {
+        let k = key(Algorithm::HmacSha256, SECRET);
+        let request_mac = [9u8; 32];
+        let now = 1_700_000_000;
+        let first = answer(&k, &request_mac, now, false);
+        let first_mac = {
+            let p = parse(&first).unwrap();
+            let t = p.additional.last().unwrap();
+            let mut r = Reader::new(&first, t.rdata.start);
+            r.name().unwrap();
+            r.u48().unwrap();
+            r.u16().unwrap();
+            let len = usize::from(r.u16().unwrap());
+            r.bytes(len).unwrap().to_vec()
+        };
+        let take =
+            |stream: &mut Stream<'_>, m: &[u8], at: u64| stream.next(m, &parse(m).unwrap(), at);
+
+        // First, two unsigned, a signed one over both, then a signed one directly after it.
+        let mut stream = Stream::new(&k, request_mac.to_vec());
+        assert_eq!(take(&mut stream, &first, now), Ok(Link::Signed));
+        let (u1, _) = later_message(&k, None, "u1");
+        let (u2, _) = later_message(&k, None, "u2");
+        let unsigned = [u1.clone(), u2.clone()].concat();
+        let (s1, s1_mac) = later_message(&k, Some((&first_mac, &unsigned, now + 1, 0)), "s1");
+        let (s2, _) = later_message(&k, Some((&s1_mac, &[], now + 1, 0)), "s2");
+        assert_eq!(take(&mut stream, &u1, now), Ok(Link::Unsigned));
+        assert_eq!(take(&mut stream, &u2, now), Ok(Link::Unsigned));
+        assert_eq!(take(&mut stream, &s1, now), Ok(Link::Signed));
+        assert_eq!(take(&mut stream, &s2, now), Ok(Link::Signed));
+
+        // An unsigned message changed in transit, or left out, fails at the next signed one.
+        for (taken, label) in [
+            (vec![u1.clone()], "missing"),
+            (vec![u2.clone(), u1.clone()], "order"),
+        ] {
+            let mut stream = Stream::new(&k, request_mac.to_vec());
+            take(&mut stream, &first, now).unwrap();
+            for m in &taken {
+                assert_eq!(take(&mut stream, m, now), Ok(Link::Unsigned), "{label}");
+            }
+            assert!(
+                matches!(take(&mut stream, &s1, now), Err(Verdict::Invalid(_))),
+                "{label}"
+            );
+        }
+
+        // 99 unsigned in a row are accepted; the 100th is not.
+        let mut stream = Stream::new(&k, request_mac.to_vec());
+        take(&mut stream, &first, now).unwrap();
+        for _ in 0..MAX_UNSIGNED_IN_A_ROW {
+            assert_eq!(take(&mut stream, &u1, now), Ok(Link::Unsigned));
+        }
+        assert!(matches!(
+            take(&mut stream, &u1, now),
+            Err(Verdict::Invalid(_))
+        ));
+        let mut ninety_nine = Vec::new();
+        for _ in 0..MAX_UNSIGNED_IN_A_ROW {
+            ninety_nine.extend_from_slice(&u1);
+        }
+        let (closing, _) = later_message(&k, Some((&first_mac, &ninety_nine, now, 0)), "end");
+        assert_eq!(take(&mut stream, &closing, now), Ok(Link::Signed));
+
+        // A Time Signed earlier than the previous one, outside the fudge, and a TSIG error in a
+        // later message.
+        for (time, error, at) in [(now - 1, 0, now), (now + 301, 0, now), (now, BADTIME, now)] {
+            let mut stream = Stream::new(&k, request_mac.to_vec());
+            take(&mut stream, &first, now).unwrap();
+            let (m, _) = later_message(&k, Some((&first_mac, &[], time, error)), "x");
+            assert!(
+                matches!(take(&mut stream, &m, at), Err(Verdict::Invalid(_))),
+                "{time} {error}"
+            );
+        }
+
+        // The first message must be signed; an unsigned BADSIG there is the server's error.
+        let mut stream = Stream::new(&k, request_mac.to_vec());
+        assert_eq!(take(&mut stream, &u1, now), Err(Verdict::Unsigned));
+        let badsig = answer_with_error(&k, &request_mac, now, BADSIG, &[], Mac::Empty);
+        let mut stream = Stream::new(&k, request_mac.to_vec());
+        assert_eq!(
+            take(&mut stream, &badsig, now),
+            Err(Verdict::ServerError(BADSIG))
+        );
+        // A later message with an empty MAC is not a server error.
+        let mut stream = Stream::new(&k, request_mac.to_vec());
+        take(&mut stream, &first, now).unwrap();
+        assert!(matches!(
+            take(&mut stream, &badsig, now),
+            Err(Verdict::Invalid(_))
         ));
     }
 

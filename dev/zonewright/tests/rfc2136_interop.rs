@@ -1424,3 +1424,79 @@ async fn client_handles_multi_string_values_written_by_nsupdate() {
     );
     assert!(stored(&lab, name, TYPE_TXT).is_empty());
 }
+
+// ---- Zone transfer -----------------------------------------------------------------------------
+
+/// `dig` transfers the zone from the mock (RFC 5936) and verifies every TSIG of the
+/// multi-message answer (RFC 8945 section 5.3.1), with every message signed and with only the
+/// first, every third and the last signed; what it prints is what the client lists. This checks
+/// the mock's reading of the multi-message digest, which the client shares, against BIND's.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs BIND nsupdate and dig at /usr/bin; run with --ignored"]
+async fn dig_transfers_the_zone_the_client_lists() {
+    let lab = Lab::start().await;
+    let control = lab.mock.control();
+    for (name, rtype, text) in [
+        ("www.example.org.", RecordType::A, "192.0.2.1"),
+        ("www.example.org.", RecordType::A, "192.0.2.2"),
+        ("example.org.", RecordType::MX, "10 mail.example.org."),
+        ("mail.example.org.", RecordType::AAAA, "2001:db8::25"),
+        ("txt.example.org.", RecordType::TXT, "\"one\" \"two\""),
+        ("alias.example.org.", RecordType::CNAME, "www.example.org."),
+    ] {
+        control.add_record(mock_record(name, rtype, 300, text));
+    }
+    for key in lab.keys() {
+        let client = lab.client(key);
+        for (per_message, sign_every) in [(0, 1), (1, 1), (2, 3)] {
+            control.transfer_records_per_message(per_message);
+            control.transfer_sign_every(sign_every);
+            let file = lab.key_file(key);
+            let port = lab.port();
+            let args = [
+                "@127.0.0.1",
+                "-p",
+                &port,
+                "-k",
+                file.to_str().unwrap(),
+                "+time=2",
+                "+tries=1",
+                "+noall",
+                "+answer",
+                ZONE,
+                "AXFR",
+            ];
+            let out = tokio::task::block_in_place(|| run(DIG, &args, ""));
+            let all = format!("{}\n{}", out.stdout, out.stderr);
+            assert_eq!(out.code, Some(0), "dig {args:?} failed:\n{all}");
+            for complaint in ["Couldn't verify", "failed", "TSIG error"] {
+                assert!(!all.contains(complaint), "{}: {all}", key.algorithm);
+            }
+            let mut printed: Vec<(String, String, String)> = out
+                .stdout
+                .lines()
+                .filter(|l| !l.trim().is_empty() && !l.starts_with(';'))
+                // A TSIG record dig may print is not zone content.
+                .filter(|l| l.split_whitespace().nth(3) != Some("TSIG"))
+                .map(parse_dig_rr)
+                .map(|rr| (rr.name, rr.rtype, rr.rdata))
+                .collect();
+            // The SOA opens and closes the transfer; the listing has it once.
+            assert_eq!(printed.first(), printed.last(), "{all}");
+            printed.pop();
+            let listing = bounded(client.list_rrsets(&zone())).await.unwrap();
+            let listed: usize = listing.rrsets.iter().map(|s| s.records().len()).sum();
+            assert_eq!(listed, printed.len(), "{all}\n{listing:?}");
+            for (name, rtype, rdata) in &printed {
+                let rtype: RecordType = rtype.parse().unwrap();
+                let data = RecordData::parse(rtype, rdata).unwrap();
+                assert!(
+                    listing.rrsets.iter().any(|s| s.name().as_str() == name
+                        && s.rtype() == rtype
+                        && s.contains(&data)),
+                    "{name} {rtype} {rdata} not listed"
+                );
+            }
+        }
+    }
+}

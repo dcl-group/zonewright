@@ -344,11 +344,10 @@ mod rfc2136 {
         let mock = Rfc2136Mock::start(Seed::standard()).await;
         let client = client(&mock);
         let before = operation_events(&capture).len();
-        let err = client.list_rrsets(&zone()).await.unwrap_err();
+        let err = client.list_zones().await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Unsupported, "{err:?}");
         let event = one_event(&capture, before);
-        assert_eq!(event.field("operation"), Some("list_rrsets"), "{event}");
-        assert_eq!(event.field("zone"), Some("example.org."), "{event}");
+        assert_eq!(event.field("operation"), Some("list_zones"), "{event}");
         assert_eq!(event.field("outcome"), Some("unsupported"), "{event}");
     }
 }

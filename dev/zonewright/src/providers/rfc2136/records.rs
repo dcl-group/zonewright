@@ -392,7 +392,7 @@ fn owned(
 
 /// A TTL as received. A value with the most significant bit set is taken as zero (RFC 2181
 /// section 8).
-fn ttl_of(secs: u32) -> Ttl {
+pub(super) fn ttl_of(secs: u32) -> Ttl {
     Ttl::from_secs(secs)
         .or_else(|_| Ttl::from_secs(0))
         .unwrap_or(Ttl::MAX)
@@ -434,7 +434,7 @@ fn referral(
 /// The value of RDATA of type `rtype`: canonical through `RecordData::from_wire`, or the RFC 3597
 /// generic form kept as non-canonical data when the RDATA is not valid for its type (design
 /// section 4.9).
-fn data_of(rtype: RecordType, rdata: &[u8]) -> RecordData {
+pub(super) fn data_of(rtype: RecordType, rdata: &[u8]) -> RecordData {
     RecordData::from_wire(rtype, rdata).unwrap_or_else(|_| {
         let hex: String = rdata.iter().map(|b| format!("{b:02x}")).collect();
         RecordData::non_canonical(&format!("\\# {} {hex}", rdata.len()))

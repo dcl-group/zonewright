@@ -50,8 +50,22 @@
 //!   variables (4.3.3); the response MAC covers the request MAC with its length, the response,
 //!   and the response's variables (5.3). An unknown key is NOTAUTH with error BADKEY and no MAC
 //!   (5.2.1, 5.3.2), a MAC that does not verify NOTAUTH with BADSIG and no MAC (5.2.2), a time
-//!   outside the fudge NOTAUTH with BADTIME, signed, with the client's time in Time Signed and
-//!   the server's time in the other data (5.2.3). Fudge 300 s (section 10).
+//!   outside the fudge NOTAUTH with BADTIME, signed, with the client's time in Time Signed, the
+//!   request's Fudge and the server's time in the other data (5.2.3). Fudge 300 s in every other
+//!   answer (section 10).
+//! - Zone transfer (RFC 5936) over TCP, for a signed AXFR query of a zone the mock serves: the
+//!   zone's SOA, every record of the zone (the records whose longest served zone it is, in the
+//!   order they are held, delegations and glue included), and the SOA again (section 2.2). Every
+//!   message carries the query's ID, QR, AA and opcode QUERY; the first copies the question,
+//!   later ones leave it empty (section 2.2.2); owner names and the names inside NS, CNAME, PTR,
+//!   MX and SOA RDATA are compressed against every name written before in the message (RFC 1035
+//!   section 4.1.4, RFC 3597 section 4). Signed per RFC 8945 section 5.3.1: the first message
+//!   as a single answer, a later one over the prior MAC (digested with its length, as the
+//!   request MAC is in section 4.3.1), the unsigned messages since and its timers.
+//!   [`Control::transfer_records_per_message`] and [`Control::transfer_sign_every`] shape the
+//!   messages and their signatures, [`Control::refuse_transfers`] refuses them, and the
+//!   `transfer_*` methods of [`Fault`] break them. A zone the mock does not serve is NOTAUTH
+//!   (RFC 5936 section 2.2.1, note e).
 //! - UDP: the mock does not implement EDNS (RFC 6891), so it never echoes an OPT record and an
 //!   answer over UDP holds at most 512 octets (RFC 1035 sections 2.3.4 and 4.2.1; RFC 6891
 //!   section 7). A longer answer is sent with TC set and without its answer and authority
@@ -79,7 +93,10 @@
 //! - an update answer copies the zone section (RFC 2136 section 3.8 also allows zero counts;
 //!   [`Fault::omit_question`] produces that form).
 //! - a UDP answer cut for length (see above) drops every answer and authority record rather than
-//!   as many as needed, and is signed over the cut message like any other answer.
+//!   as many as needed, and is signed over the cut message like any other answer;
+//! - an AXFR query over UDP, where RFC 5936 section 4.2 leaves AXFR undefined, is answered
+//!   REFUSED, signed; an AXFR of a zone without an SOA record is answered SERVFAIL;
+//! - a zone transfer leaves the question out of every message after the first.
 //!
 //! A test holds an [`Rfc2136Mock`] and changes its state and its behavior through
 //! [`Rfc2136Mock::control`]:
@@ -134,6 +151,8 @@ const TYPE_AAAA: u16 = 28;
 /// Type code of CAA (RFC 8659 section 4).
 const TYPE_CAA: u16 = 257;
 const TYPE_TSIG: u16 = 250;
+/// Type code AXFR, the query type of a zone transfer (RFC 5936 section 2.1.2).
+pub const TYPE_AXFR: u16 = 252;
 /// Type code ANY (RFC 1035 section 3.2.3).
 pub const TYPE_ANY: u16 = 255;
 /// Class IN (RFC 1035 section 3.2.4).
@@ -341,6 +360,11 @@ pub struct Fault {
     drop_reply: bool,
     extra_answer: Option<(String, u16, u16, Vec<u8>)>,
     tsig_error: u16,
+    transfer_corrupt_mac: Option<usize>,
+    transfer_unsigned_last: bool,
+    transfer_cut_after: Option<usize>,
+    transfer_serial_change: bool,
+    transfer_oversized_length: bool,
 }
 
 impl Fault {
@@ -483,7 +507,9 @@ impl Fault {
     }
 
     /// Appends an answer record owned by `name` (written uncompressed) with this type, class
-    /// and RDATA, as a server that follows a CNAME or answers for another name would.
+    /// and RDATA, as a server that follows a CNAME or answers for another name would. In a zone
+    /// transfer the record follows the opening SOA in the first message, its RDATA written as
+    /// given (a compression pointer in it included).
     pub fn extra_answer(mut self, name: &str, rtype: u16, class: u16, rdata: &[u8]) -> Fault {
         self.extra_answer = Some((name.to_owned(), rtype, class, rdata.to_vec()));
         self
@@ -503,6 +529,39 @@ impl Fault {
         self
     }
 
+    /// In a zone transfer: flips a bit of the MAC of message `index` (0 for the first). The
+    /// message must be one the mock signs ([`Control::transfer_sign_every`]).
+    pub fn transfer_corrupt_mac(mut self, index: usize) -> Fault {
+        self.transfer_corrupt_mac = Some(index);
+        self
+    }
+
+    /// In a zone transfer: sends the last message without a TSIG record.
+    pub fn transfer_unsigned_last(mut self) -> Fault {
+        self.transfer_unsigned_last = true;
+        self
+    }
+
+    /// In a zone transfer: sends `messages` messages, then closes the connection.
+    pub fn transfer_cut_after(mut self, messages: usize) -> Fault {
+        self.transfer_cut_after = Some(messages);
+        self
+    }
+
+    /// In a zone transfer: ends it with an SOA whose serial is one higher than the opening
+    /// SOA's, as a server whose zone changed during the transfer would.
+    pub fn transfer_serial_change(mut self) -> Fault {
+        self.transfer_serial_change = true;
+        self
+    }
+
+    /// In a zone transfer: writes the first message behind a length prefix of 65535, longer
+    /// than the message, then closes the connection.
+    pub fn transfer_oversized_length(mut self) -> Fault {
+        self.transfer_oversized_length = true;
+        self
+    }
+
     fn matches(&self, op: Op) -> bool {
         self.op.is_none_or(|o| o == op)
     }
@@ -516,6 +575,18 @@ struct State {
     faults: VecDeque<Fault>,
     refuse_queries: bool,
     skew: i64,
+    transfer: TransferSettings,
+}
+
+/// How the mock answers a zone transfer (see [`Control::transfer_records_per_message`],
+/// [`Control::transfer_sign_every`], [`Control::refuse_transfers`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct TransferSettings {
+    /// At most this many records per message; 0 packs as many as fit.
+    per_message: usize,
+    /// Sign the first message, every n-th and the last; 0 and 1 sign every message.
+    sign_every: usize,
+    refuse: bool,
 }
 
 /// The handle through which a test reads and changes the server's state.
@@ -544,7 +615,8 @@ impl Control {
     }
 
     /// Returns the server to the seed it was started with: the seed's records, no requests
-    /// recorded, no pending faults, queries answered and no clock skew. Reports the removal of
+    /// recorded, no pending faults, queries and transfers answered with the default packing and
+    /// signing, and no clock skew. Reports the removal of
     /// every rrset that is not in the seed and the return of every seeded rrset that was changed.
     pub fn reset(&self) {
         self.change(|state| {
@@ -655,6 +727,27 @@ impl Control {
     /// to query.
     pub fn refuse_queries(&self, on: bool) {
         lock(&self.state).refuse_queries = on;
+    }
+
+    /// Puts at most `records` records into one message of a zone transfer; 0, the default,
+    /// packs as many as fit into a message of about 60 000 octets. The opening and the closing
+    /// SOA count as records.
+    pub fn transfer_records_per_message(&self, records: usize) {
+        lock(&self.state).transfer.per_message = records;
+    }
+
+    /// Signs the first message of a zone transfer, every `n`-th message after it and the last
+    /// one, and leaves the others unsigned (RFC 8945 section 5.3.1 lets a server leave up to 99
+    /// in a row unsigned); 1, the default, signs every message. With `n` above 100 the transfer
+    /// breaks that rule.
+    pub fn transfer_sign_every(&self, n: usize) {
+        lock(&self.state).transfer.sign_every = n;
+    }
+
+    /// Refuses every zone transfer (REFUSED, signed), as a server whose policy does not let the
+    /// key transfer the zone.
+    pub fn refuse_transfers(&self, on: bool) {
+        lock(&self.state).transfer.refuse = on;
     }
 
     /// Moves the server's clock by `seconds`.
@@ -967,6 +1060,28 @@ async fn serve(mut stream: TcpStream, control: Control) {
         }
         match handle(&buf, &control).await {
             Reply::Close => return,
+            Reply::Stream(messages, how) => {
+                for (index, message) in messages.iter().enumerate() {
+                    if how.cut_after == Some(index) {
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                    let len = if how.oversized_first && index == 0 {
+                        u16::MAX
+                    } else {
+                        u16::try_from(message.len()).unwrap_or(u16::MAX)
+                    };
+                    let mut out = len.to_be_bytes().to_vec();
+                    out.extend_from_slice(message);
+                    if stream.write_all(&out).await.is_err() {
+                        return;
+                    }
+                    if how.oversized_first {
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                }
+            }
             Reply::Send(bytes, how) => {
                 let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
                 let mut out = len.to_be_bytes().to_vec();
@@ -997,6 +1112,17 @@ enum Write {
 enum Reply {
     Close,
     Send(Vec<u8>, Write),
+    /// The messages of a zone transfer, over TCP.
+    Stream(Vec<Vec<u8>>, StreamWrite),
+}
+
+/// How the messages of a zone transfer are written.
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamWrite {
+    /// Close the connection before the message with this index.
+    cut_after: Option<usize>,
+    /// Write the first message behind a length prefix of 65535 and close.
+    oversized_first: bool,
 }
 
 // ---- Parsing -----------------------------------------------------------------------------------
@@ -1291,6 +1417,9 @@ struct Signing<'a> {
     secret: Option<&'a [u8]>,
     request_mac: &'a [u8],
     time: u64,
+    /// The Fudge of the answer: the mock's own, or the request's in a BADTIME answer (RFC 8945
+    /// section 5.2.3).
+    fudge: u16,
     error: u16,
     other: Vec<u8>,
 }
@@ -1385,12 +1514,16 @@ async fn handle_on(b: &[u8], control: &Control, transport: Transport) -> Reply {
         } else {
             server_now
         };
+        // Section 5.2.3 also: "the Fudge field MUST be set to the fudge value received from
+        // the client".
+        let fudge = if error == BADTIME { tsig.fudge } else { FUDGE };
         let signing = Signing {
             key_name: tsig.key_name.clone(),
             algorithm: &tsig.algorithm,
             secret,
             request_mac: &tsig.mac,
             time,
+            fudge,
             error,
             other,
         };
@@ -1433,8 +1566,37 @@ async fn handle_on(b: &[u8], control: &Control, transport: Transport) -> Reply {
         lock(&control.state).calls.push(call);
         return Reply::Send(reply, Write::Full);
     }
+    let transfer = req.opcode == 0 && req.qtype == TYPE_AXFR;
     let outcome = match fault.rcode {
         Some(rcode) => Outcome::rcode(rcode),
+        // RFC 5936 section 4.2: "AXFR sessions over UDP transport are not defined".
+        None if transfer && transport == Transport::Udp => Outcome::rcode(REFUSED),
+        None if transfer => match transfer_records(&req, control, refuse_queries, &fault) {
+            Ok(records) => {
+                call.rcode = Some(NOERROR);
+                lock(&control.state).calls.push(call);
+                if fault.drop_reply {
+                    return Reply::Close;
+                }
+                let settings = lock(&control.state).transfer;
+                let signer = TransferSigner {
+                    key_name: tsig.key_name.clone(),
+                    algorithm: &tsig.algorithm,
+                    secret: &key.secret,
+                    request_mac: &tsig.mac,
+                    time: now(skew + fault.time_offset),
+                };
+                let messages = transfer_messages(&req, &records, settings, &signer, &fault);
+                return Reply::Stream(
+                    messages,
+                    StreamWrite {
+                        cut_after: fault.transfer_cut_after,
+                        oversized_first: fault.transfer_oversized_length,
+                    },
+                );
+            }
+            Err(rcode) => Outcome::rcode(rcode),
+        },
         None => process(&req, control, refuse_queries),
     };
     call.rcode = Some(outcome.rcode);
@@ -1452,6 +1614,7 @@ async fn handle_on(b: &[u8], control: &Control, transport: Transport) -> Reply {
         secret: Some(&key.secret),
         request_mac: &tsig.mac,
         time: now(skew + fault.time_offset),
+        fudge: FUDGE,
         error: fault.tsig_error,
         other: Vec::new(),
     });
@@ -1960,7 +2123,7 @@ fn answer(
                 &s.key_name,
                 s.algorithm,
                 s.time,
-                FUDGE,
+                s.fudge,
                 s.error,
                 &s.other,
             ));
@@ -1978,7 +2141,7 @@ fn answer(
     };
     let mut rd = wire_name(s.algorithm);
     rd.extend_from_slice(&s.time.to_be_bytes()[2..]);
-    rd.extend_from_slice(&FUDGE.to_be_bytes());
+    rd.extend_from_slice(&s.fudge.to_be_bytes());
     rd.extend_from_slice(&u16::try_from(mac.len()).unwrap_or(0).to_be_bytes());
     rd.extend_from_slice(&mac);
     rd.extend_from_slice(&id.to_be_bytes());
@@ -1993,6 +2156,347 @@ fn answer(
     m.extend_from_slice(&rd);
     m[10..12].copy_from_slice(&1u16.to_be_bytes());
     m
+}
+
+// ---- Zone transfer -----------------------------------------------------------------------------
+
+/// The records of a zone transfer of the question's zone (RFC 5936 section 2.2): the zone's SOA,
+/// the record of [`Fault::extra_answer`], every record whose longest served zone is this one,
+/// then the SOA again (with a higher serial under [`Fault::transfer_serial_change`]). The RCODE
+/// of the refusal otherwise: NOTAUTH for a zone the mock does not serve (section 2.2.1, note
+/// e), REFUSED while transfers or queries are refused, SERVFAIL for a zone without an SOA
+/// record (invented: the sources do not cover a zone without one).
+fn transfer_records(
+    req: &Request,
+    control: &Control,
+    refuse_queries: bool,
+    fault: &Fault,
+) -> Result<Vec<TransferRr>, u8> {
+    let zones = &control.seed.zones;
+    let zone = &req.qname;
+    if !zones.contains(zone) {
+        return Err(NOTAUTH);
+    }
+    let state = lock(&control.state);
+    if state.transfer.refuse || refuse_queries {
+        return Err(REFUSED);
+    }
+    let soa = state
+        .records
+        .iter()
+        .find(|r| &r.name == zone && r.rtype == TYPE_SOA)
+        .ok_or(SERVFAIL)?;
+    let rr = |r: &MockRecord| TransferRr {
+        owner: wire_name(&r.name),
+        rtype: r.rtype,
+        class: CLASS_IN,
+        ttl: r.ttl,
+        rdata: r.rdata.clone(),
+        raw: false,
+    };
+    let mut out = vec![rr(soa)];
+    if let Some((name, rtype, class, rdata)) = &fault.extra_answer {
+        out.push(TransferRr {
+            owner: wire_name(name),
+            rtype: *rtype,
+            class: *class,
+            ttl: 60,
+            rdata: rdata.clone(),
+            raw: true,
+        });
+    }
+    for record in &state.records {
+        let longest = zones
+            .iter()
+            .filter(|z| in_zone(&record.name, z))
+            .max_by_key(|z| z.len());
+        if longest == Some(zone) && !(&record.name == zone && record.rtype == TYPE_SOA) {
+            out.push(rr(record));
+        }
+    }
+    let mut closing = rr(soa);
+    if fault.transfer_serial_change
+        && let Some(serial) = soa_serial(&closing.rdata)
+        && let Some(at) = closing.rdata.len().checked_sub(20)
+    {
+        closing.rdata[at..at + 4].copy_from_slice(&serial.wrapping_add(1).to_be_bytes());
+    }
+    out.push(closing);
+    Ok(out)
+}
+
+/// One record of a zone transfer.
+#[derive(Clone, Debug)]
+struct TransferRr {
+    /// Uncompressed wire form.
+    owner: Vec<u8>,
+    rtype: u16,
+    class: u16,
+    ttl: u32,
+    rdata: Vec<u8>,
+    /// Written as given: no compression of the owner or of names inside the RDATA.
+    raw: bool,
+}
+
+/// The key and times a zone transfer is signed with.
+struct TransferSigner<'a> {
+    key_name: String,
+    algorithm: &'a str,
+    secret: &'a [u8],
+    request_mac: &'a [u8],
+    time: u64,
+}
+
+/// The largest message the mock builds for a zone transfer before its TSIG record, leaving room
+/// for the record within the 65535 octets of the framing.
+const TRANSFER_MESSAGE_SIZE: usize = 60_000;
+
+/// Names written so far into one message, for compression (RFC 1035 section 4.1.4): every
+/// suffix of labels with its offset. Labels compare octet for octet.
+#[derive(Default)]
+struct Compressor {
+    names: Vec<(Vec<Vec<u8>>, usize)>,
+}
+
+impl Compressor {
+    /// Remembers the uncompressed wire name at the start of `name`, written at offset `at`.
+    fn remember(&mut self, name: &[u8], mut at: usize) {
+        let Some(end) = name_end_in(name, 0) else {
+            return;
+        };
+        let Some(all) = name.get(..end).and_then(labels) else {
+            return;
+        };
+        for i in 0..all.len() {
+            if at < 0x4000 {
+                let suffix = all[i..].iter().map(|l| l.to_vec()).collect();
+                self.names.push((suffix, at));
+            }
+            at += 1 + all[i].len();
+        }
+    }
+
+    /// Appends the uncompressed wire name `name` to `m`, as a pointer to the longest suffix
+    /// written before.
+    fn put(&mut self, m: &mut Vec<u8>, name: &[u8]) {
+        let Some(all) = labels(name) else {
+            m.extend_from_slice(name);
+            return;
+        };
+        let all: Vec<Vec<u8>> = all.into_iter().map(<[u8]>::to_vec).collect();
+        for start in 0..=all.len() {
+            let suffix = &all[start..];
+            let known = if suffix.is_empty() {
+                None
+            } else {
+                self.names
+                    .iter()
+                    .find(|(s, _)| s.as_slice() == suffix)
+                    .map(|(_, at)| *at)
+            };
+            if known.is_some() || suffix.is_empty() {
+                for i in 0..start {
+                    if m.len() < 0x4000 {
+                        self.names.push((all[i..].to_vec(), m.len()));
+                    }
+                    m.push(u8::try_from(all[i].len()).unwrap_or(63));
+                    m.extend_from_slice(&all[i]);
+                }
+                match known {
+                    Some(at) => {
+                        let pointer = 0xc000 | u16::try_from(at).unwrap_or(0);
+                        m.extend_from_slice(&pointer.to_be_bytes());
+                    }
+                    None => m.push(0),
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// The end of the uncompressed name at `at` in `rdata`.
+fn name_end_in(rdata: &[u8], at: usize) -> Option<usize> {
+    let mut i = at;
+    loop {
+        let len = usize::from(*rdata.get(i)?);
+        i += 1 + len;
+        if len == 0 {
+            return Some(i);
+        }
+    }
+}
+
+/// Appends RDATA, with the names of NS, CNAME, PTR, MX and SOA compressed against everything
+/// written before in the message (RFC 3597 section 4 allows it for these types only).
+fn put_transfer_rdata(m: &mut Vec<u8>, rtype: u16, rdata: &[u8], names: &mut Compressor) {
+    let fields: Option<Vec<(bool, std::ops::Range<usize>)>> = (|| {
+        let whole = |end: usize| (end == rdata.len()).then_some(());
+        Some(match rtype {
+            TYPE_NS | TYPE_CNAME | TYPE_PTR => {
+                let end = name_end_in(rdata, 0)?;
+                whole(end)?;
+                vec![(true, 0..end)]
+            }
+            TYPE_MX => {
+                let end = name_end_in(rdata, 2)?;
+                whole(end)?;
+                vec![(false, 0..2), (true, 2..end)]
+            }
+            TYPE_SOA => {
+                let first = name_end_in(rdata, 0)?;
+                let second = name_end_in(rdata, first)?;
+                whole(second + 20)?;
+                vec![
+                    (true, 0..first),
+                    (true, first..second),
+                    (false, second..second + 20),
+                ]
+            }
+            _ => return None,
+        })
+    })();
+    match fields {
+        Some(fields) => {
+            for (name, range) in fields {
+                if name {
+                    names.put(m, &rdata[range]);
+                } else {
+                    m.extend_from_slice(&rdata[range]);
+                }
+            }
+        }
+        None => m.extend_from_slice(rdata),
+    }
+}
+
+/// The messages of a zone transfer of `records` (RFC 5936 section 2.2): the ID of the query, QR,
+/// AA, opcode QUERY; the question in the first message only (section 2.2.2 lets later ones
+/// leave it empty); owner names and the names inside NS, CNAME, PTR, MX and SOA RDATA compressed
+/// against every name written before in the message. Signed per RFC 8945 section 5.3.1: the
+/// first message over the request MAC with all TSIG variables, a later one over the prior MAC
+/// (with its length, as the request MAC is digested in section 4.3.1), the unsigned messages
+/// since and its own timers.
+fn transfer_messages(
+    req: &Request,
+    records: &[TransferRr],
+    settings: TransferSettings,
+    signer: &TransferSigner<'_>,
+    fault: &Fault,
+) -> Vec<Vec<u8>> {
+    // Bodies: header and records, without TSIG.
+    let mut bodies: Vec<Vec<u8>> = Vec::new();
+    let mut rest = records;
+    while !rest.is_empty() {
+        let first = bodies.is_empty();
+        let mut m = Vec::new();
+        m.extend_from_slice(&req.id.to_be_bytes());
+        m.extend_from_slice(&(0x8000u16 | 0x0400).to_be_bytes());
+        m.extend_from_slice(&u16::from(first).to_be_bytes());
+        m.extend_from_slice(&[0; 6]);
+        if first {
+            m.extend_from_slice(&req.question);
+        }
+        let mut names = Compressor::default();
+        if first {
+            // The question's name starts at offset 12.
+            names.remember(&req.question, 12);
+        }
+        let mut count = 0usize;
+        for rr in rest {
+            let limit_reached = settings.per_message > 0 && count >= settings.per_message;
+            let estimate = rr.owner.len() + 10 + rr.rdata.len();
+            if count > 0 && (limit_reached || m.len() + estimate > TRANSFER_MESSAGE_SIZE) {
+                break;
+            }
+            if rr.raw {
+                m.extend_from_slice(&rr.owner);
+            } else {
+                names.put(&mut m, &rr.owner);
+            }
+            m.extend_from_slice(&rr.rtype.to_be_bytes());
+            m.extend_from_slice(&rr.class.to_be_bytes());
+            m.extend_from_slice(&rr.ttl.to_be_bytes());
+            let at = m.len();
+            m.extend_from_slice(&[0, 0]);
+            if rr.raw {
+                m.extend_from_slice(&rr.rdata);
+            } else {
+                put_transfer_rdata(&mut m, rr.rtype, &rr.rdata, &mut names);
+            }
+            let len = u16::try_from(m.len() - at - 2).unwrap_or(0);
+            m[at..at + 2].copy_from_slice(&len.to_be_bytes());
+            count += 1;
+        }
+        m[6..8].copy_from_slice(&u16::try_from(count).unwrap_or(0).to_be_bytes());
+        rest = &rest[count..];
+        bodies.push(m);
+    }
+    // Signatures.
+    let last = bodies.len().saturating_sub(1);
+    let every = settings.sign_every.max(1);
+    let alg = algorithm(signer.algorithm);
+    let mut prior: Vec<u8> = signer.request_mac.to_vec();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut out = Vec::with_capacity(bodies.len());
+    for (index, mut m) in bodies.into_iter().enumerate() {
+        let signed = (index == 0 || index == last || index % every == 0)
+            && !(index == last && fault.transfer_unsigned_last && index != 0);
+        if !signed {
+            pending.extend_from_slice(&m);
+            out.push(m);
+            continue;
+        }
+        let mut data = u16::try_from(prior.len())
+            .unwrap_or(0)
+            .to_be_bytes()
+            .to_vec();
+        data.extend_from_slice(&prior);
+        data.extend_from_slice(&pending);
+        data.extend_from_slice(&m);
+        if index == 0 {
+            data.extend_from_slice(&variables(
+                &signer.key_name,
+                signer.algorithm,
+                signer.time,
+                FUDGE,
+                0,
+                &[],
+            ));
+        } else {
+            data.extend_from_slice(&signer.time.to_be_bytes()[2..]);
+            data.extend_from_slice(&FUDGE.to_be_bytes());
+        }
+        let mut mac = match alg {
+            Some(alg) => hmac::sign(&hmac::Key::new(alg, signer.secret), &data)
+                .as_ref()
+                .to_vec(),
+            None => Vec::new(),
+        };
+        if fault.transfer_corrupt_mac == Some(index)
+            && let Some(first) = mac.first_mut()
+        {
+            *first ^= 0x01;
+        }
+        let mut rd = wire_name(signer.algorithm);
+        rd.extend_from_slice(&signer.time.to_be_bytes()[2..]);
+        rd.extend_from_slice(&FUDGE.to_be_bytes());
+        rd.extend_from_slice(&u16::try_from(mac.len()).unwrap_or(0).to_be_bytes());
+        rd.extend_from_slice(&mac);
+        rd.extend_from_slice(&req.id.to_be_bytes());
+        rd.extend_from_slice(&[0, 0, 0, 0]);
+        m.extend_from_slice(&wire_name(&signer.key_name));
+        m.extend_from_slice(&TYPE_TSIG.to_be_bytes());
+        m.extend_from_slice(&CLASS_ANY.to_be_bytes());
+        m.extend_from_slice(&[0, 0, 0, 0]);
+        m.extend_from_slice(&u16::try_from(rd.len()).unwrap_or(0).to_be_bytes());
+        m.extend_from_slice(&rd);
+        m[10..12].copy_from_slice(&1u16.to_be_bytes());
+        prior = mac;
+        pending.clear();
+        out.push(m);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2047,15 +2551,25 @@ mod tests {
 
     /// Builds a signed request the way RFC 8945 describes it, independently of the client.
     fn signed(unsigned: &[u8], key: &MockKey, time: u64) -> (Vec<u8>, Vec<u8>) {
+        signed_with_fudge(unsigned, key, time, 300)
+    }
+
+    /// Like [`signed`], with the given Fudge.
+    fn signed_with_fudge(
+        unsigned: &[u8],
+        key: &MockKey,
+        time: u64,
+        fudge: u16,
+    ) -> (Vec<u8>, Vec<u8>) {
         let alg = algorithm(&key.algorithm).unwrap();
         let mut data = unsigned.to_vec();
-        data.extend_from_slice(&variables(&key.name, &key.algorithm, time, 300, 0, &[]));
+        data.extend_from_slice(&variables(&key.name, &key.algorithm, time, fudge, 0, &[]));
         let mac = hmac::sign(&hmac::Key::new(alg, &key.secret), &data)
             .as_ref()
             .to_vec();
         let mut rd = wire_name(&key.algorithm);
         rd.extend_from_slice(&time.to_be_bytes()[2..]);
-        rd.extend_from_slice(&300u16.to_be_bytes());
+        rd.extend_from_slice(&fudge.to_be_bytes());
         rd.extend_from_slice(&(mac.len() as u16).to_be_bytes());
         rd.extend_from_slice(&mac);
         rd.extend_from_slice(&unsigned[..2]);
@@ -2143,37 +2657,186 @@ mod tests {
     }
 
     /// RFC 8945 section 5.2.3: a BADTIME answer is signed by the request's key and carries the
-    /// client's time in Time Signed, the server's time in Other Data, and 6 in Other Len.
+    /// client's time in Time Signed, the server's time in Other Data, 6 in Other Len, and the
+    /// Fudge the request had, whatever it was.
     #[tokio::test]
     async fn a_badtime_answer_carries_the_clients_time() {
         let mock = Rfc2136Mock::start(Seed::standard()).await;
         let key = mock.control().seed().keys[0].clone();
-        let client_time = now(0) - 1000;
-        let (msg, request_mac) = signed(
-            &add_txt_update(5, "a.example.org.", "v1"),
-            &key,
-            client_time,
+        for (id, fudge) in [(5u16, 300u16), (6, 120), (7, 900)] {
+            mock.control().clear_calls();
+            let client_time = now(0) - 1000;
+            let (msg, request_mac) = signed_with_fudge(
+                &add_txt_update(id, "a.example.org.", "v1"),
+                &key,
+                client_time,
+                fudge,
+            );
+            let before = now(0);
+            let Reply::Send(reply, Write::Full) =
+                handle_on(&msg, mock.control(), Transport::Tcp).await
+            else {
+                panic!("no reply");
+            };
+            let after = now(0);
+            assert_eq!(reply[3] & 0x0f, NOTAUTH);
+            assert!(mock.control().txt("a.example.org.").is_empty());
+            assert_eq!(mock.control().calls()[0].tsig_error, BADTIME);
+            let tsig = verified_answer_tsig(&reply, &key, &request_mac);
+            assert_eq!(tsig.error, BADTIME);
+            assert_eq!(tsig.time, client_time);
+            assert_eq!(tsig.fudge, fudge, "the request's fudge");
+            assert_eq!(tsig.other.len(), 6);
+            let mut server_time = [0u8; 8];
+            server_time[2..].copy_from_slice(&tsig.other);
+            let server_time = u64::from_be_bytes(server_time);
+            assert!(
+                (before..=after).contains(&server_time),
+                "{server_time} not in {before}..={after}"
+            );
+        }
+    }
+
+    /// A signed AXFR query for `zone`.
+    fn axfr_query(id: u16, zone: &str, key: &MockKey) -> (Vec<u8>, Vec<u8>) {
+        let mut query = id.to_be_bytes().to_vec();
+        query.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        query.extend_from_slice(&wire_name(zone));
+        query.extend_from_slice(&TYPE_AXFR.to_be_bytes());
+        query.extend_from_slice(&CLASS_IN.to_be_bytes());
+        signed(&query, key, now(0))
+    }
+
+    /// The owner and type of every answer record of `message`.
+    fn transfer_rrs(message: &[u8]) -> Vec<(String, u16)> {
+        let parsed = parse_response(message).unwrap();
+        parsed
+            .into_iter()
+            .map(|(name, rtype, _)| (name, rtype))
+            .collect()
+    }
+
+    /// The answer records of a response as (owner, type, RDATA uncompressed for the types the
+    /// mock compresses), with ARCOUNT checked against the TSIG record.
+    fn parse_response(m: &[u8]) -> Option<Vec<(String, u16, Vec<u8>)>> {
+        let qd = be16(m, 4)?;
+        let an = be16(m, 6)?;
+        let mut i = 12;
+        for _ in 0..qd {
+            let (_, j) = read_name(m, i)?;
+            i = j + 4;
+        }
+        let mut out = Vec::new();
+        for _ in 0..an {
+            let (name, j) = read_name(m, i)?;
+            let rtype = be16(m, j)?;
+            let len = usize::from(be16(m, j + 8)?);
+            let rdata = request_rdata(m, rtype, j + 10, len)?;
+            out.push((name, rtype, rdata));
+            i = j + 10 + len;
+        }
+        Some(out)
+    }
+
+    fn seeded_zone() -> Seed {
+        let mut seed = Seed::standard();
+        seed.records = vec![
+            record(ZONE, TYPE_SOA, &soa(7)),
+            record(ZONE, TYPE_NS, &wire_name("ns1.example.org.")),
+            record(
+                "www.example.org.",
+                TYPE_CNAME,
+                &wire_name("host.example.org."),
+            ),
+            record(A, TYPE_TXT, &txt_rdata(b"x")),
+            record(A, TYPE_A, &[192, 0, 2, 1]),
+            record("www.example.net.", TYPE_A, &[192, 0, 2, 2]),
+        ];
+        seed
+    }
+
+    /// RFC 5936 section 2.2: the transfer begins and ends with the zone's SOA and holds every
+    /// record of the zone between; only the first message copies the question; names in the
+    /// RDATA of RFC 1035 types are compressed and read back as stored; RFC 8945 section 5.3.1:
+    /// with `transfer_sign_every(3)` the first, every third and the last message are signed.
+    #[tokio::test]
+    async fn transfer_is_framed_by_the_soa_and_signed_as_configured() {
+        let mock = Rfc2136Mock::start(seeded_zone()).await;
+        let key = mock.control().seed().keys[0].clone();
+        mock.control().transfer_records_per_message(1);
+        mock.control().transfer_sign_every(3);
+        let (msg, _) = axfr_query(9, ZONE, &key);
+        let Reply::Stream(messages, how) = handle(&msg, mock.control()).await else {
+            panic!("no stream");
+        };
+        assert!(how.cut_after.is_none() && !how.oversized_first);
+        assert_eq!(messages.len(), 6);
+        let records: Vec<(String, u16)> = messages.iter().flat_map(|m| transfer_rrs(m)).collect();
+        assert_eq!(
+            records,
+            [
+                (ZONE.to_owned(), TYPE_SOA),
+                (ZONE.to_owned(), TYPE_NS),
+                ("www.example.org.".to_owned(), TYPE_CNAME),
+                (A.to_owned(), TYPE_TXT),
+                (A.to_owned(), TYPE_A),
+                (ZONE.to_owned(), TYPE_SOA),
+            ]
         );
-        let before = now(0);
-        let Reply::Send(reply, Write::Full) = handle_on(&msg, mock.control(), Transport::Tcp).await
-        else {
+        let signed: Vec<bool> = messages.iter().map(|m| m[11] == 1).collect();
+        assert_eq!(signed, [true, false, false, true, false, true]);
+        let questions: Vec<u16> = messages.iter().map(|m| be16(m, 4).unwrap()).collect();
+        assert_eq!(questions, [1, 0, 0, 0, 0, 0]);
+        for m in &messages {
+            assert_eq!(be16(m, 0), Some(9));
+            assert_eq!(m[2] & 0x80, 0x80);
+        }
+        // The CNAME target was compressed and expands to the stored name.
+        let cname = parse_response(&messages[2]).unwrap();
+        assert_eq!(cname[0].2, wire_name("host.example.org."));
+        // A name outside the zone is not part of the transfer.
+        assert!(!records.iter().any(|(n, _)| n.ends_with("example.net.")));
+    }
+
+    /// A transfer over UDP, an unsigned one, one of a zone the mock does not serve, one while
+    /// transfers are refused, and one of a zone without an SOA are each answered by a single
+    /// message with the RCODE of the module documentation.
+    #[tokio::test]
+    async fn transfers_are_refused_as_documented() {
+        let mock = Rfc2136Mock::start(seeded_zone()).await;
+        let key = mock.control().seed().keys[0].clone();
+        let (msg, _) = axfr_query(1, ZONE, &key);
+        let Reply::Send(udp, _) = handle_on(&msg, mock.control(), Transport::Udp).await else {
             panic!("no reply");
         };
-        let after = now(0);
+        assert_eq!(udp[3] & 0x0f, REFUSED);
+        assert_eq!(udp[11], 1, "signed");
+        let mut unsigned = msg.clone();
+        unsigned.truncate(12 + wire_name(ZONE).len() + 4);
+        unsigned[11] = 0;
+        let Reply::Send(reply, _) = handle(&unsigned, mock.control()).await else {
+            panic!("no reply");
+        };
+        assert_eq!((reply[3] & 0x0f, reply[11]), (REFUSED, 0));
+        let (other, _) = axfr_query(2, "example.net.", &key);
+        let Reply::Send(reply, _) = handle(&other, mock.control()).await else {
+            panic!("no reply");
+        };
         assert_eq!(reply[3] & 0x0f, NOTAUTH);
-        assert!(mock.control().txt("a.example.org.").is_empty());
-        assert_eq!(mock.control().calls()[0].tsig_error, BADTIME);
-        let tsig = verified_answer_tsig(&reply, &key, &request_mac);
-        assert_eq!(tsig.error, BADTIME);
-        assert_eq!(tsig.time, client_time);
-        assert_eq!(tsig.other.len(), 6);
-        let mut server_time = [0u8; 8];
-        server_time[2..].copy_from_slice(&tsig.other);
-        let server_time = u64::from_be_bytes(server_time);
-        assert!(
-            (before..=after).contains(&server_time),
-            "{server_time} not in {before}..={after}"
-        );
+        mock.control().refuse_transfers(true);
+        let Reply::Send(reply, _) = handle(&msg, mock.control()).await else {
+            panic!("no reply");
+        };
+        assert_eq!((reply[3] & 0x0f, reply[11]), (REFUSED, 1));
+        mock.control().reset();
+        let Reply::Stream(..) = handle(&msg, mock.control()).await else {
+            panic!("reset allows transfers again");
+        };
+        let bare = Rfc2136Mock::start(Seed::standard()).await;
+        let Reply::Send(reply, _) = handle(&msg, bare.control()).await else {
+            panic!("no reply");
+        };
+        assert_eq!(reply[3] & 0x0f, SERVFAIL);
     }
 
     #[tokio::test]

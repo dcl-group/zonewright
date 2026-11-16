@@ -7,9 +7,8 @@
 //! Capabilities describe what this version of the crate implements: `check`, the TXT value
 //! operations for any TXT value (they travel as wire-format RDATA, one RR per message), and the
 //! record-level `get`, `set` and `delete` for every type with a type code and a wire form
-//! (design sections 2.5 and 11.2), SOA read-only. The protocol has no listing of zones or of the
-//! records of a zone (dynamic update has no such operation, RFC 2136 section 2.5), so
-//! `list_zones` and `list_rrsets` are false.
+//! (design sections 2.5 and 11.2), SOA read-only, and the listing of a zone's records by zone
+//! transfer (AXFR, RFC 5936). The protocol has no listing of zones, so `list_zones` is false.
 
 use crate::id::ProviderId;
 use crate::meta::{
@@ -89,7 +88,8 @@ const FIELDS: &[ConfigField] = &[
 /// What this version of the crate implements for RFC 2136.
 const CAPABILITIES: Capabilities = Capabilities {
     list_zones: false,
-    list_rrsets: false,
+    // By zone transfer (RFC 5936), signed with the same key.
+    list_rrsets: true,
     get_rrset: true,
     set_rrset: true,
     delete_rrset: true,

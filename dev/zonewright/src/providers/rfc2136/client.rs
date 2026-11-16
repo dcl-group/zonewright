@@ -5,8 +5,9 @@
 //! `tsig.rs` (RFC 8945 signatures) and `transport.rs` (DNS over TCP with timeouts and bounded
 //! repeats). Design section 9, choice 9: a hand-written wire format and TSIG, not a DNS library.
 //!
-//! Sources: RFC 2136 (DNS UPDATE), RFC 8945 (TSIG), RFC 7766 and RFC 1035 section 4.2.2 (DNS over
-//! TCP), RFC 1035 section 4 (the message format), and lego `providers/dns/rfc2136/rfc2136.go`.
+//! Sources: RFC 2136 (DNS UPDATE), RFC 8945 (TSIG), RFC 5936 (AXFR), RFC 7766 and RFC 1035
+//! section 4.2.2 (DNS over TCP), RFC 1035 section 4 (the message format), and lego
+//! `providers/dns/rfc2136/rfc2136.go`.
 
 use std::fmt;
 
@@ -38,6 +39,12 @@ use super::wire::{Builder, TYPE_SOA, rcode};
 /// Talks DNS over TCP to the configured `server`; every request is signed and every answer
 /// verified. TXT values are added and removed one RR at a time, so a foreign value is never
 /// part of a write (`ValueGuarantee::PerValue`). The protocol has no listing of zones.
+///
+/// `list_rrsets` transfers the zone (AXFR, RFC 5936) with the same key, so the key needs the
+/// server's permission to transfer the zone. The listing holds every rrset in the form
+/// `get_rrset` reads it; the records a DNSSEC signer keeps (DNSKEY, RRSIG, NSEC, NSEC3,
+/// NSEC3PARAM) are reported in `ZoneListing::skipped`. A transfer is bounded at 64 MiB and
+/// 100 000 messages.
 ///
 /// When the server lets the key update but refuses its queries, the TXT value operations send
 /// their change without reading first and report `AddOutcome::Accepted` or
@@ -215,8 +222,13 @@ impl Provider for Rfc2136 {
         Call::list_zones().unsupported(self).await
     }
 
+    /// One zone transfer (AXFR, RFC 5936) of `zone`, signed with the client's key; every
+    /// message of the answer is verified (RFC 8945 section 5.3.1) before any record counts.
+    /// A server that does not let the key transfer the zone answers REFUSED: `Error::Forbidden`.
     async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
-        Call::list_rrsets(zone).unsupported(self).await
+        Call::list_rrsets(zone)
+            .observe(self, self.list_zone(zone))
+            .await
     }
 }
 

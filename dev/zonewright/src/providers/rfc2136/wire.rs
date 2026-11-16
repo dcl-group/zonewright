@@ -24,6 +24,8 @@ pub(super) const TYPE_SOA: u16 = 6;
 pub(super) const TYPE_TXT: u16 = 16;
 /// Type code of TSIG (RFC 8945 section 4.2).
 pub(super) const TYPE_TSIG: u16 = 250;
+/// Type code AXFR, the query type of a zone transfer (RFC 5936 section 2.1.2).
+pub(super) const TYPE_AXFR: u16 = 252;
 /// Type code ANY (RFC 1035 section 3.2.3).
 pub(super) const TYPE_ANY: u16 = 255;
 /// Class IN (RFC 1035 section 3.2.4).

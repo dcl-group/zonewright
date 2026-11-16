@@ -46,21 +46,21 @@ use super::tsig::{self, Key, Verdict};
 use super::wire::{self, HEADER_LEN, OPCODE_UPDATE, Request, Response, rcode};
 
 /// Target of the client's `tracing` events.
-const TARGET: &str = "zonewright::rfc2136";
+pub(super) const TARGET: &str = "zonewright::rfc2136";
 
 /// Attempts per message, counting the first (design section 5.3).
-const MAX_ATTEMPTS: u32 = 3;
+pub(super) const MAX_ATTEMPTS: u32 = 3;
 
 /// Back-off step before attempt `n + 1`: `500 ms × n`, plus up to 25 % (design section 5.3).
 const BACKOFF_STEP_MS: u64 = 500;
 
-fn transient(text: &'static str) -> Error {
+pub(super) fn transient(text: &'static str) -> Error {
     Error::Transient {
         detail: Detail::constant(text),
     }
 }
 
-fn protocol(text: &'static str) -> Error {
+pub(super) fn protocol(text: &'static str) -> Error {
     Error::Protocol {
         detail: Detail::constant(text),
     }
@@ -171,25 +171,9 @@ impl Transport {
         if response.id != id || !response.is_response() || response.opcode() != request.opcode {
             return Err(protocol("the answer does not match the request"));
         }
-        match tsig::verify(&buf, &response, &request_mac, &self.key, unix_now()?) {
-            Verdict::Ok => {}
-            Verdict::Unsigned => {
-                return Err(protocol(
-                    "the answer to a signed request is not signed (RFC 8945 section 5.4)",
-                ));
-            }
-            Verdict::Invalid(why) => return Err(protocol(why)),
-            // RFC 8945 section 5.2: every TSIG error is answered with RCODE NOTAUTH.
-            Verdict::ServerError(error) if response.rcode() == rcode::NOTAUTH => {
-                return Err(Error::Auth {
-                    detail: Detail::constant(tsig::error_text(error)),
-                });
-            }
-            Verdict::ServerError(_) => {
-                return Err(protocol(
-                    "the answer reports a TSIG error with an RCODE other than NOTAUTH",
-                ));
-            }
+        let verdict = tsig::verify(&buf, &response, &request_mac, &self.key, unix_now()?);
+        if let Some(error) = verdict_error(verdict, response.rcode()) {
+            return Err(error);
         }
         if response.truncated() {
             return Err(protocol(
@@ -211,22 +195,33 @@ impl Transport {
         Ok(Answer { response, buf })
     }
 
+    /// The TSIG key.
+    pub(super) fn key(&self) -> &Key {
+        &self.key
+    }
+
+    /// The bound of one exchange, and of each message read after the first of a multi-message
+    /// answer (`ContextOptions::request_timeout`).
+    pub(super) fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Resolves the server's name and connects, within `ContextOptions::connect_timeout`.
+    pub(super) async fn open(&self) -> Result<TcpStream, Error> {
+        match timeout(self.connect_timeout, self.connect()).await {
+            Ok(result) => result,
+            Err(_) => Err(transient("connecting to the DNS server timed out")),
+        }
+    }
+
     /// Connects, writes the framed message and reads the framed answer.
     async fn round_trip(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
-        let mut stream = match timeout(self.connect_timeout, self.connect()).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(transient("connecting to the DNS server timed out")),
-        };
+        let mut stream = self.open().await?;
         let exchange = async {
-            let len = u16::try_from(message.len()).map_err(|_| Error::InvalidInput {
-                code: None,
-                detail: Detail::constant("the signed DNS message would exceed 65535 octets"),
-            })?;
-            let mut framed = Vec::with_capacity(message.len() + 2);
-            framed.extend_from_slice(&len.to_be_bytes());
-            framed.extend_from_slice(message);
-            stream.write_all(&framed).await.map_err(io_error)?;
+            stream
+                .write_all(&framed(message)?)
+                .await
+                .map_err(io_error)?;
             let len = usize::from(stream.read_u16().await.map_err(io_error)?);
             if len < HEADER_LEN {
                 return Err(protocol("the answer is shorter than a DNS header"));
@@ -260,7 +255,37 @@ impl Transport {
     }
 }
 
-fn io_error(e: std::io::Error) -> Error {
+/// `message` with its two-octet length prefix (RFC 1035 section 4.2.2).
+pub(super) fn framed(message: &[u8]) -> Result<Vec<u8>, Error> {
+    let len = u16::try_from(message.len()).map_err(|_| Error::InvalidInput {
+        code: None,
+        detail: Detail::constant("the signed DNS message would exceed 65535 octets"),
+    })?;
+    let mut framed = Vec::with_capacity(message.len() + 2);
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(message);
+    Ok(framed)
+}
+
+/// The error for a TSIG verdict on an answer whose RCODE is `code`; `None` for `Verdict::Ok`.
+pub(super) fn verdict_error(verdict: Verdict, code: u8) -> Option<Error> {
+    match verdict {
+        Verdict::Ok => None,
+        Verdict::Unsigned => Some(protocol(
+            "the answer to a signed request is not signed (RFC 8945 section 5.4)",
+        )),
+        Verdict::Invalid(why) => Some(protocol(why)),
+        // RFC 8945 section 5.2: every TSIG error is answered with RCODE NOTAUTH.
+        Verdict::ServerError(error) if code == rcode::NOTAUTH => Some(Error::Auth {
+            detail: Detail::constant(tsig::error_text(error)),
+        }),
+        Verdict::ServerError(_) => Some(protocol(
+            "the answer reports a TSIG error with an RCODE other than NOTAUTH",
+        )),
+    }
+}
+
+pub(super) fn io_error(e: std::io::Error) -> Error {
     if e.kind() == IoErrorKind::UnexpectedEof {
         transient("the DNS server closed the connection before the answer was complete")
     } else {
@@ -270,14 +295,14 @@ fn io_error(e: std::io::Error) -> Error {
 
 /// The Unix time in seconds (RFC 8945 section 4.2: "seconds since 00:00 on 1970-01-01 UTC,
 /// ignoring leap seconds").
-fn unix_now() -> Result<u64, Error> {
+pub(super) fn unix_now() -> Result<u64, Error> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|_| protocol("the system clock is set before 1970"))
 }
 
-fn backoff(attempt: u32) -> Duration {
+pub(super) fn backoff(attempt: u32) -> Duration {
     let base = BACKOFF_STEP_MS.saturating_mul(u64::from(attempt));
     Duration::from_millis(base.saturating_add(fastrand::u64(0..=base / 4)))
 }

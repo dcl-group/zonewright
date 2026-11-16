@@ -19,13 +19,13 @@ use zonewright::providers::rfc2136::{Rfc2136, Rfc2136Config, Rfc2136Credentials}
 use zonewright::{
     AddOutcome, AnyProvider, Context, ContextOptions, DeleteOutcome, DomainName, Error, ErrorKind,
     Expect, Provider, ProviderId, RecordData, RecordType, RemoveOutcome, RrSet, RrsetTtl,
-    SetOutcome, Ttl, Txt,
+    SetOutcome, SkipReason, Ttl, Txt, ZoneListing,
 };
 use zonewright_mock::rfc2136::{
     BADKEY, BADSIG, BADTIME, CLASS_ANY, CLASS_IN, CLASS_NONE, Call, FORMERR, Fault, KEY_NAME_384,
     KEY_NAME_512, MockKey, MockRecord, NOERROR, NOTAUTH, NXDOMAIN, Op, REFUSED, Rfc2136Mock,
     SERVFAIL, STANDARD_SECRET, STANDARD_SECRET_384, STANDARD_SECRET_512, Seed, TYPE_A, TYPE_ANY,
-    TYPE_CNAME, TYPE_TXT, txt_rdata,
+    TYPE_AXFR, TYPE_CNAME, TYPE_TXT, txt_rdata,
 };
 
 use common::echo::{LogCapture, assert_clean};
@@ -447,6 +447,14 @@ async fn rfc2136_no_secret_in_logs() {
         add(&good, "v3").await.unwrap_err().kind(),
         ErrorKind::Transient
     );
+    // A zone transfer of several messages, one with a forged MAC, one refused for the key.
+    mock.control().add_record(soa_record());
+    mock.control().transfer_records_per_message(1);
+    assert_eq!(list(&good).await.unwrap().rrsets.len(), 2);
+    mock.control()
+        .push(Fault::on(Op::Query).transfer_corrupt_mac(1));
+    assert_eq!(list(&good).await.unwrap_err().kind(), ErrorKind::Protocol);
+    assert_eq!(list(&badsig).await.unwrap_err().kind(), ErrorKind::Auth);
 
     let entries = capture.entries();
     let events: Vec<_> = entries
@@ -466,6 +474,7 @@ async fn rfc2136_no_secret_in_logs() {
     }
     assert!(events.iter().any(|e| e.field("rcode") == Some("2")));
     assert!(events.iter().any(|e| e.field("rcode") == Some("0")));
+    assert!(events.iter().any(|e| e.field("op") == Some("transfer")));
     let text = capture.text();
     let mut secrets = secret_spellings(CANARY_SECRET);
     secrets.extend(mac_spellings(&mock.control().calls()));
@@ -705,16 +714,10 @@ async fn rfc2136_writes_are_sent_once() {
 #[tokio::test]
 async fn rfc2136_unsupported_operations_send_nothing() {
     let (mock, client) = setup().await;
-    // The protocol has no listing of zones or records.
-    let errors = [
-        client.list_zones().await.map(drop).unwrap_err(),
-        client.list_rrsets(&zone()).await.map(drop).unwrap_err(),
-    ];
-    for err in errors {
-        match err {
-            Error::Unsupported { provider, .. } => assert_eq!(provider, ProviderId::Rfc2136),
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+    // The protocol has no listing of zones.
+    match client.list_zones().await.map(drop).unwrap_err() {
+        Error::Unsupported { provider, .. } => assert_eq!(provider, ProviderId::Rfc2136),
+        other => panic!("expected Unsupported, got {other:?}"),
     }
     // Pseudo-types have no type code; SOA is read-only.
     let alias = RrSet::new(
@@ -3016,6 +3019,489 @@ async fn rfc2136_record_answers_for_other_names_are_ignored() {
     let calls = update_calls(&mock);
     assert_eq!(calls[0].prereqs.len(), 1);
     assert_eq!(calls[0].prereqs[0].rdata, [192, 0, 2, 1]);
+}
+
+// ---- Listing by zone transfer (RFC 5936; design sections 3.4 and 11.3) ------------------------
+
+/// The apex SOA the listing tests seed: a zone transfer begins and ends with it.
+fn soa_record() -> MockRecord {
+    mock_record("example.org", RecordType::SOA, 3600, SOA_TEXT)
+}
+
+async fn list(client: &impl Provider) -> Result<ZoneListing, Error> {
+    tokio::time::timeout(SLOW, client.list_rrsets(&zone()))
+        .await
+        .expect("the operation is bounded")
+}
+
+/// How many zone transfers the mock received.
+fn transfers(mock: &Rfc2136Mock) -> usize {
+    mock.control()
+        .calls()
+        .iter()
+        .filter(|c| c.op == Op::Query && c.qtype == TYPE_AXFR)
+        .count()
+}
+
+/// A zone with every type the record model has a canonical form for, a type without one, a
+/// delegation, a wildcard, an IDN owner and a long TXT value, written through the client, is
+/// listed with exactly those sets plus the SOA and the apex NS set, with their TTLs. Whether
+/// the transfer comes in one message or in one message per record, every message signed or
+/// only the first, every hundredth and the last: the same listing. Every listed set is what
+/// `get_rrset` reads for it, and a `set_rrset` of it is `Unchanged` without an update.
+#[tokio::test]
+async fn rfc2136_listing_returns_every_set_as_get_reads_it() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.add_record(soa_record());
+    control.add_record(mock_record(
+        "example.org",
+        RecordType::NS,
+        3600,
+        "ns1.example.org.",
+    ));
+    let long = format!("\"{}\"", "x".repeat(600));
+    let idn = dn("пример.example.org").as_str().to_owned();
+    let written = [
+        ("example.org", RecordType::A, Some(300), vec!["192.0.2.80"]),
+        (
+            "example.org",
+            RecordType::MX,
+            Some(3600),
+            vec!["10 mail.example.org.", "20 mx.example.net."],
+        ),
+        (
+            "example.org",
+            RecordType::TXT,
+            None,
+            vec!["\"v=spf1 mx -all\"", "\"quote \\\" and \\\\\""],
+        ),
+        (
+            "example.org",
+            RecordType::CAA,
+            None,
+            vec!["0 issue \"ca.example.net\""],
+        ),
+        (
+            "example.org",
+            RecordType::HTTPS,
+            None,
+            vec!["1 . alpn=\"h2\""],
+        ),
+        (
+            "rt.example.org",
+            RecordType::A,
+            None,
+            vec!["192.0.2.1", "192.0.2.2", "192.0.2.3"],
+        ),
+        (
+            "rt.example.org",
+            RecordType::AAAA,
+            None,
+            vec!["2001:db8::1"],
+        ),
+        (
+            "_sip._tcp.example.org",
+            RecordType::SRV,
+            None,
+            vec!["0 5 5060 sip.example.org.", "0 0 0 ."],
+        ),
+        (
+            "alias.example.org",
+            RecordType::CNAME,
+            None,
+            vec!["target.alias.example.org."],
+        ),
+        (
+            "ptr.example.org",
+            RecordType::PTR,
+            None,
+            vec!["host.ptr.example.org."],
+        ),
+        (
+            "_443._tcp.example.org",
+            RecordType::TLSA,
+            None,
+            vec!["3 1 1 0a1b2c3d4e5f"],
+        ),
+        (
+            "ssh.example.org",
+            RecordType::SSHFP,
+            None,
+            vec!["4 2 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"],
+        ),
+        (
+            "svc.example.org",
+            RecordType::SVCB,
+            None,
+            vec!["1 . alpn=\"h2,h3\" port=8443"],
+        ),
+        (
+            "dname.example.org",
+            RecordType::DNAME,
+            None,
+            vec!["other.example.net."],
+        ),
+        (
+            "child.example.org",
+            RecordType::NS,
+            Some(172_800),
+            vec!["ns1.child.example.org.", "ns2.example.net."],
+        ),
+        ("*.example.org", RecordType::A, None, vec!["192.0.2.10"]),
+        (
+            "unknown.example.org",
+            RecordType::from_code(65_280),
+            None,
+            vec!["\\# 3 010203"],
+        ),
+        (
+            idn.as_str(),
+            RecordType::TXT,
+            None,
+            vec![long.as_str(), "\"second\""],
+        ),
+    ];
+    let mut expected = vec![
+        rrset("example.org", RecordType::SOA, Some(3600), &[SOA_TEXT]),
+        rrset(
+            "example.org",
+            RecordType::NS,
+            Some(3600),
+            &["ns1.example.org."],
+        ),
+    ];
+    for (name, rtype, ttl, texts) in &written {
+        let wanted = rrset(name, *rtype, *ttl, texts);
+        assert_eq!(
+            set(&client, &wanted, Expect::Absent).await.unwrap(),
+            SetOutcome::Created,
+            "{name} {rtype}"
+        );
+        expected.push(wanted.with_ttl(Some(
+            RrsetTtl::from_secs(ttl.unwrap_or(DEFAULT_TTL)).unwrap(),
+        )));
+    }
+    let expected = ZoneListing::new(expected, Vec::new()).rrsets;
+    let mut listing = None;
+    for (per_message, sign_every) in [(0, 1), (1, 1), (1, 100), (3, 2), (2, 1000)] {
+        control.transfer_records_per_message(per_message);
+        control.transfer_sign_every(sign_every);
+        let listed = list(&client).await.unwrap();
+        assert!(listed.skipped.is_empty(), "{:?}", listed.skipped);
+        assert_eq!(listed.rrsets, expected, "{per_message} {sign_every}");
+        assert!(
+            listed
+                .rrsets
+                .iter()
+                .all(|set| set.records().iter().all(RecordData::is_canonical))
+        );
+        listing = Some(listed);
+    }
+    control.clear_calls();
+    for listed in &listing.unwrap().rrsets {
+        let name = listed.name().as_str();
+        let read = get(&client, name, listed.rtype()).await.unwrap();
+        assert_eq!(read.as_ref(), Some(listed), "{name} {}", listed.rtype());
+        if listed.rtype() == RecordType::SOA
+            || (listed.rtype() == RecordType::NS && name == "example.org.")
+        {
+            continue;
+        }
+        assert_eq!(
+            set(&client, listed, Expect::Any).await.unwrap(),
+            SetOutcome::Unchanged,
+            "{name} {}",
+            listed.rtype()
+        );
+    }
+    assert_eq!(updates(&mock), 0);
+    // The transfers were signed with the client's key and nothing was written.
+    assert!(control.calls().iter().all(|c| !c.request_mac.is_empty()));
+}
+
+/// The records a DNSSEC signer keeps (DNSKEY at the apex, RRSIG and NSEC at a name), a meta type
+/// the record model cannot hold, and two CNAME records at one name are reported in `skipped`
+/// with `NotPlainRecords`; everything else is listed, and the listing does not fail.
+#[tokio::test]
+async fn rfc2136_listing_reports_skipped_sets() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.add_record(soa_record());
+    control.add_record(mock_record(
+        "www.example.org",
+        RecordType::A,
+        300,
+        "192.0.2.1",
+    ));
+    let raw = |name: &str, rtype: u16, rdata: Vec<u8>| MockRecord {
+        name: name.to_owned(),
+        rtype,
+        ttl: 300,
+        rdata,
+    };
+    // Synthetic RDATA in the layouts of RFC 4034 sections 2.1, 3.1 and 4.1.
+    let mut dnskey = vec![1, 1, 3, 13];
+    dnskey.extend_from_slice(&[0x5a; 64]);
+    let mut rrsig = vec![0, 1, 13, 3, 0, 0, 1, 44];
+    rrsig.extend_from_slice(&[0x6a, 0, 0, 0, 0x69, 0, 0, 0, 0x12, 0x34]);
+    rrsig.extend_from_slice(b"\x07example\x03org\x00");
+    rrsig.extend_from_slice(&[0x7b; 64]);
+    let mut nsec = b"\x03zzz\x07example\x03org\x00".to_vec();
+    nsec.extend_from_slice(&[0, 6, 0x40, 0, 0, 0, 0, 3]);
+    control.add_record(raw("example.org.", 48, dnskey));
+    control.add_record(raw("www.example.org.", 46, rrsig));
+    control.add_record(raw("www.example.org.", 47, nsec));
+    control.add_record(raw("odd.example.org.", 128, vec![1, 2, 3]));
+    control.add_record(mock_record(
+        "two.example.org",
+        RecordType::CNAME,
+        300,
+        "a.example.net.",
+    ));
+    control.add_record(mock_record(
+        "two.example.org",
+        RecordType::CNAME,
+        300,
+        "b.example.net.",
+    ));
+    let listing = list(&client).await.unwrap();
+    let listed: Vec<(String, RecordType)> = listing
+        .rrsets
+        .iter()
+        .map(|s| (s.name().to_string(), s.rtype()))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("example.org.".to_owned(), RecordType::SOA),
+            ("www.example.org.".to_owned(), RecordType::A),
+        ]
+    );
+    let mut skipped: Vec<(String, String, SkipReason)> = listing
+        .skipped
+        .iter()
+        .map(|s| (s.name.to_string(), s.type_name.clone(), s.reason))
+        .collect();
+    skipped.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let want = |name: &str, type_name: &str| {
+        (
+            name.to_owned(),
+            type_name.to_owned(),
+            SkipReason::NotPlainRecords,
+        )
+    };
+    assert_eq!(
+        skipped,
+        [
+            want("example.org.", "DNSKEY"),
+            want("odd.example.org.", "NXNAME"),
+            want("two.example.org.", "CNAME"),
+            want("www.example.org.", "NSEC"),
+            want("www.example.org.", "RRSIG"),
+        ]
+    );
+}
+
+/// RFC 5936 section 2.2: the client accepts any grouping, takes a duplicate RR once, expands a
+/// name the server compressed inside the RDATA of an RFC 1035 type against another record of
+/// the message, and keeps RDATA it cannot read as its type (a compression pointer inside a
+/// DNAME, whose names RFC 3597 section 4 does not let a server compress) as non-canonical data
+/// instead of misreading it.
+#[tokio::test]
+async fn rfc2136_listing_reads_what_a_server_may_send() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.add_record(soa_record());
+    for _ in 0..2 {
+        control.add_record(mock_record(
+            "dup.example.org",
+            RecordType::A,
+            300,
+            "192.0.2.7",
+        ));
+    }
+    control.add_record(mock_record(
+        "mx.example.org",
+        RecordType::MX,
+        300,
+        "10 dup.example.org.",
+    ));
+    // The pointer refers to offset 12, the zone's name in the question of the first message.
+    control.push(Fault::on(Op::Query).extra_answer(
+        "dname.example.org.",
+        39,
+        CLASS_IN,
+        &[3, b's', b'u', b'b', 0xc0, 12],
+    ));
+    let listing = list(&client).await.unwrap();
+    let find = |name: &str, rtype: RecordType| {
+        listing
+            .rrsets
+            .iter()
+            .find(|s| s.name().as_str() == name && s.rtype() == rtype)
+            .unwrap_or_else(|| panic!("{name} {rtype} in {listing:?}"))
+    };
+    assert_eq!(
+        find("dup.example.org.", RecordType::A).records(),
+        [rd(RecordType::A, "192.0.2.7")]
+    );
+    assert_eq!(
+        find("mx.example.org.", RecordType::MX).records(),
+        [rd(RecordType::MX, "10 dup.example.org.")]
+    );
+    let dname = find("dname.example.org.", RecordType::DNAME).records();
+    assert_eq!(dname.len(), 1);
+    assert!(!dname[0].is_canonical());
+    assert_eq!(dname[0].as_str(), "\\# 6 03737562c00c");
+}
+
+/// Every way a transfer can fail ends the listing with an error and no records: a forged MAC in
+/// a middle message, an unsigned last message, 100 unsigned messages in a row (99 are
+/// accepted), a stream cut after the first message, a closing SOA with another serial, an
+/// oversized length prefix, a record of another class, a refusal, a zone the server does not
+/// serve, TSIG errors, SERVFAIL, and a zone without its SOA. Transient failures are repeated
+/// up to three times, the others are not. No error text holds the secret or a MAC.
+#[tokio::test]
+async fn rfc2136_listing_failures() {
+    let mock = Rfc2136Mock::start(canary_seed()).await;
+    let control = mock.control();
+    let ctx = context();
+    let good = client_with(&mock, CANARY_KEY, CANARY_SECRET, &ctx);
+    let badsig = client_with(&mock, KEY, CANARY_SECRET, &ctx);
+    control.add_record(soa_record());
+    for i in 0..110 {
+        control.add_txt("bulk.example.org.", &format!("value-{i}"), 300);
+    }
+    let mut texts: Vec<(String, String)> = Vec::new();
+    // Runs one listing that must fail with `kind` after `attempts` transfers.
+    async fn failing(
+        mock: &Rfc2136Mock,
+        client: &Rfc2136,
+        zone: &DomainName,
+        kind: ErrorKind,
+        attempts: usize,
+        label: &str,
+        texts: &mut Vec<(String, String)>,
+    ) -> Error {
+        let before = transfers(mock);
+        let result = tokio::time::timeout(SLOW, client.list_rrsets(zone))
+            .await
+            .expect("the operation is bounded");
+        let err = result.expect_err(label);
+        assert_eq!(err.kind(), kind, "{label}: {err:?}");
+        assert_eq!(transfers(mock) - before, attempts, "{label}: attempts");
+        texts.push((label.to_owned(), format!("{err} {err:?}")));
+        err
+    }
+    let z = zone();
+
+    // The boundary of RFC 8945 section 5.3.1: 99 unsigned messages in a row pass, 100 do not.
+    control.transfer_records_per_message(1);
+    control.transfer_sign_every(100);
+    assert_eq!(list(&good).await.unwrap().rrsets.len(), 2);
+    control.transfer_sign_every(101);
+    let k = ErrorKind::Protocol;
+    let err = failing(&mock, &good, &z, k, 1, "too many unsigned", &mut texts).await;
+    assert!(err.to_string().contains("99 messages"), "{err}");
+    control.transfer_sign_every(1);
+
+    let once = [
+        (
+            "forged middle message",
+            Fault::on(Op::Query).transfer_corrupt_mac(50),
+            "does not verify",
+        ),
+        (
+            "unsigned last message",
+            Fault::on(Op::Query).transfer_unsigned_last(),
+            "last message",
+        ),
+        (
+            "record of another class",
+            Fault::on(Op::Query).extra_answer("x.example.org.", TYPE_A, 3, &[192, 0, 2, 1]),
+            "class IN",
+        ),
+    ];
+    for (label, fault, needle) in once {
+        control.push(fault);
+        let err = failing(&mock, &good, &z, ErrorKind::Protocol, 1, label, &mut texts).await;
+        assert!(err.to_string().contains(needle), "{label}: {err}");
+    }
+    // An unsigned last message is refused also when the server signs only some messages.
+    control.transfer_sign_every(3);
+    control.push(Fault::on(Op::Query).transfer_unsigned_last());
+    let label = "unsigned last of a sparse transfer";
+    failing(&mock, &good, &z, ErrorKind::Protocol, 1, label, &mut texts).await;
+    control.transfer_sign_every(1);
+
+    let repeated = [
+        (
+            "cut after the first message",
+            Fault::on(Op::Query).transfer_cut_after(1).times(3),
+        ),
+        (
+            "serial changed",
+            Fault::on(Op::Query).transfer_serial_change().times(3),
+        ),
+        (
+            "oversized length prefix",
+            Fault::on(Op::Query).transfer_oversized_length().times(3),
+        ),
+        ("servfail", Fault::on(Op::Query).rcode(SERVFAIL).times(3)),
+    ];
+    for (label, fault) in repeated {
+        control.push(fault);
+        let err = failing(&mock, &good, &z, ErrorKind::Transient, 3, label, &mut texts).await;
+        if label == "serial changed" {
+            assert!(err.to_string().contains("changed during"), "{err}");
+        }
+    }
+    // A transient failure that clears up: the second attempt lists the zone.
+    control.push(Fault::on(Op::Query).transfer_serial_change());
+    assert_eq!(list(&good).await.unwrap().rrsets.len(), 2);
+
+    control.refuse_transfers(true);
+    let k = ErrorKind::Forbidden;
+    let refused = failing(&mock, &good, &z, k, 1, "refused", &mut texts).await;
+    assert!(
+        refused.to_string().contains("transfer"),
+        "a hint about the transfer policy: {refused}"
+    );
+    control.refuse_transfers(false);
+    let other = dn("example.net");
+    let k = ErrorKind::ZoneNotFound;
+    failing(&mock, &good, &other, k, 1, "not served", &mut texts).await;
+    failing(&mock, &badsig, &z, ErrorKind::Auth, 1, "badsig", &mut texts).await;
+    control.clock_skew(1000);
+    failing(&mock, &good, &z, ErrorKind::Auth, 1, "badtime", &mut texts).await;
+    control.clock_skew(0);
+    control.push(Fault::on(Op::Query).rcode(NOTAUTH).tsig_error(BADSIG));
+    failing(
+        &mock,
+        &good,
+        &z,
+        ErrorKind::Auth,
+        1,
+        "tsig error",
+        &mut texts,
+    )
+    .await;
+    control.push(Fault::on(Op::Query).rcode(FORMERR));
+    let k = ErrorKind::Rejected;
+    let formerr = failing(&mock, &good, &z, k, 1, "formerr", &mut texts).await;
+    assert_eq!(formerr.provider_code().map(|c| c.as_str()), Some("FORMERR"));
+
+    let mut secrets = secret_spellings(CANARY_SECRET);
+    secrets.extend(mac_spellings(&control.calls()));
+    control.reset();
+    let k = ErrorKind::Transient;
+    failing(&mock, &good, &z, k, 3, "no soa", &mut texts).await;
+    secrets.extend(mac_spellings(&control.calls()));
+    for (label, text) in &texts {
+        assert_no_spelling(label, text, &secrets);
+    }
+    assert_eq!(texts.len(), 16);
 }
 
 // ---- Served over DNS ---------------------------------------------------------------------------
