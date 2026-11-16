@@ -2168,6 +2168,20 @@ async fn yandex_cloud_dotless_names_inside_values_are_non_canonical() {
             assert_eq!(read.records()[0].as_str(), provider);
             let listing = client.list_rrsets(&zone()).await.unwrap();
             assert!(listing.rrsets.contains(&read), "{rtype} {provider}");
+            // A storage round trip keeps the value non-canonical, so writing the stored set
+            // back changes nothing.
+            let round_tripped: RrSet =
+                serde_json::from_str(&serde_json::to_string(&read).unwrap()).unwrap();
+            assert_eq!(round_tripped, read, "{rtype} {provider}");
+            assert_eq!(
+                client
+                    .set_rrset(&zone(), &round_tripped, Expect::Matches(&round_tripped))
+                    .await
+                    .unwrap(),
+                SetOutcome::Unchanged,
+                "{rtype} {provider}"
+            );
+            assert_eq!(writes(&mock), 0, "{rtype} {provider}");
             let wanted = rrset(name, rtype, None, &[reading]);
             let as_read = rrset(name, rtype, Some(600), &[reading]);
             let e = client

@@ -112,11 +112,13 @@ member against the set's type: it parses the member's text with `RecordData::par
 requires the identical text, otherwise `Syntax`. That rejects MX data in an A set and data that is
 canonical for another type only. Non-canonical members are taken as they are.
 
-Equality and hashing of `RecordData` use the text and the canonical flag. Within a set the two never
-disagree: text that parses for the set's type is stored as canonical, also when it arrives as
-`{ "raw": … }` during deserialization. Deserializing a set with `raw` members is the only public way
-to obtain non-canonical data; it exists so that a listed set survives a round trip through an
-application's storage. Section 4.9 limits what a write accepts.
+Equality and hashing of `RecordData` use the text and the canonical flag. Deserialization restores
+exactly what was serialized: a `{ "raw": … }` member stays non-canonical and is never parsed,
+because a client may keep text the strict parser accepts as non-canonical where its provider's
+reading of that text is not established (section 4.9). A non-canonical value never equals a
+canonical one, also when their texts are equal. Deserializing a set with `raw` members is the only
+public way to obtain non-canonical data; it exists so that a listed set survives a round trip
+through an application's storage. Section 4.9 limits what a write accepts.
 
 `RrSet::ttl()` is `Option<RrsetTtl>`, with one meaning for reads and writes:
 

@@ -2356,7 +2356,21 @@ async fn selectel_v2_values_outside_the_documented_form_are_non_canonical() {
         assert_eq!(read.records()[0].as_str(), provider);
         let listing = client.list_rrsets(&zone()).await.unwrap();
         assert!(listing.rrsets.contains(&read), "{rtype} {provider}");
+        // A storage round trip keeps the value non-canonical, so writing the stored set back
+        // changes nothing.
+        let round_tripped: RrSet =
+            serde_json::from_str(&serde_json::to_string(&read).unwrap()).unwrap();
+        assert_eq!(round_tripped, read, "{rtype} {provider}");
         let before = writes(&mock);
+        assert_eq!(
+            client
+                .set_rrset(&zone(), &round_tripped, Expect::Matches(&round_tripped))
+                .await
+                .unwrap(),
+            SetOutcome::Unchanged,
+            "{rtype} {provider}"
+        );
+        assert_eq!(writes(&mock), before, "{rtype} {provider}");
         assert_eq!(
             client
                 .set_rrset(&zone(), &rrset(&name, rtype, None, &[wanted]), Expect::Any)

@@ -11,7 +11,8 @@ use crate::name::DomainName;
 /// Serialized as `{ "name", "type", "ttl", "records": [...] }`. `ttl` is a number of seconds,
 /// the string `"provider_default"`, or `null` (also when the key is missing) for a set that
 /// states no TTL. A canonical record is a string, parsed with [`RecordData::parse`] for the
-/// set's type; a non-canonical one is `{ "raw": text }`.
+/// set's type; a non-canonical one is `{ "raw": text }`. Deserialization restores exactly what
+/// was serialized; a `raw` member is never parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RrSet {
     name: DomainName,
@@ -176,10 +177,9 @@ impl<'de> serde::Deserialize<'de> for RrSet {
                 RecordIn::Text(text) => {
                     RecordData::parse(input.rtype, &text).map_err(D::Error::custom)?
                 }
-                // Text that parses for the set's type is stored as canonical, so equality never
-                // depends on how a value arrived.
-                RecordIn::Raw(raw) => RecordData::parse(input.rtype, &raw.raw)
-                    .unwrap_or_else(|_| RecordData::non_canonical(&raw.raw)),
+                // A raw member stays raw: the client that read it may have refused text the strict
+                // parser accepts (design section 4.9), so parsing it here could change its meaning.
+                RecordIn::Raw(raw) => RecordData::non_canonical(&raw.raw),
             };
             records.push(data);
         }

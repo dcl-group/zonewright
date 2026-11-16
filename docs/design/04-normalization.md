@@ -188,7 +188,10 @@ definition of each canonical form.
 
 A client reads provider text with a private constructor that first tries the strict parser (with the
 provider's TXT dialect and name convention). If that fails, the value is kept as the provider's
-text, trimmed of surrounding whitespace, and marked non-canonical.
+text, trimmed of surrounding whitespace, and marked non-canonical. A client may also keep text the
+strict parser accepts as non-canonical where the provider's reading of it is not established (a name
+without the trailing dot inside a value, text with a backslash); such a value stays non-canonical
+through a storage round trip.
 
 - `is_canonical()` is false; `to_wire` and the typed `from_data` fail with `NotCanonical`.
 - It still compares by text, so an application sees it as a distinct value and a listing never fails

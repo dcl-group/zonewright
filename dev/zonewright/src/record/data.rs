@@ -74,7 +74,9 @@ impl RecordData {
         self.canonical
     }
 
-    /// Provider text that could not be parsed, kept trimmed of surrounding whitespace.
+    /// Text kept as it is instead of in canonical form, trimmed of surrounding whitespace: text
+    /// the strict parser refused, text a client chose not to parse, or a `raw` member of a
+    /// deserialized set.
     pub(crate) fn non_canonical(text: &str) -> RecordData {
         RecordData {
             text: text.trim().to_owned(),

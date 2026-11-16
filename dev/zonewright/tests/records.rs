@@ -1435,15 +1435,31 @@ fn rrset_serde_raw_members() {
     assert!(json.contains(r#"{"raw":"odd provider text"}"#), "{json}");
     assert_eq!(set_json(&json), set);
 
-    // Raw text that parses for the type is stored as canonical.
-    let parsed = set_json(
+    // Raw text that parses for the type stays raw: it is never parsed on deserialization.
+    let kept = set_json(
         r#"{"name":"example.org.","type":"MX","ttl":null,"records":[{"raw":"10 MAIL.example.org"}]}"#,
     );
-    assert!(parsed.records()[0].is_canonical());
-    assert_eq!(
-        parsed.records()[0],
+    assert!(!kept.records()[0].is_canonical());
+    assert_eq!(kept.records()[0].as_str(), "10 MAIL.example.org");
+    assert_ne!(
+        kept.records()[0],
         parse(RecordType::MX, "10 mail.example.org.")
     );
+    assert_eq!(set_json(&serde_json::to_string(&kept).unwrap()), kept);
+
+    // The same for a dotless CNAME target, the shape a client keeps non-canonical on purpose.
+    let cname = set_json(
+        r#"{"name":"www.example.org.","type":"CNAME","ttl":300,"records":[{"raw":"mail.example.org"}]}"#,
+    );
+    assert!(!cname.records()[0].is_canonical());
+    assert_eq!(cname.records()[0].as_str(), "mail.example.org");
+    assert_ne!(
+        cname.records()[0],
+        parse(RecordType::CNAME, "mail.example.org.")
+    );
+    let json = serde_json::to_string(&cname).unwrap();
+    assert!(json.contains(r#"{"raw":"mail.example.org"}"#), "{json}");
+    assert_eq!(set_json(&json), cname);
 
     // A raw value and the canonical value with the same text are distinct.
     let mixed = set_json(

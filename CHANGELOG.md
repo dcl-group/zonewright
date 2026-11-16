@@ -25,6 +25,10 @@ All notable changes to this crate are recorded in this file. The format follows
   accepted and its outcome is unknown), not `Error::Protocol`.
 - Route 53: the TXT value read asks for two rrsets and refuses a name where a second set shares the
   name and type of a plain-looking one, as the record-level read already did.
+- A `{ "raw": … }` member of a deserialized `RrSet` stays non-canonical instead of being parsed. A
+  stored set that a client read with non-canonical values now equals a fresh read, and writing it
+  back no longer replaces those records. A hand-written `raw` member whose text parses is no longer
+  turned into canonical data.
 
 ## 0.1.0 - 2026-11-16
 
