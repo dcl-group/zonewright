@@ -66,12 +66,30 @@
 //!   a client that relied on it); its page token is an offset, and any other token is `400`.
 //!
 //! Error texts are invented.
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`YandexCloudMock::changes`], and a [`link`](crate::link::link) serves them over DNS. An
+//! `updateRecordSets` is published when the mock applies it, which is when it is accepted (see
+//! above): polling its operation changes nothing, and a call refused or set to fail publishes
+//! nothing. Only public zones are published; a private zone is answered only inside the cloud
+//! networks it is bound to, so it and its record sets are left out. Left out as well: ANAME
+//! sets, which the provider answers with the addresses of their target, which the mock does not
+//! resolve, and a set whose owner name is outside its zone (possible only through
+//! [`Control::insert_rrset`]). The published form of a set: its absolute owner name; the TTL as
+//! a number; a name inside a CNAME, NS, PTR, MX, SRV, SVCB or HTTPS value made absolute, `@` as
+//! the zone and a name without the trailing dot read as absolute and given the dot (the record
+//! types page writes such names, for ANAME and MX, without the dot and means them absolute); a
+//! TXT value as quoted character-strings, an unquoted value split at its spaces into several
+//! strings (the page's master-file rule) and every string of more than 255 octets split into
+//! 255-octet chunks ("Chunks longer than 255 characters are split automatically"); any other
+//! value as stored. [`Control::reset`] returns the mock to its seed.
 
 // Handlers return finished HTTP answers as their error values and hand them straight to axum;
 // boxing them would only add noise.
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -89,7 +107,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 
-use crate::MockServer;
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, MockServer, RequestLog};
 
 /// Path of the DNS API below the server's base URL.
 pub const DNS_PATH: &str = "/dns/v1";
@@ -313,7 +332,11 @@ struct Op {
 
 #[derive(Debug)]
 struct Inner {
+    /// The seed the mock was started with, for [`Control::reset`].
+    original: Seed,
+    /// The seed in force; [`Control::set_token_ttl`] changes it.
     seed: Seed,
+    changes: Changes,
     iam_url: String,
     zones: Vec<Zone>,
     rrsets: Vec<RecordSet>,
@@ -330,10 +353,147 @@ struct Inner {
 }
 
 impl Inner {
+    /// The state of a mock started with `seed`; `iam_url` is the `aud` the token endpoint
+    /// requires.
+    fn new(seed: Seed, changes: Changes, iam_url: String) -> Inner {
+        let mut inner = Inner {
+            original: seed.clone(),
+            seed: seed.clone(),
+            changes,
+            iam_url,
+            zones: Vec::new(),
+            rrsets: Vec::new(),
+            tokens: HashMap::new(),
+            issued: Vec::new(),
+            operations: HashMap::new(),
+            operation_polls: 1,
+            fail_next_operation: None,
+            strict_failure: StrictFailure::Http,
+            page_size: None,
+            record_page_size: None,
+            listing_names: ListingNames::Absolute,
+            next_id: 0,
+        };
+        for zone in &seed.zones {
+            let id = inner.new_id("dnszone");
+            inner.zones.push(Zone {
+                id,
+                zone: fqdn(&zone.zone),
+                public: zone.public,
+            });
+        }
+        inner
+    }
+
+    /// What a DNS server for the mock's public zones would answer (module documentation).
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        for zone in self.zones.iter().filter(|z| z.public) {
+            out.zone(&zone.zone);
+        }
+        for set in &self.rrsets {
+            let Some(zone) = self.zones.iter().find(|z| z.id == set.zone_id && z.public) else {
+                continue;
+            };
+            let inside = set.name == zone.zone || set.name.ends_with(&format!(".{}", zone.zone));
+            if !inside || set.rtype == "ANAME" {
+                continue;
+            }
+            let values = set
+                .data
+                .iter()
+                .map(|d| published_value(&set.rtype, d, &zone.zone))
+                .collect();
+            out.rrset(
+                &zone.zone,
+                &set.name,
+                &set.rtype,
+                set.ttl.parse::<u32>().ok(),
+                values,
+            );
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+
     fn new_id(&mut self, prefix: &str) -> String {
         self.next_id += 1;
         format!("{prefix}{:012}", self.next_id)
     }
+}
+
+/// A data element in zone-file text form (module documentation).
+fn published_value(rtype: &str, data: &str, zone: &str) -> String {
+    let host = |name: &str| {
+        if name == "@" {
+            zone.to_owned()
+        } else if name.ends_with('.') {
+            name.to_owned()
+        } else {
+            format!("{name}.")
+        }
+    };
+    let fields: Vec<&str> = data.split(' ').collect();
+    match (rtype, fields.as_slice()) {
+        ("CNAME" | "NS" | "PTR", [target]) => host(target),
+        ("MX", [preference, exchange]) => format!("{preference} {}", host(exchange)),
+        ("SRV", [priority, weight, port, target]) => {
+            format!("{priority} {weight} {port} {}", host(target))
+        }
+        ("SVCB" | "HTTPS", [priority, target, params @ ..]) => {
+            let mut out = format!("{priority} {}", host(target));
+            for param in params {
+                out.push(' ');
+                out.push_str(param);
+            }
+            out
+        }
+        ("TXT", _) => txt_value(data),
+        _ => data.to_owned(),
+    }
+}
+
+/// A TXT data element as quoted character-strings of at most 255 octets each: quoted strings
+/// as they are (split when longer), unquoted text split at its spaces.
+fn txt_value(data: &str) -> String {
+    let strings: Vec<&str> = if data.starts_with('"') {
+        // The API's quoted form (see `check_txt`): strings in double quotes separated by spaces.
+        data.split('"')
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, s)| s)
+            .collect()
+    } else {
+        data.split(' ').filter(|s| !s.is_empty()).collect()
+    };
+    let mut out = Vec::new();
+    for string in strings {
+        let bytes = string.as_bytes();
+        if bytes.is_empty() {
+            out.push("\"\"".to_owned());
+        }
+        for chunk in bytes.chunks(255) {
+            let mut text = String::from("\"");
+            for &byte in chunk {
+                match byte {
+                    b'"' | b'\\' => {
+                        text.push('\\');
+                        text.push(char::from(byte));
+                    }
+                    0x20..=0x7e => text.push(char::from(byte)),
+                    _ => text.push_str(&format!("\\{byte:03}")),
+                }
+            }
+            text.push('"');
+            out.push(text);
+        }
+    }
+    out.join(" ")
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -356,6 +516,9 @@ pub struct YandexCloudMock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for YandexCloudMock {
@@ -367,45 +530,30 @@ impl Deref for YandexCloudMock {
 }
 
 impl YandexCloudMock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let mut inner = Inner {
-            seed: seed.clone(),
-            iam_url: String::new(),
-            zones: Vec::new(),
-            rrsets: Vec::new(),
-            tokens: HashMap::new(),
-            issued: Vec::new(),
-            operations: HashMap::new(),
-            operation_polls: 1,
-            fail_next_operation: None,
-            strict_failure: StrictFailure::Http,
-            page_size: None,
-            record_page_size: None,
-            listing_names: ListingNames::Absolute,
-            next_id: 0,
-        };
-        for zone in &seed.zones {
-            let id = inner.new_id("dnszone");
-            inner.zones.push(Zone {
-                id,
-                zone: fqdn(&zone.zone),
-                public: zone.public,
-            });
-        }
-        let state = Arc::new(Mutex::new(inner));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone(), String::new())));
         let router = Router::new()
             .route(IAM_PATH, post(iam_token))
             .route("/dns/v1/zones", get(zones_list))
             .route("/dns/v1/zones/{zone}", get(zone_get).post(zone_post))
             .route("/operations/{id}", get(operation_get))
             .with_state(state.clone());
-        let server = MockServer::start(router).await;
+        let server = MockServer::start_on(addr, router).await;
         lock(&state).iam_url = server.url(IAM_PATH);
-        Self {
-            server,
-            control: Control { state },
-        }
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The DNS API endpoint, for the client's `dns_url`.
@@ -429,7 +577,41 @@ impl YandexCloudMock {
     }
 }
 
+impl ChangeSource for YandexCloudMock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its zones under their first
+    /// identifiers, no record sets, no issued tokens, the token lifetime of the seed, no pending
+    /// operations, one poll per operation, no pending operation failure, failed conditions
+    /// refused over HTTP, no page sizes, absolute listing names, an empty request log and no
+    /// pending faults. Reports the removal of every rrset that was published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.original.clone();
+            let iam_url = inner.iam_url.clone();
+            *inner = Inner::new(seed, inner.changes.clone(), iam_url);
+        });
+        self.log.clear();
+    }
+
     /// Every zone.
     pub fn zones(&self) -> Vec<Zone> {
         lock(&self.state).zones.clone()
@@ -452,29 +634,31 @@ impl Control {
 
     /// Adds a zone to the folder; returns its identifier.
     pub fn insert_zone(&self, zone: &str, public: bool) -> String {
-        let mut inner = lock(&self.state);
-        let id = inner.new_id("dnszone");
-        inner.zones.push(Zone {
-            id: id.clone(),
-            zone: fqdn(zone),
-            public,
-        });
-        id
+        self.change(|inner| {
+            let id = inner.new_id("dnszone");
+            inner.zones.push(Zone {
+                id: id.clone(),
+                zone: fqdn(zone),
+                public,
+            });
+            id
+        })
     }
 
     /// Deletes the public zone `zone` and creates it again under a new identifier, with the
     /// same record sets. Returns the new identifier.
     pub fn recreate_zone(&self, zone: &str) -> String {
         let old = self.zone_id(zone);
-        let mut inner = lock(&self.state);
-        let new = inner.new_id("dnszone");
-        for z in inner.zones.iter_mut().filter(|z| z.id == old) {
-            z.id = new.clone();
-        }
-        for r in inner.rrsets.iter_mut().filter(|r| r.zone_id == old) {
-            r.zone_id = new.clone();
-        }
-        new
+        self.change(|inner| {
+            let new = inner.new_id("dnszone");
+            for z in inner.zones.iter_mut().filter(|z| z.id == old) {
+                z.id = new.clone();
+            }
+            for r in inner.rrsets.iter_mut().filter(|r| r.zone_id == old) {
+                r.zone_id = new.clone();
+            }
+            new
+        })
     }
 
     /// Every record set.
@@ -505,17 +689,18 @@ impl Control {
     pub fn insert_rrset(&self, zone: &str, name: &str, rtype: &str, ttl: &str, data: &[&str]) {
         let zone_id = self.zone_id(zone);
         let name = fqdn(name);
-        let mut inner = lock(&self.state);
-        inner
-            .rrsets
-            .retain(|r| !(r.zone_id == zone_id && r.name == name && r.rtype == rtype));
-        inner.rrsets.push(RecordSet {
-            zone_id,
-            name,
-            rtype: rtype.to_owned(),
-            ttl: ttl.to_owned(),
-            data: data.iter().map(|d| (*d).to_owned()).collect(),
-            description: None,
+        self.change(|inner| {
+            inner
+                .rrsets
+                .retain(|r| !(r.zone_id == zone_id && r.name == name && r.rtype == rtype));
+            inner.rrsets.push(RecordSet {
+                zone_id,
+                name,
+                rtype: rtype.to_owned(),
+                ttl: ttl.to_owned(),
+                data: data.iter().map(|d| (*d).to_owned()).collect(),
+                description: None,
+            });
         });
     }
 
@@ -538,22 +723,26 @@ impl Control {
     pub fn set_description(&self, zone: &str, name: &str, rtype: &str, description: Option<&str>) {
         let zone_id = self.zone_id(zone);
         let name = fqdn(name);
-        for r in lock(&self.state)
-            .rrsets
-            .iter_mut()
-            .filter(|r| r.zone_id == zone_id && r.name == name && r.rtype == rtype)
-        {
-            r.description = description.map(str::to_owned);
-        }
+        self.change(|inner| {
+            for r in inner
+                .rrsets
+                .iter_mut()
+                .filter(|r| r.zone_id == zone_id && r.name == name && r.rtype == rtype)
+            {
+                r.description = description.map(str::to_owned);
+            }
+        });
     }
 
     /// Deletes a record set directly, as another writer would.
     pub fn delete_rrset(&self, zone: &str, name: &str, rtype: &str) {
         let zone_id = self.zone_id(zone);
         let name = fqdn(name);
-        lock(&self.state)
-            .rrsets
-            .retain(|r| !(r.zone_id == zone_id && r.name == name && r.rtype == rtype));
+        self.change(|inner| {
+            inner
+                .rrsets
+                .retain(|r| !(r.zone_id == zone_id && r.name == name && r.rtype == rtype));
+        });
     }
 
     /// Revokes every token issued so far: requests with them answer `401`.
@@ -1056,7 +1245,9 @@ async fn zone_post(
         error_of_operation = Some((code, message.to_owned()));
     }
     if error_of_operation.is_none() {
+        let before = inner.published();
         inner.rrsets = next;
+        inner.report(&before, Origin::Api);
     }
     let id = inner.new_id("dnsop");
     let polls = inner.operation_polls;

@@ -3404,3 +3404,126 @@ async fn yandex_360_listing_whose_total_changes_is_protocol() {
     let e = client.list_rrsets(&zone()).await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
 }
+
+// ---- Link to the DNS mock ----------------------------------------------------------------------
+
+#[cfg(feature = "inspector")]
+mod dns_link {
+    use serde_json::json;
+    use zonewright::{Expect, Provider, RecordType};
+    use zonewright_mock::changes::ChangeSource;
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+
+    use super::{NAME, add, rr, setup, zone};
+    use crate::common::link::{ask, is_absent, rd, txt, txt_round_trip, values};
+
+    /// A value written through the client is served over DNS; the single records of one name and
+    /// type are served as one rrset.
+    #[tokio::test]
+    async fn yandex_360_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = txt_round_trip(&mock, &client, &dns).await;
+
+        add(&client, "first").await.unwrap();
+        add(&client, "second").await.unwrap();
+        link.settled().await;
+        assert_eq!(mock.control().txt_records(NAME).len(), 2);
+        let mut served = values(ask(dns.addr(), NAME, RecordType::TXT).await);
+        served.sort_by_key(ToString::to_string);
+        assert_eq!(served, [txt("first"), txt("second")]);
+        assert_eq!(link.skipped(), 0);
+    }
+
+    /// Host names, stored with or without the trailing dot, are served fully qualified; a domain
+    /// that is not delegated, and NS records, are not published.
+    #[tokio::test]
+    async fn yandex_360_names_in_values_are_served_fully_qualified() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        for set in [
+            rr(
+                "alias.example.org",
+                RecordType::CNAME,
+                Some(300),
+                &["target.example.net."],
+            ),
+            rr(
+                "example.org",
+                RecordType::MX,
+                Some(300),
+                &["10 mx.example.org."],
+            ),
+        ] {
+            client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
+        }
+        let control = mock.control();
+        control.insert_fields(
+            "example.org",
+            "www",
+            "CNAME",
+            json!({"target": "web.example.net"}),
+            300,
+        );
+        control.insert_fields(
+            "example.org",
+            "mail",
+            "MX",
+            json!({"exchange": "mx2.example.org", "preference": 20}),
+            300,
+        );
+        control.insert_record("example.org", "sub", "NS", "ns1.example.net.", 300);
+        control.insert_domain("parked.example.net", false);
+        control.insert_record("parked.example.net", "www", "TXT", "hidden", 300);
+        link.settled().await;
+        assert_eq!(link.skipped(), 0);
+        for (name, rtype, text) in [
+            (
+                "alias.example.org",
+                RecordType::CNAME,
+                "target.example.net.",
+            ),
+            ("example.org", RecordType::MX, "10 mx.example.org."),
+            ("www.example.org", RecordType::CNAME, "web.example.net."),
+            ("mail.example.org", RecordType::MX, "20 mx2.example.org."),
+        ] {
+            assert_eq!(
+                values(ask(dns.addr(), name, rtype).await),
+                [rd(rtype, text)],
+                "{name} {rtype}"
+            );
+        }
+        let published = mock.published();
+        assert_eq!(published.zones, ["example.org"]);
+        assert!(published.rrsets.iter().all(|c| c.rtype != "NS"));
+    }
+
+    /// `reset` returns the mock to its seed: the record is gone from the mock and from DNS, the
+    /// request log is empty, and the client works again.
+    #[tokio::test]
+    async fn yandex_360_reset_returns_the_mock_to_its_seed() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        add(&client, "before-reset").await.unwrap();
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("before-reset")]
+        );
+        mock.control().reset();
+        link.settled().await;
+        assert!(mock.control().records().is_empty());
+        assert!(mock.log().is_empty());
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+        add(&client, "after-reset").await.unwrap();
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("after-reset")]
+        );
+    }
+}

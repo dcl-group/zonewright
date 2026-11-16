@@ -74,9 +74,24 @@
 //! // ... drive the client against mock.base_url() ...
 //! assert_eq!(mock.control().txt_values("_acme-challenge.example.org"), ["v1"]);
 //! ```
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`Yandex360Mock::changes`], the records of one name and type grouped into one rrset, and a
+//! [`link`](crate::link::link) serves them over DNS. Only delegated domains are published: the
+//! provider's name servers answer for a domain delegated to them, and a domain that is not is
+//! left out with its records. The published form of a record: the owner name made absolute (`@`
+//! is the domain; a stored name is relative, also one that repeats the domain); A and AAAA the
+//! `address`; CNAME the `target`, MX `<preference> <exchange>`, SRV
+//! `<priority> <weight> <port> <target>`, each host name read as absolute with or without the
+//! trailing dot (as the client reads it) and published with the dot; TXT the `text`, as it is
+//! when it is quoted and as one quoted value (in 255-octet character-strings) otherwise, the
+//! rule by which the client reads it; CAA `<flag> <tag> <value>`. Left out: NS records, whose
+//! value field no page names, and a record that lacks a field of its type (possible only
+//! through the control handle). [`Control::reset`] returns the mock to its seed.
 
 #![allow(clippy::result_large_err)]
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -87,7 +102,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::{Map, Value, json};
 
-use crate::MockServer;
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, MockServer, RequestLog};
 
 /// The organization the standard seed accepts.
 pub const ORG_ID: &str = "7654321";
@@ -195,6 +211,9 @@ const CAA_FIELDS: &[&str] = &["flag", "tag", "value"];
 
 #[derive(Debug)]
 struct Inner {
+    /// The seed the mock was started with, for [`Control::reset`].
+    seed: Seed,
+    changes: Changes,
     org_id: String,
     token: String,
     domains: Vec<(String, bool)>,
@@ -203,6 +222,126 @@ struct Inner {
     /// Caps `perPage`, to force small pages.
     page_cap: Option<usize>,
     name_form: NameForm,
+}
+
+impl Inner {
+    /// The state of a mock started with `seed`.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        Inner {
+            org_id: seed.org_id.clone(),
+            token: seed.token.clone(),
+            domains: seed.domains.clone(),
+            seed,
+            changes,
+            records: Vec::new(),
+            next_id: 1000,
+            page_cap: None,
+            name_form: NameForm::Relative,
+        }
+    }
+
+    /// What a DNS server for the mock's delegated domains would answer (module documentation).
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        let delegated = |domain: &str| self.domains.iter().any(|(d, on)| d == domain && *on);
+        for (domain, _) in self.domains.iter().filter(|(_, on)| *on) {
+            out.zone(domain);
+        }
+        for record in &self.records {
+            if !delegated(&record.domain) {
+                continue;
+            }
+            let Some(value) = published_value(record) else {
+                continue;
+            };
+            let owner = if record.name == "@" {
+                record.domain.clone()
+            } else {
+                format!("{}.{}", record.name, record.domain)
+            };
+            out.record(
+                &record.domain,
+                &owner,
+                &record.rtype,
+                Some(record.ttl),
+                value,
+            );
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+}
+
+/// The value of `record` in zone-file text form (module documentation); `None` for a record the
+/// mock does not publish.
+fn published_value(record: &Record) -> Option<String> {
+    let host = |key: &str| {
+        let name = record.field(key)?;
+        Some(if name.ends_with('.') {
+            name.to_owned()
+        } else {
+            format!("{name}.")
+        })
+    };
+    let number = |key: &str| record.number(key);
+    Some(match record.rtype.as_str() {
+        "A" | "AAAA" => record.field("address")?.to_owned(),
+        "CNAME" => host("target")?,
+        "MX" => format!("{} {}", number("preference")?, host("exchange")?),
+        "SRV" => format!(
+            "{} {} {} {}",
+            number("priority")?,
+            number("weight")?,
+            number("port")?,
+            host("target")?
+        ),
+        "CAA" => format!(
+            "{} {} {}",
+            number("flag")?,
+            record.field("tag")?,
+            record.field("value")?
+        ),
+        "TXT"
+            if record.text.len() >= 2
+                && record.text.starts_with('"')
+                && record.text.ends_with('"') =>
+        {
+            record.text.clone()
+        }
+        "TXT" => character_strings(&record.text),
+        _ => return None,
+    })
+}
+
+/// `text` as quoted character-strings of at most 255 octets each (RFC 1035 section 5.1): `"`
+/// and `\` escaped with a backslash, any octet outside printable ASCII as `\DDD`.
+fn character_strings(text: &str) -> String {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return "\"\"".to_owned();
+    }
+    let mut out = Vec::new();
+    for chunk in bytes.chunks(255) {
+        let mut string = String::from("\"");
+        for &byte in chunk {
+            match byte {
+                b'"' | b'\\' => {
+                    string.push('\\');
+                    string.push(char::from(byte));
+                }
+                0x20..=0x7e => string.push(char::from(byte)),
+                _ => string.push_str(&format!("\\{byte:03}")),
+            }
+        }
+        string.push('"');
+        out.push(string);
+    }
+    out.join(" ")
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -225,6 +364,9 @@ pub struct Yandex360Mock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for Yandex360Mock {
@@ -236,17 +378,15 @@ impl Deref for Yandex360Mock {
 }
 
 impl Yandex360Mock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let state = Arc::new(Mutex::new(Inner {
-            org_id: seed.org_id,
-            token: seed.token,
-            domains: seed.domains,
-            records: Vec::new(),
-            next_id: 1000,
-            page_cap: None,
-            name_form: NameForm::Relative,
-        }));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new()
             .route("/directory/v1/org/{org}/domains", get(domains_list))
             .route(
@@ -258,10 +398,14 @@ impl Yandex360Mock {
                 post(record_edit).delete(record_delete),
             )
             .with_state(state.clone());
-        Self {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The API endpoint, for the client's `base_url`.
@@ -275,7 +419,39 @@ impl Yandex360Mock {
     }
 }
 
+impl ChangeSource for Yandex360Mock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its organization, token and domains, no
+    /// records, record identifiers from 1001 again, no page cap, relative names in listings, an
+    /// empty request log and no pending faults. Reports the removal of every rrset that was
+    /// published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.seed.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// Every record, in creation order.
     pub fn records(&self) -> Vec<Record> {
         lock(&self.state).records.clone()
@@ -367,12 +543,7 @@ impl Control {
             Some(Value::String(text)) => text,
             _ => String::new(),
         };
-        let id = self.insert(domain, "@", rtype, text, fields, ttl);
-        let mut inner = lock(&self.state);
-        if let Some(record) = inner.records.iter_mut().find(|r| r.id == id) {
-            record.name = name.to_lowercase();
-        }
-        id
+        self.insert_stored(domain, name.to_lowercase(), rtype, text, fields, ttl)
     }
 
     fn insert(
@@ -384,43 +555,56 @@ impl Control {
         fields: Map<String, Value>,
         ttl: u32,
     ) -> u64 {
-        let mut inner = lock(&self.state);
-        inner.next_id += 1;
-        let id = inner.next_id;
-        inner.records.push(Record {
-            id,
-            domain: domain.to_owned(),
-            name: relative(name, domain),
-            rtype: rtype.to_owned(),
-            text,
-            fields,
-            ttl,
-        });
-        id
+        self.insert_stored(domain, relative(name, domain), rtype, text, fields, ttl)
+    }
+
+    /// Adds a record under the stored (relative) name `name`.
+    fn insert_stored(
+        &self,
+        domain: &str,
+        name: String,
+        rtype: &str,
+        text: String,
+        fields: Map<String, Value>,
+        ttl: u32,
+    ) -> u64 {
+        self.change(|inner| {
+            inner.next_id += 1;
+            let id = inner.next_id;
+            inner.records.push(Record {
+                id,
+                domain: domain.to_owned(),
+                name,
+                rtype: rtype.to_owned(),
+                text,
+                fields,
+                ttl,
+            });
+            id
+        })
     }
 
     /// Deletes the record `id` directly, as another writer would.
     pub fn delete_record(&self, id: u64) {
-        lock(&self.state).records.retain(|r| r.id != id);
+        self.change(|inner| inner.records.retain(|r| r.id != id));
     }
 
     /// Adds a domain, delegated or not.
     pub fn insert_domain(&self, domain: &str, delegated: bool) {
-        lock(&self.state)
-            .domains
-            .push((domain.to_owned(), delegated));
+        self.change(|inner| inner.domains.push((domain.to_owned(), delegated)));
     }
 
     /// Deletes `domain` with its records and creates it again with the same records under new
     /// identifiers.
     pub fn recreate_domain(&self, domain: &str) {
-        let mut inner = lock(&self.state);
-        let mut next = inner.next_id;
-        for record in inner.records.iter_mut().filter(|r| r.domain == domain) {
-            next += 1;
-            record.id = next;
-        }
-        inner.next_id = next;
+        self.change(|inner| {
+            let mut next = inner.next_id;
+            for record in inner.records.iter_mut().filter(|r| r.domain == domain) {
+                next += 1;
+                record.id = next;
+            }
+            inner.next_id = next;
+        });
     }
 
     /// Caps `perPage` at `cap`, so that listings come in small pages.
@@ -735,7 +919,9 @@ async fn record_create(
         ttl: written.ttl,
     };
     let created = record_json(&record, inner.name_form);
+    let before = inner.published();
     inner.records.push(record);
+    inner.report(&before, Origin::Api);
     axum::Json(created).into_response()
 }
 
@@ -757,6 +943,7 @@ async fn record_edit(
         Err(response) => return response,
     };
     let form = inner.name_form;
+    let before = inner.published();
     let Some(record) = inner
         .records
         .iter_mut()
@@ -769,7 +956,9 @@ async fn record_edit(
     record.text = written.text;
     record.fields = written.fields;
     record.ttl = written.ttl;
-    axum::Json(record_json(record, form)).into_response()
+    let answer = record_json(record, form);
+    inner.report(&before, Origin::Api);
+    axum::Json(answer).into_response()
 }
 
 async fn record_delete(
@@ -784,6 +973,7 @@ async fn record_delete(
     let Ok(id) = id.parse::<u64>() else {
         return bad_request("recordId is not a number");
     };
+    let published = inner.published();
     let before = inner.records.len();
     inner
         .records
@@ -791,5 +981,6 @@ async fn record_delete(
     if inner.records.len() == before {
         return not_found();
     }
+    inner.report(&published, Origin::Api);
     axum::Json(json!({})).into_response()
 }

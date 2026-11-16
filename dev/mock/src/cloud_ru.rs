@@ -69,12 +69,27 @@
 //!
 //! A test holds a [`CloudRuMock`]. It dereferences to the [`MockServer`], so the request log and
 //! the fault queue of the shared harness work as usual.
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`CloudRuMock::changes`], and a [`link`](crate::link::link) serves them over DNS. A write is
+//! published when the mock applies it, which is when it is accepted (see above): polling its
+//! operation changes nothing, and a write whose operation is set to fail publishes nothing. Every
+//! zone of every project is published, read-only ones too, and so are read-only records: the flag
+//! refuses writes through the API and does not change what the name servers answer. Left out: a
+//! record with GSLB links (`gslbData` with a non-empty `links` list), whose answer depends on the
+//! health of its links and the balancing policy, which the mock does not model; `gslbData`
+//! without links leaves a record plain. The published form of a record: the owner name, `*.`
+//! before it for a wildcard record; the type in upper case (`spf` as `SPF`); a name inside a
+//! CNAME, NS, MX or SRV value, which the API writes without the trailing dot, with the dot added;
+//! a TXT or SPF value as quoted character-strings of at most 255 octets each; any other value as
+//! stored. [`Control::reset`] returns the mock to its seed.
 
 // Handlers return finished HTTP answers as their error values and hand them straight to axum;
 // boxing them would only add noise.
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -86,7 +101,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::{Map, Value, json};
 
-use crate::MockServer;
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, MockServer, RequestLog};
 
 /// Path of the token endpoint below the server's base URL.
 pub const IAM_PATH: &str = "/api/v1/auth/token";
@@ -191,7 +207,11 @@ struct Operation {
 
 #[derive(Debug)]
 struct Inner {
+    /// The seed the mock was started with, for [`Control::reset`].
+    original: Seed,
+    /// The seed in force; [`Control::set_token_expires_in`] changes it.
     seed: Seed,
+    changes: Changes,
     zones: Vec<Zone>,
     records: Vec<Record>,
     tokens: HashMap<String, bool>,
@@ -205,6 +225,75 @@ struct Inner {
 }
 
 impl Inner {
+    /// The state of a mock started with `seed`.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        let mut inner = Inner {
+            original: seed.clone(),
+            seed: seed.clone(),
+            changes,
+            zones: Vec::new(),
+            records: Vec::new(),
+            tokens: HashMap::new(),
+            issued: Vec::new(),
+            operations: HashMap::new(),
+            polls_before_done: 1,
+            fail_next: None,
+            name_style: NameStyle::Relative,
+            page_size_cap: None,
+            next_id: 0,
+        };
+        for zone in &seed.zones {
+            let id = inner.new_id();
+            inner.zones.push(Zone {
+                id,
+                project_id: seed.project_id.clone(),
+                domain: fqdn(zone),
+                read_only: false,
+            });
+        }
+        inner
+    }
+
+    /// What a DNS server for the mock's zones would answer (module documentation).
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        for zone in &self.zones {
+            out.zone(&zone.domain);
+        }
+        for record in &self.records {
+            let Some(zone) = self.zone(&record.zone_id) else {
+                continue;
+            };
+            if has_gslb_links(record) {
+                continue;
+            }
+            let owner = if record.wildcard {
+                format!("*.{}", record.owner)
+            } else {
+                record.owner.clone()
+            };
+            let values = record
+                .values
+                .iter()
+                .map(|v| published_value(&record.rtype, v))
+                .collect();
+            out.rrset(
+                &zone.domain,
+                &owner,
+                &record.rtype,
+                u32::try_from(record.ttl).ok(),
+                values,
+            );
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+
     /// A new identifier in the UUID form the provider uses.
     fn new_id(&mut self) -> String {
         self.next_id += 1;
@@ -232,6 +321,63 @@ impl Inner {
     }
 }
 
+/// The record carries GSLB links: `gslbData` with a non-empty `links` list.
+fn has_gslb_links(record: &Record) -> bool {
+    record
+        .gslb
+        .as_ref()
+        .and_then(|g| g.get("links"))
+        .and_then(Value::as_array)
+        .is_some_and(|links| !links.is_empty())
+}
+
+/// A value in the API's text form as zone-file text (module documentation).
+fn published_value(rtype: &str, value: &str) -> String {
+    let host = |name: &str| {
+        if name.ends_with('.') {
+            name.to_owned()
+        } else {
+            format!("{name}.")
+        }
+    };
+    let fields: Vec<&str> = value.split(' ').collect();
+    match (rtype, fields.as_slice()) {
+        ("cname" | "ns", [target]) => host(target),
+        ("mx", [preference, exchange]) => format!("{preference} {}", host(exchange)),
+        ("srv", [priority, weight, port, target]) => {
+            format!("{priority} {weight} {port} {}", host(target))
+        }
+        ("txt" | "spf", _) => character_strings(value),
+        _ => value.to_owned(),
+    }
+}
+
+/// `text` as quoted character-strings of at most 255 octets each (RFC 1035 section 5.1): `"`
+/// and `\` escaped with a backslash, any octet outside printable ASCII as `\DDD`.
+fn character_strings(text: &str) -> String {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return "\"\"".to_owned();
+    }
+    let mut out = Vec::new();
+    for chunk in bytes.chunks(255) {
+        let mut string = String::from("\"");
+        for &byte in chunk {
+            match byte {
+                b'"' | b'\\' => {
+                    string.push('\\');
+                    string.push(char::from(byte));
+                }
+                0x20..=0x7e => string.push(char::from(byte)),
+                _ => string.push_str(&format!("\\{byte:03}")),
+            }
+        }
+        string.push('"');
+        out.push(string);
+    }
+    out.join(" ")
+}
+
 type Shared = Arc<Mutex<Inner>>;
 
 fn lock(state: &Shared) -> MutexGuard<'_, Inner> {
@@ -252,6 +398,9 @@ pub struct CloudRuMock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for CloudRuMock {
@@ -263,31 +412,15 @@ impl Deref for CloudRuMock {
 }
 
 impl CloudRuMock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let mut inner = Inner {
-            seed: seed.clone(),
-            zones: Vec::new(),
-            records: Vec::new(),
-            tokens: HashMap::new(),
-            issued: Vec::new(),
-            operations: HashMap::new(),
-            polls_before_done: 1,
-            fail_next: None,
-            name_style: NameStyle::Relative,
-            page_size_cap: None,
-            next_id: 0,
-        };
-        for zone in &seed.zones {
-            let id = inner.new_id();
-            inner.zones.push(Zone {
-                id,
-                project_id: seed.project_id.clone(),
-                domain: fqdn(zone),
-                read_only: false,
-            });
-        }
-        let state = Arc::new(Mutex::new(inner));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new()
             .route(IAM_PATH, post(token))
             .route("/v1/publicZonesSole", get(zones_list))
@@ -301,10 +434,14 @@ impl CloudRuMock {
             )
             .route("/v1/operations/{id}", get(operation_get))
             .with_state(state.clone());
-        Self {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The DNS API endpoint, for the client's `dns_url`.
@@ -323,7 +460,40 @@ impl CloudRuMock {
     }
 }
 
+impl ChangeSource for CloudRuMock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its zones under their first
+    /// identifiers, no records, no issued tokens, the token lifetime of the seed, no pending
+    /// operations, one poll per operation, no pending operation failure, relative names, no
+    /// page size cap, an empty request log and no pending faults. Reports the removal of every
+    /// rrset that was published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.original.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// Every zone.
     pub fn zones(&self) -> Vec<Zone> {
         lock(&self.state).zones.clone()
@@ -346,15 +516,16 @@ impl Control {
 
     /// Adds a zone of `project_id`. Returns its identifier.
     pub fn insert_zone(&self, domain: &str, project_id: &str) -> String {
-        let mut inner = lock(&self.state);
-        let id = inner.new_id();
-        inner.zones.push(Zone {
-            id: id.clone(),
-            project_id: project_id.to_owned(),
-            domain: fqdn(domain),
-            read_only: false,
-        });
-        id
+        self.change(|inner| {
+            let id = inner.new_id();
+            inner.zones.push(Zone {
+                id: id.clone(),
+                project_id: project_id.to_owned(),
+                domain: fqdn(domain),
+                read_only: false,
+            });
+            id
+        })
     }
 
     /// Marks zone `domain` read-only or writable.
@@ -373,21 +544,22 @@ impl Control {
     /// (under new record identifiers). Returns the new zone identifier.
     pub fn recreate_zone(&self, domain: &str) -> String {
         let old_id = self.zone_id(domain);
-        let mut inner = lock(&self.state);
-        let new_id = inner.new_id();
-        for zone in inner.zones.iter_mut().filter(|z| z.id == old_id) {
-            zone.id = new_id.clone();
-        }
-        let moved: Vec<usize> = (0..inner.records.len())
-            .filter(|&i| inner.records[i].zone_id == old_id)
-            .collect();
-        for i in moved {
-            let record_id = inner.new_id();
-            let record = &mut inner.records[i];
-            record.zone_id = new_id.clone();
-            record.id = record_id;
-        }
-        new_id
+        self.change(|inner| {
+            let new_id = inner.new_id();
+            for zone in inner.zones.iter_mut().filter(|z| z.id == old_id) {
+                zone.id = new_id.clone();
+            }
+            let moved: Vec<usize> = (0..inner.records.len())
+                .filter(|&i| inner.records[i].zone_id == old_id)
+                .collect();
+            for i in moved {
+                let record_id = inner.new_id();
+                let record = &mut inner.records[i];
+                record.zone_id = new_id.clone();
+                record.id = record_id;
+            }
+            new_id
+        })
     }
 
     /// Every record.
@@ -423,22 +595,23 @@ impl Control {
     ) -> String {
         let zone_id = self.zone_id(zone);
         let (owner, wildcard) = key(name);
-        let mut inner = lock(&self.state);
-        let id = inner.new_id();
-        inner.records.push(Record {
-            id: id.clone(),
-            zone_id,
-            owner,
-            rtype: rtype.to_owned(),
-            values: values.iter().map(|v| (*v).to_owned()).collect(),
-            ttl,
-            read_only: false,
-            description: None,
-            tags: Vec::new(),
-            wildcard,
-            gslb: None,
-        });
-        id
+        self.change(|inner| {
+            let id = inner.new_id();
+            inner.records.push(Record {
+                id: id.clone(),
+                zone_id,
+                owner,
+                rtype: rtype.to_owned(),
+                values: values.iter().map(|v| (*v).to_owned()).collect(),
+                ttl,
+                read_only: false,
+                description: None,
+                tags: Vec::new(),
+                wildcard,
+                gslb: None,
+            });
+            id
+        })
     }
 
     /// Appends `value` to the TXT record of `name`, or creates the record (TTL 3600) in the zone
@@ -449,16 +622,21 @@ impl Control {
     /// If no zone contains `name`.
     pub fn append_txt(&self, name: &str, value: &str) {
         let owner = fqdn(name);
-        {
-            let mut inner = lock(&self.state);
-            if let Some(record) = inner
+        let appended = self.change(|inner| {
+            match inner
                 .records
                 .iter_mut()
                 .find(|r| r.owner == owner && !r.wildcard && r.rtype == "txt")
             {
-                record.values.push(value.to_owned());
-                return;
+                Some(record) => {
+                    record.values.push(value.to_owned());
+                    true
+                }
+                None => false,
             }
+        });
+        if appended {
+            return;
         }
         let zone = self
             .zones()
@@ -503,21 +681,25 @@ impl Control {
 
     fn edit(&self, name: &str, rtype: &str, change: impl Fn(&mut Record)) {
         let (owner, wildcard) = key(name);
-        for record in lock(&self.state)
-            .records
-            .iter_mut()
-            .filter(|r| r.owner == owner && r.wildcard == wildcard && r.rtype == rtype)
-        {
-            change(record);
-        }
+        self.change(|inner| {
+            for record in inner
+                .records
+                .iter_mut()
+                .filter(|r| r.owner == owner && r.wildcard == wildcard && r.rtype == rtype)
+            {
+                change(record);
+            }
+        });
     }
 
     /// Deletes the record of `name` and `rtype` directly, as another writer would.
     pub fn delete_record(&self, name: &str, rtype: &str) {
         let (owner, wildcard) = key(name);
-        lock(&self.state)
-            .records
-            .retain(|r| !(r.owner == owner && r.wildcard == wildcard && r.rtype == rtype));
+        self.change(|inner| {
+            inner
+                .records
+                .retain(|r| !(r.owner == owner && r.wildcard == wildcard && r.rtype == rtype));
+        });
     }
 
     /// The values of the TXT record of `name`, in order; empty when there is none.
@@ -976,6 +1158,7 @@ async fn record_create(State(state): State<Shared>, headers: HeaderMap, body: By
     }
     let fail = inner.fail_next.take();
     if fail.is_none() {
+        let before = inner.published();
         let id = inner.new_id();
         inner.records.push(Record {
             id,
@@ -990,6 +1173,7 @@ async fn record_create(State(state): State<Shared>, headers: HeaderMap, body: By
             wildcard,
             gslb: request.get("gslbData").cloned(),
         });
+        inner.report(&before, Origin::Api);
     }
     axum::Json(inner.operation(fail)).into_response()
 }
@@ -1037,6 +1221,7 @@ async fn record_update(
     }
     let fail = inner.fail_next.take();
     if fail.is_none() {
+        let before = inner.published();
         let record = &mut inner.records[index];
         record.values = values;
         if let Some(ttl) = ttl {
@@ -1048,6 +1233,7 @@ async fn record_update(
             .map(str::to_owned);
         record.tags = string_list(request.get("tags")).unwrap_or_default();
         record.gslb = request.get("gslbData").cloned();
+        inner.report(&before, Origin::Api);
     }
     axum::Json(inner.operation(fail)).into_response()
 }
@@ -1069,7 +1255,9 @@ async fn record_delete(
     }
     let fail = inner.fail_next.take();
     if fail.is_none() {
+        let before = inner.published();
         inner.records.remove(index);
+        inner.report(&before, Origin::Api);
     }
     axum::Json(inner.operation(fail)).into_response()
 }

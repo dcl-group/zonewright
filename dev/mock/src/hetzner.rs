@@ -83,11 +83,24 @@
 //! // ... drive the client against mock.base_url() ...
 //! assert_eq!(mock.control().txt_values("_acme-challenge"), ["\"v1\""]);
 //! ```
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`HetznerMock::changes`], and a [`link`](crate::link::link) serves them over DNS. A write is
+//! published when its action finishes (the `GET /v1/actions/{id}` that answers `success`), not
+//! when the action is accepted; an action that finishes with `error`, or that no test ever looks
+//! at, publishes nothing. Only zones in `primary` mode are published: a secondary zone's records
+//! come from its primary server by zone transfer, and the mock holds none of them, so a
+//! secondary zone and anything stored under it are left out. The published form of an rrset: the
+//! owner name made absolute (`@` is the apex); a name inside a CNAME, NS, PTR, MX or SRV value
+//! that has no trailing dot is relative to the zone and is made absolute; a TXT value that is not
+//! quoted is quoted; any other value as stored. An rrset without a TTL is published with the
+//! zone's default TTL, 3600. [`Control::reset`] returns the mock to its seed.
 
 // Reason: the error side of a handler's result is the response it answers with.
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -98,7 +111,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use serde_json::{Value, json};
 
-use crate::MockServer;
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, MockServer, RequestLog};
 
 /// Path of the API below the server's base URL.
 pub const API_PATH: &str = "/v1";
@@ -108,6 +122,9 @@ const MAX_PER_PAGE: usize = 50;
 
 /// Default `per_page`.
 const DEFAULT_PER_PAGE: usize = 25;
+
+/// The default TTL of every zone, as the zone views state it.
+const ZONE_TTL: u32 = 3600;
 
 /// Largest number of records in one action request.
 const MAX_RECORDS: usize = 50;
@@ -232,6 +249,9 @@ struct ActionState {
 
 #[derive(Debug)]
 struct Inner {
+    /// The seed the mock was started with, for [`Control::reset`].
+    seed: Seed,
+    changes: Changes,
     token: String,
     zones: Vec<Zone>,
     rrsets: Vec<Rrset>,
@@ -242,6 +262,104 @@ struct Inner {
     null_total: bool,
     action_looks: u32,
     fail_next_action: Option<(String, String)>,
+}
+
+impl Inner {
+    /// The state of a mock started with `seed`.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        let mut next_zone = 1000;
+        let zones = seed
+            .zones
+            .iter()
+            .map(|(name, mode)| {
+                next_zone += 1;
+                Zone {
+                    id: next_zone,
+                    name: name.clone(),
+                    mode: mode.clone(),
+                }
+            })
+            .collect();
+        Inner {
+            token: seed.token.clone(),
+            seed,
+            changes,
+            zones,
+            rrsets: Vec::new(),
+            actions: HashMap::new(),
+            next_zone,
+            next_action: 5000,
+            page_cap: None,
+            null_total: false,
+            action_looks: 1,
+            fail_next_action: None,
+        }
+    }
+
+    /// What a DNS server for the mock's zones would answer: the rrsets of the primary zones, in
+    /// the form the module documentation describes.
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        for zone in self.zones.iter().filter(|z| z.mode == "primary") {
+            out.zone(&zone.name);
+        }
+        for set in &self.rrsets {
+            let Some(zone) = self
+                .zones
+                .iter()
+                .find(|z| z.id == set.zone_id && z.mode == "primary")
+            else {
+                continue;
+            };
+            let owner = if set.name == "@" {
+                zone.name.clone()
+            } else {
+                format!("{}.{}", set.name, zone.name)
+            };
+            let values = set
+                .records
+                .iter()
+                .map(|r| published_value(&set.rtype, &r.value, &zone.name))
+                .collect();
+            out.rrset(
+                &zone.name,
+                &owner,
+                &set.rtype,
+                Some(set.ttl.unwrap_or(ZONE_TTL)),
+                values,
+            );
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+}
+
+/// A stored value in zone-file text form (module documentation).
+fn published_value(rtype: &str, value: &str, zone: &str) -> String {
+    let host = |name: &str| {
+        if name.ends_with('.') {
+            name.to_owned()
+        } else {
+            format!("{name}.{zone}.")
+        }
+    };
+    let fields: Vec<&str> = value.split(' ').collect();
+    match (rtype, fields.as_slice()) {
+        ("CNAME" | "NS" | "PTR", [target]) => host(target),
+        ("MX", [priority, target]) => format!("{priority} {}", host(target)),
+        ("SRV", [priority, weight, port, target]) => {
+            format!("{priority} {weight} {port} {}", host(target))
+        }
+        ("TXT", _) if !value.starts_with('"') => {
+            format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+        }
+        _ => value.to_owned(),
+    }
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -264,6 +382,9 @@ pub struct HetznerMock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for HetznerMock {
@@ -275,33 +396,15 @@ impl Deref for HetznerMock {
 }
 
 impl HetznerMock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let mut next_zone = 1000;
-        let zones = seed
-            .zones
-            .into_iter()
-            .map(|(name, mode)| {
-                next_zone += 1;
-                Zone {
-                    id: next_zone,
-                    name,
-                    mode,
-                }
-            })
-            .collect();
-        let state = Arc::new(Mutex::new(Inner {
-            token: seed.token,
-            zones,
-            rrsets: Vec::new(),
-            actions: HashMap::new(),
-            next_zone,
-            next_action: 5000,
-            page_cap: None,
-            null_total: false,
-            action_looks: 1,
-            fail_next_action: None,
-        }));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new()
             .route("/v1/zones", get(zones_list))
             .route("/v1/zones/{zone}", get(zone_get))
@@ -331,10 +434,14 @@ impl HetznerMock {
             )
             .route("/v1/actions/{id}", get(action_get))
             .with_state(state.clone());
-        Self {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The API endpoint, for the client's `base_url`.
@@ -348,7 +455,40 @@ impl HetznerMock {
     }
 }
 
+impl ChangeSource for HetznerMock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its token, its zones under their first
+    /// identifiers, no rrsets, no actions (an action that has not finished is dropped and never
+    /// applied), no page cap, the pagination total stated, one look per action, no pending action
+    /// failure, an empty request log and no pending faults. Reports the removal of every rrset
+    /// that was published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.seed.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// Every rrset, in creation order.
     pub fn rrsets(&self) -> Vec<Rrset> {
         lock(&self.state).rrsets.clone()
@@ -384,29 +524,30 @@ impl Control {
         ttl: Option<u32>,
         values: &[&str],
     ) {
-        let mut inner = lock(&self.state);
-        let Some(zone_id) = inner.zones.iter().find(|z| z.name == zone).map(|z| z.id) else {
-            return;
-        };
-        let name = relative(name, zone);
-        inner
-            .rrsets
-            .retain(|r| !(r.zone_id == zone_id && r.name == name && r.rtype == rtype));
-        inner.rrsets.push(Rrset {
-            zone_id,
-            name,
-            rtype: rtype.to_owned(),
-            ttl,
-            records: values
-                .iter()
-                .map(|v| StoredRecord {
-                    value: (*v).to_owned(),
-                    comment: String::new(),
-                })
-                .collect(),
-            labels: Vec::new(),
-            protected: false,
-        });
+        self.change(|inner| {
+            let Some(zone_id) = inner.zones.iter().find(|z| z.name == zone).map(|z| z.id) else {
+                return;
+            };
+            let name = relative(name, zone);
+            inner
+                .rrsets
+                .retain(|r| !(r.zone_id == zone_id && r.name == name && r.rtype == rtype));
+            inner.rrsets.push(Rrset {
+                zone_id,
+                name,
+                rtype: rtype.to_owned(),
+                ttl,
+                records: values
+                    .iter()
+                    .map(|v| StoredRecord {
+                        value: (*v).to_owned(),
+                        comment: String::new(),
+                    })
+                    .collect(),
+                labels: Vec::new(),
+                protected: false,
+            });
+        })
     }
 
     /// Changes the rrset of `name` and `rtype` in the zone `zone` directly, as another writer
@@ -418,63 +559,67 @@ impl Control {
         rtype: &str,
         change: impl FnOnce(&mut Rrset),
     ) {
-        let mut inner = lock(&self.state);
-        let Some(zone_id) = inner.zones.iter().find(|z| z.name == zone).map(|z| z.id) else {
-            return;
-        };
-        let name = relative(name, zone);
-        if let Some(set) = inner
-            .rrsets
-            .iter_mut()
-            .find(|r| r.zone_id == zone_id && r.name == name && r.rtype == rtype)
-        {
-            change(set);
-        }
+        self.change(|inner| {
+            let Some(zone_id) = inner.zones.iter().find(|z| z.name == zone).map(|z| z.id) else {
+                return;
+            };
+            let name = relative(name, zone);
+            if let Some(set) = inner
+                .rrsets
+                .iter_mut()
+                .find(|r| r.zone_id == zone_id && r.name == name && r.rtype == rtype)
+            {
+                change(set);
+            }
+        })
     }
 
     /// Appends a record to an existing rrset directly, as another writer would, with a
     /// `comment`.
     pub fn add_value(&self, zone: &str, name: &str, rtype: &str, value: &str, comment: &str) {
-        let mut inner = lock(&self.state);
-        let Some(zone_id) = inner.zones.iter().find(|z| z.name == zone).map(|z| z.id) else {
-            return;
-        };
-        let name = relative(name, zone);
-        if let Some(set) = inner
-            .rrsets
-            .iter_mut()
-            .find(|r| r.zone_id == zone_id && r.name == name && r.rtype == rtype)
-        {
-            set.records.push(StoredRecord {
-                value: value.to_owned(),
-                comment: comment.to_owned(),
-            });
-        }
+        self.change(|inner| {
+            let Some(zone_id) = inner.zones.iter().find(|z| z.name == zone).map(|z| z.id) else {
+                return;
+            };
+            let name = relative(name, zone);
+            if let Some(set) = inner
+                .rrsets
+                .iter_mut()
+                .find(|r| r.zone_id == zone_id && r.name == name && r.rtype == rtype)
+            {
+                set.records.push(StoredRecord {
+                    value: value.to_owned(),
+                    comment: comment.to_owned(),
+                });
+            }
+        })
     }
 
     /// Deletes the rrset directly, as another writer would.
     pub fn delete_rrset(&self, zone: &str, name: &str, rtype: &str) {
-        let mut inner = lock(&self.state);
-        let Some(zone_id) = inner.zones.iter().find(|z| z.name == zone).map(|z| z.id) else {
-            return;
-        };
-        let name = relative(name, zone);
-        inner
-            .rrsets
-            .retain(|r| !(r.zone_id == zone_id && r.name == name && r.rtype == rtype));
+        self.change(|inner| {
+            let Some(zone_id) = inner.zones.iter().find(|z| z.name == zone).map(|z| z.id) else {
+                return;
+            };
+            let name = relative(name, zone);
+            inner
+                .rrsets
+                .retain(|r| !(r.zone_id == zone_id && r.name == name && r.rtype == rtype));
+        })
     }
 
     /// Adds a zone in `mode`, `primary` or `secondary`. Returns its identifier.
     pub fn add_zone(&self, name: &str, mode: &str) -> u64 {
-        let mut inner = lock(&self.state);
-        inner.next_zone += 1;
-        let id = inner.next_zone;
-        inner.zones.push(Zone {
-            id,
-            name: name.to_owned(),
-            mode: mode.to_owned(),
-        });
-        id
+        self.change(|inner| {
+            inner.next_zone += 1;
+            let id = inner.next_zone;
+            inner.zones.push(Zone {
+                id,
+                name: name.to_owned(),
+                mode: mode.to_owned(),
+            });
+            id
+        })
     }
 
     /// The identifier of the zone `name`.
@@ -489,31 +634,33 @@ impl Control {
     /// Deletes the zone with its rrsets and creates it again under a new identifier; the rrsets
     /// come back only when `keep_records` is true. Returns the new identifier.
     pub fn recreate_zone(&self, name: &str, keep_records: bool) -> u64 {
-        let mut inner = lock(&self.state);
-        inner.next_zone += 1;
-        let new = inner.next_zone;
-        let Some(zone) = inner.zones.iter_mut().find(|z| z.name == name) else {
-            return 0;
-        };
-        let old = zone.id;
-        zone.id = new;
-        if keep_records {
-            for set in inner.rrsets.iter_mut().filter(|r| r.zone_id == old) {
-                set.zone_id = new;
+        self.change(|inner| {
+            inner.next_zone += 1;
+            let new = inner.next_zone;
+            let Some(zone) = inner.zones.iter_mut().find(|z| z.name == name) else {
+                return 0;
+            };
+            let old = zone.id;
+            zone.id = new;
+            if keep_records {
+                for set in inner.rrsets.iter_mut().filter(|r| r.zone_id == old) {
+                    set.zone_id = new;
+                }
+            } else {
+                inner.rrsets.retain(|r| r.zone_id != old);
             }
-        } else {
-            inner.rrsets.retain(|r| r.zone_id != old);
-        }
-        new
+            new
+        })
     }
 
     /// Deletes the zone with its rrsets.
     pub fn delete_zone(&self, name: &str) {
-        let mut inner = lock(&self.state);
-        if let Some(id) = inner.zones.iter().find(|z| z.name == name).map(|z| z.id) {
-            inner.zones.retain(|z| z.id != id);
-            inner.rrsets.retain(|r| r.zone_id != id);
-        }
+        self.change(|inner| {
+            if let Some(id) = inner.zones.iter().find(|z| z.name == name).map(|z| z.id) {
+                inner.zones.retain(|z| z.id != id);
+                inner.rrsets.retain(|r| r.zone_id != id);
+            }
+        })
     }
 
     /// Caps `per_page` at `cap`, so that the zone listing comes in small pages.
@@ -1469,7 +1616,10 @@ async fn action_get(
         action.finished = true;
         if action.error.is_none() {
             let change = action.change.clone();
+            // The change is published now, when the action finishes.
+            let before = inner.published();
             apply(&mut inner, change);
+            inner.report(&before, Origin::Api);
         }
     }
     let Some(action) = inner.actions.get(&id) else {

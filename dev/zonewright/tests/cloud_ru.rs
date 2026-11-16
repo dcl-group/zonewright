@@ -3561,3 +3561,131 @@ async fn live_cloud_ru_record_round_trip() {
     }
     assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
 }
+
+// ---- Link to the DNS mock ----------------------------------------------------------------------
+
+#[cfg(feature = "inspector")]
+mod dns_link {
+    use serde_json::json;
+    use zonewright::{Expect, Provider, RecordType};
+    use zonewright_mock::changes::ChangeSource;
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+
+    use super::{NAME, REC, ZONE, add, rrset, setup, setup_records, zone};
+    use crate::common::link::{ask, is_absent, rd, txt, txt_round_trip, values};
+
+    /// A value written through the client is served over DNS; a record with GSLB links is not
+    /// published, a read-only record is.
+    #[tokio::test]
+    async fn cloud_ru_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = txt_round_trip(&mock, &client, &dns).await;
+
+        let control = mock.control();
+        control.insert_record(ZONE, "gslb.example.org", "a", 300, &["192.0.2.1"]);
+        control.insert_record(ZONE, "fixed.example.org", "a", 300, &["192.0.2.2"]);
+        control.set_read_only("fixed.example.org", "a", true);
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), "gslb.example.org", RecordType::A).await),
+            [rd(RecordType::A, "192.0.2.1")]
+        );
+        control.set_gslb(
+            "gslb.example.org",
+            "a",
+            Some(json!({
+                "links": [{"fqdn": "server1.example.org", "isEnabled": true}],
+                "balancingPolicy": "BALANCING_POLICY_ROUND_ROBIN"
+            })),
+        );
+        link.settled().await;
+        let answer = ask(dns.addr(), "gslb.example.org", RecordType::A).await;
+        assert!(is_absent(&answer), "{answer:?}");
+        assert_eq!(
+            values(ask(dns.addr(), "fixed.example.org", RecordType::A).await),
+            [rd(RecordType::A, "192.0.2.2")]
+        );
+        // GSLB data without links leaves the record plain.
+        control.set_gslb("gslb.example.org", "a", Some(json!({"links": []})));
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), "gslb.example.org", RecordType::A).await),
+            [rd(RecordType::A, "192.0.2.1")]
+        );
+        assert_eq!(link.skipped(), 0);
+    }
+
+    /// Names inside values, which the API holds without the trailing dot, are served fully
+    /// qualified; a wildcard record is published below its name.
+    #[tokio::test]
+    async fn cloud_ru_names_in_values_are_served_fully_qualified() {
+        let (mock, client) = setup_records().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        for set in [
+            rrset(REC, RecordType::CNAME, Some(300), &["target.example.net."]),
+            rrset(
+                "mail.example.org",
+                RecordType::MX,
+                Some(300),
+                &["10 mx.example.org."],
+            ),
+        ] {
+            client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
+        }
+        mock.control()
+            .insert_record(ZONE, "*.wild.example.org", "a", 300, &["192.0.2.3"]);
+        link.settled().await;
+        assert_eq!(link.skipped(), 0);
+        assert_eq!(
+            mock.control().record(REC, "cname").unwrap().values,
+            ["target.example.net"]
+        );
+        for (name, rtype, text) in [
+            (REC, RecordType::CNAME, "target.example.net."),
+            ("mail.example.org", RecordType::MX, "10 mx.example.org."),
+        ] {
+            assert_eq!(
+                values(ask(dns.addr(), name, rtype).await),
+                [rd(rtype, text)],
+                "{name} {rtype}"
+            );
+        }
+        assert!(
+            mock.published()
+                .rrsets
+                .iter()
+                .any(|c| c.name == "*.wild.example.org" && c.rtype == "A")
+        );
+    }
+
+    /// `reset` returns the mock to its seed: the record is gone from the mock and from DNS, the
+    /// request log is empty, and the client works again.
+    #[tokio::test]
+    async fn cloud_ru_reset_returns_the_mock_to_its_seed() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        add(&client, "before-reset").await.unwrap();
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("before-reset")]
+        );
+        mock.control().reset();
+        link.settled().await;
+        assert!(mock.control().records().is_empty());
+        assert!(mock.log().is_empty());
+        assert_eq!(mock.control().tokens_issued(), 0);
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+        add(&client, "after-reset").await.unwrap();
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("after-reset")]
+        );
+    }
+}

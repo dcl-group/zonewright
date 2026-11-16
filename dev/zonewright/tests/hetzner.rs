@@ -3750,3 +3750,128 @@ async fn hetzner_provider_default_ttl() {
         assert_eq!(control.rrset(&owner, "A").unwrap().ttl, stored, "{ttl}");
     }
 }
+
+// ---- Link to the DNS mock ----------------------------------------------------------------------
+
+#[cfg(feature = "inspector")]
+mod dns_link {
+    use std::sync::Mutex;
+
+    use zonewright::{Expect, Provider, RecordType};
+    use zonewright_mock::Fault;
+    use zonewright_mock::changes::ChangeSource;
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+
+    use super::{ACTION, NAME, add, rrset, setup};
+    use crate::common::link::{ask, is_absent, rd, txt, txt_round_trip, values};
+
+    /// A value written through the client is served over DNS once its action finished, and not
+    /// while the action is still running.
+    #[tokio::test]
+    async fn hetzner_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = txt_round_trip(&mock, &client, &dns).await;
+
+        // Three looks at the action: at each of them, before the mock answers, nothing new has
+        // been published; the change is published by the look that finishes the action.
+        mock.control().set_action_looks(3);
+        let changes = mock.changes().clone();
+        let start = changes.emitted();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let hook_seen = seen.clone();
+        mock.faults().push(
+            Fault::on("GET", ACTION)
+                .times(3)
+                .run(move || hook_seen.lock().unwrap().push(changes.emitted())),
+        );
+        add(&client, "late").await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), [start, start, start]);
+        assert_eq!(mock.changes().emitted(), start + 1);
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("late")]
+        );
+    }
+
+    /// Names inside values are published fully qualified, also where the provider holds them
+    /// relative to the zone; a zone that is not primary is not published.
+    #[tokio::test]
+    async fn hetzner_names_in_values_are_served_fully_qualified() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        let zone = crate::common::dn("example.org");
+        for set in [
+            rrset(
+                "alias.example.org",
+                RecordType::CNAME,
+                Some(300),
+                &["target.example.net."],
+            ),
+            rrset(
+                "example.org",
+                RecordType::MX,
+                Some(300),
+                &["10 mail.example.org."],
+            ),
+        ] {
+            client.set_rrset(&zone, &set, Expect::Any).await.unwrap();
+        }
+        // Spelled relative to the zone, as another writer may store them.
+        let control = mock.control();
+        control.insert_rrset("example.org", "rel", "MX", None, &["20 mx2"]);
+        control.insert_rrset("example.org", "www", "CNAME", Some(600), &["web"]);
+        control.insert_rrset("mirror.example.net", "www", "A", None, &["192.0.2.1"]);
+        link.settled().await;
+        assert_eq!(link.skipped(), 0);
+        for (name, rtype, text) in [
+            (
+                "alias.example.org",
+                RecordType::CNAME,
+                "target.example.net.",
+            ),
+            ("example.org", RecordType::MX, "10 mail.example.org."),
+            ("rel.example.org", RecordType::MX, "20 mx2.example.org."),
+            ("www.example.org", RecordType::CNAME, "web.example.org."),
+        ] {
+            assert_eq!(
+                values(ask(dns.addr(), name, rtype).await),
+                [rd(rtype, text)],
+                "{name} {rtype}"
+            );
+        }
+        let published = mock.published();
+        assert!(!published.zones.contains(&"mirror.example.net".to_owned()));
+        assert!(published.rrsets.iter().all(|c| c.zone == "example.org"));
+    }
+
+    /// `reset` returns the mock to its seed: the record is gone from the mock and from DNS, the
+    /// request log is empty, and the client works again.
+    #[tokio::test]
+    async fn hetzner_reset_returns_the_mock_to_its_seed() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        add(&client, "before-reset").await.unwrap();
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("before-reset")]
+        );
+        mock.control().reset();
+        link.settled().await;
+        assert!(mock.control().rrsets().is_empty());
+        assert!(mock.log().is_empty());
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+        add(&client, "after-reset").await.unwrap();
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("after-reset")]
+        );
+    }
+}
