@@ -38,6 +38,8 @@ All notable changes to this crate are recorded in this file. The format follows
   stored set that a client read with non-canonical values now equals a fresh read, and writing it
   back no longer replaces those records. A hand-written `raw` member whose text parses is no longer
   turned into canonical data.
+- The refusal of an explicit TTL at a provider that chooses the TTL itself says so instead of naming
+  a range.
 
 ## 0.1.0 - 2026-11-16
 

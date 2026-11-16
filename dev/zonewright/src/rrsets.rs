@@ -117,6 +117,7 @@ use crate::name::DomainName;
 use crate::provider::{DeleteOutcome, Expect, SetOutcome, SkipReason, SkippedRrset, ZoneListing};
 use crate::record::{RecordData, RecordType, RrSet, RrsetTtl, singleton};
 use crate::redact::Detail;
+use crate::values::ttl_refusal;
 
 // ---- Shared types --------------------------------------------------------------------------------
 
@@ -647,12 +648,7 @@ fn check_set<B: RrsetBase>(
 /// the provider's default where the provider has one that a write can ask for.
 fn check_ttl(caps: &Capabilities, ttl: Option<RrsetTtl>) -> Result<(), Error> {
     match ttl {
-        Some(ttl) if !caps.accepts_ttl(ttl) => Err(invalid(match ttl {
-            RrsetTtl::ProviderDefault => {
-                "the provider has no default TTL of its own: the TTL must be a number"
-            }
-            _ => "the TTL is outside the range the provider accepts",
-        })),
+        Some(ttl) if !caps.accepts_ttl(ttl) => Err(invalid(ttl_refusal(caps, ttl))),
         _ => Ok(()),
     }
 }
@@ -1522,7 +1518,7 @@ mod tests {
 
     use super::{
         Current, Found, Listing, Member, Neighbors, PerRecord, RecordUpdate, RecordsRead,
-        RrsetBase, SetTtl, Step, Stored, WholeChange, WholeRead, WholeSet,
+        RrsetBase, SetTtl, Step, Stored, WholeChange, WholeRead, WholeSet, check_ttl,
     };
     use crate::error::{Error, ErrorKind};
     use crate::id::ProviderId;
@@ -2506,6 +2502,27 @@ mod tests {
             assert!(e.to_string().contains("default TTL"), "{label}: {e}");
             assert_eq!(shape.requests(), 0, "{label}: a request was made");
         }
+    }
+
+    #[test]
+    fn a_refused_number_names_the_reason() {
+        let explicit = |secs| Some(RrsetTtl::from_secs(secs).unwrap());
+        let range = caps(Preconditions::ReadThenWrite, true);
+        let e = check_ttl(&range, explicit(30)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("outside the range"), "{e}");
+        let chosen = Capabilities {
+            ttl: TtlSupport::NotSettable,
+            ..range
+        };
+        let e = check_ttl(&chosen, explicit(600)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput);
+        assert!(
+            e.to_string()
+                .contains("the provider chooses the TTL; a requested TTL cannot be honored"),
+            "{e}"
+        );
+        assert!(!e.to_string().contains("range"), "{e}");
     }
 
     #[tokio::test]

@@ -42,7 +42,7 @@ use std::future::Future;
 use crate::error::{Error, Operation};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
-use crate::meta::{Capabilities, ValueGuarantee};
+use crate::meta::{Capabilities, TtlSupport, ValueGuarantee};
 use crate::name::DomainName;
 use crate::provider::{AddOutcome, RemoveOutcome};
 use crate::record::{RrsetTtl, Txt};
@@ -307,12 +307,7 @@ fn precheck<B: TxtBase>(
         && !caps.accepts_ttl(ttl)
     {
         return Err(Error::InvalidInput {
-            detail: Detail::constant(match ttl {
-                RrsetTtl::ProviderDefault => {
-                    "the provider has no default TTL of its own: the TTL must be a number"
-                }
-                _ => "the TTL is outside the range the provider accepts",
-            }),
+            detail: Detail::constant(ttl_refusal(caps, ttl)),
         });
     }
     if caps.txt_plain_only && !value.is_plain() {
@@ -324,6 +319,21 @@ fn precheck<B: TxtBase>(
         });
     }
     backend.check_value(value)
+}
+
+/// The text of the refusal of a requested TTL that `caps` does not accept (design section 3.6).
+/// Shared with the record-level layer, which is compiled with a subset of the providers that
+/// compile this module.
+pub(crate) fn ttl_refusal(caps: &Capabilities, ttl: RrsetTtl) -> &'static str {
+    match ttl {
+        RrsetTtl::ProviderDefault => {
+            "the provider has no default TTL of its own: the TTL must be a number"
+        }
+        _ if caps.ttl == TtlSupport::NotSettable => {
+            "the provider chooses the TTL; a requested TTL cannot be honored"
+        }
+        _ => "the TTL is outside the range the provider accepts",
+    }
 }
 
 fn holds<H>(record: &TxtRecord<H>, value: &Txt) -> bool {
@@ -1510,6 +1520,11 @@ mod tests {
             );
             let err = env.add(&txt("v"), ttl(60)).await.unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput, "{shape:?}");
+            assert!(
+                err.to_string()
+                    .contains("the provider chooses the TTL; a requested TTL cannot be honored"),
+                "{shape:?}: {err}"
+            );
             assert!(env.take_log().is_empty(), "{shape:?}");
             assert_eq!(env.add(&txt("v"), None).await.unwrap(), AddOutcome::Created);
         }
