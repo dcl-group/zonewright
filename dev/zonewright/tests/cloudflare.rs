@@ -3065,6 +3065,9 @@ async fn live_cloudflare_add_and_remove() {
             cleanup.push(format!("{e}"));
         }
     }
+    if !cleanup.is_empty() {
+        eprintln!("cleanup failed: {cleanup:?}");
+    }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());
     }
@@ -3160,6 +3163,9 @@ async fn live_cloudflare_record_round_trip() {
         if let Err(e) = client.delete_rrset(&zone, &name, rtype, Expect::Any).await {
             cleanup.push(format!("{e}"));
         }
+    }
+    if !cleanup.is_empty() {
+        eprintln!("cleanup failed: {cleanup:?}");
     }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());

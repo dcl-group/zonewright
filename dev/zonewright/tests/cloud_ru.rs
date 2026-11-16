@@ -11,7 +11,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -1156,7 +1156,9 @@ async fn cloud_ru_unfinished_operation_keeps_being_polled() {
     let (mock, client) = setup().await;
     mock.control().set_operation_polls(u32::MAX);
     let polled = async {
+        let deadline = Instant::now() + Duration::from_secs(10);
         while mock.log().count(Some("GET"), OPERATIONS) < 3 {
+            assert!(Instant::now() < deadline, "the client stopped polling");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     };
@@ -3411,6 +3413,9 @@ async fn live_cloud_ru_add_and_remove() {
             cleanup.push(format!("{e}"));
         }
     }
+    if !cleanup.is_empty() {
+        eprintln!("cleanup failed: {cleanup:?}");
+    }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());
     }
@@ -3547,6 +3552,9 @@ async fn live_cloud_ru_record_round_trip() {
         if let Err(e) = client.delete_rrset(&zone, &name, rtype, Expect::Any).await {
             cleanup.push(format!("{e}"));
         }
+    }
+    if !cleanup.is_empty() {
+        eprintln!("cleanup failed: {cleanup:?}");
     }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());

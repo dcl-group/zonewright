@@ -3471,6 +3471,9 @@ async fn live_selectel_v2_add_and_remove() {
             cleanup.push(format!("{e}"));
         }
     }
+    if !cleanup.is_empty() {
+        eprintln!("cleanup failed: {cleanup:?}");
+    }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());
     }
@@ -3681,6 +3684,9 @@ async fn live_selectel_v2_record_round_trip() {
         Ok(Some(_)) => cleanup.push("the CNAME at the test's name holds foreign data".into()),
         Ok(None) => {}
         Err(e) => cleanup.push(format!("{e}")),
+    }
+    if !cleanup.is_empty() {
+        eprintln!("cleanup failed: {cleanup:?}");
     }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());

@@ -11,7 +11,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
 use zonewright::providers::route53::{Route53, Route53Config, Route53Credentials};
@@ -1172,7 +1172,9 @@ async fn route53_change_is_polled_until_insync() {
     let before = mock.log().count(Some("GET"), STATUS);
     let writes_before = writes(&mock);
     let polled = async {
+        let deadline = Instant::now() + Duration::from_secs(10);
         while mock.log().count(Some("GET"), STATUS) < before + 3 {
+            assert!(Instant::now() < deadline, "the client stopped polling");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     };
@@ -3201,6 +3203,9 @@ async fn live_route53_add_and_remove() {
             cleanup.push(format!("{e}"));
         }
     }
+    if !cleanup.is_empty() {
+        eprintln!("cleanup failed: {cleanup:?}");
+    }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());
     }
@@ -3302,6 +3307,9 @@ async fn live_route53_record_round_trip() {
         {
             cleanup.push(format!("{e}"));
         }
+    }
+    if !cleanup.is_empty() {
+        eprintln!("cleanup failed: {cleanup:?}");
     }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());

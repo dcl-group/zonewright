@@ -11,7 +11,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use secrecy::SecretString;
@@ -1058,7 +1058,9 @@ async fn yandex_cloud_unfinished_operation_keeps_being_polled() {
     let (mock, client) = setup().await;
     mock.control().set_operation_polls(u32::MAX);
     let polled = async {
+        let deadline = Instant::now() + Duration::from_secs(10);
         while mock.log().count(Some("GET"), OPERATIONS) < 3 {
+            assert!(Instant::now() < deadline, "the client stopped polling");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     };
@@ -3458,6 +3460,9 @@ async fn live_yandex_cloud_add_and_remove() {
             cleanup.push(format!("{e}"));
         }
     }
+    if !cleanup.is_empty() {
+        eprintln!("cleanup failed: {cleanup:?}");
+    }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());
     }
@@ -3673,6 +3678,9 @@ async fn live_yandex_cloud_record_round_trip() {
         Ok(Some(_)) => cleanup.push("the CNAME at the test's name holds foreign data".into()),
         Ok(None) => {}
         Err(e) => cleanup.push(format!("{e}")),
+    }
+    if !cleanup.is_empty() {
+        eprintln!("cleanup failed: {cleanup:?}");
     }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());
