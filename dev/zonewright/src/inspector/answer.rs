@@ -21,9 +21,12 @@ const CNAME: u16 = 5;
 
 /// Converts one answer record into canonical [`RecordData`].
 ///
-/// For the types whose RDATA may contain compressed names (NS, CNAME, PTR, MX, SOA, SRV) the
-/// fields come from the decoded message and are written back in uncompressed form; for every
-/// other type, including types the codec does not know, the raw RDATA is used. Both go through
+/// For NS, CNAME, PTR, MX, SOA and SRV, whose names `hickory-proto` decodes and decompresses,
+/// the fields come from the decoded message and are written back in uncompressed form. Every
+/// other type, DNAME included and types the codec does not know, is read from its raw RDATA:
+/// RFC 3597 section 4 forbids compressing names in the RDATA of types not defined in RFC 1035,
+/// and RFC 6672 section 2.5 forbids it for the DNAME target, so a compression pointer there is a
+/// syntax error and the answer is `Failed`. Both go through
 /// `RecordData::from_wire`, the one definition of each canonical form. The error text never
 /// quotes the data.
 pub(crate) fn convert_record(data: &RData, rtype: u16, raw: &[u8]) -> Result<RecordData, String> {
@@ -197,11 +200,16 @@ fn rrset(records: &[&ReplyRecord]) -> Answer {
             }
             Err(detail) => return Answer::Failed(detail.clone()),
         }
-        ttl = ttl.min(record.ttl);
+        // RFC 2181 section 8: a TTL with the most significant bit set is treated as zero. Each
+        // record's TTL is mapped before the minimum is taken.
+        let secs = if record.ttl > Ttl::MAX.as_secs() {
+            0
+        } else {
+            record.ttl
+        };
+        ttl = ttl.min(secs);
     }
-    // RFC 2181 section 8: a TTL with the most significant bit set is treated as zero.
-    let secs = if ttl > Ttl::MAX.as_secs() { 0 } else { ttl };
-    let ttl = match Ttl::from_secs(secs) {
+    let ttl = match Ttl::from_secs(ttl) {
         Ok(ttl) => ttl,
         Err(err) => return Answer::Failed(bounded(&err.to_string())),
     };
@@ -340,6 +348,25 @@ mod tests {
         r.ttl = 0x8000_0000;
         let answer = classify(Ok(reply(0, true, vec![r])), &q, SERVER);
         assert!(matches!(answer, Answer::Records { ttl, .. } if ttl.as_secs() == 0));
+        // The rule applies to each record before the smallest TTL is taken, in any order.
+        let two = |first: u32, second: u32| {
+            vec![
+                rec("a.example.org", RecordType::A, first, "192.0.2.1"),
+                rec("a.example.org", RecordType::A, second, "192.0.2.2"),
+            ]
+        };
+        for (first, second) in [
+            (0x8000_0000, 60),
+            (60, 0x8000_0000),
+            (0xFFFF_FFFF, 0x7FFF_FFFF),
+            (0x7FFF_FFFF, 0xFFFF_FFFF),
+        ] {
+            let answer = classify(Ok(reply(0, true, two(first, second))), &q, SERVER);
+            assert!(
+                matches!(answer, Answer::Records { ttl, .. } if ttl.as_secs() == 0),
+                "{first:#x} {second:#x}: {answer:?}"
+            );
+        }
     }
 
     #[test]
@@ -565,5 +592,29 @@ mod tests {
             data(RecordType::A, "192.0.2.1")
         );
         assert!(convert_record(&a, 1, &[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn a_dname_is_read_from_its_raw_rdata_and_a_compressed_target_is_an_error() {
+        use hickory_proto::rr::RecordType as Codec;
+        use hickory_proto::rr::rdata::NULL;
+        // `hickory-proto` 0.26.3 has no DNAME data variant: `RData::read` falls through to
+        // `RData::Unknown` with the RDATA kept as `NULL` (src/rr/record_data.rs).
+        let target = wire("t.example.org");
+        let dname = RData::Unknown {
+            code: Codec::DNAME,
+            rdata: NULL::with(target.clone()),
+        };
+        assert_eq!(
+            convert_record(&dname, 39, &target).unwrap(),
+            data(RecordType::DNAME, "t.example.org.")
+        );
+        // RFC 6672 section 2.5: the target is never compressed; a pointer is malformed.
+        let pointer = [0xc0u8, 0x0c];
+        let compressed = RData::Unknown {
+            code: Codec::DNAME,
+            rdata: NULL::with(pointer.to_vec()),
+        };
+        assert!(convert_record(&compressed, 39, &pointer).is_err());
     }
 }
