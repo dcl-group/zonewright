@@ -28,6 +28,8 @@ deny = [
     { crate = "openssl" },
     { crate = "openssl-sys" },
     { crate = "native-tls" },
+    { crate = "openssl-src" },
+    { crate = "rsa" },
 ]
 
 [sources]
