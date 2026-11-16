@@ -248,7 +248,11 @@ Behavior that the design fixes because the generic sections cannot:
   are `Error::Config` unless `hosted_zone_id` selects one. Region `us-east-1` and service `route53`
   are constants. A signature rejected for clock skew is `Error::Auth` with that hint. A requested
   TTL may be 0 to 2147483647, as the API accepts (`ResourceRecordSet.TTL`); the `ttl` setting keeps
-  1 to 86400.
+  1 to 86400. The read before a TXT value operation asks for two rrsets at the name and type, as the
+  record-level read does: a second set of the same name and type makes the name not plain records,
+  and the operation is `Error::Rejected` with nothing written, whatever the first set carries. The
+  API reference does not state that a set without `SetIdentifier` never shares its name and type
+  with another set, so the client does not rely on it.
 - `selectel_v2`. Names are sent in Unicode form. Records with the `disabled` flag follow section
   3.4. An rrset holds at most 100 records; a larger request is `InvalidInput`. An rrset is addressed
   by reading it by name and type on every operation, not by a remembered ID. The answer to a create

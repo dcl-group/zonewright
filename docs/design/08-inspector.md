@@ -200,11 +200,13 @@ More entries than `max_servers`, or an entry that is not asked (no address, or `
 Answer records are converted to `RecordData` through the typed constructors and `from_wire` of
 section 4: fields are taken from the decoded message for the types whose names the codec
 decompresses (NS, CNAME, PTR, MX, SOA, SRV), and the raw RDATA goes through `RecordData::from_wire`
-for everything else, including types the codec does not know. A compressed name in the RDATA of
-another type, DNAME included, is malformed (RFC 3597 section 4, RFC 6672 section 2.5). TXT
-character-strings are concatenated as bytes; nothing is lossily converted to UTF-8. Names inside
-RDATA become `TargetName` values, for which every valid wire name has a text form, so an unusual
-target does not fail. Only RDATA that is malformed for its type makes the answer `Failed`.
+for everything else, including types the codec does not know. Names in the RDATA of other types are
+not decompressed: for types not defined in RFC 1035 a sender must not compress them (RFC 3597
+section 4; RFC 6672 section 2.5 for the DNAME target), so a compression pointer in a DNAME target is
+a syntax error. TXT character-strings are concatenated as bytes; nothing is lossily converted to
+UTF-8. Names inside RDATA become `TargetName` values, for which every valid wire name has a text
+form, so an unusual target does not fail. Only RDATA that is malformed for its type makes the answer
+`Failed`.
 
 The result compares directly with what a provider client returns for the same record, which is the
 point of section 4.

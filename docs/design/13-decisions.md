@@ -202,5 +202,24 @@ Added after review:
 56. **The provider's default TTL has three capability levels.** Section 2.5, `ProviderDefaultTtl`.
     Timeweb Cloud can request it only for new records; a bool would either overstate it or hide it.
     The `ttl` setting's spelling is `"provider_default"`, not `null` (section 2.8).
+57. **An accepted write whose answer cannot be read is `Transient`, also outside a poll.** Section
+    3.7. Hetzner's 2xx write answer without a readable action and an action or change with a status
+    the client does not know leave the outcome unknown; `Protocol` would tell the caller not to
+    repeat an operation that is safe to repeat.
+58. **A raw member of a deserialized set is never parsed.** Sections 2.2 and 4.9. A client keeps
+    some text non-canonical although the strict parser accepts it; parsing it on the way back from
+    storage changed the set and could change what a record means.
+59. **SVCB and HTTPS data in service mode must be self-consistent.** Section 4.6. RFC 9460 section
+    2.4.3 asks it of both roles the crate plays; the rule is checked in one place, so the text,
+    typed and wire paths cannot differ.
+60. **The Route 53 TXT read uses the record-level rule for shared names.** Section 11.3. Asking for
+    one rrset would rest on a property of the API that no source states.
+61. **reg.ru compares owner names after trimming at both levels, and refuses a plan that would
+    remove a record without a content before any write.** Section 11.3. Two levels that disagree
+    about which records a name holds are worse than either reading; and the refusal that protects
+    the other records of the type must come before the plan's creates, not after them.
+62. **A whole-set client does not repair surplus singleton records.** Section 3.4. It answers
+    `Error::Protocol` and writes nothing; no whole-set API is known to return such a set (decided by
+    the maintainer on 2026-11-16).
 
 Section 13.4, the open points, is in [`13-open-points.md`](./13-open-points.md).
