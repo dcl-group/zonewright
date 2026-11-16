@@ -15,6 +15,8 @@ All notable changes to this crate are recorded in this file. The format follows
 - RFC 2136: an answer that reports a TSIG error is `Error::Auth` only when it is an unsigned
   `BADKEY` or `BADSIG` (which RFC 8945 requires to be unsigned) or when its MAC verifies against the
   request; otherwise it is `Error::Protocol`.
+- `zonewright-mock`: the RFC 2136 mock's BADTIME answer carries the client's time in Time Signed, as
+  RFC 8945 section 5.2.3 requires.
 
 ## 0.1.0 - 2026-11-16
 

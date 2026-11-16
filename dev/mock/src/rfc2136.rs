@@ -46,8 +46,8 @@
 //!   variables (4.3.3); the response MAC covers the request MAC with its length, the response,
 //!   and the response's variables (5.3). An unknown key is NOTAUTH with error BADKEY and no MAC
 //!   (5.2.1, 5.3.2), a MAC that does not verify NOTAUTH with BADSIG and no MAC (5.2.2), a time
-//!   outside the fudge NOTAUTH with BADTIME, signed, with the server's time in the other data
-//!   (5.2.3). Fudge 300 s (section 10).
+//!   outside the fudge NOTAUTH with BADTIME, signed, with the client's time in Time Signed and
+//!   the server's time in the other data (5.2.3). Fudge 300 s (section 10).
 //! - UDP: the mock does not implement EDNS (RFC 6891), so it never echoes an OPT record and an
 //!   answer over UDP holds at most 512 octets (RFC 1035 sections 2.3.4 and 4.2.1; RFC 6891
 //!   section 7). A longer answer is sent with TC set and without its answer and authority
@@ -1133,12 +1133,19 @@ async fn handle_on(b: &[u8], control: &Control, transport: Transport) -> Reply {
         } else {
             Vec::new()
         };
+        // RFC 8945 section 5.2.3: a BADTIME answer "MUST include the client's current time in
+        // the Time Signed field", so that the client can verify it despite the clock difference.
+        let time = if error == BADTIME {
+            tsig.time
+        } else {
+            server_now
+        };
         let signing = Signing {
             key_name: tsig.key_name.clone(),
             algorithm: &tsig.algorithm,
             secret,
             request_mac: &tsig.mac,
-            time: server_now,
+            time,
             error,
             other,
         };
