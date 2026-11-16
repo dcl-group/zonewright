@@ -20,8 +20,9 @@
 //! so that names can be compressed (also inside MX, SRV, NS, CNAME and SOA data), RDATA is sent
 //! exactly as a test gives it, and malformed or oversized messages can be produced.
 //! [`DnsMock::add`], [`DnsMock::set`] and [`Data::txt`] refuse, with a panic that names the
-//! limit, a name or TXT string that cannot be encoded; a [`Record`] given to a fault and [`Data::Raw`] are sent as given. An answer over
-//! 65 535 octets is sent over TCP as a truncated message (the TC flag, no records).
+//! limit, a name or TXT string that cannot be encoded; a [`Record`] given to a fault and
+//! [`Data::Raw`] are sent as given. An answer over 65 535 octets is sent over TCP as a truncated
+//! message (the TC flag, no records).
 //!
 //! Wire facts come from RFC 1035 (section 4.1 message layout, 4.1.4 compression, 4.2.1 the
 //! 512-octet UDP limit and the TC bit, 4.2.2 the TCP length prefix), RFC 6891 (EDNS OPT record,

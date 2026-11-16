@@ -9,9 +9,10 @@
 //! conformance tests holds every client to that.
 //!
 //! The event names the provider, the operation, the zone (for `check`, the number of zones), the
-//! owner name and the record type where the operation has them, the outcome, the provider's error
-//! code when the error carries one, and the wall time. It never carries a record value, a TTL,
-//! the text of an error, or anything from a request, a response or the configuration.
+//! owner name and the record type where the operation has them, the outcome (`ok` or the error's
+//! kind) and the wall time. It never carries a record value, a TTL, the text of an error, the
+//! provider's error code (it is read from a response body; the caller has it on the error), or
+//! anything else from a request, a response or the configuration.
 
 use std::future::Future;
 use std::time::Instant;
@@ -176,12 +177,9 @@ impl<'a> Call<'a> {
                 Some(field::display(rtype)),
             ),
         };
-        let (outcome, code) = match result {
-            Ok(_) => ("ok", None),
-            Err(err) => (
-                err.kind().as_str(),
-                err.provider_code().map(|code| code.as_str()),
-            ),
+        let outcome = match result {
+            Ok(_) => "ok",
+            Err(err) => err.kind().as_str(),
         };
         tracing::debug!(
             target: TARGET,
@@ -192,7 +190,6 @@ impl<'a> Call<'a> {
             name,
             rtype,
             outcome,
-            code,
             elapsed_ms,
             "provider operation"
         );

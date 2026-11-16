@@ -10,6 +10,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use zeroize::Zeroizing;
 
 use super::{DETAIL_MAX_BYTES, Detail, bound, is_unsafe_char};
@@ -80,9 +82,13 @@ impl SecretSlot {
 ///    64 KiB. The work is therefore bounded by 84 decoded layers of at most 64 KiB, each
 ///    searched for every needle.
 ///
+/// [`Scrubber::code`] applies a further check of its own, described there.
+///
 /// The needles are held in zeroizing memory, and `Debug` prints none of them.
 pub(crate) struct Scrubber {
     fixed: Vec<Zeroizing<String>>,
+    /// The spellings of the fixed secrets that drop a provider code, ASCII-lowercased.
+    fixed_code: Vec<Zeroizing<String>>,
     runtime: Mutex<Vec<SlotEntry>>,
 }
 
@@ -97,6 +103,8 @@ struct SlotEntry {
 struct RuntimeSecret {
     secret: Zeroizing<String>,
     spellings: Vec<Zeroizing<String>>,
+    /// The spellings that drop a provider code, ASCII-lowercased.
+    code_spellings: Vec<Zeroizing<String>>,
 }
 
 impl fmt::Debug for Scrubber {
@@ -108,10 +116,16 @@ impl fmt::Debug for Scrubber {
 impl Scrubber {
     /// A scrubber for the given secrets; empty ones are ignored.
     pub(crate) fn new<'a>(secrets: impl IntoIterator<Item = &'a str>) -> Scrubber {
-        let mut fixed: Vec<Zeroizing<String>> = secrets.into_iter().flat_map(spellings).collect();
+        let secrets: Vec<&str> = secrets.into_iter().collect();
+        let mut fixed: Vec<Zeroizing<String>> =
+            secrets.iter().copied().flat_map(spellings).collect();
         sort_longest_first(&mut fixed);
+        let mut fixed_code: Vec<Zeroizing<String>> =
+            secrets.iter().copied().flat_map(code_spellings).collect();
+        sort_longest_first(&mut fixed_code);
         Scrubber {
             fixed,
+            fixed_code,
             runtime: Mutex::new(Vec::new()),
         }
     }
@@ -136,6 +150,7 @@ impl Scrubber {
         let fresh = RuntimeSecret {
             secret: Zeroizing::new(secret.to_owned()),
             spellings: spellings(secret),
+            code_spellings: code_spellings(secret),
         };
         match index.and_then(|i| runtime.get_mut(i)) {
             Some(entry) => {
@@ -182,14 +197,44 @@ impl Scrubber {
 
     /// A [`ProviderCode`] from the text of the field a provider defines as its error code.
     ///
-    /// The text goes through [`Scrubber::detail`] first; if that changes it in any way (a secret
-    /// removed or withheld, a character cleaned, the text cut), there is no code. Otherwise the
-    /// alphabet and length rules of [`ProviderCode`] apply.
+    /// There is no code when any of these holds:
+    ///
+    /// - [`Scrubber::detail`] changes the text in any way: a spelling of a registered secret
+    ///   that it removes or withholds (see [`Scrubber`]), a character cleaned, the text cut;
+    /// - the text contains, compared ASCII-case-insensitively, a non-empty secret registered now
+    ///   (given to [`Scrubber::new`], or the current or previous secret of a slot);
+    ///   the lowercase or uppercase hexadecimal spelling of its UTF-8 bytes; or its base64
+    ///   spelling in the standard or the URL-safe alphabet (RFC 4648 sections 4 and 5), with or
+    ///   without padding;
+    /// - the text breaks the alphabet or length rules of [`ProviderCode`].
+    ///
+    /// A text that holds only part of a secret, or a spelling not listed here, is not detected
+    /// by these checks.
     pub(crate) fn code(&self, text: &str) -> Option<ProviderCode> {
         if self.detail(text).as_str() != text {
             return None;
         }
+        if self.holds_code_spelling(text) {
+            return None;
+        }
         ProviderCode::new(text)
+    }
+
+    /// True when `text` contains, ASCII-case-insensitively, one of the spellings of a registered
+    /// secret that [`Scrubber::code`] compares (see [`code_spellings`]).
+    fn holds_code_spelling(&self, text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        let runtime = self.runtime.lock().unwrap_or_else(PoisonError::into_inner);
+        self.fixed_code
+            .iter()
+            .chain(runtime.iter().flat_map(|entry| {
+                entry
+                    .current
+                    .code_spellings
+                    .iter()
+                    .chain(entry.previous.iter().flat_map(|p| p.code_spellings.iter()))
+            }))
+            .any(|needle| lower.contains(needle.as_str()))
     }
 
     /// Runs `f` with every needle, fixed and run-time.
@@ -461,6 +506,35 @@ fn spellings(secret: &str) -> Vec<Zeroizing<String>> {
         .collect();
     out.extend(cleaned);
     out.retain(|spelling| !spelling.is_empty());
+    sort_longest_first(&mut out);
+    out
+}
+
+/// The spellings of `secret` that [`Scrubber::code`] compares ASCII-case-insensitively, each
+/// ASCII-lowercased: the secret, the hexadecimal spelling of its bytes (lowercasing makes the
+/// uppercase one the same needle), and its base64 spellings in the standard and the URL-safe
+/// alphabet, with and without padding. None for an empty secret.
+fn code_spellings(secret: &str) -> Vec<Zeroizing<String>> {
+    if secret.is_empty() {
+        return Vec::new();
+    }
+    let bytes = secret.as_bytes();
+    let mut hex = Zeroizing::new(String::with_capacity(bytes.len().saturating_mul(2)));
+    for &b in bytes {
+        push_hex_digit(&mut hex, b >> 4, false);
+        push_hex_digit(&mut hex, b & 0x0f, false);
+    }
+    let mut out = vec![
+        Zeroizing::new(secret.to_owned()),
+        hex,
+        Zeroizing::new(STANDARD.encode(bytes)),
+        Zeroizing::new(STANDARD_NO_PAD.encode(bytes)),
+        Zeroizing::new(URL_SAFE.encode(bytes)),
+        Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes)),
+    ];
+    for spelling in &mut out {
+        spelling.make_ascii_lowercase();
+    }
     sort_longest_first(&mut out);
     out
 }
@@ -1029,13 +1103,77 @@ mod tests {
             scrubber.code("INVALID_ZONE").map(|c| c.to_string()),
             Some("INVALID_ZONE".to_owned())
         );
-        // The credential itself, embedded in a code, in an encoding the decoded check finds.
+        // The credential itself, alone and embedded in a code.
         assert!(scrubber.code("TOKEN_123").is_none());
         assert!(scrubber.code("E_TOKEN_123_X").is_none());
-        assert!(scrubber.code("TOKEN%5F123").is_none());
         // Outside the alphabet or too long.
         assert!(scrubber.code("bad code").is_none());
         assert!(scrubber.code(&"A".repeat(65)).is_none());
+    }
+
+    /// Each spelling `Scrubber::code` compares is found, in any ASCII case, for a secret given
+    /// at construction and for one registered at run time (current and previous of its slot).
+    #[test]
+    fn code_spellings_are_found() {
+        // UTF-8 6b 5a 39 cf bf: five bytes, so the base64 spellings are padded.
+        let secret = "kZ9\u{3ff}";
+        // UTF-8 ef af bf ef af bf: the standard and the URL-safe base64 differ (`+/`, `-_`).
+        let other = "\u{fbff}\u{fbff}";
+        let spellings = [
+            ("verbatim", "kZ9\u{3ff}"),
+            ("verbatim, other case", "KZ9\u{3ff}"),
+            ("hex lowercase", "6b5a39cfbf"),
+            ("hex uppercase", "6B5A39CFBF"),
+            ("base64 padded", "a1o5z78="),
+            ("base64 unpadded", "a1o5z78"),
+            ("base64 unpadded, other case", "A1O5Z78"),
+            ("base64 standard", "76+/76+/"),
+            ("base64 URL-safe", "76-_76-_"),
+        ];
+        let fixed = Scrubber::new([secret, other]);
+        let runtime = Scrubber::new([]);
+        let slot = SecretSlot::new();
+        runtime.remember(&slot, secret);
+        let other_slot = SecretSlot::new();
+        runtime.remember(&other_slot, other);
+        let unrelated = Scrubber::new(["unrelated-secret"]);
+        for (what, spelling) in spellings {
+            let text = format!("E_{spelling}_X");
+            assert!(fixed.holds_code_spelling(&text), "{what}");
+            assert!(runtime.holds_code_spelling(&text), "{what}");
+            assert!(!unrelated.holds_code_spelling(&text), "{what}");
+        }
+        // Part of a secret is not one of its spellings.
+        assert!(!fixed.holds_code_spelling("E_6b5a39cf_X"));
+        // The previous secret of a slot still counts, the one before it no longer.
+        runtime.remember(&slot, "second-secret");
+        assert!(runtime.holds_code_spelling("E_6B5A39CFBF_X"));
+        runtime.remember(&slot, "third-secret");
+        assert!(!runtime.holds_code_spelling("E_6B5A39CFBF_X"));
+    }
+
+    /// A text in the alphabet of `ProviderCode`, which therefore passes on its own, is dropped
+    /// when it holds a spelling of a secret that the alphabet admits: the secret in another
+    /// case, its hex spelling in either case, and its unpadded base64 (URL-safe alphabet).
+    #[test]
+    fn code_is_dropped_for_a_spelling_the_alphabet_admits() {
+        let scrubber = Scrubber::new(["Token-123", "\u{fbff}\u{fbff}"]);
+        let unrelated = Scrubber::new(["unrelated-secret"]);
+        for text in [
+            "E_TOKEN-123",
+            "E_token-123_X",
+            "546f6b656e2d313233",
+            "E_546F6B656E2D313233_X",
+            // base64 of `Token-123` without padding.
+            "VG9rZW4tMTIz",
+            "E_vg9rzw4tmtiz",
+            // URL-safe base64 of the second secret.
+            "E_76-_76-_",
+        ] {
+            assert!(ProviderCode::new(text).is_some(), "{text}");
+            assert!(unrelated.code(text).is_some(), "{text}");
+            assert!(scrubber.code(text).is_none(), "{text}");
+        }
     }
 
     #[test]

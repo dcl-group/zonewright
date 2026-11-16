@@ -13,7 +13,7 @@ desired-state diffing, no scheduling, no audit and no metrics.
 
 ## Status
 
-Version 0.2.0. The provider clients are implemented and tested against mocks. One client, Selectel
+Version 0.2.1. The provider clients are implemented and tested against mocks. One client, Selectel
 v2, is verified against the live API for TXT values, zone listing and the connection check; its
 record operations and the other clients are not yet.
 
@@ -229,10 +229,11 @@ idempotent requests are retried, a bounded number of times. An operation as a wh
 of its own: an application that wants one wraps the call in its own timeout and drops the future.
 Dropping is safe. After a dropped or failed write the outcome at the provider is unknown, and
 repeating the same call converges on the same state: a repeated `add_txt_value` answers
-`AlreadyPresent`, a repeated `remove_txt_value` `NotPresent`, a repeated `set_rrset` `Unchanged`.
-One provider needs care: nic.ru stages changes and publishes them with a commit, and a zone left
-with staged changes by an operation that was dropped in mid-request is refused by later operations
-until the staged changes are committed or rolled back in the provider's panel.
+`AlreadyPresent` (`Accepted` at acme-dns, whose records cannot be read), a repeated
+`remove_txt_value` `NotPresent`, a repeated `set_rrset` `Unchanged`. One provider needs care: nic.ru
+stages changes and publishes them with a commit, and a zone left with staged changes by an operation
+that was dropped in mid-request is refused by later operations until the staged changes are
+committed or rolled back in the provider's panel.
 
 ## What the crate does not do
 
@@ -334,11 +335,11 @@ only (no `metrics` or `prometheus`) and installs no subscriber.
 Each provider operation (`check`, `list_zones`, `add_txt_value` and the others) emits one `DEBUG`
 event with target `zonewright::operation` when it completes. The event names the provider, the
 operation, the zone, the owner name and record type where there are any, the outcome (`ok` or the
-error kind), the provider's error code when there is one, and the elapsed milliseconds. Below that,
-the HTTP transport logs one `DEBUG` event per attempt (`zonewright::http`: the method, the path
-without the query string, the status code and the duration) and the RFC 2136 client one per DNS
-exchange (`zonewright::rfc2136`). Record values, TTLs, error text, credentials, and request and
-response bodies and headers are never logged.
+error kind), and the elapsed milliseconds. Below that, the HTTP transport logs one `DEBUG` event per
+attempt (`zonewright::http`: the method, the path without the query string, the status code and the
+duration) and the RFC 2136 client one per DNS exchange (`zonewright::rfc2136`). Record values, TTLs,
+error text, credentials, and request and response bodies and headers are never logged. A provider's
+own error code is not logged either; it is on the error, as `Error::provider_code()`.
 
 ## MSRV and versioning
 

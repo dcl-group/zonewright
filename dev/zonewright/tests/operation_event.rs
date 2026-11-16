@@ -1,6 +1,7 @@
 //! The operation event (design section 5.6): one `DEBUG` event with target
 //! `zonewright::operation` per call of a `Provider` method, with the typed client and through
-//! `AnyProvider` alike, carrying names, the outcome and the provider code, and never a value.
+//! `AnyProvider` alike, carrying names and the outcome, and never a value or the provider's
+//! error code.
 //!
 //! Exercised for two HTTP clients of different API shapes (Cloudflare, per record; Selectel v2,
 //! per rrset) and for the RFC 2136 client. That every client routes every method through the
@@ -24,19 +25,23 @@ use common::echo::{Captured, LogCapture};
 /// The target of the operation event.
 const TARGET: &str = "zonewright::operation";
 
-/// Every field the event may carry.
-const FIELDS: [&str; 10] = [
-    "message",
-    "provider",
-    "operation",
-    "zones",
-    "zone",
-    "name",
-    "rtype",
-    "outcome",
-    "code",
-    "elapsed_ms",
-];
+/// The fields every operation event carries.
+const ALWAYS: [&str; 5] = ["message", "provider", "operation", "outcome", "elapsed_ms"];
+
+/// The documented fields of the event of `operation`, sorted: [`ALWAYS`], plus `zones` for
+/// `check`, `zone` for `list_rrsets`, and `zone`, `name` and `rtype` for the operations on one
+/// rrset. There is no `code`.
+fn documented_fields(operation: &str) -> Vec<&'static str> {
+    let mut fields = ALWAYS.to_vec();
+    match operation {
+        "check" => fields.push("zones"),
+        "list_zones" => {}
+        "list_rrsets" => fields.push("zone"),
+        _ => fields.extend(["zone", "name", "rtype"]),
+    }
+    fields.sort_unstable();
+    fields
+}
 
 /// The TXT value of every test: distinctive, so that a field that held it would show.
 const VALUE: &str = "zwOperationEventValue7";
@@ -57,7 +62,8 @@ fn value() -> Txt {
 }
 
 /// The operation events captured so far, after checking their shape: level `DEBUG`, the fixed
-/// message, only known fields, `elapsed_ms` present, and the TXT value in no field.
+/// message, exactly the documented fields for the operation (no `code` among them),
+/// `elapsed_ms` a number, and the TXT value in no field.
 fn operation_events(capture: &LogCapture) -> Vec<Captured> {
     let events: Vec<Captured> = capture
         .entries()
@@ -71,9 +77,11 @@ fn operation_events(capture: &LogCapture) -> Vec<Captured> {
             Some("provider operation"),
             "{event}"
         );
-        for name in event.names() {
-            assert!(FIELDS.contains(&name), "unexpected field {name}: {event}");
-        }
+        assert_eq!(event.field("code"), None, "{event}");
+        let mut names = event.names();
+        names.sort_unstable();
+        let operation = event.field("operation").unwrap_or_default();
+        assert_eq!(names, documented_fields(operation), "{event}");
         assert!(
             event
                 .field("elapsed_ms")
@@ -117,7 +125,7 @@ fn assert_add_names(event: &Captured, provider: &str) {
 }
 
 /// Runs an `add_txt_value` that succeeds, through the typed client and through `AnyProvider`,
-/// and asserts one event for each with `outcome = ok` and no `code`.
+/// and asserts one event for each with `outcome = ok`.
 async fn assert_add_ok<P: Provider>(capture: &LogCapture, client: P, provider: &str)
 where
     AnyProvider: From<P>,
@@ -130,7 +138,6 @@ where
     let event = one_event(capture, before);
     assert_add_names(&event, provider);
     assert_eq!(event.field("outcome"), Some("ok"), "{event}");
-    assert_eq!(event.field("code"), None, "{event}");
 
     // Through `AnyProvider`: the client's event, and no second one.
     let any = AnyProvider::from(client);
@@ -143,8 +150,9 @@ where
     assert_eq!(event.field("outcome"), Some("ok"), "{event}");
 }
 
-/// Asserts that the last call was refused as `kind` with `code`, and that exactly one event
-/// reports it with the same outcome and code.
+/// Asserts that the last call was refused with the provider code `code` on the error, and that
+/// exactly one event reports it with the error's kind as `outcome` and without the code, which
+/// comes from the response and stays on the error.
 fn assert_refusal(
     capture: &LogCapture,
     before: usize,
@@ -156,7 +164,14 @@ fn assert_refusal(
     let event = one_event(capture, before);
     assert_add_names(&event, provider);
     assert_eq!(event.field("outcome"), Some(err.kind().as_str()), "{event}");
-    assert_eq!(event.field("code"), code, "{event}");
+    if let Some(code) = code {
+        for (field, text) in event.fields.iter().filter(|(f, _)| f != "elapsed_ms") {
+            assert!(
+                !text.contains(code),
+                "field {field} holds the code: {event}"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "cloudflare")]
@@ -187,9 +202,9 @@ mod cloudflare {
         assert_add_ok(&capture, client(&mock), "cloudflare").await;
     }
 
-    /// A refusal with Cloudflare's error code: `outcome` is the kind, `code` the provider's.
+    /// A refusal with Cloudflare's error code: `outcome` is the kind; the code stays on the error.
     #[tokio::test(flavor = "current_thread")]
-    async fn cloudflare_refusal_reports_kind_and_code() {
+    async fn cloudflare_refusal_reports_the_kind_only() {
         let (capture, _guard) = LogCapture::install();
         let mock = CloudflareMock::start(Seed::standard()).await;
         let client = client(&mock);
@@ -258,7 +273,7 @@ mod selectel_v2 {
         assert_add_ok(&capture, client(&mock), "selectel_v2").await;
     }
 
-    /// A refusal without a provider code: `outcome` is the kind, and there is no `code`.
+    /// A refusal without a provider code: `outcome` is the kind.
     #[tokio::test(flavor = "current_thread")]
     async fn selectel_v2_refusal_reports_kind() {
         let (capture, _guard) = LogCapture::install();
@@ -305,9 +320,9 @@ mod rfc2136 {
         assert_add_ok(&capture, client(&mock), "rfc2136").await;
     }
 
-    /// A refusal by RCODE: `outcome` is the kind, `code` the RCODE's mnemonic.
+    /// A refusal by RCODE: `outcome` is the kind; the RCODE's mnemonic stays on the error.
     #[tokio::test(flavor = "current_thread")]
-    async fn rfc2136_refusal_reports_kind_and_code() {
+    async fn rfc2136_refusal_reports_the_kind_only() {
         let (capture, _guard) = LogCapture::install();
         let mock = Rfc2136Mock::start(Seed::standard()).await;
         let client = client(&mock);

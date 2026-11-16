@@ -180,7 +180,7 @@ Build:
     Section 10.
 47. **A scan enforces the per-provider tests.** Section 12.3.
 
-Added after review:
+Added later:
 
 48. **`PreconditionFailed` and `Conflict` are different errors.** One is the caller's expectation
     not holding and never succeeds on repetition; the other is a race the provider caught and the

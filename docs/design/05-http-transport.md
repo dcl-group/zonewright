@@ -362,13 +362,14 @@ Every call of a `Provider` method on a client of the crate emits one event when 
 `DEBUG`, target `zonewright::operation`, message `provider operation`. Fields: `provider`,
 `operation` (`Operation::as_str`), `zones` (for `check`, the number of zones given), `zone`, `name`
 and `rtype` (for the operations on one rrset; `TXT` for the value operations), `outcome` (`ok` or
-`ErrorKind::as_str`), `code` (`Error::provider_code`, when present) and `elapsed_ms`. A failed
-operation is `DEBUG` as well; the caller decides how loud the error is. Each client runs every trait
-method, including those it does not support, through the private `operation::Call` (`observe` /
-`unsupported`), because the trait's default bodies emit nothing. `AnyProvider` forwards and emits
-nothing, and an implementation outside the crate emits nothing. The event borrows its fields and
-allocates nothing. It never carries record data, a TTL, `Detail` text, configuration, or anything
-from a request or a response. A source scan in `tests/conformance.rs` holds every client to this.
+`ErrorKind::as_str`) and `elapsed_ms`. A failed operation is `DEBUG` as well; the caller decides how
+loud the error is. Each client runs every trait method, including those it does not support, through
+the private `operation::Call` (`observe` / `unsupported`), because the trait's default bodies emit
+nothing. `AnyProvider` forwards and emits nothing, and an implementation outside the crate emits
+nothing. The event borrows its fields and allocates nothing. It never carries record data, a TTL,
+`Detail` text, the provider's error code (it is read from a response body and stays on the error),
+configuration, or anything else from a request or a response. A source scan in
+`tests/conformance.rs` holds every client to this.
 
 The transport emits one event per HTTP attempt at `DEBUG`, target `zonewright::http`, with the
 fields `provider` (the ID), `method`, `path` (URL path, no query string), `status` (absent when

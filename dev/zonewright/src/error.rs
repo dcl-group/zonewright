@@ -412,8 +412,16 @@ const PROVIDER_CODE_MAX_BYTES: usize = 64;
 /// has none.
 ///
 /// A code is 1 to 64 bytes of ASCII letters, digits and `_ - . :`. The crate takes it only from
-/// the field the provider defines as its error code; a text outside these rules, or one that
-/// quotes a credential of the client, is not carried at all, never cut or altered.
+/// the field the provider defines as its error code, and carries it whole or not at all, never
+/// cut or altered. A text outside these rules is not carried. Nor, for the HTTP clients, is a
+/// text that contains a secret of the client (a credential, or a token or signed assertion it
+/// obtained and still remembers) in one of these spellings, compared in any ASCII case: the
+/// secret itself; the hexadecimal spelling of its UTF-8 bytes; its base64 spelling in the
+/// standard or the URL-safe alphabet, with or without padding. A code that holds only part of a
+/// secret, or a secret in another spelling, is not detected.
+///
+/// The RFC 2136 client does not read a code from the server: its code is the crate's own
+/// mnemonic of the answer's RCODE.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ProviderCode(Arc<str>);
 

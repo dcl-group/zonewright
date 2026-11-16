@@ -369,12 +369,17 @@ Properties:
   `ProviderCode` is 1 to 64 bytes of ASCII letters, digits and `_ - . :`; a numeric code is written
   in decimal. It has no public constructor, so an error built outside the crate has none. Inside the
   crate it is taken only from the field the provider's documentation (or lego, or its client code)
-  names as the error code, and built only by `Scrubber::code`, which drops the code when scrubbing
-  would change it in any way and then applies the alphabet and length check. A code is never cut or
-  altered, only kept or dropped. The value belongs to the provider and is only as stable as the
-  provider keeps it, so an application matches on `(ProviderId, code)` and treats `ErrorKind` as the
-  primary classification. `None` means the provider gave no code, the crate does not read one for
-  that provider, or the client refused the request itself.
+  names as the error code. For the HTTP clients it is built only by `Scrubber::code`, which drops
+  the code when scrubbing would change it in any way, or when it contains a registered secret
+  (fixed, or the current or previous one of a run-time slot), compared in any ASCII case, as the
+  secret itself, as the hex spelling of its UTF-8 bytes, or as standard or URL-safe base64 with or
+  without padding, and then applies the alphabet and length check. Part of a secret, or any other
+  spelling, is not detected. The RFC 2136 client builds its code from a crate constant chosen by the
+  answer's RCODE (the mnemonic of RFC 2136 section 2.2, or the number); nothing the server sent
+  enters it. A code is never cut or altered, only kept or dropped. The value belongs to the provider
+  and is only as stable as the provider keeps it, so an application matches on `(ProviderId, code)`
+  and treats `ErrorKind` as the primary classification. `None` means the provider gave no code, the
+  crate does not read one for that provider, or the client refused the request itself.
 - Retryability is a property of the kind. `Transient` after a write means the write may or may not
   have happened; every operation is safe to repeat (section 3.2). `PreconditionFailed` is not
   retryable and `Conflict` is: the first is the caller's expectation being wrong, the second a race

@@ -229,10 +229,11 @@ pub(super) fn rcode_error(code: u8) -> Error {
 /// the table of RFC 2136 section 2.2 (which lists the values 0 to 5 of RFC 1035 section 4.1.1
 /// with their mnemonics, and adds 6 to 10), or the decimal number of an RCODE that table does
 /// not name. The text is the crate's own, chosen by the number on the wire; nothing the server
-/// sent enters it.
+/// sent enters it. NOERROR is not a refusal and has no arm: every caller handles it first.
+/// SERVFAIL is mapped to `Transient` before a code is asked for; its arm keeps the table whole
+/// for the failure RCODEs.
 pub(super) fn rcode_code(code: u8) -> Option<ProviderCode> {
     let mnemonic = match code {
-        rcode::NOERROR => "NOERROR",
         rcode::FORMERR => "FORMERR",
         rcode::SERVFAIL => "SERVFAIL",
         rcode::NXDOMAIN => "NXDOMAIN",

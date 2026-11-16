@@ -44,15 +44,15 @@
 //! - `name` and `rtype`: the owner name and the record type, for the operations on one rrset
 //!   (`rtype` is `TXT` for the TXT value operations).
 //! - `outcome`: `ok`, or the error's kind ([`ErrorKind::as_str`]).
-//! - `code`: the provider's code for a refusal ([`Error::provider_code`]), when there is one.
 //! - `elapsed_ms`: the wall time of the call in milliseconds.
 //!
 //! A failed operation is reported at `DEBUG` as well: the error goes to the caller, who decides
 //! how loud it is. An unsupported operation is reported too, with `outcome` `unsupported`. The
 //! event never carries a record value or any other record data, a TTL, the text of an error, the
-//! client's configuration, or anything from a request or a response; zone and owner names are
-//! not secrets and are included. An implementation of [`Provider`] outside the crate emits
-//! nothing.
+//! provider's error code (it comes from a response body; the caller has it on the error, through
+//! [`Error::provider_code`]), the client's configuration, or anything else from a request or a
+//! response; zone and owner names, which the caller passed in, are included. An implementation
+//! of [`Provider`] outside the crate emits nothing.
 //!
 //! Below the operation, the HTTP transport emits one `DEBUG` event per attempt (target
 //! `zonewright::http`: method, path without the query string, status, attempt, duration) and the

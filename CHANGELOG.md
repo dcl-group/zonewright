@@ -12,15 +12,18 @@ All notable changes to this crate are recorded in this file. The format follows
   provider's own machine-readable code for a refusal, when it gave one, in a new field `code`.
   Clients that read one: acme-dns, Beget, Cloud.ru, Cloudflare, DigitalOcean, Hetzner, nic.ru,
   reg.ru, RFC 2136 (the RCODE mnemonic of RFC 2136 section 2.2, or its number), Route 53, Timeweb
-  Cloud, Yandex 360, Yandex Cloud. A code is kept or dropped, never altered, and never carries a
-  credential.
+  Cloud, Yandex 360, Yandex Cloud. A code is kept whole or dropped, never altered. For the HTTP
+  clients, a code is dropped when it contains a secret of the client (a credential, or a token or
+  signed assertion it obtained and still remembers) in any ASCII case, as itself, as the hex
+  spelling of its UTF-8 bytes, or as standard or URL-safe base64 with or without padding. Part of a
+  secret, or any other spelling, is not detected.
 - Every call of a `Provider` method on a client of the crate emits one `tracing` event when it
   completes, with the typed client and through `AnyProvider` alike: level `DEBUG`, target
   `zonewright::operation`, message `provider operation`. Fields: `provider`, `operation`, `zone` (or
   `zones`, the count, for `check`), `name` and `rtype` where the operation has them, `outcome` (`ok`
-  or the error kind), `code` (the provider code, when present) and `elapsed_ms`. Record values,
-  TTLs, error text, configuration and request or response data are never included. An implementation
-  of `Provider` outside the crate emits nothing.
+  or the error kind) and `elapsed_ms`. Record values, TTLs, error text, the provider's error code,
+  configuration, and request or response data are never included. An implementation of `Provider`
+  outside the crate emits nothing.
 - `rfc2136`: TSIG algorithm `hmac-sha384` (RFC 8945 section 6), next to `hmac-sha256` and
   `hmac-sha512`.
 - `zonewright-mock`: the RFC 2136 mock verifies and signs `hmac-sha384`; `Seed::standard()` gains
@@ -34,25 +37,28 @@ All notable changes to this crate are recorded in this file. The format follows
   replaces it.
 - Documentation: `TrustRoots::Platform` is not available on Android; with the `platform-verifier`
   feature the crate does not compile for that target.
-- The summary paragraph of the 0.2.0 section below names the behavior changes that its "Fixed" list
-  holds.
+- Documentation: `TrustRoots::Platform` and `TrustRoots::None` say that their failure is reported by
+  `Context::new` only in a build with an HTTP provider, the only kind that uses the trust settings.
+- The summary of the 0.2.0 section below also points to the behavior changes listed under its
+  "Fixed".
 
 ### Fixed
 
-- Route 53: the refusal of a TXT value operation at a name whose type is held by several sets, or by
-  a set bound to a health check or a traffic policy, says so; it named only aliases and routing
-  policies.
+- Route 53: the refusal of an operation at a name whose type is held by several sets, or by a set
+  bound to a health check or a traffic policy, says so, for the TXT value operations and the record
+  operations alike; the TXT value operations named only aliases and routing policies.
 - `zonewright-mock`: a link with a delay too long to add to the current time no longer stops
   applying changes.
-- `zonewright-mock`: `link::link` no longer replays a change made while the link was being set up,
-  which could briefly answer an older value.
+- `zonewright-mock`: `link::link` reads the source again until its state and its subscription agree
+  (up to eight times), so that a change made while the link is being set up is not replayed over a
+  newer state, which could briefly answer an older value.
 - `zonewright-mock`: the SOA in the authority section of a negative answer of `dns::DnsMock` carries
   the smaller of its TTL and its MINIMUM (RFC 2308 section 3).
-- `zonewright-mock`: `dns::Data::txt`, `DnsMock::add` and `DnsMock::set` panic on a TXT string over
-  255 octets and on a name with a label over 63 octets or over 255 octets in all, instead of sending
-  a message that cannot be decoded; a TCP answer over 65 535 octets is sent truncated (TC) instead
-  of with a wrong length prefix. A link skips, and counts in `Link::skipped`, an rrset whose owner
-  name cannot be encoded and a value whose RDATA would be over 65 535 octets.
+- `zonewright-mock`: `dns::Data::txt` panics on a string over 255 octets, and `DnsMock::add` and
+  `DnsMock::set` panic on a name with a label over 63 octets or over 255 octets in all, instead of
+  sending a message that cannot be decoded; a TCP answer over 65 535 octets is sent truncated (TC)
+  instead of with a wrong length prefix. A link skips, and counts in `Link::skipped`, an rrset whose
+  owner name cannot be encoded and a value whose RDATA would be over 65 535 octets.
 - `zonewright-mock`: `dns::DnsMock` follows a chain of 16 CNAME records to its final record, and
   answers a longer chain or a loop with the first 16 records and no SOA.
 

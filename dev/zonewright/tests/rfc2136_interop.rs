@@ -16,7 +16,8 @@
 //! Observed with nsupdate 9.10.6 and DiG 9.10.6 (the builds shipped with macOS) on 2026-11-15.
 //! That `nsupdate` accepts `hmac-md5`, `hmac-sha1`, `hmac-sha224`, `hmac-sha256`, `hmac-sha384`
 //! and `hmac-sha512`; the client and the mock implement `hmac-sha256`, `hmac-sha384` and
-//! `hmac-sha512`, and those three are covered.
+//! `hmac-sha512`, and the tests of this file exercise those three when they are run with
+//! `--ignored`.
 #![cfg(feature = "rfc2136")]
 // Test code: a failed assumption is a failed test.
 #![allow(

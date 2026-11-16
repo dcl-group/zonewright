@@ -1,7 +1,8 @@
 //! HMAC (RFC 2104) with SHA-256, SHA-384 and SHA-512 over `aws-lc-rs`.
 //!
-//! Users: TSIG (RFC 8945, `hmac-sha256`, `hmac-sha384` and `hmac-sha512`) and AWS Signature Version 4. The key
-//! is borrowed; these functions neither copy it into memory of their own nor keep it.
+//! Users: TSIG (RFC 8945, `hmac-sha256`, `hmac-sha384` and `hmac-sha512`) and AWS Signature
+//! Version 4. The key is borrowed; these functions neither copy it into memory of their own nor
+//! keep it.
 
 use aws_lc_rs::hmac as backend;
 
