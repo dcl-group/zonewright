@@ -200,7 +200,12 @@ Behavior that the design fixes because the generic sections cannot:
 - `regru`. `check` calls the API's no-operation request, which the documentation describes as
   requiring valid credentials, on every call; `credentials_verified` is always true. No function
   sets a TTL and the listing states none: every set reads with the provider's default, which a write
-  may request (`Requestable`).
+  may request (`Requestable`). The owner name of a listed record is compared after trimming white
+  space around `subname`, at the record level and for the TXT value operations alike; a removal
+  always sends the client's own relative name. A plan that would remove a record whose listed
+  content is empty or blank is refused with `Error::Rejected` before any write, since
+  `zone/remove_record` without a content removes every record of the type at the name (documentation
+  9.18).
 - `beget`. `check` calls the domain listing, which like every method of the API requires the login
   and password; `credentials_verified` is true also with an empty zone list.
 - `rfc2136`. DNS over TCP to the configured `server` (an IP literal or a host name, with an optional

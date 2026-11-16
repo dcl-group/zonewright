@@ -19,8 +19,10 @@
 //!   (documentation 9.2, 9.3, 9.9), so the capabilities say that a TTL cannot be set and the
 //!   record layer refuses a requested one before any request;
 //! - delete: `zone/remove_record` with the type and the content the read returned, sent once and
-//!   never without a content (`api::Api::remove_record` refuses a blank one before any request;
-//!   without it the function removes every record of the type at the name), followed by a read of
+//!   never without a content (without it the function removes every record of the type at the
+//!   name): a plan that would remove a record whose listed content is blank is refused with
+//!   `Error::Rejected` before any write (`check_removable`), and `api::Api::remove_record` refuses
+//!   a blank content before its request as a second guard. Each removal is followed by a read of
 //!   the zone as in `txt.rs`: the documentation names no answer for a content nothing holds, so a
 //!   `success` alone does not prove that the record is gone, and a record with that content still
 //!   there is `Error::Protocol`;
@@ -77,7 +79,7 @@ use crate::provider::{SkipReason, ZoneListing};
 use crate::record::{RecordData, RecordType, RrsetTtl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
-    self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
+    self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Step, Stored,
 };
 
 use super::api::{A, AAAA, Rr, TXT};
@@ -187,8 +189,10 @@ fn listed(type_name: &str) -> Listed {
     }
 }
 
-/// Whether `rr` is a record of `kind` at `name`, compared as names (`@` is the zone itself).
-fn is_at(rr: &Rr, zone: &DomainName, name: &DomainName, kind: Kind) -> bool {
+/// Whether `rr` is a record of `kind` at `name`, compared as names (`@` is the zone itself). The
+/// TXT value operations (`txt.rs`) read through this function too, so both levels place a record
+/// at the same name.
+pub(super) fn is_at(rr: &Rr, zone: &DomainName, name: &DomainName, kind: Kind) -> bool {
     rr.rectype
         .as_deref()
         .is_some_and(|rtype| rtype.eq_ignore_ascii_case(kind.api_name()))
@@ -196,6 +200,11 @@ fn is_at(rr: &Rr, zone: &DomainName, name: &DomainName, kind: Kind) -> bool {
 }
 
 /// Whether `rr`, of any type, is at `name`, compared as [`is_at`] compares.
+///
+/// White space around `subname` is ignored. The documentation does not say that the API pads a
+/// name; the trim only keeps a padded spelling from hiding a record at its name. A removal never
+/// sends the listed spelling: it names the client's own relative name (`txt::subdomain`), and the
+/// read after it reports a record the API kept as a removal that did not happen.
 fn owner_is(rr: &Rr, zone: &DomainName, name: &DomainName) -> bool {
     rr.subname
         .as_deref()
@@ -241,6 +250,28 @@ fn write_aaaa(data: &RecordData) -> String {
 fn write_txt(data: &RecordData) -> Option<String> {
     let txt = Txt::from_data(data).ok().filter(Txt::is_plain)?;
     TXT_WRITE.write(&txt)
+}
+
+/// Refuses the removal of a record whose content, its handle, is empty or only white space,
+/// before any write.
+///
+/// `api::Api::remove_record` refuses such a content before its request, because without a content
+/// `zone/remove_record` removes every record of the type at the name (documentation 9.18). That
+/// refusal comes only when the removal's turn arrives, after the creates of a replacement or the
+/// earlier removals of a delete were applied. This guard runs on the whole plan first, so such a
+/// record ends the operation with nothing written. Whether the API ever lists a record without a
+/// content is not known; the guard is local and asks nothing of the API.
+pub(super) fn check_removable(handle: &str) -> Result<(), Error> {
+    if handle.trim().is_empty() {
+        return Err(Error::Rejected {
+            status: None,
+            detail: Detail::constant(
+                "the provider listed a record without a content, which its API cannot remove on \
+                 its own; the record has to be removed at the provider",
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn not_sendable() -> Error {
@@ -397,6 +428,22 @@ impl PerRecord for Regru {
 
     fn updates_in_place(&self) -> bool {
         false
+    }
+
+    /// A plan that would remove a record without a content is refused before any write
+    /// ([`check_removable`]).
+    fn check_plan(
+        &self,
+        _zone: &DomainName,
+        _name: &DomainName,
+        _rtype: RecordType,
+        _context: &Neighbors,
+        steps: &[Step<'_, String>],
+    ) -> Result<(), Error> {
+        steps.iter().try_for_each(|step| match step {
+            Step::Delete(record) => check_removable(&record.handle),
+            Step::Create { .. } | Step::Update { .. } => Ok(()),
+        })
     }
 
     fn holds_cname(&self, _rtype: RecordType, context: &Neighbors) -> Option<bool> {

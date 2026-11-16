@@ -8,7 +8,8 @@
 //! API:
 //!
 //! - read: `zone/get_resource_records` for the whole zone, in one answer; the records of type TXT
-//!   whose `subname` is the name asked for, compared as names (`@` is the zone itself);
+//!   whose `subname` is the name asked for, compared as names (`@` is the zone itself) by the
+//!   record level's comparison (`records::is_at`);
 //! - create: `zone/add_txt`, sent once, with the name relative to the zone and the value. The
 //!   function has no TTL parameter (documentation 9.9), so the TTL the value layer chose is not
 //!   sent and the capabilities say that a TTL cannot be set;
@@ -40,6 +41,7 @@ use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
 use super::api::TXT;
 use super::client::Regru;
+use super::records::{Kind, check_removable, is_at};
 
 /// How TXT content is read.
 const READ: TxtDialect = TxtDialect::Auto;
@@ -86,17 +88,8 @@ impl PerRecord for Regru {
             .records(zone)
             .await?
             .into_iter()
-            .filter(|rr| {
-                rr.rectype
-                    .as_deref()
-                    .is_some_and(|rtype| rtype.eq_ignore_ascii_case(TXT))
-                    && rr
-                        .subname
-                        .as_deref()
-                        .and_then(|sub| DomainName::from_relative(sub, zone).ok())
-                        .as_ref()
-                        == Some(name)
-            })
+            // The record level's comparison, so that both levels place a record at one name.
+            .filter(|rr| is_at(rr, zone, name, Kind::Txt))
             .map(|rr| {
                 let content = rr.content.unwrap_or_default();
                 TxtRecord {
@@ -131,6 +124,10 @@ impl PerRecord for Regru {
         record: &TxtRecord<String>,
     ) -> Result<(), Error> {
         let sub = subdomain(zone, name)?;
+        // A record without a content is refused before its removal is sent (see
+        // `records::check_removable`). The value layer removes only records that hold the value
+        // being removed, which is never blank, so this is a guard, not a path in use.
+        check_removable(&record.handle)?;
         self.api
             .remove_record(zone, sub, TXT, &record.handle)
             .await?;

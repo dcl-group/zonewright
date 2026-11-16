@@ -40,6 +40,11 @@ All notable changes to this crate are recorded in this file. The format follows
   turned into canonical data.
 - The refusal of an explicit TTL at a provider that chooses the TTL itself says so instead of naming
   a range.
+- reg.ru: the TXT value operations place a listed record at its name the way the record operations
+  do, ignoring white space around the listed `subname`, so both levels see the same records.
+- reg.ru: a `set_rrset` or `delete_rrset` that would have to remove a listed record without a
+  content is refused with `Error::Rejected` before any write, instead of failing with `InvalidInput`
+  after the records it had already created or removed.
 
 ## 0.1.0 - 2026-11-16
 

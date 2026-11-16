@@ -1206,6 +1206,58 @@ async fn regru_exact_name_match() {
     }
 }
 
+/// A listed `subname` padded with white space is the name it spells at both levels: the TXT value
+/// operations see the record there as the record operations do. A removal names the client's own
+/// spelling of the name, never the padded one; when the API keeps the padded record (the mock
+/// matches `subdomain` exactly), the read after the removal reports a removal that did not happen
+/// instead of a success, and no other record is touched.
+#[tokio::test]
+async fn regru_padded_subname_is_the_same_name_at_both_levels() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let padded = format!(" {SUB} ");
+    control.add_record("example.org", &padded, "TXT", "AAA");
+    control.add_record("example.org", SUB, "TXT", "BBB");
+    control.add_record("example.org", "other", "TXT", "AAA");
+
+    // The record level places the padded record at the name.
+    assert_eq!(
+        client
+            .get_rrset(&zone(), &name(), RecordType::TXT)
+            .await
+            .unwrap(),
+        Some(rr(NAME, RecordType::TXT, &["\"AAA\"", "\"BBB\""]))
+    );
+    // So does the TXT value level: the value is there, nothing is written.
+    assert_eq!(
+        add(&client, "AAA").await.unwrap(),
+        AddOutcome::AlreadyPresent
+    );
+    assert_eq!(writes(&mock), 0);
+
+    // The removal is sent with the client's name and the listed content, and is not reported as
+    // done while the record is still listed at the name.
+    let e = remove(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    let removals = mock.log().matching(Some("POST"), REMOVE);
+    assert_eq!(removals.len(), 1);
+    let input = input_of(&removals[0]);
+    assert_eq!(input["subdomain"], SUB);
+    assert_eq!(input["content"], "AAA");
+    assert_eq!(control.txt("example.org", &padded), ["AAA"]);
+    assert_eq!(control.txt("example.org", SUB), ["BBB"]);
+    assert_eq!(control.txt("example.org", "other"), ["AAA"]);
+
+    // The record level reports the same.
+    let e = client
+        .delete_rrset(&zone(), &name(), RecordType::TXT, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    assert_eq!(control.txt("example.org", &padded), ["AAA"]);
+    assert_eq!(control.txt("example.org", "other"), ["AAA"]);
+}
+
 /// Contents that come back quoted are read as the values they hold.
 #[tokio::test]
 async fn regru_quoted_content_is_read() {
@@ -2553,35 +2605,34 @@ async fn regru_replacement_creates_before_it_deletes() {
     assert_eq!(stored(&mock, "www", "A"), ["192.0.2.5", "192.0.2.6"]);
 }
 
-/// A record whose content is blank is never removed: a removal without a content would remove
-/// every record of the type at the name. The client refuses it before the request; the other
-/// records stay.
+/// A record whose content is empty or blank is never removed: a removal without a content would
+/// remove every record of the type at the name. A plan that would remove one is refused with
+/// `Rejected` before any write, so a replacement does not stop after its creates and a delete does
+/// not stop after its first removals: nothing is created and nothing is removed.
 #[tokio::test]
 async fn regru_blank_content_is_never_removed() {
     let (mock, client) = setup().await;
     let control = mock.control();
-    control.add_record("example.org", "www", "A", " ");
-    control.add_record("example.org", "www", "A", "192.0.2.1");
-    let wanted = rr("www.example.org", RecordType::A, &["192.0.2.2"]);
-    let e = client
-        .set_rrset(&zone(), &wanted, Expect::Any)
-        .await
-        .unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
-    // The new record was created before; no removal request carried a blank content.
-    assert!(stored(&mock, "www", "A").contains(&" ".to_owned()));
-    assert!(stored(&mock, "www", "A").contains(&"192.0.2.2".to_owned()));
-    for request in mock.log().matching(Some("POST"), REMOVE) {
-        let input = input_of(&request);
-        let content = input["content"].as_str().expect("a content");
-        assert!(!content.trim().is_empty(), "{input}");
+    for (sub, blank) in [("www", " "), ("mail", "")] {
+        let owner = format!("{sub}.example.org");
+        control.add_record("example.org", sub, "A", "192.0.2.1");
+        control.add_record("example.org", sub, "A", blank);
+        let before = stored(&mock, sub, "A");
+        let wanted = rr(&owner, RecordType::A, &["192.0.2.2"]);
+        let e = client
+            .set_rrset(&zone(), &wanted, Expect::Any)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::Rejected { .. }), "{sub}: {e:?}");
+        assert_eq!(record_writes(&mock), 0, "{sub}");
+        let e = client
+            .delete_rrset(&zone(), &dn(&owner), RecordType::A, Expect::Any)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::Rejected { .. }), "{sub}: {e:?}");
+        assert_eq!(record_writes(&mock), 0, "{sub}");
+        assert_eq!(stored(&mock, sub, "A"), before, "{sub}");
     }
-    let e = client
-        .delete_rrset(&zone(), &dn("www.example.org"), RecordType::A, Expect::Any)
-        .await
-        .unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
-    assert!(stored(&mock, "www", "A").contains(&" ".to_owned()));
 }
 
 /// A removal the API answered `success` but did not apply is not reported as done: the client
