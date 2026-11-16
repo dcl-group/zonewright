@@ -110,8 +110,8 @@ The mock crate (published as `zonewright-mock`, with the same version as `zonewr
 `form`; `tokio`; `serde`; `serde_json`; `aws-lc-rs` (its own verification of SigV4, TSIG and PS256,
 independent of the crate under test); `base64`; `roxmltree`; `hickory-proto` with `std` only (the
 DNS server for the inspector tests). It does not depend on `zonewright`. It does not inherit
-`[workspace.lints]`: its own `[lints.rust]` denies `unsafe_code` and warns on `missing_docs`, and
-the workspace clippy denials do not apply to it.
+`[workspace.lints]`: its own `[lints.rust]` denies `unsafe_code` and `missing_docs`, and the
+workspace clippy denials do not apply to it.
 
 `tracing` is also a dev-dependency because the secret tests' `tracing` capture
 (`tests/common/echo.rs`) builds without any feature. The crate's manifest also sets

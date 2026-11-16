@@ -1315,13 +1315,72 @@ fn provider_test_files_define_the_required_tests() {
             .join(format!("{}.rs", id.as_str()));
         let text = std::fs::read_to_string(&path).unwrap();
         for suffix in required {
-            let name = format!("fn {}_{suffix}(", id.as_str());
-            if !text.contains(&name) {
-                missing.push(format!("{}: missing {name}", path.display()));
+            let name = format!("{}_{suffix}", id.as_str());
+            if !defines_test(&text, &name) {
+                missing.push(format!(
+                    "{}: fn {name} is missing or is not a test that runs",
+                    path.display()
+                ));
             }
         }
     }
     assert!(missing.is_empty(), "{}", missing.join("\n"));
+}
+
+/// Whether `text` defines the function `name` as a test that runs: the lines directly above the
+/// function (attributes and doc comments) carry `#[test]` or `#[tokio::test`, and none of them is
+/// `#[ignore`. A name that only occurs in a comment, a helper function and an ignored test do not
+/// count.
+fn defines_test(text: &str, name: &str) -> bool {
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let sync = format!("fn {name}(");
+    let asynchronous = format!("async fn {name}(");
+    lines.iter().enumerate().any(|(at, line)| {
+        if !line.starts_with(&sync) && !line.starts_with(&asynchronous) {
+            return false;
+        }
+        let above: Vec<&str> = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|l| l.starts_with("#[") || l.starts_with("///"))
+            .copied()
+            .collect();
+        above
+            .iter()
+            .any(|l| l.starts_with("#[test]") || l.starts_with("#[tokio::test"))
+            && !above.iter().any(|l| l.starts_with("#[ignore"))
+    })
+}
+
+#[test]
+fn a_required_test_must_be_a_test_that_runs() {
+    let name = "x_secret_echo";
+    assert!(defines_test(
+        "#[tokio::test]\nasync fn x_secret_echo() {",
+        name
+    ));
+    assert!(defines_test(
+        "#[test]\n/// Doc.\nfn x_secret_echo() {",
+        name
+    ));
+    assert!(defines_test(
+        "    #[tokio::test(start_paused = true)]\n    async fn x_secret_echo() {",
+        name
+    ));
+    assert!(!defines_test("// fn x_secret_echo() {", name));
+    assert!(!defines_test("fn x_secret_echo() {", name));
+    assert!(!defines_test(
+        "#[test]\n\nfn other() {}\nfn x_secret_echo() {",
+        name
+    ));
+    assert!(!defines_test(
+        "#[tokio::test]\n#[ignore = \"live\"]\nasync fn x_secret_echo() {",
+        name
+    ));
+    assert!(!defines_test(
+        "#[tokio::test]\nasync fn x_secret_echo_more() {",
+        name
+    ));
 }
 
 /// Both crate directories carry the license texts, so that they are in the published packages;

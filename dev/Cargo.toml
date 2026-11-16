@@ -10,7 +10,7 @@ repository = "https://github.com/dcl-group/zonewright"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
-missing_docs = "warn"
+missing_docs = "deny"
 
 [workspace.lints.clippy]
 # Library code does not panic; tests may (see clippy.toml).

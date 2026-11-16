@@ -175,12 +175,12 @@ true, only by the maintainer's commit after these tests passed.
 `cargo deny check`; `cargo test --all-features`; `cargo hack check --each-feature` over the public
 features and `cargo hack test --each-feature` likewise, plus the no-feature build; `cargo doc` with
 warnings denied; a build with the MSRV toolchain. Workspace lints: `unsafe_code = "deny"`,
-`missing_docs` (a warning, denied by the gates), and, for the `zonewright` crate, the clippy lints
-`unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`, `indexing_slicing`,
-`dbg_macro`, `print_stdout` and `print_stderr` denied in library code (`zonewright-mock` does not
-inherit the workspace lints; it sets `unsafe_code` and `missing_docs` itself); `clippy.toml` allows
-unwrap, expect, panic, indexing, `dbg!` and printing in test code. The gates are run by hand from
-`dev/`; no CI configuration is part of the repository.
+`missing_docs = "deny"`, and, for the `zonewright` crate, the clippy lints `unwrap_used`,
+`expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`, `indexing_slicing`, `dbg_macro`,
+`print_stdout` and `print_stderr` denied in library code (`zonewright-mock` does not inherit the
+workspace lints; it sets `unsafe_code` and `missing_docs` itself); `clippy.toml` allows unwrap,
+expect, panic, indexing, `dbg!` and printing in test code. The gates are run by hand from `dev/`; no
+CI configuration is part of the repository.
 
 Two public features change which transport tests exist. The SOCKS5 tests (`src/http/proxy.rs`,
 `src/http/proxy_tests.rs`, `tests/transport.rs`) are compiled with `socks`, and the tests of the

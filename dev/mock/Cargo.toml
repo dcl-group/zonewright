@@ -26,4 +26,4 @@ tokio = { version = "1.54.1", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "deny"
-missing_docs = "warn"
+missing_docs = "deny"
