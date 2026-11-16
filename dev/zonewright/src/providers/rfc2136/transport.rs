@@ -6,12 +6,17 @@
 //!   the TCP connect, `ContextOptions::request_timeout` one exchange from sending the request to
 //!   having read the whole answer. A length prefix below the size of a DNS header is refused;
 //!   the framing itself bounds an answer at 65535 octets.
-//! - Every request is signed and every answer verified (RFC 8945 sections 5.1 and 5.4): its ID,
-//!   QR bit, opcode and question or zone section must match the request, and its TSIG must
-//!   verify against the request MAC. An answer that is not signed with the key is
-//!   `Error::Protocol` whatever its RCODE, so a forged answer can neither report success nor turn
-//!   a removal into "not present". TSIG errors reported by the server (NOTAUTH with BADKEY,
-//!   BADSIG, BADTIME, BADTRUNC; RFC 8945 section 5.2) are `Error::Auth`.
+//! - Every request is signed, and every answer must carry a TSIG of the key that verifies
+//!   against the request MAC (RFC 8945 sections 5.1 and 5.4); its ID, QR bit, opcode and
+//!   question or zone section must match the request. An answer that does not verify is
+//!   `Error::Protocol` whatever its RCODE, so a forged answer can neither report success nor
+//!   turn a removal into "not present". The one exception is a NOTAUTH answer with TSIG error
+//!   BADKEY or BADSIG and an empty MAC, which RFC 8945 (sections 5.2.1, 5.2.2, 5.3.2) requires to
+//!   be unsigned: it is `Error::Auth` unverified, so someone who can inject into the connection
+//!   can make an applied update look refused. Other TSIG errors (BADTIME, BADTRUNC) are
+//!   `Error::Auth` only when their MAC verifies. The client does not wait for a further answer
+//!   after one that fails verification (section 5.4): the connection carries one exchange and is
+//!   closed (section 5.3.1).
 //! - Repeats (design sections 5.3 and 11.3): [`Transport::exchange`] is for the messages that
 //!   are idempotent at the server — a query, an empty update with a prerequisite, the addition
 //!   of one RR (a duplicate "will be silently ignored", RFC 2136 section 2.5.1) and the deletion

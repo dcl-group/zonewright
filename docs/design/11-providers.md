@@ -209,12 +209,14 @@ Behavior that the design fixes because the generic sections cannot:
     failure. Record-level updates, which carry value-dependent prerequisites, are sent once.
   - `ContextOptions::loopback_only`: a `server` that is not a loopback IP literal is `Error::Config`
     at construction. Host names are refused in that mode, since classifying one would need a lookup.
-  - A response that is not signed with the key is `Error::Protocol` whatever its response code, so a
-    forged negative answer cannot turn a removal into `NotPresent`. TSIG errors are `Error::Auth`,
-    with a hint about clock skew for `BADTIME`. `NOTAUTH` is `ZoneNotFound`; `REFUSED` on an update
-    is `Forbidden`; `REFUSED` on the query before a TXT value operation is tolerated and leads to
-    the blind path of section 3.5, while at record level it is `Forbidden`, since `SetOutcome` has
-    no blind outcome. The TSIG key is at least 16 octets.
+  - A response whose TSIG does not verify against the request is `Error::Protocol` whatever its
+    response code, so a forged negative answer cannot turn a removal into `NotPresent`. TSIG errors
+    are `Error::Auth`, with a hint about clock skew for `BADTIME`: `BADKEY` and `BADSIG` unverified,
+    since RFC 8945 requires those answers to be unsigned (a forged one can therefore make an applied
+    update look refused), every other TSIG error only when its MAC verifies. `NOTAUTH` is
+    `ZoneNotFound`; `REFUSED` on an update is `Forbidden`; `REFUSED` on the query before a TXT value
+    operation is tolerated and leads to the blind path of section 3.5, while at record level it is
+    `Forbidden`, since `SetOutcome` has no blind outcome. The TSIG key is at least 16 octets.
   - Preconditions: the protocol's update prerequisites (RFC 2136 section 2.4) are evaluated by the
     server atomically with the update, hence `Preconditions::Atomic`. The record-level operations
     send `Expect::Absent` as "RRset does not exist" and `Expect::Matches`, as well as the client's

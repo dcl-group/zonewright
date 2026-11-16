@@ -12,6 +12,9 @@ All notable changes to this crate are recorded in this file. The format follows
   as zero before the smallest TTL is taken (RFC 2181 section 8).
 - nic.ru: a TXT value operation refuses a zone whose record listing reports staged changes made
   after the zone lookup, as the record-level operations do.
+- RFC 2136: an answer that reports a TSIG error is `Error::Auth` only when it is an unsigned
+  `BADKEY` or `BADSIG` (which RFC 8945 requires to be unsigned) or when its MAC verifies against the
+  request; otherwise it is `Error::Protocol`.
 
 ## 0.1.0 - 2026-11-16
 

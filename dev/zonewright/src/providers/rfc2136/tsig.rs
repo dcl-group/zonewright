@@ -8,7 +8,8 @@
 //!   record (ARCOUNT less one, the message ID replaced by the original ID), and the response's
 //!   TSIG variables (sections 4.3.2 and 5.3). It is compared in constant time.
 //! - The time of a verified response must lie within its fudge of the local clock (section
-//!   5.2.3); the MAC is checked before the time (section 10.1).
+//!   5.2.3); the MAC is checked before the time (section 10.1). A verified answer that reports a
+//!   TSIG error is exempt from the time check.
 //! - Truncated MACs (section 5.2.2.1) are neither sent nor accepted.
 //!
 //! Algorithms: `hmac-sha256` and `hmac-sha512` (section 6, table 3). Fudge 300 s, the value
@@ -223,8 +224,10 @@ pub(super) fn sign(msg: &mut Vec<u8>, key: &Key, now: u64) -> Result<Vec<u8>, Er
 pub(super) enum Verdict {
     /// The MAC verifies and the time is within the fudge; no TSIG error.
     Ok,
-    /// The server reports a TSIG error (BADSIG, BADKEY, BADTIME, BADTRUNC or another code).
-    /// Such answers carry no MAC, or a MAC this client does not rely on (RFC 8945 section 5.3.2).
+    /// The server reports a TSIG error: BADKEY or BADSIG with an empty MAC (RFC 8945 sections
+    /// 5.2.1, 5.2.2 and 5.3.2: these answers are unsigned and cannot be verified), or any TSIG
+    /// error in an answer whose MAC verifies against the request MAC (BADTIME, section 5.2.3).
+    /// The time check is not applied to it.
     ServerError(u16),
     /// The response has no TSIG record.
     Unsigned,
@@ -278,11 +281,20 @@ pub(super) fn verify(
     if record.name != key.name.as_str() || algorithm != key.algorithm.text_name() {
         return Verdict::Invalid("the response is signed with another key or algorithm");
     }
-    if error != 0 {
+    // RFC 8945 sections 5.2.1, 5.2.2 and 5.3.2: a BADKEY or BADSIG answer is unsigned (MAC
+    // size 0), so it cannot be verified; it is the only answer honored without a MAC.
+    if (error == BADKEY || error == BADSIG) && mac.is_empty() {
         return Verdict::ServerError(error);
     }
+    // Every other answer, including one with another TSIG error (BADTIME must be signed, section
+    // 5.2.3), must carry a full MAC that verifies (section 5.4).
     if mac.len() != key.algorithm.mac_len() {
-        return Verdict::Invalid("the MAC of the response is truncated or missing");
+        return Verdict::Invalid(if error != 0 {
+            "the answer reports a TSIG error that must be signed, but its MAC is missing or \
+             truncated"
+        } else {
+            "the MAC of the response is truncated or missing"
+        });
     }
     let Some(body) = buf.get(..record.start) else {
         return Verdict::Invalid("the TSIG record of the response is malformed");
@@ -308,7 +320,16 @@ pub(super) fn verify(
     data.extend_from_slice(&body);
     data.extend_from_slice(&vars);
     if !key.algorithm.verify(key.secret.expose_secret(), &data, mac) {
-        return Verdict::Invalid("the MAC of the response does not verify");
+        return Verdict::Invalid(if error != 0 {
+            "the answer reports a TSIG error whose MAC does not verify"
+        } else {
+            "the MAC of the response does not verify"
+        });
+    }
+    // A verified TSIG error is honored before the time check: for BADTIME the clocks differ by
+    // definition, and the MAC already binds the answer to this request (section 5.2.3).
+    if error != 0 {
+        return Verdict::ServerError(error);
     }
     if now.abs_diff(time) > u64::from(fudge) {
         return Verdict::Invalid("the time of the response is outside its fudge");
@@ -376,28 +397,130 @@ mod tests {
 
     /// Builds a signed answer to `request_mac` the way a server does (RFC 8945 section 5.3).
     fn answer(k: &Key, request_mac: &[u8], time: u64, corrupt: bool) -> Vec<u8> {
+        let mac = if corrupt { Mac::Corrupt } else { Mac::Good };
+        answer_with_error(k, request_mac, time, 0, &[], mac)
+    }
+
+    /// The MAC of an answer built by [`answer_with_error`].
+    #[derive(Clone, Copy)]
+    enum Mac {
+        /// The MAC a server computes (RFC 8945 section 5.3).
+        Good,
+        /// That MAC with one bit flipped.
+        Corrupt,
+        /// MAC size 0, as in an unsigned error answer (section 5.3.2).
+        Empty,
+    }
+
+    /// Like [`answer`], with the TSIG error and other data of the answer's TSIG record, which the
+    /// MAC covers (section 4.3.3).
+    fn answer_with_error(
+        k: &Key,
+        request_mac: &[u8],
+        time: u64,
+        error: u16,
+        other: &[u8],
+        mac: Mac,
+    ) -> Vec<u8> {
         let zone = DomainName::parse("example.org").unwrap();
         let mut m = Builder::update(&zone).finish().unwrap().with_id(5);
         m[2] |= 0x80;
         let mut data = (request_mac.len() as u16).to_be_bytes().to_vec();
         data.extend_from_slice(request_mac);
         data.extend_from_slice(&m);
-        data.extend_from_slice(&variables(k, time, FUDGE, 0, &[]).unwrap());
-        let mut mac = k.algorithm.mac(SECRET, &data);
-        if corrupt {
-            mac[0] ^= 1;
+        data.extend_from_slice(&variables(k, time, FUDGE, error, other).unwrap());
+        let mut tag = k.algorithm.mac(SECRET, &data);
+        match mac {
+            Mac::Good => {}
+            Mac::Corrupt => tag[0] ^= 1,
+            Mac::Empty => tag.clear(),
         }
         let mut rd = k.algorithm.wire_name().to_vec();
         rd.extend_from_slice(&time.to_be_bytes()[2..]);
         rd.extend_from_slice(&FUDGE.to_be_bytes());
-        rd.extend_from_slice(&(mac.len() as u16).to_be_bytes());
-        rd.extend_from_slice(&mac);
-        rd.extend_from_slice(&[0, 5, 0, 0, 0, 0]);
+        rd.extend_from_slice(&(tag.len() as u16).to_be_bytes());
+        rd.extend_from_slice(&tag);
+        rd.extend_from_slice(&[0, 5]);
+        rd.extend_from_slice(&error.to_be_bytes());
+        rd.extend_from_slice(&(other.len() as u16).to_be_bytes());
+        rd.extend_from_slice(other);
         m.extend_from_slice(b"\x06zw-key\x00\x00\xfa\x00\xff\0\0\0\0");
         m.extend_from_slice(&(rd.len() as u16).to_be_bytes());
         m.extend_from_slice(&rd);
         m[11] = 1;
         m
+    }
+
+    /// RFC 8945: an unsigned answer is honored only for BADKEY and BADSIG (sections 5.2.1,
+    /// 5.2.2, 5.3.2); every other TSIG error, BADTIME first (section 5.2.3), only when its MAC
+    /// verifies against the request MAC (section 5.4). A verified TSIG error is not subject to
+    /// the time check.
+    #[test]
+    fn verify_honors_a_tsig_error_only_unsigned_badkey_badsig_or_verified() {
+        let k = key(Algorithm::HmacSha256, SECRET);
+        let request_mac = [9u8; 32];
+        let now = 1_700_000_000;
+        let server_time = (now + 1000u64).to_be_bytes()[2..].to_vec();
+        let check = |error: u16, time: u64, other: &[u8], mac: Mac, signed_over: &[u8]| {
+            let buf = answer_with_error(&k, signed_over, time, error, other, mac);
+            verify(&buf, &parse(&buf).unwrap(), &request_mac, &k, now)
+        };
+        let missing = Verdict::Invalid(
+            "the answer reports a TSIG error that must be signed, but its MAC is missing or \
+             truncated",
+        );
+        let forged = Verdict::Invalid("the answer reports a TSIG error whose MAC does not verify");
+
+        // Unsigned BADKEY and BADSIG.
+        assert_eq!(
+            check(BADKEY, now, &[], Mac::Empty, &request_mac),
+            Verdict::ServerError(BADKEY)
+        );
+        assert_eq!(
+            check(BADSIG, now, &[], Mac::Empty, &request_mac),
+            Verdict::ServerError(BADSIG)
+        );
+        // BADTIME signed over the request MAC with the client's time, and with a Time Signed
+        // outside the fudge.
+        assert_eq!(
+            check(BADTIME, now, &server_time, Mac::Good, &request_mac),
+            Verdict::ServerError(BADTIME)
+        );
+        assert_eq!(
+            check(BADTIME, now + 1000, &server_time, Mac::Good, &request_mac),
+            Verdict::ServerError(BADTIME)
+        );
+        // BADTIME with a corrupted MAC, without a MAC, and signed over another request MAC.
+        assert_eq!(
+            check(BADTIME, now, &server_time, Mac::Corrupt, &request_mac),
+            forged
+        );
+        assert_eq!(
+            check(BADTIME, now, &server_time, Mac::Empty, &request_mac),
+            missing
+        );
+        assert_eq!(
+            check(BADTIME, now, &server_time, Mac::Good, &[8u8; 32]),
+            forged
+        );
+        // BADTRUNC.
+        assert_eq!(
+            check(BADTRUNC, now, &[], Mac::Good, &request_mac),
+            Verdict::ServerError(BADTRUNC)
+        );
+        assert_eq!(check(BADTRUNC, now, &[], Mac::Empty, &request_mac), missing);
+        // An unknown code.
+        assert_eq!(check(99, now, &[], Mac::Empty, &request_mac), missing);
+        assert_eq!(
+            check(99, now, &[], Mac::Good, &request_mac),
+            Verdict::ServerError(99)
+        );
+        // A signed BADSIG is honored when it verifies.
+        assert_eq!(
+            check(BADSIG, now, &[], Mac::Good, &request_mac),
+            Verdict::ServerError(BADSIG)
+        );
+        assert_eq!(check(BADSIG, now, &[], Mac::Corrupt, &request_mac), forged);
     }
 
     #[test]

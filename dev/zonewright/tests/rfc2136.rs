@@ -1419,6 +1419,46 @@ async fn rfc2136_tsig_error_without_notauth_is_protocol() {
     );
 }
 
+/// A NOTAUTH answer that reports a TSIG error other than an unsigned BADKEY or BADSIG is honored
+/// only when its MAC verifies against the request MAC (RFC 8945 sections 5.2.3, 5.3.2 and 5.4).
+/// With a corrupted MAC it is `Protocol`, not `Auth`, and it is not repeated.
+#[tokio::test]
+async fn rfc2136_tsig_error_with_a_bad_mac_is_protocol() {
+    /// TSIG error BADTRUNC (RFC 8945 section 3).
+    const BADTRUNC: u16 = 22;
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.push(
+        Fault::on(Op::Update)
+            .rcode(NOTAUTH)
+            .tsig_error(BADTIME)
+            .corrupt_mac(),
+    );
+    let err = add(&client, "v1").await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Protocol, "{err:?}");
+    assert_eq!(updates(&mock), 1);
+    control.push(
+        Fault::on(Op::Update)
+            .rcode(NOTAUTH)
+            .tsig_error(BADTRUNC)
+            .corrupt_mac(),
+    );
+    let err = add(&client, "v1").await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Protocol, "{err:?}");
+    assert_eq!(updates(&mock), 2);
+    let before = queries(&mock);
+    control.push(
+        Fault::on(Op::Query)
+            .rcode(NOTAUTH)
+            .tsig_error(BADTIME)
+            .corrupt_mac(),
+    );
+    let err = client.check(&[]).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Protocol, "{err:?}");
+    assert_eq!(queries(&mock), before + 1);
+    assert!(mock.control().txt(NAME_DOT).is_empty(), "nothing written");
+}
+
 /// Without zones, `check` still exercises the key: a signed query whose answer is verified.
 #[tokio::test]
 async fn rfc2136_check_exercises_the_credentials() {

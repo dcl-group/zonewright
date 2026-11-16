@@ -146,10 +146,11 @@ and the mock is cross-checked against BIND's `nsupdate` and `dig` (9.10.6, on 20
 tests in `tests/rfc2136_interop.rs`, which need those tools and touch loopback only: updates,
 prerequisites, TSIG refusals and the TXT forms agree in both directions. The cross-check found three
 defects, all in the mock (compressed names in request RDATA, no SOA in negative answers, no UDP) and
-none in the client. No server implementation (BIND's `named`, Knot, PowerDNS) has been tried. A
-synthesized wildcard answer at a name that does not exist looks like a value there, so an add can
-report `AlreadyPresent` wrongly; without DNSSEC this cannot be detected. Is that limitation
-acceptable as documented?
+none in the client. No server implementation (BIND's `named`, Knot, PowerDNS) has been tried. How a
+server implementation signs a BADTIME answer has not been observed; the client accepts it only when
+its MAC verifies against the request MAC (RFC 8945 section 5.2.3). A synthesized wildcard answer at
+a name that does not exist looks like a value there, so an add can report `AlreadyPresent` wrongly;
+without DNSSEC this cannot be detected. Is that limitation acceptable as documented?
 
 **24.** **reg.ru `INVALID_DOMAIN_NAME_FORMAT`** is classed as "zone not found" by assumption (the
 documentation does not say when it is returned). Keep, or report it as `Rejected`?
