@@ -188,8 +188,27 @@ fn echo_client(echo: &EchoServer, ctx: &Context) -> Porkbun {
 
 #[derive(Clone, Copy, Debug)]
 enum Write {
+    /// `add_txt_value`: a create.
     Add,
+    /// `remove_txt_value` of the value the listing holds: a delete.
     Remove,
+    /// `set_rrset` of the value the listing holds with another TTL: an edit.
+    Edit,
+}
+
+/// Runs `write` against [`NAME`]; the outcome as text.
+async fn run_write(client: &Porkbun, write: Write) -> Result<String, Error> {
+    match write {
+        Write::Add => add(client, "v1").await.map(|o| format!("{o:?}")),
+        Write::Remove => remove(client, "v1").await.map(|o| format!("{o:?}")),
+        Write::Edit => {
+            let set = rr(NAME, RecordType::TXT, Some(900), &["\"v1\""]);
+            client
+                .set_rrset(&zone(), &set, Expect::Any)
+                .await
+                .map(|o| format!("{o:?}"))
+        }
+    }
 }
 
 /// `check` and a write against an echo that quotes every request back, both key headers
@@ -206,11 +225,7 @@ async fn echo_round(label: &str, client: &Porkbun, write: Write) {
         ),
         Err(e) => texts.push(format!("{e} | {e:?}")),
     }
-    let result = match write {
-        Write::Add => add(client, "v1").await.map(|o| format!("{o:?}")),
-        Write::Remove => remove(client, "v1").await.map(|o| format!("{o:?}")),
-    };
-    let text = match result {
+    let text = match run_write(client, write).await {
         Ok(outcome) => panic!("{label}: the echo accepted a write: {outcome}"),
         Err(e) => format!("{e} | {e:?}"),
     };
@@ -224,9 +239,9 @@ async fn echo_round(label: &str, client: &Porkbun, write: Write) {
     }
 }
 
-/// `check` and the writes against an echo, for every dialect. Every request carries both keys as
-/// headers, so every echoed answer quotes both; four kinds of request reach it: the ping, the
-/// domain lookup, the create and the delete.
+/// `check` and the writes against an echo, for every dialect. The reads carry both keys as
+/// headers and the writes carry both in the body, so every echoed answer quotes both; five kinds
+/// of request reach it: the ping, the domain lookup, the create, the edit and the delete.
 #[tokio::test]
 async fn porkbun_secret_echo() {
     let ctx = context();
@@ -268,6 +283,7 @@ async fn porkbun_secret_echo() {
             (Existing::Nothing, Write::Add, [400, 403, 500].as_slice()),
             (Existing::Foreign, Write::Add, [400, 403, 500].as_slice()),
             (Existing::Ours, Write::Remove, [400, 403].as_slice()),
+            (Existing::Ours, Write::Edit, [400, 403, 500].as_slice()),
         ] {
             for &status in statuses {
                 let label = format!("{} {:?} {status} {write:?}", dialect.name, dialect.spelling);
@@ -281,25 +297,38 @@ async fn porkbun_secret_echo() {
                         ),
                 );
                 let client = echo_client(&echo, &ctx);
-                let e = match write {
-                    Write::Add => add(&client, "v1").await.map(|o| format!("{o:?}")),
-                    Write::Remove => remove(&client, "v1").await.map(|o| format!("{o:?}")),
-                }
-                .unwrap_err();
+                let e = run_write(&client, write).await.unwrap_err();
                 let text = format!("{e} | {e:?} | {client:?}");
                 assert!(text.contains(REDACTED), "{label}: {text}");
                 assert_clean(&label, &text, &CANARIES);
                 let path = match write {
                     Write::Add => CREATE,
                     Write::Remove => DELETE,
+                    Write::Edit => EDIT,
                 };
-                assert!(
-                    echo.log().count(Some("POST"), path) >= 1,
-                    "{label}: the write did not reach the echo"
+                // Sent once (a delete answered 400 or 403 is not retried either), with both keys
+                // in the body the echo quoted back.
+                let sent = echo.log().matching(Some("POST"), path);
+                assert_eq!(
+                    sent.len(),
+                    1,
+                    "{label}: the write did not reach the echo once"
                 );
-                // Neither key travels in a body.
+                let body = sent[0].body_json().unwrap();
+                assert_eq!(body["apikey"], serde_json::json!(CANARY_KEY), "{label}");
+                assert_eq!(
+                    body["secretapikey"],
+                    serde_json::json!(CANARY_TOKEN),
+                    "{label}"
+                );
+                // The reads carry the keys in headers only; the writes carry no key header.
                 for entry in echo.log().entries() {
-                    assert_clean(&label, &entry.body_str(), &CANARIES);
+                    if entry.method == "GET" {
+                        assert_clean(&label, &entry.body_str(), &CANARIES);
+                    } else {
+                        assert_eq!(entry.header("x-api-key"), None, "{label}");
+                        assert_eq!(entry.header("x-secret-api-key"), None, "{label}");
+                    }
                 }
             }
         }
@@ -337,8 +366,9 @@ async fn porkbun_secret_echo_of_each_key() {
     }
 }
 
-/// A `TRACE` capture over a success, a refusal of the keys, a 500 and a wrong key pair: the
-/// transport's events are there, and no canary is.
+/// A `TRACE` capture over a success, a refusal of the keys, a 500, a refusal of each write that
+/// quotes its whole body (both keys), and a wrong key pair: the transport's events are there, and
+/// no canary is, in any event, error or `Debug` output.
 #[tokio::test(flavor = "current_thread")]
 async fn porkbun_no_secret_in_logs() {
     let (capture, _guard) = LogCapture::install();
@@ -372,6 +402,50 @@ async fn porkbun_no_secret_in_logs() {
     let e = add(&client, "v3").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
     texts.push(format!("{e} | {e:?}"));
+
+    // Each write answered with a refusal that quotes the whole request body, both keys in it.
+    add(&client, "v1").await.unwrap();
+    let quoted = |fields: serde_json::Value| {
+        let mut body = serde_json::json!({"apikey": CANARY_KEY, "secretapikey": CANARY_TOKEN});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let message = format!("refused request {body}");
+        serde_json::json!({"status": "ERROR", "code": "INVALID_INPUT", "message": message})
+            .to_string()
+    };
+    let cases = [
+        (
+            CREATE,
+            Write::Add,
+            quoted(serde_json::json!({"name": "_acme-challenge", "type": "TXT",
+                                      "content": "v1", "ttl": 600})),
+        ),
+        (
+            EDIT,
+            Write::Edit,
+            quoted(serde_json::json!({"name": "_acme-challenge", "type": "TXT",
+                                      "content": "v1", "ttl": 900})),
+        ),
+        (DELETE, Write::Remove, quoted(serde_json::json!({}))),
+    ];
+    for (path, write, body) in cases {
+        if matches!(write, Write::Add) {
+            remove(&client, "v1").await.unwrap();
+        }
+        let before = mock.log().count(Some("POST"), path);
+        mock.faults()
+            .push(Fault::on("POST", path).respond(400, body));
+        let e = run_write(&client, write).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{path}: {e:?}");
+        assert_eq!(mock.log().count(Some("POST"), path), before + 1, "{path}");
+        let text = format!("{e} | {e:?}");
+        assert!(text.contains(REDACTED), "{path}: {text}");
+        texts.push(text);
+        if matches!(write, Write::Add) {
+            add(&client, "v1").await.unwrap();
+        }
+    }
 
     let wrong = client_with(&mock, CANARY_TOKEN, CANARY_KEY, &context());
     let e = wrong.check(&[zone()]).await.unwrap_err();
@@ -430,7 +504,7 @@ async fn porkbun_invalid_input_sends_nothing() {
         assert_eq!(e.kind(), ErrorKind::InvalidInput, "{value}: {e:?}");
     }
     // The documented minimum is 600 (lego sends 300).
-    for ttl in [300, 599, 86_401] {
+    for ttl in [300, 599] {
         let e = client
             .add_txt_value(
                 &zone(),
@@ -861,9 +935,10 @@ async fn porkbun_delete_by_id_is_retried() {
 
 // ---- Requests, names and TTLs ------------------------------------------------------------------
 
-/// The requests as the documentation describes them: both keys as headers on every request and
-/// in no body, reads by `GET`, the create's fields with the name relative to the domain and an
-/// integer TTL, the delete by identifier with an empty object.
+/// The requests as the documentation describes them: reads by `GET` with both keys as headers
+/// and no body; writes by `POST` with both keys as the first members of the body and no key
+/// header; the create's fields with the name relative to the domain and an integer TTL; the
+/// delete by identifier with the keys only.
 #[tokio::test]
 async fn porkbun_request_shapes() {
     let (mock, client) = setup().await;
@@ -871,19 +946,26 @@ async fn porkbun_request_shapes() {
     add(&client, "AAA").await.unwrap();
     remove(&client, "AAA").await.unwrap();
     let log = mock.log();
+    let keys_first = format!(r#"{{"apikey":"{KEY}","secretapikey":"{SECRET}""#);
     for entry in log.entries() {
-        assert_eq!(entry.header("x-api-key"), Some(KEY), "{}", entry.path);
-        assert_eq!(
-            entry.header("x-secret-api-key"),
-            Some(SECRET),
-            "{}",
-            entry.path
-        );
-        let body = entry.body_str();
-        assert!(!body.contains(KEY) && !body.contains(SECRET), "{body}");
-        assert!(!body.contains("apikey"), "{body}");
         if entry.method == "GET" {
+            assert_eq!(entry.header("x-api-key"), Some(KEY), "{}", entry.path);
+            assert_eq!(
+                entry.header("x-secret-api-key"),
+                Some(SECRET),
+                "{}",
+                entry.path
+            );
             assert!(entry.body.is_empty(), "{}", entry.path);
+        } else {
+            assert_eq!(entry.method, "POST");
+            assert_eq!(entry.header("x-api-key"), None, "{}", entry.path);
+            assert_eq!(entry.header("x-secret-api-key"), None, "{}", entry.path);
+            assert!(
+                entry.body_str().starts_with(&keys_first),
+                "{}",
+                entry.body_str()
+            );
         }
     }
     let ping = log.matching(Some("GET"), PING).pop().unwrap();
@@ -897,6 +979,7 @@ async fn porkbun_request_shapes() {
     assert_eq!(
         post.body_json().unwrap(),
         serde_json::json!({
+            "apikey": KEY, "secretapikey": SECRET,
             "name": "_acme-challenge", "type": "TXT", "content": "AAA", "ttl": 600
         })
     );
@@ -908,7 +991,10 @@ async fn porkbun_request_shapes() {
         "{}",
         delete.path
     );
-    assert_eq!(delete.body_json().unwrap(), serde_json::json!({}));
+    assert_eq!(
+        delete.body_json().unwrap(),
+        serde_json::json!({"apikey": KEY, "secretapikey": SECRET})
+    );
 
     // The apex is a blank name, a wildcard `*`.
     client
@@ -1383,7 +1469,6 @@ fn porkbun_config_errors_name_no_value() {
     let keys = serde_json::json!({"api_key": "pk", "secret_api_key": "sk"}).to_string();
     let cases = [
         (with("ttl", serde_json::json!(599)), keys.clone(), "ttl"),
-        (with("ttl", serde_json::json!(86_401)), keys.clone(), "ttl"),
         (
             with("ttl", serde_json::json!("provider_default")),
             keys.clone(),
@@ -1833,9 +1918,16 @@ async fn porkbun_set_any_replaces_and_delete_converges() {
     );
     let edits = mock.log().matching(Some("POST"), EDIT);
     assert_eq!(edits.len(), 2);
-    for edit in &edits {
-        assert_eq!(edit.body_json().unwrap(), serde_json::json!({"ttl": 900}));
-    }
+    // The whole record goes out, the content as read and the new TTL; `notes` is left out.
+    let mut bodies: Vec<serde_json::Value> = edits.iter().map(|e| e.body_json().unwrap()).collect();
+    bodies.sort_by_key(|b| b["content"].to_string());
+    assert_eq!(
+        bodies,
+        ["192.0.2.2", "192.0.2.3"].map(|content| serde_json::json!({
+            "apikey": KEY, "secretapikey": SECRET,
+            "name": "www", "type": "A", "content": content, "ttl": 900
+        }))
+    );
     let records = control.records_at(www, "A");
     assert!(records.iter().all(|r| r.ttl == 900));
     assert!(
@@ -1892,7 +1984,10 @@ async fn porkbun_cname_is_replaced_in_place() {
     assert_eq!(edit.path, format!("/api/json/v3/dns/edit/example.org/{id}"));
     assert_eq!(
         edit.body_json().unwrap(),
-        serde_json::json!({"content": "new.example.net"})
+        serde_json::json!({
+            "apikey": KEY, "secretapikey": SECRET,
+            "name": "www", "type": "CNAME", "content": "new.example.net", "ttl": 900
+        })
     );
     assert_eq!(mock.log().count(Some("POST"), CREATE), 0);
     assert_eq!(mock.log().count(Some("POST"), DELETE), 0);
@@ -1915,6 +2010,111 @@ async fn porkbun_cname_is_replaced_in_place() {
         SetOutcome::Created
     );
     assert_eq!(stored(&mock, www, "CNAME"), ["other.example.net"]);
+}
+
+/// The provider refuses a second record with the same name, type and content, and the priority
+/// of MX and SRV is outside the content: a plan that would create such a record (changing only
+/// the priority of a value, or two values that differ only in priority) is refused after the read
+/// and before any write, so it cannot leave a mixture. A delete of the rrset, then the set, does
+/// it; a value whose content differs is replaced as usual.
+#[tokio::test]
+async fn porkbun_priority_change_is_refused_before_a_write() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_record_with(
+        "example.org",
+        "@",
+        "MX",
+        "mail.example.org",
+        600,
+        Some(10),
+        None,
+    );
+    let sip = "_sip._tcp.example.org";
+    control.insert_record_with(
+        "example.org",
+        sip,
+        "SRV",
+        "5 5060 sip.example.org",
+        600,
+        Some(1),
+        None,
+    );
+    let original = control.records();
+    for set in [
+        rr(
+            "example.org",
+            RecordType::MX,
+            None,
+            &["20 mail.example.org."],
+        ),
+        rr(
+            "example.org",
+            RecordType::MX,
+            None,
+            &["10 new.example.org.", "20 mail.example.org."],
+        ),
+        rr(
+            "example.org",
+            RecordType::MX,
+            None,
+            &["10 mail.example.org.", "20 mail.example.org."],
+        ),
+        rr(sip, RecordType::SRV, None, &["2 5 5060 sip.example.org."]),
+    ] {
+        let e = client
+            .set_rrset(&zone(), &set, Expect::Any)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{set:?}: {e:?}");
+        assert!(!e.is_retryable());
+    }
+    // Two new values that differ only in priority, at a name without the type.
+    let twins = rr(
+        "other.example.org",
+        RecordType::MX,
+        None,
+        &["10 mx.example.net.", "20 mx.example.net."],
+    );
+    let e = client
+        .set_rrset(&zone(), &twins, Expect::Absent)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    assert_eq!(writes(&mock), 0);
+    assert_eq!(control.records(), original);
+
+    // Another weight is another content: replaced as usual, creates before deletes.
+    let reweighted = rr(sip, RecordType::SRV, None, &["1 6 5060 sip.example.org."]);
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &reweighted, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    // The documented way to change only a priority: delete the rrset, then set it.
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &zone(), RecordType::MX, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    let moved = rr(
+        "example.org",
+        RecordType::MX,
+        None,
+        &["20 mail.example.org."],
+    );
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &moved, Expect::Absent)
+            .await
+            .unwrap(),
+        SetOutcome::Created
+    );
+    assert_eq!(control.records_at("example.org", "MX")[0].prio, Some(20));
 }
 
 /// The read shows every record at the name, so a CNAME next to other data is refused after the
@@ -1952,7 +2152,7 @@ async fn porkbun_cname_and_other_data_are_refused_before_a_write() {
 }
 
 /// Refusals before any request: the apex NS set is not writable, a type outside the list is
-/// `UnsupportedRecordType` for every operation, a TTL outside 600 to 86400 and an expectation
+/// `UnsupportedRecordType` for every operation, a TTL below 600 and an expectation
 /// about another name or type are `InvalidInput`, a name outside the zone is `NameOutsideZone`.
 #[tokio::test]
 async fn porkbun_record_refusals_send_nothing() {
@@ -1984,7 +2184,7 @@ async fn porkbun_record_refusals_send_nothing() {
             .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::UnsupportedRecordType, "{rtype}: {e:?}");
     }
-    for ttl in [300, 599, 86_401] {
+    for ttl in [300, 599] {
         let set = rr("www.example.org", RecordType::A, Some(ttl), &["192.0.2.1"]);
         let e = client
             .set_rrset(&zone(), &set, Expect::Any)
@@ -2029,7 +2229,7 @@ async fn porkbun_record_refusals_send_nothing() {
     assert!(mock.log().is_empty(), "{:?}", mock.log().entries());
 
     // The bounds themselves are accepted.
-    for ttl in [600, 86_400] {
+    for ttl in [600, 2_147_483_647] {
         let set = rr("www.example.org", RecordType::A, Some(ttl), &["192.0.2.1"]);
         client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
         assert_eq!(
@@ -2401,16 +2601,18 @@ async fn live_porkbun_add_and_remove() {
 /// and a random tag:
 ///
 /// - the keys are taken as the headers `X-API-Key` and `X-Secret-API-Key` by `GET /ping` (with
-///   `credentialsValid: true`), `GET /domain/listAll`, `GET /dns/retrieve` and every `POST`
-///   write (create, edit, delete with `{}` as the body);
+///   `credentialsValid: true`), `GET /domain/listAll` and `GET /dns/retrieve` (documented per
+///   operation; the writes carry them in the body, as their request schemas require);
 /// - `/dns/retrieve` states names fully qualified, the apex of a name and a wildcard included;
 /// - the `content` forms the client writes are taken and read back as the same values: host
 ///   names without the trailing dot, MX and SRV with `prio`, SRV `weight port target`, CAA
 ///   `flags tag "value"`, TLSA `usage selector matching hex`, TXT the value itself;
-/// - a TTL of 600 is accepted, and an edit with only `ttl` changes only the TTL;
-/// - a CNAME is replaced in place by an edit with only `content`;
-/// - a value replaced in an MX set with the same exchange and another priority is not refused as
-///   a duplicate (`DUPLICATE_RECORD` compares name, type and content);
+/// - a TTL of 600 is accepted, and an edit of the whole record with a new `ttl` changes only the
+///   TTL;
+/// - a CNAME is replaced in place by an edit of the whole record with a new `content`;
+/// - the client refuses, before any write, a replacement that changes only the priority of an MX
+///   value (`DUPLICATE_RECORD` compares name, type and content), and a delete of the rrset
+///   followed by the set does it;
 /// - a delete of a record already deleted is answered `INVALID_RECORD_ID`, which the client
 ///   confirms by a new read.
 ///
@@ -2517,18 +2719,39 @@ async fn porkbun_live_assumptions() {
                     .unwrap(),
                 retuned
             );
-            // The same exchange with another priority next to it.
+            // The same exchange with another priority: refused before any write, done by a
+            // delete of the rrset and a new set.
             let reprioritized = set(
                 base.clone(),
                 RecordType::MX,
                 &[format!("30 mx.{base}"), format!("20 mx2.{base}")],
             );
+            let e = client
+                .set_rrset(&zone, &reprioritized, Expect::Any)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
             assert_eq!(
                 client
-                    .set_rrset(&zone, &reprioritized, Expect::Any)
+                    .get_rrset(&zone, &base, RecordType::MX)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                retuned
+            );
+            assert_eq!(
+                client
+                    .delete_rrset(&zone, &base, RecordType::MX, Expect::Matches(&retuned))
                     .await
                     .unwrap(),
-                SetOutcome::Replaced
+                DeleteOutcome::Deleted
+            );
+            assert_eq!(
+                client
+                    .set_rrset(&zone, &reprioritized, Expect::Absent)
+                    .await
+                    .unwrap(),
+                SetOutcome::Created
             );
             // A CNAME replaced in place.
             let moved = set(

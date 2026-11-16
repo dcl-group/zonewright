@@ -54,7 +54,8 @@
 //! - a new domain gets an apex NS rrset with [`Seed::apex_ns`] (the documentation says deSEC's
 //!   name servers are set up for a new domain, without the values), TTL 3600;
 //! - the cursors are `p<offset>`; [`Control::set_paging`] makes the listing page in ways the
-//!   documentation does not exclude ([`Paging`]), for tests of a client's end rule.
+//!   documentation does not exclude ([`Paging`]), for tests of a client's end rule, among
+//!   them the `Link` header as one field line per link.
 //!
 //! Not modeled: bulk writes (an array body is `400`), the `…` subname syntax of a path, token
 //! management and policies, `allowed_subnets`, the zone file export, the SOA rrset and the DNSSEC
@@ -211,6 +212,10 @@ pub enum Paging {
     RepeatCursor,
     /// The `next` link carries no `cursor` parameter.
     NoCursorInLink,
+    /// As documented, with each link of the `Link` header in a field line of its own (RFC 9110
+    /// section 5.3 allows a list-valued header to be split so; the documentation prints the
+    /// links on three lines).
+    SplitLinkFields,
 }
 
 #[derive(Debug)]
@@ -707,7 +712,13 @@ fn listing(
         links.push(format!("<{url}>; rel=\"next\""));
     }
     let mut response = axum::Json(Value::Array(items)).into_response();
-    if let Ok(link) = HeaderValue::from_str(&links.join(", ")) {
+    if inner.paging == Paging::SplitLinkFields {
+        for link in &links {
+            if let Ok(link) = HeaderValue::from_str(link) {
+                response.headers_mut().append("link", link);
+            }
+        }
+    } else if let Ok(link) = HeaderValue::from_str(&links.join(", ")) {
         response.headers_mut().insert("link", link);
     }
     response

@@ -2030,3 +2030,67 @@ async fn nothing_secret_reaches_tracing() {
     );
     assert!(!text.contains("filter="), "{text}");
 }
+
+/// DNSimple's shape: a 429 that states the end of the window only in `X-RateLimit-Reset`, as a
+/// Unix time.
+fn quota(reset_in: i64) -> Fault {
+    let at = jiff::Timestamp::now().as_second() + reset_in;
+    Fault::any()
+        .respond(429, r#"{"message":"quota exceeded"}"#)
+        .header("x-ratelimit-limit", "2400")
+        .header("x-ratelimit-remaining", "0")
+        .header("x-ratelimit-reset", &at.to_string())
+}
+
+#[tokio::test]
+async fn a_declared_unix_reset_header_gives_the_wait() {
+    // A short wait is slept through, then the request is repeated.
+    let server = ok_server().await;
+    let http = http_on(&server, |b| b.rate_reset_unix("x-ratelimit-reset"));
+    server.faults().push(quota(2));
+    let started = Instant::now();
+    assert_eq!(http.send(&get(&server, "/x")).await.unwrap().status(), 200);
+    assert_eq!(server.log().len(), 2);
+    // The reset has a resolution of one second.
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "{:?}",
+        started.elapsed()
+    );
+    // A window that ends in an hour is reported, not slept through.
+    let server = ok_server().await;
+    let http = http_on(&server, |b| b.rate_reset_unix("x-ratelimit-reset"));
+    server.faults().push(quota(3600).always());
+    let started = Instant::now();
+    let e = http.send(&get(&server, "/x")).await.unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let wait = e.retry_after().unwrap();
+    assert!(
+        wait > Duration::from_secs(3590) && wait <= Duration::from_secs(3600),
+        "{wait:?}"
+    );
+    assert_eq!(server.log().len(), 1);
+    // A request that is not idempotent is sent once and reports the wait.
+    let server = ok_server().await;
+    let http = http_on(&server, |b| b.rate_reset_unix("x-ratelimit-reset"));
+    server.faults().push(quota(2));
+    let e = http.send(&post(&server, "/x")).await.unwrap_err();
+    assert!(
+        e.retry_after().is_some_and(|w| w <= Duration::from_secs(2)),
+        "{e:?}"
+    );
+    assert_eq!(server.log().len(), 1);
+    // A client that does not declare the header does not read it.
+    let server = ok_server().await;
+    server.faults().push(quota(3600).always());
+    let e = default_http().send(&get(&server, "/x")).await.unwrap_err();
+    assert!(
+        matches!(e, Error::RateLimited { retry_after: None }),
+        "{e:?}"
+    );
+    assert_eq!(server.log().len(), 3);
+}

@@ -24,6 +24,7 @@ use common::{context, dn, sample_client};
 /// The persisted strings, written out literally: a change here is a change of a persisted value.
 const IDS: &[(ProviderId, &str)] = &[
     (ProviderId::AcmeDns, "acme_dns"),
+    (ProviderId::AzureDns, "azure_dns"),
     (ProviderId::Beget, "beget"),
     (ProviderId::CloudRu, "cloud_ru"),
     (ProviderId::Cloudflare, "cloudflare"),
@@ -33,8 +34,10 @@ const IDS: &[(ProviderId, &str)] = &[
     (ProviderId::EdgeCenter, "edgecenter"),
     (ProviderId::Gandi, "gandi"),
     (ProviderId::Gcore, "gcore"),
+    (ProviderId::GoogleCloud, "google_cloud"),
     (ProviderId::Hetzner, "hetzner"),
     (ProviderId::Nicru, "nicru"),
+    (ProviderId::Ovh, "ovh"),
     (ProviderId::Porkbun, "porkbun"),
     (ProviderId::Regru, "regru"),
     (ProviderId::Rfc2136, "rfc2136"),
@@ -108,6 +111,7 @@ fn parse_is_exact() {
 fn available_follows_the_features() {
     let expected = [
         (ProviderId::AcmeDns, cfg!(feature = "acme_dns")),
+        (ProviderId::AzureDns, cfg!(feature = "azure_dns")),
         (ProviderId::Beget, cfg!(feature = "beget")),
         (ProviderId::CloudRu, cfg!(feature = "cloud_ru")),
         (ProviderId::Cloudflare, cfg!(feature = "cloudflare")),
@@ -117,8 +121,10 @@ fn available_follows_the_features() {
         (ProviderId::EdgeCenter, cfg!(feature = "edgecenter")),
         (ProviderId::Gandi, cfg!(feature = "gandi")),
         (ProviderId::Gcore, cfg!(feature = "gcore")),
+        (ProviderId::GoogleCloud, cfg!(feature = "google_cloud")),
         (ProviderId::Hetzner, cfg!(feature = "hetzner")),
         (ProviderId::Nicru, cfg!(feature = "nicru")),
+        (ProviderId::Ovh, cfg!(feature = "ovh")),
         (ProviderId::Porkbun, cfg!(feature = "porkbun")),
         (ProviderId::Regru, cfg!(feature = "regru")),
         (ProviderId::Rfc2136, cfg!(feature = "rfc2136")),
@@ -361,6 +367,8 @@ fn capabilities_are_consistent() {
 const ATOMIC_RRSET_WRITE: &[(ProviderId, bool)] = &[
     // No rrset can be replaced: the API only adds a value to a rotating pair.
     (ProviderId::AcmeDns, false),
+    // One PUT carries the whole record set with its TTL, conditional on the etag read.
+    (ProviderId::AzureDns, true),
     // `dns/changeRecords` replaces the TXT set of a name in one request.
     (ProviderId::Beget, true),
     // One record per name and type holds the list of values; one request replaces it.
@@ -379,12 +387,17 @@ const ATOMIC_RRSET_WRITE: &[(ProviderId, bool)] = &[
     // each carrying the values and the TTL.
     (ProviderId::Gandi, true),
     (ProviderId::Gcore, true),
+    // One `changes.create` deletes the rrset as read and adds the new one, atomically.
+    (ProviderId::GoogleCloud, true),
     // `set_records` replaces the records of an rrset in one request and `POST …/rrsets` creates
     // it with its records, but a replacement that also changes the TTL of an existing rrset is
     // `set_records` and then `change_ttl`: two requests.
     (ProviderId::Hetzner, false),
     // Individual records, staged and committed: several requests.
     (ProviderId::Nicru, false),
+    // Individual records with IDs: a replacement is several staged requests (creates, then
+    // deletes), published together by one refresh of the zone.
+    (ProviderId::Ovh, false),
     // Individual records with IDs: a replacement is several requests (creates, then deletes).
     (ProviderId::Porkbun, false),
     (ProviderId::Regru, false),
@@ -420,6 +433,9 @@ fn atomic_rrset_write_follows_the_native_unit() {
 const PROVIDER_DEFAULT_TTL: &[(ProviderId, ProviderDefaultTtl)] = &[
     // The server serves every value with a TTL of its own choosing: it is the only TTL there is.
     (ProviderId::AcmeDns, ProviderDefaultTtl::Requestable),
+    // What a record set written without `TTL` gets is not documented; the client always sends
+    // a number, and a set read without one reads with no TTL stated.
+    (ProviderId::AzureDns, ProviderDefaultTtl::Absent),
     // Every record carries a TTL; no read, so nothing reads as the default.
     (ProviderId::Beget, ProviderDefaultTtl::Absent),
     // A record's `ttl` is a number of seconds.
@@ -438,12 +454,18 @@ const PROVIDER_DEFAULT_TTL: &[(ProviderId, ProviderDefaultTtl)] = &[
     // a number, and an rrset read without one reads with no TTL stated.
     (ProviderId::Gandi, ProviderDefaultTtl::Absent),
     (ProviderId::Gcore, ProviderDefaultTtl::Absent),
+    // `ttl` is a number on every rrset the client writes; there is no TTL of the provider's
+    // own to ask for.
+    (ProviderId::GoogleCloud, ProviderDefaultTtl::Absent),
     // An rrset's `ttl` may be `null`: the zone's default applies; a create without `ttl` and a
     // `change_ttl` with `null` ask for it.
     (ProviderId::Hetzner, ProviderDefaultTtl::Requestable),
     // A record's `ttl` is optional; without one the zone's default applies (Docs 4.6). A TTL
     // change stages the record again, with or without `<ttl>`.
     (ProviderId::Nicru, ProviderDefaultTtl::Requestable),
+    // The client writes an explicit `ttl` on every record; what `0` and `null` mean is not
+    // documented, so a record read with either is reported without a TTL.
+    (ProviderId::Ovh, ProviderDefaultTtl::Absent),
     // A record created without `ttl` gets the account's minimum, which a read shows as a
     // number.
     (ProviderId::Porkbun, ProviderDefaultTtl::Absent),
@@ -592,6 +614,8 @@ fn config_type_object(
     match id {
         #[cfg(feature = "acme_dns")]
         ProviderId::AcmeDns => Some(keys::<acme_dns::AcmeDnsConfig>(settings)),
+        #[cfg(feature = "azure_dns")]
+        ProviderId::AzureDns => Some(keys::<azure_dns::AzureDnsConfig>(settings)),
         #[cfg(feature = "beget")]
         ProviderId::Beget => Some(keys::<beget::BegetConfig>(settings)),
         #[cfg(feature = "cloud_ru")]
@@ -610,10 +634,14 @@ fn config_type_object(
         ProviderId::Gandi => Some(keys::<gandi::GandiConfig>(settings)),
         #[cfg(feature = "gcore")]
         ProviderId::Gcore => Some(keys::<gcore::GcoreConfig>(settings)),
+        #[cfg(feature = "google_cloud")]
+        ProviderId::GoogleCloud => Some(keys::<google_cloud::GoogleCloudConfig>(settings)),
         #[cfg(feature = "hetzner")]
         ProviderId::Hetzner => Some(keys::<hetzner::HetznerConfig>(settings)),
         #[cfg(feature = "nicru")]
         ProviderId::Nicru => Some(keys::<nicru::NicruConfig>(settings)),
+        #[cfg(feature = "ovh")]
+        ProviderId::Ovh => Some(keys::<ovh::OvhConfig>(settings)),
         #[cfg(feature = "porkbun")]
         ProviderId::Porkbun => Some(keys::<porkbun::PorkbunConfig>(settings)),
         #[cfg(feature = "regru")]
@@ -869,6 +897,8 @@ fn config_deserializes(
     match id {
         #[cfg(feature = "acme_dns")]
         ProviderId::AcmeDns => parses::<acme_dns::AcmeDnsConfig>(settings),
+        #[cfg(feature = "azure_dns")]
+        ProviderId::AzureDns => parses::<azure_dns::AzureDnsConfig>(settings),
         #[cfg(feature = "beget")]
         ProviderId::Beget => parses::<beget::BegetConfig>(settings),
         #[cfg(feature = "cloud_ru")]
@@ -887,10 +917,14 @@ fn config_deserializes(
         ProviderId::Gandi => parses::<gandi::GandiConfig>(settings),
         #[cfg(feature = "gcore")]
         ProviderId::Gcore => parses::<gcore::GcoreConfig>(settings),
+        #[cfg(feature = "google_cloud")]
+        ProviderId::GoogleCloud => parses::<google_cloud::GoogleCloudConfig>(settings),
         #[cfg(feature = "hetzner")]
         ProviderId::Hetzner => parses::<hetzner::HetznerConfig>(settings),
         #[cfg(feature = "nicru")]
         ProviderId::Nicru => parses::<nicru::NicruConfig>(settings),
+        #[cfg(feature = "ovh")]
+        ProviderId::Ovh => parses::<ovh::OvhConfig>(settings),
         #[cfg(feature = "porkbun")]
         ProviderId::Porkbun => parses::<porkbun::PorkbunConfig>(settings),
         #[cfg(feature = "regru")]

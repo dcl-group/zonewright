@@ -117,15 +117,26 @@ struct RrsetBody<'a> {
 
 /// The body of a value-level change.
 // Source: the reference, "Update a record (RRset) in the zone records linked to a domain":
-// `add_rrset_values` and `remove_rrset_values` ("Default: []"), `rrset_ttl` optional. The TTL is
-// never sent: the change leaves the rrset's TTL alone (design section 3.6), which is the reading
-// of an optional member left out; an assumption, not documented.
+// `add_rrset_values` and `remove_rrset_values` ("Default: []"), `rrset_ttl` optional; the
+// reference's only example sends `rrset_ttl` with the value. What the API does with the TTL of a
+// change without `rrset_ttl` is not documented (kept, or set to a default), so the caller sends
+// the TTL it read whenever the read stated one: right under either reading (design section 3.6).
 #[derive(Serialize)]
 struct PatchBody<'a> {
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     add_rrset_values: &'a [String],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     remove_rrset_values: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rrset_ttl: Option<u32>,
+}
+
+/// The documented `200` answer of a value-level change: the rrset after it. Only its values are
+/// read; `None` when the body does not carry them.
+#[derive(Deserialize)]
+struct PatchAnswer {
+    #[serde(default)]
+    rrset_values: Option<Vec<String>>,
 }
 
 /// The answer to a create.
@@ -139,6 +150,9 @@ pub(super) enum Created {
     Exists,
     /// `404`: the domain is gone (not documented for this call; the reading the client takes).
     NotFound,
+    /// Another success status, which the reference does not document for this call: whether
+    /// the rrset was created is not known.
+    Undocumented,
     /// Another refusal, as the error it maps to.
     Refused(Error),
 }
@@ -157,8 +171,9 @@ pub(super) enum Written {
 /// The answer to a value-level change.
 #[derive(Debug)]
 pub(super) enum Patched {
-    /// `200`: the rrset exists after the change.
-    Present,
+    /// `200` (or another success with a body): the rrset exists after the change, with these
+    /// values when the body states them (`None`: it does not).
+    Present(Option<Vec<String>>),
     /// `204`: "The request was successful, but the resource record set no longer exists at
     /// the end of the operation."
     Gone,
@@ -362,7 +377,7 @@ impl Api {
             201 => Created::Done,
             200 | 409 => Created::Exists,
             404 => Created::NotFound,
-            status if (200..300).contains(&status) => Created::Done,
+            status if (200..300).contains(&status) => Created::Undocumented,
             _ => Created::Refused(self.refusal(&response)),
         })
     }
@@ -393,7 +408,8 @@ impl Api {
         Ok(self.written(&response))
     }
 
-    /// Adds `add` and removes `remove` from the values of an rrset. Sent once: an add is not
+    /// Adds `add` and removes `remove` from the values of an rrset, with `ttl` as the rrset's
+    /// TTL when given (see `PatchBody`). Sent once: an add is not
     /// idempotent where the provider keeps duplicates (not documented either way).
     // Source: the reference, "Update a record (RRset) in the zone records linked to a domain":
     // "Add or remove some values of a Resource Record set (RRset)"; 200 with the rrset, 204 "the
@@ -409,11 +425,13 @@ impl Api {
         rtype: &str,
         add: &[String],
         remove: &[String],
+        ttl: Option<u32>,
     ) -> Result<Patched, Error> {
         let url = self.rrset_url(zone, name, rtype)?;
         let body = PatchBody {
             add_rrset_values: add,
             remove_rrset_values: remove,
+            rrset_ttl: ttl,
         };
         let response = self
             .http
@@ -422,7 +440,11 @@ impl Api {
         Ok(match response.status() {
             204 => Patched::Gone,
             404 => Patched::NotFound,
-            _ if response.is_success() => Patched::Present,
+            _ if response.is_success() => Patched::Present(
+                serde_json::from_slice::<PatchAnswer>(response.body())
+                    .ok()
+                    .and_then(|answer| answer.rrset_values),
+            ),
             _ => Patched::Refused(self.refusal(&response)),
         })
     }

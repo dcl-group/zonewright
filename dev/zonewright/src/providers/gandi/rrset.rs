@@ -62,6 +62,14 @@ impl Gandi {
                 ),
             }),
             Created::NotFound => Err(vanished()),
+            // "A status the documentation lists without a meaning has none": only `201` says
+            // "created".
+            Created::Undocumented => Err(Error::Protocol {
+                detail: Detail::constant(
+                    "the provider answered the create with a status its documentation does not \
+                     give; whether the rrset was created is not known",
+                ),
+            }),
             Created::Refused(e) => Err(e),
         }
     }

@@ -29,14 +29,18 @@
 //! - a delete is `204`;
 //! - error bodies carry `cause`, `code`, `message` and `object`.
 //!
-//! Answers the mock invents because the documentation is silent, each chosen so that a client
-//! cannot rely on a lenient reading:
+//! Answers the mock invents because the documentation is silent. Most are chosen so that a
+//! client cannot rely on a lenient reading; where the documentation allows several readings and
+//! none of them is the strict one, the mock starts with one and can be switched to the others:
 //!
 //! - a missing domain is `404` on every route below it, the domain itself included;
 //! - a request without a bearer token is `401`;
-//! - a `PATCH` or a `DELETE` of a missing rrset is `404`; a `PATCH` that adds a value the rrset
-//!   holds, or removes one it does not hold, changes nothing for that value; a `PATCH` without
-//!   `rrset_ttl` keeps the rrset's TTL;
+//! - a `DELETE` of a missing rrset is `404`;
+//! - a `PATCH` starts in the lenient reading ([`PatchReading::Lenient`]): without `rrset_ttl` it
+//!   keeps the rrset's TTL, a value to add that the rrset holds or a value to remove it does not
+//!   hold changes nothing, and a missing rrset is `404`. [`Control::set_patch`] switches to one of
+//!   the other readings: the TTL set to the default, a duplicate add or an absent remove refused,
+//!   a missing rrset created by an add;
 //! - a `PUT` of a missing rrset creates it (lego relies on that; the reference says only
 //!   "Overwrites");
 //! - an rrset written without `rrset_ttl` gets 10800, the TTL of the reference's examples;
@@ -183,6 +187,28 @@ pub struct Rrset {
     pub values: Vec<String>,
 }
 
+/// What a value-level change (`PATCH`) does where the reference is silent: the reading the mock
+/// starts with and the other readings the documentation allows, for tests that a client either
+/// behaves correctly or fails safely under each. One reading at a time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PatchReading {
+    /// A change without `rrset_ttl` keeps the TTL; a value to add that is present and a value to
+    /// remove that is absent are ignored; a missing rrset is `404`.
+    #[default]
+    Lenient,
+    /// As `Lenient`, but a change without `rrset_ttl` sets the TTL to the default of an rrset
+    /// written without one (10800).
+    TtlReset,
+    /// As `Lenient`, but a value to add that the rrset holds is refused (`400`).
+    DuplicateAddRefused,
+    /// As `Lenient`, but a value to remove that the rrset does not hold is refused (`400`).
+    AbsentRemoveRefused,
+    /// As `Lenient`, but a change with values to add to a missing rrset creates it (`200`, with
+    /// the TTL given or the default).
+    MissingCreated,
+}
+
 /// How a listing pages: the documented reading and two readings the client must survive.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -203,6 +229,7 @@ struct Inner {
     zones: Vec<Zone>,
     rrsets: Vec<Rrset>,
     paging: Paging,
+    patch: PatchReading,
     changes: Changes,
 }
 
@@ -221,6 +248,7 @@ impl Inner {
             seed,
             rrsets: Vec::new(),
             paging: Paging::Total,
+            patch: PatchReading::Lenient,
             changes,
         }
     }
@@ -361,8 +389,8 @@ impl Control {
     }
 
     /// Returns the mock to the seed it was started with: its domains, no rrsets, the documented
-    /// paging, an empty request log and no pending faults. Reports the removal of every rrset
-    /// that was published.
+    /// paging, the lenient `PATCH` reading, an empty request log and no pending faults. Reports
+    /// the removal of every rrset that was published.
     pub fn reset(&self) {
         self.faults.clear();
         self.change(|inner| {
@@ -404,6 +432,12 @@ impl Control {
     /// How listings page from now on ([`Paging`]).
     pub fn set_paging(&self, paging: Paging) {
         lock(&self.state).paging = paging;
+    }
+
+    /// What a value-level change does from now on where the reference is silent
+    /// ([`PatchReading`]).
+    pub fn set_patch(&self, reading: PatchReading) {
+        lock(&self.state).patch = reading;
     }
 
     /// The default and largest page of a listing from now on.
@@ -900,10 +934,11 @@ async fn rrset_patch(
     if rtype == "SOA" {
         return bad_request("the SOA record cannot be written");
     }
-    let Some(at) = inner.position(&fqdn, &name, &rtype) else {
-        return not_found("record not found");
-    };
-    let held = inner.rrsets[at].values.clone();
+    let reading = inner.patch;
+    let at = inner.position(&fqdn, &name, &rtype);
+    let held = at
+        .map(|at| inner.rrsets[at].values.clone())
+        .unwrap_or_default();
     let parsed = object(
         &bytes,
         &["add_rrset_values", "remove_rrset_values", "rrset_ttl"],
@@ -919,6 +954,29 @@ async fn rrset_patch(
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
+    let Some(at) = at else {
+        if reading == PatchReading::MissingCreated && !add.is_empty() {
+            let before = inner.published();
+            let rrset = Rrset {
+                zone: fqdn,
+                name,
+                rtype,
+                ttl: Some(ttl.unwrap_or(DEFAULT_TTL)),
+                values: add,
+            };
+            let answer = axum::Json(rrset_json(&rrset)).into_response();
+            inner.rrsets.push(rrset);
+            inner.report(&before, Origin::Api);
+            return answer;
+        }
+        return not_found("record not found");
+    };
+    if reading == PatchReading::DuplicateAddRefused && add.iter().any(|v| held.contains(v)) {
+        return bad_request("a value to add is already in the record");
+    }
+    if reading == PatchReading::AbsentRemoveRefused && remove.iter().any(|v| !held.contains(v)) {
+        return bad_request("a value to remove is not in the record");
+    }
     let before = inner.published();
     let rrset = &mut inner.rrsets[at];
     rrset.values.retain(|v| !remove.contains(v));
@@ -927,8 +985,10 @@ async fn rrset_patch(
             rrset.values.push(value);
         }
     }
-    if let Some(ttl) = ttl {
-        rrset.ttl = Some(ttl);
+    match ttl {
+        Some(ttl) => rrset.ttl = Some(ttl),
+        None if reading == PatchReading::TtlReset => rrset.ttl = Some(DEFAULT_TTL),
+        None => {}
     }
     let answer = if rrset.values.is_empty() {
         inner.rrsets.remove(at);

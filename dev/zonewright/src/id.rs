@@ -16,6 +16,8 @@ use crate::meta::ProviderMeta;
 pub enum ProviderId {
     /// acme-dns (`acme_dns`).
     AcmeDns,
+    /// Azure DNS (`azure_dns`).
+    AzureDns,
     /// Beget (`beget`).
     Beget,
     /// Cloud.ru (`cloud_ru`).
@@ -34,10 +36,14 @@ pub enum ProviderId {
     Gandi,
     /// Gcore (`gcore`).
     Gcore,
+    /// Google Cloud DNS (`google_cloud`).
+    GoogleCloud,
     /// Hetzner (`hetzner`).
     Hetzner,
     /// nic.ru (`nicru`).
     Nicru,
+    /// OVHcloud (`ovh`).
+    Ovh,
     /// Porkbun (`porkbun`).
     Porkbun,
     /// reg.ru (`regru`).
@@ -62,6 +68,7 @@ impl ProviderId {
     /// Every identifier, in alphabetical order of the persisted strings. Complete in every build.
     pub const ALL: &'static [ProviderId] = &[
         ProviderId::AcmeDns,
+        ProviderId::AzureDns,
         ProviderId::Beget,
         ProviderId::CloudRu,
         ProviderId::Cloudflare,
@@ -71,8 +78,10 @@ impl ProviderId {
         ProviderId::EdgeCenter,
         ProviderId::Gandi,
         ProviderId::Gcore,
+        ProviderId::GoogleCloud,
         ProviderId::Hetzner,
         ProviderId::Nicru,
+        ProviderId::Ovh,
         ProviderId::Porkbun,
         ProviderId::Regru,
         ProviderId::Rfc2136,
@@ -92,6 +101,7 @@ impl ProviderId {
     pub const fn as_str(self) -> &'static str {
         match self {
             ProviderId::AcmeDns => "acme_dns",
+            ProviderId::AzureDns => "azure_dns",
             ProviderId::Beget => "beget",
             ProviderId::CloudRu => "cloud_ru",
             ProviderId::Cloudflare => "cloudflare",
@@ -101,8 +111,10 @@ impl ProviderId {
             ProviderId::EdgeCenter => "edgecenter",
             ProviderId::Gandi => "gandi",
             ProviderId::Gcore => "gcore",
+            ProviderId::GoogleCloud => "google_cloud",
             ProviderId::Hetzner => "hetzner",
             ProviderId::Nicru => "nicru",
+            ProviderId::Ovh => "ovh",
             ProviderId::Porkbun => "porkbun",
             ProviderId::Regru => "regru",
             ProviderId::Rfc2136 => "rfc2136",
@@ -120,6 +132,7 @@ impl ProviderId {
     pub fn parse(s: &str) -> Option<ProviderId> {
         let id = match s {
             "acme_dns" => ProviderId::AcmeDns,
+            "azure_dns" => ProviderId::AzureDns,
             "beget" => ProviderId::Beget,
             "cloud_ru" => ProviderId::CloudRu,
             "cloudflare" => ProviderId::Cloudflare,
@@ -129,8 +142,10 @@ impl ProviderId {
             "edgecenter" => ProviderId::EdgeCenter,
             "gandi" => ProviderId::Gandi,
             "gcore" => ProviderId::Gcore,
+            "google_cloud" => ProviderId::GoogleCloud,
             "hetzner" => ProviderId::Hetzner,
             "nicru" => ProviderId::Nicru,
+            "ovh" => ProviderId::Ovh,
             "porkbun" => ProviderId::Porkbun,
             "regru" => ProviderId::Regru,
             "rfc2136" => ProviderId::Rfc2136,
@@ -151,6 +166,7 @@ impl ProviderId {
     pub const fn available(self) -> bool {
         match self {
             ProviderId::AcmeDns => cfg!(feature = "acme_dns"),
+            ProviderId::AzureDns => cfg!(feature = "azure_dns"),
             ProviderId::Beget => cfg!(feature = "beget"),
             ProviderId::CloudRu => cfg!(feature = "cloud_ru"),
             ProviderId::Cloudflare => cfg!(feature = "cloudflare"),
@@ -160,8 +176,10 @@ impl ProviderId {
             ProviderId::EdgeCenter => cfg!(feature = "edgecenter"),
             ProviderId::Gandi => cfg!(feature = "gandi"),
             ProviderId::Gcore => cfg!(feature = "gcore"),
+            ProviderId::GoogleCloud => cfg!(feature = "google_cloud"),
             ProviderId::Hetzner => cfg!(feature = "hetzner"),
             ProviderId::Nicru => cfg!(feature = "nicru"),
+            ProviderId::Ovh => cfg!(feature = "ovh"),
             ProviderId::Porkbun => cfg!(feature = "porkbun"),
             ProviderId::Regru => cfg!(feature = "regru"),
             ProviderId::Rfc2136 => cfg!(feature = "rfc2136"),

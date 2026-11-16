@@ -5,9 +5,6 @@ use std::fmt;
 
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{RSA_PSS_SHA256, RsaKeyPair};
-use rustls_pki_types::PrivateKeyDer;
-use rustls_pki_types::pem::PemObject;
-use zeroize::Zeroize;
 
 use super::KeyError;
 
@@ -31,18 +28,7 @@ impl Ps256Key {
     /// [`KeyError::UnsupportedKey`]; text without a decodable private-key section is
     /// [`KeyError::Pem`].
     pub(crate) fn from_pem(pem: &str) -> Result<Ps256Key, KeyError> {
-        let mut der = PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(|_| KeyError::Pem)?;
-        let parsed =
-            match &der {
-                PrivateKeyDer::Pkcs8(key) => RsaKeyPair::from_pkcs8(key.secret_pkcs8_der())
-                    .map_err(|_| KeyError::UnsupportedKey),
-                PrivateKeyDer::Pkcs1(key) => RsaKeyPair::from_der(key.secret_pkcs1_der())
-                    .map_err(|_| KeyError::UnsupportedKey),
-                _ => Err(KeyError::UnsupportedKey),
-            };
-        // The decoded DER is owned by `der`; wipe it now that the backend has its own copy.
-        der.zeroize();
-        parsed.map(Ps256Key)
+        super::rsa_pem::rsa_key_pair(pem).map(Ps256Key)
     }
 
     /// Raw signature bytes; salt length equals the digest length (RFC 7518 section 3.5).

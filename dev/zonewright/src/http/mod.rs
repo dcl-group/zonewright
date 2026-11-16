@@ -62,10 +62,16 @@ mod tests;
 pub(crate) use gate::RateGate;
 #[cfg(any(feature = "selectel_v2", feature = "vk_cloud"))]
 pub(crate) use keystone::Keystone;
-#[cfg(any(feature = "cloud_ru", feature = "hetzner", feature = "yandex_cloud"))]
+#[cfg(any(
+    feature = "cloud_ru",
+    feature = "google_cloud",
+    feature = "hetzner",
+    feature = "yandex_cloud"
+))]
 pub(crate) use poll::poll_interval;
 #[cfg(any(
     feature = "cloud_ru",
+    feature = "google_cloud",
     feature = "hetzner",
     feature = "route53",
     feature = "yandex_cloud"
@@ -77,6 +83,9 @@ pub(crate) use poll::{PollStep, Poller};
     feature = "cloud_ru",
     feature = "cloudflare",
     feature = "digitalocean",
+    feature = "ovh",
+    feature = "google_cloud",
+    feature = "azure_dns",
     feature = "porkbun",
     feature = "gandi",
     feature = "dnsimple",
@@ -95,21 +104,31 @@ pub(crate) use poll::{PollStep, Poller};
 ))]
 pub(crate) use request::Request;
 pub(crate) use request::Response;
-#[cfg(any(feature = "cloud_ru", feature = "nicru", feature = "yandex_cloud"))]
+#[cfg(any(
+    feature = "azure_dns",
+    feature = "cloud_ru",
+    feature = "google_cloud",
+    feature = "nicru",
+    feature = "yandex_cloud"
+))]
 pub(crate) use request::TokenAuth;
-#[cfg(feature = "route53")]
+#[cfg(any(feature = "ovh", feature = "route53"))]
 pub(crate) use request::{Finish, Outgoing};
 #[cfg(feature = "acme_dns")]
 pub(crate) use retry::SendError;
 #[cfg(any(
+    feature = "azure_dns",
     feature = "cloud_ru",
+    feature = "google_cloud",
     feature = "nicru",
     feature = "selectel_v2",
     feature = "yandex_cloud"
 ))]
 pub(crate) use token::Token;
 #[cfg(any(
+    feature = "azure_dns",
     feature = "cloud_ru",
+    feature = "google_cloud",
     feature = "nicru",
     feature = "selectel_v2",
     feature = "vk_cloud",
@@ -121,6 +140,7 @@ pub(crate) use token::lifetime_until;
 #[cfg(any(
     feature = "cloud_ru",
     feature = "cloudflare",
+    feature = "google_cloud",
     feature = "route53",
     feature = "selectel_v2",
     feature = "vk_cloud",
@@ -131,6 +151,7 @@ pub(crate) use url::{Endpoint, Origin};
 #[cfg(any(
     feature = "cloud_ru",
     feature = "cloudflare",
+    feature = "google_cloud",
     feature = "hetzner",
     feature = "selectel_v2",
     feature = "vk_cloud",
@@ -140,6 +161,7 @@ pub(crate) use zone_cache::ZoneId;
 #[cfg(any(
     feature = "cloud_ru",
     feature = "cloudflare",
+    feature = "google_cloud",
     feature = "hetzner",
     feature = "route53",
     feature = "selectel_v2",
@@ -308,6 +330,9 @@ pub(crate) struct Http {
     code: Option<MessageFn>,
     /// Marks further answers as rate-limit answers, treated like a 429.
     rate_limit: Option<RateLimitFn>,
+    /// A header of the client's provider that states, as a Unix time, when a rate limit ends
+    /// ([`HttpBuilder::rate_reset_unix`]).
+    rate_reset_unix: Option<&'static str>,
     /// The origins of the client's endpoints: the only hosts its requests may go to.
     origins: Vec<Origin>,
     /// True when the transport presents a client certificate.
@@ -403,6 +428,7 @@ pub(crate) struct HttpBuilder {
     message: MessageFn,
     code: Option<MessageFn>,
     rate_limit: Option<RateLimitFn>,
+    rate_reset_unix: Option<&'static str>,
     origins: Vec<Origin>,
     error: Option<Error>,
 }
@@ -420,6 +446,7 @@ impl HttpBuilder {
             message: request::default_message,
             code: None,
             rate_limit: None,
+            rate_reset_unix: None,
             origins: Vec::new(),
             error: None,
         };
@@ -528,6 +555,16 @@ impl HttpBuilder {
         self
     }
 
+    /// Reads the wait of a rate-limit answer also from `header`, a Unix time in seconds at which
+    /// the limit ends, for a provider that states the end of its window only there. Consulted
+    /// after `Retry-After` and before `RateLimit-Reset` (design section 5.3); what such a header
+    /// means differs between providers, so it is never read for a client that does not declare
+    /// it. `header` is a lowercase header name.
+    pub(crate) fn rate_reset_unix(mut self, header: &'static str) -> HttpBuilder {
+        self.rate_reset_unix = Some(header);
+        self
+    }
+
     /// The handle, or the first problem met while building it.
     pub(crate) fn build(self) -> Result<Http, Error> {
         if let Some(e) = self.error {
@@ -554,6 +591,7 @@ impl HttpBuilder {
             message: self.message,
             code: self.code,
             rate_limit: self.rate_limit,
+            rate_reset_unix: self.rate_reset_unix,
             origins: self.origins,
             identity,
         })

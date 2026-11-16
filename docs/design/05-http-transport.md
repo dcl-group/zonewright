@@ -228,13 +228,16 @@ a whole rrset, which can hold values another writer added after the read: it is 
   429 with a classifier (`HttpBuilder::rate_limit`; Route 53 answers HTTP 400 with the codes
   `Throttling`, `ThrottlingException` and `PriorRequestNotComplete`), and such an answer is handled
   exactly like a 429. The wait is taken from `Retry-After` (delay-seconds or an HTTP date in the
-  IMF-fixdate form; the obsolete RFC 850 and asctime forms are not read) or `RateLimit-Reset` (a
-  value above 10⁹ is a Unix time, as Hetzner sends it, a smaller one delay-seconds). For an
-  idempotent request with attempts left and a wait of at most 30 s, the transport sleeps for the
-  wait or the back-off, whichever is longer, and retries, so a wait of zero or a time in the past
-  does not produce three requests in a few milliseconds; without a header it uses the back-off.
-  Otherwise the result is `Error::RateLimited { retry_after }`, with the wait clamped to 24 hours so
-  that a caller can add it to an `Instant`.
+  IMF-fixdate form; the obsolete RFC 850 and asctime forms are not read), a header of the client's
+  own provider that states the end of a rate-limit window as a Unix time, or `RateLimit-Reset` (a
+  value above 10⁹ is a Unix time, as Hetzner sends it, a smaller one delay-seconds), in that order.
+  A client declares the own header with `HttpBuilder::rate_reset_unix`, and it is read for that
+  client only: DNSimple declares `X-RateLimit-Reset`. For an idempotent request with attempts left
+  and a wait of at most 30 s, the transport sleeps for the wait or the back-off, whichever is
+  longer, and retries, so a wait of zero or a time in the past does not produce three requests in a
+  few milliseconds; without a header it uses the back-off. Otherwise the result is
+  `Error::RateLimited { retry_after }`, with the wait clamped to 24 hours so that a caller can add
+  it to an `Instant`.
 - A request that fails because a redirect was refused, because `loopback_only` or the endpoint
   binding of section 5.2 blocked it, or because a TLS certificate was refused (the server's, or the
   client certificate by the server) is never retried. A refused certificate is `Error::Config`: the

@@ -91,6 +91,11 @@ impl Dnsimple {
             // The token as given is registered too, whether or not it was trimmed.
             .secret(raw)
             .message(api::error_message)
+            // Source: Overview, "Rate limiting": an exceeded hourly quota is answered 429
+            // `{"message":"quota exceeded"}` with `X-RateLimit-Reset`, "The time at which the
+            // current rate limit window in Unix time format", and no `Retry-After`; the block
+            // after failed authentications sends `Retry-After`, which the transport reads first.
+            .rate_reset_unix("x-ratelimit-reset")
             .build()?;
         Ok(Dnsimple {
             api: Api::new(http, settings.api, settings.account_id),

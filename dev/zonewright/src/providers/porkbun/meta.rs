@@ -57,7 +57,7 @@ const FIELDS: &[ConfigField] = &[
         required: false,
         kind: FieldKind::Ttl {
             min: 600,
-            max: 86_400,
+            max: 2_147_483_647,
             provider_default: false,
         },
         default: Some("600"),
@@ -110,11 +110,10 @@ const CAPABILITIES: Capabilities = Capabilities {
     // Individual records with identifiers: a replacement is several requests (creates, then
     // deletes), and no request carries a condition on the rrset as read.
     atomic_rrset_write: false,
-    // The minimum is documented; the maximum is an assumption, marked and explained in
-    // `config.rs`.
+    // The minimum is documented; no maximum is, so RFC 2181's stands (`config.rs`).
     ttl: TtlSupport::PerRecord {
         min: 600,
-        max: 86_400,
+        max: 2_147_483_647,
     },
     // Every record carries a TTL: one created without `ttl` gets the account's minimum, which
     // a read shows as a number.

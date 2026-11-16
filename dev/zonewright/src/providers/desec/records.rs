@@ -48,6 +48,11 @@
 //! ANAME are refused by the API ("Unsupported Types"). The NS rrset at the apex is created with
 //! the domain ("NS records pointing to deSEC's name servers … will be created", Domains, field
 //! `zonefile`); the record layer refuses writes to it before any request.
+//!
+//! Examples of content are documented for A and AAAA, CNAME, MX, NS, TLSA and TXT. For CAA, DNAME,
+//! HTTPS, PTR, SRV, SSHFP and SVCB the general rule above is the only source: that the API's
+//! canonical text of those types (it may quote every SVCB parameter value or split long hex, for
+//! example) reads back equal to the crate's is inferred, not observed, until a live run.
 
 use crate::error::Error;
 use crate::id::ProviderId;

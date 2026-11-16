@@ -5,8 +5,8 @@
 //!
 //! Capabilities describe what this version of the crate implements: `check`, `list_zones`, the
 //! record-level operations for the types whose value form a source gives (the client's
-//! `content.rs` cites each), and the TXT value operations on plain values, which use the API's
-//! per-value `PATCH`.
+//! `content.rs` cites each), and the TXT value operations on the values the record level
+//! writes, which use the API's per-value `PATCH`.
 
 use std::time::Duration;
 
@@ -99,10 +99,12 @@ const CAPABILITIES: Capabilities = Capabilities {
         RecordType::TXT,
     ]),
     read_only_types: &[],
-    // Only plain values (`Txt::is_plain`) in the TXT value operations: an ACME value is one, and
-    // no source says how the API treats a quote, a backslash or a byte outside printable ASCII
-    // inside a value.
-    txt_plain_only: true,
+    // The TXT value operations accept what the record level writes, one rule for both
+    // (`content.rs`): 1 to 255 printable ASCII octets without `"` or `\`, spaces included (the
+    // reference's TXT example has them); the client refuses the rest before any request
+    // (`txt.rs`, `TxtBase::check_value`), since no source says how the API treats a quote, a
+    // backslash or a byte outside printable ASCII.
+    txt_plain_only: false,
     // `PATCH` with `add_rrset_values` / `remove_rrset_values` names only our value; a new rrset
     // is created by a `POST` that the API refuses (`409`) when the rrset exists. A foreign value
     // is never part of a request.

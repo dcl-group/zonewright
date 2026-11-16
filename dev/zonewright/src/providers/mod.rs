@@ -19,6 +19,7 @@ use crate::provider::{
 use crate::record::{RecordType, RrSet, RrsetTtl, Txt};
 
 pub mod acme_dns;
+pub mod azure_dns;
 pub mod beget;
 pub mod cloud_ru;
 pub mod cloudflare;
@@ -28,12 +29,14 @@ pub mod dnsimple;
 pub mod edgecenter;
 pub mod gandi;
 pub mod gcore;
+pub mod google_cloud;
 // The DNS API v2 that Gcore serves and EdgeCenter serves in a fork of its own: the code both
 // clients share.
 #[cfg(any(feature = "edgecenter", feature = "gcore"))]
 mod gcore_shared;
 pub mod hetzner;
 pub mod nicru;
+pub mod ovh;
 pub mod porkbun;
 pub mod regru;
 pub mod rfc2136;
@@ -48,6 +51,7 @@ pub mod yandex_cloud;
 pub(crate) fn meta_of(id: ProviderId) -> &'static ProviderMeta {
     match id {
         ProviderId::AcmeDns => &acme_dns::meta::META,
+        ProviderId::AzureDns => &azure_dns::meta::META,
         ProviderId::Beget => &beget::meta::META,
         ProviderId::CloudRu => &cloud_ru::meta::META,
         ProviderId::Cloudflare => &cloudflare::meta::META,
@@ -57,8 +61,10 @@ pub(crate) fn meta_of(id: ProviderId) -> &'static ProviderMeta {
         ProviderId::EdgeCenter => &edgecenter::meta::META,
         ProviderId::Gandi => &gandi::meta::META,
         ProviderId::Gcore => &gcore::meta::META,
+        ProviderId::GoogleCloud => &google_cloud::meta::META,
         ProviderId::Hetzner => &hetzner::meta::META,
         ProviderId::Nicru => &nicru::meta::META,
+        ProviderId::Ovh => &ovh::meta::META,
         ProviderId::Porkbun => &porkbun::meta::META,
         ProviderId::Regru => &regru::meta::META,
         ProviderId::Rfc2136 => &rfc2136::meta::META,
@@ -84,6 +90,9 @@ pub enum AnyProvider {
     /// The acme-dns client (`acme_dns`).
     #[cfg(feature = "acme_dns")]
     AcmeDns(acme_dns::AcmeDns),
+    /// The Azure DNS client (`azure_dns`).
+    #[cfg(feature = "azure_dns")]
+    AzureDns(azure_dns::AzureDns),
     /// The Beget client (`beget`).
     #[cfg(feature = "beget")]
     Beget(beget::Beget),
@@ -111,12 +120,18 @@ pub enum AnyProvider {
     /// The Gcore client (`gcore`).
     #[cfg(feature = "gcore")]
     Gcore(gcore::Gcore),
+    /// The Google Cloud DNS client (`google_cloud`).
+    #[cfg(feature = "google_cloud")]
+    GoogleCloud(google_cloud::GoogleCloud),
     /// The Hetzner client (`hetzner`).
     #[cfg(feature = "hetzner")]
     Hetzner(hetzner::Hetzner),
     /// The nic.ru client (`nicru`).
     #[cfg(feature = "nicru")]
     Nicru(nicru::Nicru),
+    /// The OVHcloud client (`ovh`).
+    #[cfg(feature = "ovh")]
+    Ovh(ovh::Ovh),
     /// The Porkbun client (`porkbun`).
     #[cfg(feature = "porkbun")]
     Porkbun(porkbun::Porkbun),
@@ -153,6 +168,8 @@ macro_rules! forward {
         match *$any {
             #[cfg(feature = "acme_dns")]
             AnyProvider::AcmeDns(ref $client) => $body,
+            #[cfg(feature = "azure_dns")]
+            AnyProvider::AzureDns(ref $client) => $body,
             #[cfg(feature = "beget")]
             AnyProvider::Beget(ref $client) => $body,
             #[cfg(feature = "cloud_ru")]
@@ -171,10 +188,14 @@ macro_rules! forward {
             AnyProvider::Gandi(ref $client) => $body,
             #[cfg(feature = "gcore")]
             AnyProvider::Gcore(ref $client) => $body,
+            #[cfg(feature = "google_cloud")]
+            AnyProvider::GoogleCloud(ref $client) => $body,
             #[cfg(feature = "hetzner")]
             AnyProvider::Hetzner(ref $client) => $body,
             #[cfg(feature = "nicru")]
             AnyProvider::Nicru(ref $client) => $body,
+            #[cfg(feature = "ovh")]
+            AnyProvider::Ovh(ref $client) => $body,
             #[cfg(feature = "porkbun")]
             AnyProvider::Porkbun(ref $client) => $body,
             #[cfg(feature = "regru")]
@@ -210,6 +231,7 @@ impl AnyProvider {
     #[cfg_attr(
         all(
             feature = "acme_dns",
+            feature = "azure_dns",
             feature = "beget",
             feature = "cloud_ru",
             feature = "cloudflare",
@@ -219,8 +241,10 @@ impl AnyProvider {
             feature = "edgecenter",
             feature = "gandi",
             feature = "gcore",
+            feature = "google_cloud",
             feature = "hetzner",
             feature = "nicru",
+            feature = "ovh",
             feature = "porkbun",
             feature = "regru",
             feature = "rfc2136",
@@ -236,6 +260,7 @@ impl AnyProvider {
     #[cfg_attr(
         not(any(
             feature = "acme_dns",
+            feature = "azure_dns",
             feature = "beget",
             feature = "cloud_ru",
             feature = "cloudflare",
@@ -245,8 +270,10 @@ impl AnyProvider {
             feature = "edgecenter",
             feature = "gandi",
             feature = "gcore",
+            feature = "google_cloud",
             feature = "hetzner",
             feature = "nicru",
+            feature = "ovh",
             feature = "porkbun",
             feature = "regru",
             feature = "rfc2136",
@@ -271,6 +298,10 @@ impl AnyProvider {
             ProviderId::AcmeDns => {
                 #[cfg(feature = "acme_dns")]
                 return acme_dns::from_json(settings, credentials, ctx).map(AnyProvider::AcmeDns);
+            }
+            ProviderId::AzureDns => {
+                #[cfg(feature = "azure_dns")]
+                return azure_dns::from_json(settings, credentials, ctx).map(AnyProvider::AzureDns);
             }
             ProviderId::Beget => {
                 #[cfg(feature = "beget")]
@@ -311,6 +342,11 @@ impl AnyProvider {
                 #[cfg(feature = "gcore")]
                 return gcore::from_json(settings, credentials, ctx).map(AnyProvider::Gcore);
             }
+            ProviderId::GoogleCloud => {
+                #[cfg(feature = "google_cloud")]
+                return google_cloud::from_json(settings, credentials, ctx)
+                    .map(AnyProvider::GoogleCloud);
+            }
             ProviderId::Hetzner => {
                 #[cfg(feature = "hetzner")]
                 return hetzner::from_json(settings, credentials, ctx).map(AnyProvider::Hetzner);
@@ -318,6 +354,10 @@ impl AnyProvider {
             ProviderId::Nicru => {
                 #[cfg(feature = "nicru")]
                 return nicru::from_json(settings, credentials, ctx).map(AnyProvider::Nicru);
+            }
+            ProviderId::Ovh => {
+                #[cfg(feature = "ovh")]
+                return ovh::from_json(settings, credentials, ctx).map(AnyProvider::Ovh);
             }
             ProviderId::Porkbun => {
                 #[cfg(feature = "porkbun")]
@@ -368,6 +408,7 @@ impl AnyProvider {
 #[cfg_attr(
     not(any(
         feature = "acme_dns",
+        feature = "azure_dns",
         feature = "beget",
         feature = "cloud_ru",
         feature = "cloudflare",
@@ -377,8 +418,10 @@ impl AnyProvider {
         feature = "edgecenter",
         feature = "gandi",
         feature = "gcore",
+        feature = "google_cloud",
         feature = "hetzner",
         feature = "nicru",
+        feature = "ovh",
         feature = "porkbun",
         feature = "regru",
         feature = "rfc2136",
@@ -466,6 +509,13 @@ impl From<acme_dns::AcmeDns> for AnyProvider {
     }
 }
 
+#[cfg(feature = "azure_dns")]
+impl From<azure_dns::AzureDns> for AnyProvider {
+    fn from(client: azure_dns::AzureDns) -> AnyProvider {
+        AnyProvider::AzureDns(client)
+    }
+}
+
 #[cfg(feature = "beget")]
 impl From<beget::Beget> for AnyProvider {
     fn from(client: beget::Beget) -> AnyProvider {
@@ -529,6 +579,13 @@ impl From<gcore::Gcore> for AnyProvider {
     }
 }
 
+#[cfg(feature = "google_cloud")]
+impl From<google_cloud::GoogleCloud> for AnyProvider {
+    fn from(client: google_cloud::GoogleCloud) -> AnyProvider {
+        AnyProvider::GoogleCloud(client)
+    }
+}
+
 #[cfg(feature = "hetzner")]
 impl From<hetzner::Hetzner> for AnyProvider {
     fn from(client: hetzner::Hetzner) -> AnyProvider {
@@ -540,6 +597,13 @@ impl From<hetzner::Hetzner> for AnyProvider {
 impl From<nicru::Nicru> for AnyProvider {
     fn from(client: nicru::Nicru) -> AnyProvider {
         AnyProvider::Nicru(client)
+    }
+}
+
+#[cfg(feature = "ovh")]
+impl From<ovh::Ovh> for AnyProvider {
+    fn from(client: ovh::Ovh) -> AnyProvider {
+        AnyProvider::Ovh(client)
     }
 }
 

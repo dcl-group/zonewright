@@ -99,8 +99,8 @@ impl PerRecord for Dnsimple {
         };
         match self.api.create_record(zone, &record).await? {
             Written::Done => Ok(()),
-            // The zone does not exist (any more): nothing was written.
-            Written::NotFound => Err(Error::zone_not_found(zone.clone())),
+            // Nothing was written; the zone is gone, or the token may not write to it.
+            Written::NotFound(refusal) => Err(self.create_refused(zone, refusal).await),
         }
     }
 
@@ -115,12 +115,15 @@ impl PerRecord for Dnsimple {
         }
         match self.api.delete_record(zone, record.handle.id).await? {
             Written::Done => Ok(()),
-            Written::NotFound => {
-                // The record is gone, or the zone is and was created again. Only a new read
-                // tells them apart.
+            Written::NotFound(refusal) => {
+                // The record is gone, or the zone is and was created again, or the record is
+                // still there and the token may not delete it. Only a new read tells them apart.
                 let PerRecordRead::Records(now) = PerRecord::read(self, zone, name).await? else {
                     return Ok(());
                 };
+                if now.iter().any(|r| r.handle.id == record.handle.id) {
+                    return Err(refusal);
+                }
                 let still_there = now.iter().any(|r| r.value == record.value);
                 if still_there && record.value.is_some() {
                     Err(Error::Conflict {

@@ -1249,10 +1249,11 @@ async fn desec_list_zones_reads_every_page() {
     assert_eq!(cursors, ["cursor=", "cursor=p2", "cursor=p4"]);
 }
 
-/// The rrset listing reads every page and ends at the page without a `next` link, at an empty
-/// page, and refuses a server that pages oddly: one that ignores the cursor and answers the
-/// same page again, one whose `next` link repeats the cursor just used, and one whose `next`
-/// link has no cursor are `Protocol`, never an endless loop or a shorter result.
+/// The rrset listing reads every page, also with the `Link` header split into one field line per
+/// link, and ends at the page without a `next` link. A server that pages oddly is `Protocol`,
+/// never an endless loop or a shorter result: one that ignores the cursor and answers the same
+/// page again, one whose `next` link repeats the cursor just used, one whose `next` link has no
+/// cursor, an empty page with a `next` link, and a `Link` field that is not readable text.
 #[tokio::test]
 async fn desec_listing_ends_under_every_paging_reading() {
     let (mock, client) = setup().await;
@@ -1297,14 +1298,40 @@ async fn desec_listing_ends_under_every_paging_reading() {
     }
     control.set_paging(Paging::Documented);
 
-    // An empty page with a `next` link ends the listing.
+    // The links as one field line each: every line is read, and the listing is whole.
+    control.set_paging(Paging::SplitLinkFields);
+    mock.log().clear();
+    assert_eq!(client.list_rrsets(&zone()).await.unwrap().rrsets.len(), 6);
+    assert_eq!(client.list_zones().await.unwrap().len(), 5);
+    let pages = mock.log().matching(Some("GET"), RRSETS);
+    assert_eq!(pages.len(), 3);
+    control.set_paging(Paging::Documented);
+
+    // An empty page that still names a next page, and a `Link` field that is not readable
+    // text, are `Protocol`: neither is taken for the last page.
+    let next = "<http://127.0.0.1/api/v1/domains/example.org/rrsets/?cursor=p2>; rel=\"next\"";
+    mock.faults().push(
+        Fault::on("GET", RRSETS)
+            .respond(200, "[]")
+            .header("link", next),
+    );
+    let e = client.list_rrsets(&zone()).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    assert!(e.to_string().contains("empty page"), "{e}");
+    mock.faults().push(
+        Fault::on("GET", RRSETS)
+            .respond(
+                200,
+                r#"[{"subname":"a","type":"A","ttl":3600,"records":["192.0.2.1"]}]"#,
+            )
+            .header("link", "<http://127.0.0.1/?cursor=\u{e9}>; rel=\"next\""),
+    );
+    let e = client.list_rrsets(&zone()).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    // An empty page without a `next` link is the end.
     mock.faults()
-        .push(Fault::on("GET", RRSETS).respond(200, "[]").header(
-            "link",
-            "<http://127.0.0.1/api/v1/domains/example.org/rrsets/?cursor=p2>; rel=\"next\"",
-        ));
-    let listing = client.list_rrsets(&zone()).await.unwrap();
-    assert!(listing.rrsets.is_empty());
+        .push(Fault::on("GET", RRSETS).respond(200, "[]"));
+    assert!(client.list_rrsets(&zone()).await.unwrap().rrsets.is_empty());
 }
 
 /// The answer to a read of one rrset may leave out `subname`, `name` and `type`, which the path
@@ -1939,6 +1966,13 @@ mod dns_link {
 }
 
 // ---- Live (design section 12.5; run only by the maintainer) ------------------------------------
+//
+// The provider's documented limits (https://desec.readthedocs.io/en/latest/rate-limits.html):
+// writes 2 per second, 15 per minute, 100 per hour and 300 per day per domain; reads 10 per second
+// and 50 per minute per account. The client repeats neither a throttled write nor a read whose
+// `Retry-After` exceeds 30 seconds, so the live tests pace their writes and wait out a throttled
+// operation themselves ([`Throttle`]); the cleanup does the same with a budget of its own, so that
+// it outlasts a throttle that ended the body.
 
 fn live_env(key: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| panic!("set {key} to run the live test"))
@@ -1958,10 +1992,8 @@ fn random_u64() -> u64 {
     hasher.finish()
 }
 
-fn live_client() -> (Arc<AnyProvider>, DomainName) {
+fn live_client_with(credentials: String) -> Arc<AnyProvider> {
     let settings = live_env("ZONEWRIGHT_LIVE_DESEC_SETTINGS");
-    let credentials = live_env("ZONEWRIGHT_LIVE_DESEC_CREDENTIALS");
-    let zone = dn(&live_env("ZONEWRIGHT_LIVE_DESEC_ZONE"));
     let ctx = Context::new(zonewright::ContextOptions::default()).unwrap();
     let client = AnyProvider::from_json(
         ProviderId::Desec,
@@ -1970,12 +2002,96 @@ fn live_client() -> (Arc<AnyProvider>, DomainName) {
         &ctx,
     )
     .unwrap();
-    (Arc::new(client), zone)
+    Arc::new(client)
+}
+
+fn live_client() -> (Arc<AnyProvider>, DomainName) {
+    let client = live_client_with(live_env("ZONEWRIGHT_LIVE_DESEC_CREDENTIALS"));
+    let zone = dn(&live_env("ZONEWRIGHT_LIVE_DESEC_ZONE"));
+    (client, zone)
+}
+
+/// Spacing of two operations that write: 15 writes per minute per domain is one every 4 seconds.
+const LIVE_WRITE_SPACING: Duration = Duration::from_millis(4100);
+
+/// Longest single wait for a throttled operation; a wait the provider does not state is 60 s.
+const LIVE_MAX_WAIT: Duration = Duration::from_secs(300);
+
+/// Longest time one [`Throttle`] waits out throttling in all.
+const LIVE_BUDGET: Duration = Duration::from_secs(20 * 60);
+
+/// Paces the writes of a live test and repeats an operation that ended with `RateLimited`, after
+/// the wait the provider stated (at most [`LIVE_MAX_WAIT`]), until [`LIVE_BUDGET`] is spent.
+/// Repeating is safe: a throttled request was refused, not applied, and every operation starts
+/// with a fresh read.
+struct Throttle {
+    last_write: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+    end: tokio::time::Instant,
+}
+
+impl Throttle {
+    fn new() -> Arc<Throttle> {
+        Arc::new(Throttle {
+            last_write: tokio::sync::Mutex::new(None),
+            end: tokio::time::Instant::now() + LIVE_BUDGET,
+        })
+    }
+
+    /// Runs `op`; `writes` says whether it may write, and is then spaced from the last one.
+    async fn run<T, F, Fut>(&self, writes: bool, mut op: F) -> Result<T, Error>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, Error>>,
+    {
+        loop {
+            if writes {
+                let mut last = self.last_write.lock().await;
+                if let Some(at) = *last {
+                    tokio::time::sleep_until(at + LIVE_WRITE_SPACING).await;
+                }
+                *last = Some(tokio::time::Instant::now());
+            }
+            let result = op().await;
+            if let Err(Error::RateLimited { retry_after, .. }) = &result {
+                let wait = retry_after
+                    .unwrap_or(Duration::from_secs(60))
+                    .min(LIVE_MAX_WAIT)
+                    + Duration::from_secs(1);
+                if tokio::time::Instant::now() + wait <= self.end {
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            }
+            return result;
+        }
+    }
+}
+
+/// Deletes each `(name, type)` with its own throttle budget, and returns what it could not
+/// remove.
+async fn live_cleanup(
+    client: &AnyProvider,
+    zone: &DomainName,
+    sets: &[(DomainName, RecordType)],
+) -> Vec<String> {
+    let throttle = Throttle::new();
+    let mut left = Vec::new();
+    for (name, rtype) in sets {
+        let result = throttle
+            .run(true, || {
+                client.delete_rrset(zone, name, *rtype, Expect::Any)
+            })
+            .await;
+        if let Err(e) = result {
+            left.push(format!("{name} {rtype}: {e}"));
+        }
+    }
+    left
 }
 
 /// Adds and removes two values under a generated label in the zone the maintainer names, and
-/// removes exactly the values it added afterwards, also when the body failed. Mind the
-/// provider's write limit of 15 per minute per domain.
+/// removes exactly the values it added afterwards, also when the body failed. Writes are paced
+/// and throttled operations waited out ([`Throttle`]); it takes about half a minute.
 #[tokio::test]
 #[ignore = "live API; run only by the maintainer"]
 async fn live_desec_add_and_remove() {
@@ -1990,53 +2106,44 @@ async fn live_desec_add_and_remove() {
         let (client, zone, name, values) =
             (client.clone(), zone.clone(), name.clone(), values.clone());
         tokio::spawn(async move {
-            let report = client.check([&zone]).await.unwrap();
+            let t = Throttle::new();
+            let (c, z, n) = (&*client, &zone, &name);
+            let report = t.run(false, || c.check([z])).await.unwrap();
             assert!(report.credentials_verified);
             assert!(report.zones[0].found, "{report:?}");
             let [a, b] = &values;
-            assert_eq!(
-                client.add_txt_value(&zone, &name, a, None).await.unwrap(),
-                AddOutcome::Created
-            );
-            assert_eq!(
-                client.add_txt_value(&zone, &name, b, None).await.unwrap(),
-                AddOutcome::Appended
-            );
-            assert_eq!(
-                client.add_txt_value(&zone, &name, b, None).await.unwrap(),
-                AddOutcome::AlreadyPresent
-            );
-            assert_eq!(
-                client.remove_txt_value(&zone, &name, a).await.unwrap(),
-                RemoveOutcome::Removed
-            );
-            assert_eq!(
-                client.remove_txt_value(&zone, &name, a).await.unwrap(),
-                RemoveOutcome::NotPresent
-            );
-            assert_eq!(
-                client.remove_txt_value(&zone, &name, b).await.unwrap(),
-                RemoveOutcome::RrsetDeleted
-            );
+            let add = |v| t.run(true, move || c.add_txt_value(z, n, v, None));
+            assert_eq!(add(a).await.unwrap(), AddOutcome::Created);
+            assert_eq!(add(b).await.unwrap(), AddOutcome::Appended);
+            assert_eq!(add(b).await.unwrap(), AddOutcome::AlreadyPresent);
+            let remove = |v| t.run(true, move || c.remove_txt_value(z, n, v));
+            assert_eq!(remove(a).await.unwrap(), RemoveOutcome::Removed);
+            assert_eq!(remove(a).await.unwrap(), RemoveOutcome::NotPresent);
+            assert_eq!(remove(b).await.unwrap(), RemoveOutcome::RrsetDeleted);
         })
     };
     let outcome = body.await;
+    // Cleanup: exactly the values this test added, with the value operations.
+    let t = Throttle::new();
     let mut cleanup = Vec::new();
     for value in &values {
-        if let Err(e) = client.remove_txt_value(&zone, &name, value).await {
-            cleanup.push(format!("{e}"));
+        let removed = t
+            .run(true, || client.remove_txt_value(&zone, &name, value))
+            .await;
+        if let Err(e) = removed {
+            cleanup.push(format!("{name} {value:?}: {e}"));
         }
     }
     if let Err(e) = outcome {
         std::panic::resume_unwind(e.into_panic());
     }
-    assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
+    assert!(cleanup.is_empty(), "cleanup left: {cleanup:?}");
 }
 
 /// A record-level round trip on an A rrset under a generated label: create, read, replace with
-/// new records and a new TTL, unchanged repeat, list, delete. The cleanup deletes that rrset,
-/// the only one the test wrote, also when the body failed. TTLs are 3600 and 7200, at or above
-/// the usual `minimum_ttl` of a domain.
+/// new records and a new TTL, unchanged repeat, list, delete. The cleanup deletes that rrset, the
+/// only one the test wrote, also when the body failed. TTLs are 3600 and 7200, at or above the
+/// usual `minimum_ttl` of a domain. Writes are paced ([`Throttle`]).
 #[tokio::test]
 #[ignore = "live API; run only by the maintainer"]
 async fn live_desec_record_round_trip() {
@@ -2047,6 +2154,8 @@ async fn live_desec_record_round_trip() {
     let records = {
         let (client, zone, rec_name) = (client.clone(), zone.clone(), rec_name.clone());
         tokio::spawn(async move {
+            let t = Throttle::new();
+            let (c, z, n) = (&*client, &zone, &rec_name);
             let first = RrSet::new(
                 rec_name.clone(),
                 RecordType::A,
@@ -2054,18 +2163,6 @@ async fn live_desec_record_round_trip() {
                 [rd(RecordType::A, "192.0.2.10")],
             )
             .unwrap();
-            assert_eq!(
-                client
-                    .set_rrset(&zone, &first, Expect::Absent)
-                    .await
-                    .unwrap(),
-                SetOutcome::Created
-            );
-            let read = client
-                .get_rrset(&zone, &rec_name, RecordType::A)
-                .await
-                .unwrap();
-            assert_eq!(read.as_ref(), Some(&first));
             let second = RrSet::new(
                 rec_name.clone(),
                 RecordType::A,
@@ -2076,41 +2173,51 @@ async fn live_desec_record_round_trip() {
                 ],
             )
             .unwrap();
+            let (f, s) = (&first, &second);
             assert_eq!(
-                client
-                    .set_rrset(&zone, &second, Expect::Matches(&first))
+                t.run(true, || c.set_rrset(z, f, Expect::Absent))
+                    .await
+                    .unwrap(),
+                SetOutcome::Created
+            );
+            let read = t
+                .run(false, || c.get_rrset(z, n, RecordType::A))
+                .await
+                .unwrap();
+            assert_eq!(read.as_ref(), Some(&first));
+            assert_eq!(
+                t.run(true, || c.set_rrset(z, s, Expect::Matches(f)))
                     .await
                     .unwrap(),
                 SetOutcome::Replaced
             );
             assert_eq!(
-                client
-                    .set_rrset(&zone, &second, Expect::Matches(&second))
+                t.run(true, || c.set_rrset(z, s, Expect::Matches(s)))
                     .await
                     .unwrap(),
                 SetOutcome::Unchanged
             );
-            let listing = client.list_rrsets(&zone).await.unwrap();
+            let listing = t.run(false, || c.list_rrsets(z)).await.unwrap();
             assert!(listing.rrsets.contains(&second), "{listing:?}");
             assert_eq!(
-                client
-                    .delete_rrset(&zone, &rec_name, RecordType::A, Expect::Matches(&second))
-                    .await
-                    .unwrap(),
+                t.run(true, || c.delete_rrset(
+                    z,
+                    n,
+                    RecordType::A,
+                    Expect::Matches(s)
+                ))
+                .await
+                .unwrap(),
                 DeleteOutcome::Deleted
             );
         })
         .await
     };
-    let cleanup = client
-        .delete_rrset(&zone, &rec_name, RecordType::A, Expect::Any)
-        .await;
+    let cleanup = live_cleanup(&client, &zone, &[(rec_name.clone(), RecordType::A)]).await;
     if let Err(e) = records {
         std::panic::resume_unwind(e.into_panic());
     }
-    if let Err(e) = cleanup {
-        panic!("cleanup failed: {e}");
-    }
+    assert!(cleanup.is_empty(), "cleanup left: {cleanup:?}");
 }
 
 /// The live check of what the client assumes and no source settles. In the zone of
@@ -2119,27 +2226,45 @@ async fn live_desec_record_round_trip() {
 ///
 /// - one set of every type of the capabilities other than A (CAA, CNAME, DNAME, HTTPS, MX, NS,
 ///   PTR, SRV, SSHFP, SVCB, TLSA, AAAA and TXT): each read back equal to what was sent and
-///   repeated as `Unchanged`, which shows that the API's canonical form of each type reads as
-///   the crate's (assumed for every type but the documented AAAA example);
+///   repeated as `Unchanged`. For CAA, DNAME, HTTPS, PTR, SRV, SSHFP and SVCB the content form
+///   rests on the documentation's general rule ("presentation format") only, so this run is
+///   what shows that the API's canonical text of those types reads as the crate's;
 /// - TXT values with a space, a quote, a backslash, non-ASCII bytes and more than 255 octets,
 ///   added and removed with the value operations (the escapes the documentation gives);
 /// - an A set at a wildcard owner (`*` in the path as `%2A`, assumed to be decoded);
 /// - a set created by one client while another, on a separate `Context`, creates the same name
 ///   and type: the second create meets an existing rrset (documented `400`) and the client's new
 ///   read must give `Created`, `Replaced` or `Conflict`, never `Rejected`;
-/// - a change (`PATCH`) of a set that a second client deleted meanwhile: assumed `404`, so
-///   `Conflict` (or `Created` if the API creates it); never `Rejected`;
 /// - `check` of the zone and of a name the account does not own; every created set is found by
-///   `list_rrsets`, which pages when the zone holds more than 500 rrsets.
+///   `list_rrsets`, which pages when the zone holds more than 500 rrsets;
+/// - optionally, with `ZONEWRIGHT_LIVE_DESEC_SCOPED_CREDENTIALS` (the credentials JSON of a
+///   second token whose policies restrict writes: a default policy with `perm_write` false and
+///   one policy that allows TXT at one name), `check` with that token, whose probe lists the
+///   domains: the client assumes that every token may, the documentation says only that every
+///   token may read every rrset. With `ZONEWRIGHT_LIVE_DESEC_SCOPED_NAME` (the name the policy
+///   allows) it also adds and removes one value there with that token. Skipped when unset.
 ///
-/// Everything it created is deleted afterwards by name and type, also when a step failed; it
-/// touches nothing else. It sends about 50 writes: run it with the provider's limit of 15 writes
-/// per minute per domain in mind (the client reports `RateLimited`, it does not wait).
+/// Not covered: what a `PATCH` of an rrset that does not exist is answered with (the client
+/// assumes `404`). The crate's public API cannot order a change after another writer's delete,
+/// so no step here settles it; it is open, for a manual request.
+///
+/// Writes are spaced 4.1 s apart and throttled operations waited out ([`Throttle`]): about 40
+/// writes, so at least three minutes, at most about 20 minutes of waiting plus the cleanup's own
+/// 20. Together with the other live tests it stays under the 100 writes per hour per domain only
+/// when it is run once an hour. Everything it created is deleted afterwards by name and type,
+/// with a throttle budget of its own, also when a step failed; what the cleanup could not remove
+/// is listed in the failure. It touches nothing else.
 #[tokio::test]
 #[ignore = "live API; run only by the maintainer"]
 async fn desec_live_assumptions() {
     let (client, zone) = live_client();
     let prefix = live_env("ZONEWRIGHT_LIVE_DESEC_PREFIX");
+    let scoped = std::env::var("ZONEWRIGHT_LIVE_DESEC_SCOPED_CREDENTIALS")
+        .ok()
+        .map(live_client_with);
+    let scoped_name = std::env::var("ZONEWRIGHT_LIVE_DESEC_SCOPED_NAME")
+        .ok()
+        .map(|name| dn(&name));
     let tag = format!("{prefix}-{:016x}", random_u64());
     let base = zone.prepend(&tag).unwrap();
     let owner = |label: &str| base.prepend(label).unwrap();
@@ -2194,69 +2319,61 @@ async fn desec_live_assumptions() {
     .into_iter()
     .map(txt)
     .collect();
+    let scoped_value = txt(&format!("zw-live-{tag}-scoped"));
     let raced = owner("race");
-    let vanished = owner("vanish");
     let mut created: Vec<(DomainName, RecordType)> =
         sets.iter().map(|s| (s.name().clone(), s.rtype())).collect();
     created.push((raced.clone(), RecordType::A));
-    created.push((vanished.clone(), RecordType::A));
     created.push((values_name.clone(), RecordType::TXT));
     let body = {
-        let (client, zone, sets, values, values_name, raced, vanished) = (
+        let (client, zone, sets, values, values_name, raced) = (
             client.clone(),
             zone.clone(),
             sets.clone(),
             values.clone(),
             values_name.clone(),
             raced.clone(),
-            vanished.clone(),
         );
+        let (scoped, scoped_name, scoped_value) =
+            (scoped.clone(), scoped_name.clone(), scoped_value.clone());
         tokio::spawn(async move {
-            let report = client
-                .check([&zone, &dn("zw-not-owned.invalid")])
-                .await
-                .unwrap();
+            let t = Throttle::new();
+            let (c, z) = (&*client, &zone);
+            let not_owned = dn("zw-not-owned.invalid");
+            let report = t.run(false, || c.check([z, &not_owned])).await.unwrap();
             assert!(report.zones[0].found, "{report:?}");
             assert!(!report.zones[1].found, "{report:?}");
             for set in &sets {
+                let what = format!("{} {}", set.name(), set.rtype());
                 assert_eq!(
-                    client.set_rrset(&zone, set, Expect::Absent).await.unwrap(),
+                    t.run(true, || c.set_rrset(z, set, Expect::Absent))
+                        .await
+                        .unwrap(),
                     SetOutcome::Created,
-                    "{} {}",
-                    set.name(),
-                    set.rtype()
+                    "{what}"
                 );
-                let read = client
-                    .get_rrset(&zone, set.name(), set.rtype())
+                let read = t
+                    .run(false, || c.get_rrset(z, set.name(), set.rtype()))
                     .await
                     .unwrap()
                     .unwrap();
+                assert_eq!(read.records(), set.records(), "{what}");
+                let read = &read;
                 assert_eq!(
-                    read.records(),
-                    set.records(),
-                    "{} {}",
-                    set.name(),
-                    set.rtype()
-                );
-                assert_eq!(
-                    client
-                        .set_rrset(&zone, set, Expect::Matches(&read))
+                    t.run(true, || c.set_rrset(z, set, Expect::Matches(read)))
                         .await
                         .unwrap(),
                     SetOutcome::Unchanged,
-                    "{} {}",
-                    set.name(),
-                    set.rtype()
+                    "{what}"
                 );
             }
+            let vn = &values_name;
             for value in &values {
-                client
-                    .add_txt_value(&zone, &values_name, value, None)
+                t.run(true, || c.add_txt_value(z, vn, value, None))
                     .await
                     .unwrap();
                 assert_eq!(
-                    client
-                        .add_txt_value(&zone, &values_name, value, None)
+                    t.run(true, || c.add_txt_value(z, vn, value, None))
                         .await
                         .unwrap(),
                     AddOutcome::AlreadyPresent,
@@ -2264,29 +2381,22 @@ async fn desec_live_assumptions() {
                 );
             }
             for value in &values {
-                let outcome = client
-                    .remove_txt_value(&zone, &values_name, value)
+                let outcome = t
+                    .run(true, || c.remove_txt_value(z, vn, value))
                     .await
                     .unwrap();
                 assert_ne!(outcome, RemoveOutcome::NotPresent, "{value:?}");
             }
-            let (settings, credentials) = (
-                live_env("ZONEWRIGHT_LIVE_DESEC_SETTINGS"),
-                live_env("ZONEWRIGHT_LIVE_DESEC_CREDENTIALS"),
-            );
-            let other_ctx = Context::new(zonewright::ContextOptions::default()).unwrap();
-            let other = AnyProvider::from_json(
-                ProviderId::Desec,
-                &settings,
-                &SecretString::from(credentials),
-                &other_ctx,
-            )
-            .unwrap();
+            // Two creates of one name and type from clients that do not share a lock.
+            let other = live_client_with(live_env("ZONEWRIGHT_LIVE_DESEC_CREDENTIALS"));
             let race_a = set(raced.clone(), RecordType::A, "192.0.2.21");
             let race_b = set(raced.clone(), RecordType::A, "192.0.2.22");
+            // The two are not spaced from each other (they would no longer race): one write
+            // slot is taken for both, and the documented 2 writes per second allow them.
+            t.run(true, || async { Ok::<(), Error>(()) }).await.unwrap();
             let (a, b) = tokio::join!(
-                client.set_rrset(&zone, &race_a, Expect::Any),
-                other.set_rrset(&zone, &race_b, Expect::Any),
+                t.run(false, || c.set_rrset(z, &race_a, Expect::Any)),
+                t.run(false, || other.set_rrset(z, &race_b, Expect::Any)),
             );
             for outcome in [a, b] {
                 match outcome {
@@ -2295,27 +2405,7 @@ async fn desec_live_assumptions() {
                     Ok(outcome) => panic!("unexpected outcome {outcome:?}"),
                 }
             }
-            // A change of a set deleted meanwhile by another client.
-            client
-                .set_rrset(
-                    &zone,
-                    &set(vanished.clone(), RecordType::A, "192.0.2.30"),
-                    Expect::Absent,
-                )
-                .await
-                .unwrap();
-            let changed_set = set(vanished.clone(), RecordType::A, "192.0.2.31");
-            let (changed, deleted) = tokio::join!(
-                client.set_rrset(&zone, &changed_set, Expect::Any),
-                other.delete_rrset(&zone, &vanished, RecordType::A, Expect::Any),
-            );
-            deleted.unwrap();
-            match changed {
-                Ok(SetOutcome::Replaced | SetOutcome::Created) => {}
-                Err(e) => assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}"),
-                Ok(outcome) => panic!("unexpected outcome {outcome:?}"),
-            }
-            let listing = client.list_rrsets(&zone).await.unwrap();
+            let listing = t.run(false, || c.list_rrsets(z)).await.unwrap();
             for set in &sets {
                 assert!(
                     listing
@@ -2327,17 +2417,69 @@ async fn desec_live_assumptions() {
                     set.rtype()
                 );
             }
+            // A token restricted by policies: its `check` lists the domains.
+            if let Some(scoped) = &scoped {
+                let s = &**scoped;
+                let report = t.run(false, || s.check([z])).await.unwrap();
+                assert!(report.credentials_verified, "{report:?}");
+                assert!(report.zones[0].found, "{report:?}");
+                if let Some(name) = &scoped_name {
+                    let v = &scoped_value;
+                    assert_eq!(
+                        t.run(true, || s.add_txt_value(z, name, v, None))
+                            .await
+                            .unwrap(),
+                        AddOutcome::Created
+                    );
+                    assert_ne!(
+                        t.run(true, || s.remove_txt_value(z, name, v))
+                            .await
+                            .unwrap(),
+                        RemoveOutcome::NotPresent
+                    );
+                }
+            }
         })
         .await
     };
-    let mut cleanup = Vec::new();
-    for (name, rtype) in &created {
-        if let Err(e) = client.delete_rrset(&zone, name, *rtype, Expect::Any).await {
-            cleanup.push(format!("{name} {rtype}: {e}"));
+    let mut cleanup = live_cleanup(&client, &zone, &created).await;
+    if let (Some(scoped), Some(name)) = (&scoped, &scoped_name) {
+        let t = Throttle::new();
+        let removed = t
+            .run(true, || scoped.remove_txt_value(&zone, name, &scoped_value))
+            .await;
+        if let Err(e) = removed {
+            cleanup.push(format!("{name} {scoped_value:?}: {e}"));
         }
     }
     if let Err(e) = body {
         std::panic::resume_unwind(e.into_panic());
     }
-    assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
+    assert!(cleanup.is_empty(), "cleanup left: {cleanup:?}");
+}
+
+/// The live tests' [`Throttle`] against the mock: a write throttled for longer than the
+/// transport waits inline is waited out and repeated once the throttle ends, and two writes are
+/// spaced by [`LIVE_WRITE_SPACING`].
+#[tokio::test]
+async fn desec_live_throttle_waits_out_a_throttle() {
+    let (mock, client) = setup().await;
+    let t = Throttle::new();
+    let (zone, name, aaa, bbb) = (zone(), name(), txt("AAA"), txt("BBB"));
+    mock.faults()
+        .push(Fault::on("POST", RRSETS).rate_limited("1"));
+    let started = tokio::time::Instant::now();
+    let outcome = t
+        .run(true, || client.add_txt_value(&zone, &name, &aaa, None))
+        .await
+        .unwrap();
+    assert_eq!(outcome, AddOutcome::Created);
+    assert_eq!(mock.log().count(Some("POST"), RRSETS), 2);
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    let before = tokio::time::Instant::now();
+    t.run(true, || client.add_txt_value(&zone, &name, &bbb, None))
+        .await
+        .unwrap();
+    assert!(before.elapsed() >= Duration::from_secs(2));
+    assert_eq!(stored_txt(&mock), [quoted("AAA"), quoted("BBB")]);
 }

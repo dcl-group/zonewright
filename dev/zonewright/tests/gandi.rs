@@ -26,7 +26,7 @@ use zonewright_mock::axum;
 use zonewright_mock::axum::http::{Method, StatusCode};
 use zonewright_mock::axum::response::IntoResponse as _;
 use zonewright_mock::echo::{EchoServer, Echoed, Render};
-use zonewright_mock::gandi::{GandiMock, Paging, Seed};
+use zonewright_mock::gandi::{GandiMock, Paging, PatchReading, Seed};
 use zonewright_mock::{Fault, MockServer};
 
 use common::echo::{CANARY_KEY, CANARY_TOKEN, LogCapture, REDACTED, assert_clean, dialects};
@@ -574,7 +574,15 @@ async fn gandi_name_outside_zone_sends_nothing() {
 #[tokio::test]
 async fn gandi_invalid_input_sends_nothing() {
     let (mock, client) = setup().await;
-    for value in ["two words", "quo\"te", "back\\slash", ""] {
+    let long = "x".repeat(256);
+    for value in [
+        "quo\"te",
+        "back\\slash",
+        "",
+        "tab\there",
+        "caf\u{e9}",
+        long.as_str(),
+    ] {
         let e = add(&client, value).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidInput, "{value}: {e:?}");
         let e = remove(&client, value).await.unwrap_err();
@@ -668,7 +676,7 @@ async fn gandi_never_removes_foreign_value() {
     assert_eq!(add(&client, "ours").await.unwrap(), AddOutcome::Appended);
     assert_eq!(
         last_body(&mock, "PATCH", TXT_RRSET),
-        json!({ "add_rrset_values": [q("ours")] })
+        json!({ "add_rrset_values": [q("ours")], "rrset_ttl": 600 })
     );
     let during = control.rrset(ZONE, RR, "TXT").unwrap();
     assert_eq!(during.ttl, Some(600));
@@ -682,7 +690,7 @@ async fn gandi_never_removes_foreign_value() {
     );
     assert_eq!(
         last_body(&mock, "PATCH", TXT_RRSET),
-        json!({ "remove_rrset_values": [q("ours")] })
+        json!({ "remove_rrset_values": [q("ours")], "rrset_ttl": 600 })
     );
     assert_eq!(control.rrset(ZONE, RR, "TXT").unwrap(), original);
     assert_eq!(mock.log().count(Some("PUT"), ANY_RRSET), 0);
@@ -1251,7 +1259,7 @@ async fn gandi_request_shapes() {
     let patch = mock.log().matching(Some("PATCH"), TXT_RRSET).pop().unwrap();
     assert_eq!(
         patch.body_json().unwrap(),
-        json!({ "add_rrset_values": [q("BBB")] })
+        json!({ "add_rrset_values": [q("BBB")], "rrset_ttl": 300 })
     );
 
     // A requested TTL for a new rrset; the apex.
@@ -1313,10 +1321,19 @@ async fn gandi_txt_dialect() {
         add(&client, "quoted").await.unwrap(),
         AddOutcome::AlreadyPresent
     );
-    // `two words` is not the value `twowords`.
+    // `two words` is not the value `twowords`, nor the value `two words`: bare text with a
+    // space is undecided.
     assert_eq!(
         add(&client, "twowords").await.unwrap(),
         AddOutcome::Appended
+    );
+    assert_eq!(
+        add(&client, "two words").await.unwrap(),
+        AddOutcome::Appended
+    );
+    assert_eq!(
+        last_body(&mock, "PATCH", TXT_RRSET)["add_rrset_values"],
+        json!([q("two words")])
     );
     assert_eq!(
         remove(&client, "bare").await.unwrap(),
@@ -1324,7 +1341,7 @@ async fn gandi_txt_dialect() {
     );
     assert_eq!(
         last_body(&mock, "PATCH", TXT_RRSET),
-        json!({ "remove_rrset_values": ["bare"] })
+        json!({ "remove_rrset_values": ["bare"], "rrset_ttl": 300 })
     );
     let set = client
         .get_rrset(&zone(), &name(), RecordType::TXT)
@@ -1992,6 +2009,227 @@ async fn gandi_concurrent_sets_are_serialized() {
     assert_eq!(mock.log().count(Some("POST"), A_RRSET), 1);
 }
 
+// ---- The value-level change where the reference is silent -------------------------------------
+
+/// The `PATCH` carries the TTL the read stated, for an add and for a remove; when the read stated
+/// none, it carries none.
+#[tokio::test]
+async fn gandi_patch_carries_the_ttl_read() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_rrset(ZONE, RR, "TXT", Some(7200), &["\"foreign\""]);
+    add(&client, "ours").await.unwrap();
+    assert_eq!(last_body(&mock, "PATCH", TXT_RRSET)["rrset_ttl"], 7200);
+    remove(&client, "ours").await.unwrap();
+    assert_eq!(last_body(&mock, "PATCH", TXT_RRSET)["rrset_ttl"], 7200);
+
+    control.insert_rrset(ZONE, RR, "TXT", None, &["\"foreign\""]);
+    add(&client, "ours").await.unwrap();
+    assert_eq!(
+        last_body(&mock, "PATCH", TXT_RRSET),
+        json!({ "add_rrset_values": [q("ours")] })
+    );
+}
+
+/// Under every reading of the `PATCH` the documentation allows, an add and a remove next to a
+/// foreign value leave the foreign value and the rrset's TTL as they were.
+#[tokio::test]
+async fn gandi_patch_readings_keep_foreign_values_and_the_ttl() {
+    for reading in [
+        PatchReading::Lenient,
+        PatchReading::TtlReset,
+        PatchReading::DuplicateAddRefused,
+        PatchReading::AbsentRemoveRefused,
+        PatchReading::MissingCreated,
+    ] {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        control.set_patch(reading);
+        control.insert_rrset(ZONE, RR, "TXT", Some(600), &["\"foreign\"", "bare"]);
+        let original = control.rrset(ZONE, RR, "TXT").unwrap();
+        assert_eq!(
+            add(&client, "ours").await.unwrap(),
+            AddOutcome::Appended,
+            "{reading:?}"
+        );
+        assert_eq!(
+            control.rrset(ZONE, RR, "TXT").unwrap().ttl,
+            Some(600),
+            "{reading:?}"
+        );
+        assert_eq!(
+            remove(&client, "ours").await.unwrap(),
+            RemoveOutcome::Removed,
+            "{reading:?}"
+        );
+        assert_eq!(
+            control.rrset(ZONE, RR, "TXT").unwrap(),
+            original,
+            "{reading:?}"
+        );
+    }
+}
+
+/// When another writer changes the rrset between the read and the `PATCH`, the client either
+/// ends in the right state or returns the provider's refusal: it never removes or overwrites
+/// another value, and never reports a change that did not happen.
+#[tokio::test]
+async fn gandi_patch_races_fail_safely() {
+    // A duplicate add: the value arrived meanwhile.
+    for (reading, expect_ok) in [
+        (PatchReading::Lenient, true),
+        (PatchReading::DuplicateAddRefused, false),
+    ] {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        control.set_patch(reading);
+        control.insert_rrset(ZONE, RR, "TXT", Some(600), &["\"foreign\""]);
+        let hook = control.clone();
+        mock.faults()
+            .push(Fault::on("PATCH", TXT_RRSET).run(move || {
+                hook.edit_rrset(ZONE, RR, "TXT", |rrset| rrset.values.push(q("ours")));
+            }));
+        let result = add(&client, "ours").await;
+        match result {
+            Ok(outcome) => {
+                assert!(expect_ok, "{reading:?}");
+                assert_eq!(outcome, AddOutcome::Appended);
+            }
+            Err(e) => {
+                assert!(!expect_ok, "{reading:?}: {e:?}");
+                assert_eq!(e.kind(), ErrorKind::Rejected, "{reading:?}: {e:?}");
+            }
+        }
+        assert_eq!(txt_values(&mock), [q("foreign"), q("ours")], "{reading:?}");
+        assert_eq!(control.rrset(ZONE, RR, "TXT").unwrap().ttl, Some(600));
+        assert_eq!(
+            add(&client, "ours").await.unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+    }
+    // An absent remove: the value left meanwhile.
+    for (reading, expect_ok) in [
+        (PatchReading::Lenient, true),
+        (PatchReading::AbsentRemoveRefused, false),
+    ] {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        control.set_patch(reading);
+        control.insert_rrset(ZONE, RR, "TXT", Some(600), &["\"foreign\"", "\"ours\""]);
+        let hook = control.clone();
+        mock.faults()
+            .push(Fault::on("PATCH", TXT_RRSET).run(move || {
+                hook.edit_rrset(ZONE, RR, "TXT", |rrset| {
+                    rrset.values.retain(|v| v != "\"ours\"")
+                });
+            }));
+        let result = remove(&client, "ours").await;
+        assert_eq!(result.is_ok(), expect_ok, "{reading:?}: {result:?}");
+        if let Err(e) = result {
+            assert_eq!(e.kind(), ErrorKind::Rejected, "{reading:?}: {e:?}");
+        }
+        assert_eq!(txt_values(&mock), [q("foreign")], "{reading:?}");
+        assert_eq!(
+            remove(&client, "ours").await.unwrap(),
+            RemoveOutcome::NotPresent
+        );
+    }
+    // A missing rrset: deleted meanwhile by its owner. A server that answers `404` gives
+    // `Conflict`; one that creates the rrset holds our value afterwards, with the TTL sent.
+    for reading in [PatchReading::Lenient, PatchReading::MissingCreated] {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        control.set_patch(reading);
+        control.insert_rrset(ZONE, RR, "TXT", Some(600), &["\"foreign\""]);
+        let hook = control.clone();
+        mock.faults()
+            .push(Fault::on("PATCH", TXT_RRSET).run(move || hook.delete_rrset(ZONE, RR, "TXT")));
+        let result = add(&client, "ours").await;
+        match reading {
+            PatchReading::Lenient => {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::Conflict);
+                assert!(control.rrsets().is_empty());
+                assert_eq!(add(&client, "ours").await.unwrap(), AddOutcome::Created);
+            }
+            _ => {
+                assert_eq!(result.unwrap(), AddOutcome::Appended);
+                let rrset = control.rrset(ZONE, RR, "TXT").unwrap();
+                assert_eq!(rrset.values, [q("ours")]);
+                assert_eq!(rrset.ttl, Some(600));
+            }
+        }
+    }
+}
+
+/// A `200` to a `PATCH` is a success only when the rrset it states shows the change; an answer
+/// without the values is confirmed by a read. A create answered with a status the reference does
+/// not give for it is `Protocol`.
+#[tokio::test]
+async fn gandi_write_answers_are_checked() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    control.insert_rrset(ZONE, RR, "TXT", Some(300), &["\"foreign\""]);
+    // The answer states an rrset without the value added: nothing is claimed.
+    mock.faults().push(Fault::on("PATCH", TXT_RRSET).respond(
+        200,
+        r#"{"rrset_name":"_acme-challenge","rrset_type":"TXT","rrset_values":["\"foreign\""]}"#,
+    ));
+    let e = add(&client, "ours").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    // A respelled value counts.
+    mock.faults().push(
+        Fault::on("PATCH", TXT_RRSET).respond(200, r#"{"rrset_values":["\"foreign\"","ours"]}"#),
+    );
+    assert_eq!(add(&client, "ours").await.unwrap(), AddOutcome::Appended);
+    assert_eq!(txt_values(&mock), [q("foreign")]);
+    // An answer without values is confirmed by a read: the value is not there.
+    let reads = mock.log().count(Some("GET"), TXT_RRSET);
+    mock.faults()
+        .push(Fault::on("PATCH", TXT_RRSET).respond(200, r#"{"message":"ok"}"#));
+    let e = add(&client, "ours").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    assert_eq!(mock.log().count(Some("GET"), TXT_RRSET), reads + 2);
+    // Without a fault the change is applied and the answer shows it.
+    assert_eq!(add(&client, "ours").await.unwrap(), AddOutcome::Appended);
+
+    // A remove whose answer still holds the value.
+    mock.faults().push(
+        Fault::on("PATCH", TXT_RRSET)
+            .respond(200, r#"{"rrset_values":["\"foreign\"","\"ours\""]}"#),
+    );
+    let e = remove(&client, "ours").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    // An answer without values, the value gone after all: a success after the read.
+    let hook = control.clone();
+    mock.faults().push(
+        Fault::on("PATCH", TXT_RRSET)
+            .run(move || {
+                hook.edit_rrset(ZONE, RR, "TXT", |rrset| {
+                    rrset.values.retain(|v| v != "\"ours\"")
+                });
+            })
+            .respond(200, "{}"),
+    );
+    assert_eq!(
+        remove(&client, "ours").await.unwrap(),
+        RemoveOutcome::Removed
+    );
+    assert_eq!(txt_values(&mock), [q("foreign")]);
+
+    // A create answered `202`: not a documented "created".
+    mock.faults()
+        .push(Fault::on("POST", A_RRSET).respond(202, r#"{"message":"accepted"}"#));
+    let e = client
+        .set_rrset(
+            &zone(),
+            &rrset(REC, RecordType::A, None, &["192.0.2.1"]),
+            Expect::Any,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+}
+
 // ---- Live (design section 12.5; run only by the maintainer) ------------------------------------
 
 fn live_env(key: &str) -> String {
@@ -2180,9 +2418,9 @@ async fn live_gandi_record_round_trip() {
 ///   what was sent (canonical: names keep their trailing dot, TXT comes back as quoted text) and
 ///   repeated as `Unchanged`;
 /// - an A set at a wildcard owner (`*` in the path as `%2A`);
-/// - TXT values through the value operations: the create, a `PATCH` add without `rrset_ttl`
-///   (the TTL must stay as it was), a `PATCH` remove of one value, and a `PATCH` remove of the
-///   last value, which must leave no rrset;
+/// - TXT values through the value operations: the create, a `PATCH` add with the TTL read (the
+///   TTL must stay as it was, and the answer must state the rrset with the value), a `PATCH`
+///   remove of one value, and a `PATCH` remove of the last value, which must leave no rrset;
 /// - a set created by one client while another, on a separate `Context`, creates the same name
 ///   and type: the second create meets an existing rrset and must give `Created`, `Replaced` or
 ///   `Conflict`, never `Rejected`;
@@ -2196,7 +2434,7 @@ async fn live_gandi_record_round_trip() {
 /// touches nothing else.
 #[tokio::test]
 #[ignore = "live API: run only by the maintainer"]
-async fn live_gandi_assumptions() {
+async fn gandi_live_assumptions() {
     let (client, zone) = live_client();
     let prefix = live_env("ZONEWRIGHT_LIVE_GANDI_PREFIX");
     let tag = format!("{prefix}-{:016x}", random_u64());

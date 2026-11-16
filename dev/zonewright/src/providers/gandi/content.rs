@@ -11,7 +11,7 @@
 //! | AAAA  | `2001:db8::1`                              | the reference's examples                       |
 //! | CNAME | `www.example.net.`                         | the reference's listing example                |
 //! | MX    | `10 spool.mail.gandi.net.`                 | the reference's snapshot example               |
-//! | TXT   | `"v=spf1 include:_mailcust.gandi.net ?all"` | the reference's create and listing examples   |
+//! | TXT   | `"v=spf1 include:_mailcust.gandi.net ?all"` | the reference's `POST /domains/{fqdn}/records` and snapshot examples |
 //! | NS    | `ns1.example.net.`                         | dns-update `providers/gandiv5.rs` (`into_fqdn`) |
 //! | SRV   | `10 20 5060 sip.example.org.`              | dns-update `providers/gandiv5.rs` (`"{} {} {} {}"`) |
 //!
@@ -28,11 +28,13 @@
 //! never as one reading or the other; the client writes names with the trailing dot.
 //!
 //! TXT (design section 4.4). The reference writes and lists TXT values as zone-file text in
-//! double quotes: `"\"v=spf1 include:_mailcust.gandi.net ?all\""` in the create and replace
-//! examples, the zone listing and the snapshot, and the quoted ACME token of the verification
-//! example; dns-update writes `format!("\"{}\"", …)`. lego writes the value unquoted
-//! (`internal/client.go`, `AddTXTRecord`), and the reference's examples of a create by name show
-//! `"some-text-value"`. Reading is therefore `Auto`: text that starts with `"` is zone-file text
+//! double quotes: `"\"v=spf1 include:_mailcust.gandi.net ?all\""` in the request examples of
+//! "Creates a new record" (`POST /domains/{fqdn}/records`) and of "Replace the whole zone with new
+//! records" (`PUT /domains/{fqdn}/records`), in the snapshot example ("Snapshot details"), and the
+//! quoted token of the verification example ("Add a verification DNS record"); dns-update writes
+//! `format!("\"{}\"", …)`. lego writes the value unquoted (`internal/client.go`,
+//! `AddTXTRecord`), and the examples of the calls by name (`GET`, `POST` and `PUT
+//! /domains/{fqdn}/records/{rrset_name}`) show the unquoted `"some-text-value"`. Reading is therefore `Auto`: text that starts with `"` is zone-file text
 //! (one quoted string or several), anything else is the value itself, as long as it holds no
 //! whitespace and no `"` (text the zone-file rule would split or that mixes the forms is
 //! undecided). Writing is one quoted string. What no source establishes is not read as a value and

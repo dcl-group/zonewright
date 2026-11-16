@@ -124,6 +124,11 @@ impl Provider for Gandi {
 
     /// Reads one page of the domain listing, which exercises the token on every call, and looks
     /// every zone up afresh.
+    ///
+    /// A token that is wrong, expired or without the needed permission is `Error::Forbidden`, not
+    /// `Error::Auth`: the reference answers a bearer token that "has expired, does not have
+    /// enought permission or does not exists" with `403` (its `401` is "a wrong API Key", the
+    /// deprecated scheme), and the two cases cannot be told apart.
     async fn check<'a>(
         &self,
         zones: impl IntoIterator<Item = &'a DomainName> + Send,

@@ -1146,7 +1146,6 @@ async fn dnsimple_listing_pages_by_number() {
             listing_body(&one, 3, 1, 3),
             listing_body(&serde_json::json!([]), 3, 2, 3),
         ],
-        vec![listing_body(&one, 2, 1, 2), listing_body(&other, 3, 2, 2)],
         vec![listing_body(&one, 2, 1, 2), listing_body(&one, 2, 2, 2)],
     ] {
         mock.faults().clear();
@@ -1159,6 +1158,18 @@ async fn dnsimple_listing_pages_by_number() {
         assert_eq!(e.kind(), ErrorKind::Protocol, "{bodies:?}: {e:?}");
         assert_eq!(writes(&mock), before);
     }
+    // A total that changes between pages: the zone changed while it was read, and a repeat
+    // reads it again.
+    mock.faults().clear();
+    for body in [listing_body(&one, 2, 1, 2), listing_body(&other, 3, 2, 2)] {
+        mock.faults()
+            .push(Fault::on("GET", RECORDS).respond(200, body));
+    }
+    let before = writes(&mock);
+    let e = add(&client, "new").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert!(e.is_retryable());
+    assert_eq!(writes(&mock), before);
     mock.faults().clear();
     // An empty listing may state no page at all.
     let empty = listing_body(&serde_json::json!([]), 0, 1, 0);
@@ -1263,11 +1274,217 @@ async fn dnsimple_zone_not_found() {
     assert!(matches!(e, Error::ZoneNotFound { .. }), "{e:?}");
     let e = client.list_rrsets(&missing).await.unwrap_err();
     assert!(matches!(e, Error::ZoneNotFound { .. }), "{e:?}");
-    // The zone vanished between the read and the create.
-    mock.faults().push(Fault::on("POST", RECORDS).status(404));
+    // The zone vanished between the read and the create: the create's 404 is confirmed by a
+    // read of the zone.
+    let hook = mock.control().clone();
+    mock.faults().push(
+        Fault::on("POST", RECORDS)
+            .run(move || hook.remove_zone("example.org"))
+            .status(404),
+    );
     let e = add(&client, "v").await.unwrap_err();
     assert!(matches!(e, Error::ZoneNotFound { .. }), "{e:?}");
+    assert_eq!(mock.log().count(Some("GET"), ZONE), 1);
     assert!(mock.control().records().is_empty());
+}
+
+/// A 404 to a create, an update or a delete is "does not exist or no permission" (the
+/// Overview): it is confirmed by a read, and when the zone or the record is still there the
+/// refusal is returned as the provider stated it, not taken for a missing zone or record.
+#[tokio::test]
+async fn dnsimple_not_found_to_a_write_is_confirmed_by_a_read() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    let denied = r#"{"message":"Not Found"}"#;
+    // The TXT value create and the record create: the zone is there.
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).respond(404, denied));
+    let e = add(&client, "v").await.unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::Rejected {
+                status: Some(404),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert_eq!(mock.log().count(Some("GET"), ZONE), 1);
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).respond(404, denied));
+    let set = rr("www.example.org", RecordType::A, None, &["192.0.2.1"]);
+    let e = client
+        .set_rrset(&zone(), &set, Expect::Any)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::Rejected {
+                status: Some(404),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(control.records().is_empty());
+
+    // The update: the record is still there (a refusal) or gone (`Conflict`).
+    client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
+    let retuned = set
+        .clone()
+        .with_ttl(Some(RrsetTtl::from_secs(600).unwrap()));
+    mock.faults()
+        .push(Fault::on("PATCH", RECORD).respond(404, denied));
+    let e = client
+        .set_rrset(&zone(), &retuned, Expect::Any)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::Rejected {
+                status: Some(404),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    let id = control.records()[0].id;
+    let hook = control.clone();
+    mock.faults().push(
+        Fault::on("PATCH", RECORD)
+            .run(move || hook.delete_record(id))
+            .respond(404, denied),
+    );
+    let e = client
+        .set_rrset(&zone(), &retuned, Expect::Any)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+
+    // The deletes of both layers: the record is still there under its identifier.
+    client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
+    mock.faults()
+        .push(Fault::on("DELETE", RECORD).respond(404, denied));
+    let e = client
+        .delete_rrset(&zone(), &dn("www.example.org"), RecordType::A, Expect::Any)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::Rejected {
+                status: Some(404),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert_eq!(stored(&mock, "www.example.org", "A"), ["192.0.2.1"]);
+    add(&client, "AAA").await.unwrap();
+    mock.faults()
+        .push(Fault::on("DELETE", RECORD).respond(404, denied));
+    let e = remove(&client, "AAA").await.unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::Rejected {
+                status: Some(404),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert_eq!(control.txt_values(NAME), ["AAA"]);
+}
+
+/// Seconds since the Unix epoch, now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// The documented quota answer (429, `X-RateLimit-Reset` as a Unix time, no `Retry-After`):
+/// a read with a short wait waits and is repeated; a read whose window ends in an hour reports
+/// the wait at once instead of sleeping; a write is sent once and reports the wait. The block
+/// after failed authentications reports its `Retry-After`.
+#[tokio::test]
+async fn dnsimple_rate_limit() {
+    let (mock, client) = setup().await;
+    let control = mock.control();
+    // Learn the account first, so that only the listing meets the quota.
+    client.list_zones().await.unwrap();
+
+    // A short window: the read waits for it and is repeated once.
+    control.exhaust_quota(unix_now() + 2);
+    let hook = control.clone();
+    mock.faults().push(
+        Fault::on("GET", RECORDS)
+            .skip(1)
+            .run(move || hook.restore_quota())
+            .pass(),
+    );
+    let started = std::time::Instant::now();
+    assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(mock.log().count(Some("GET"), RECORDS), 2);
+    mock.faults().clear();
+
+    // A window that ends in an hour: no inline sleep, no repeat, the wait reported.
+    mock.log().clear();
+    control.exhaust_quota(unix_now() + 3600);
+    let started = std::time::Instant::now();
+    let e = add(&client, "BBB").await.unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let wait = e.retry_after().unwrap();
+    assert!(
+        wait > Duration::from_secs(3590) && wait <= Duration::from_secs(3600),
+        "{e:?}"
+    );
+    assert_eq!(mock.log().count(Some("GET"), RECORDS), 1);
+    assert_eq!(writes(&mock), 0);
+    control.restore_quota();
+
+    // A write meets the quota: sent once, the wait reported.
+    mock.log().clear();
+    let hook = control.clone();
+    let reset = unix_now() + 20;
+    mock.faults().push(
+        Fault::on("POST", RECORDS)
+            .run(move || hook.exhaust_quota(reset))
+            .pass(),
+    );
+    let e = add(&client, "CCC").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::RateLimited, "{e:?}");
+    let wait = e.retry_after().unwrap();
+    assert!(
+        wait > Duration::from_secs(15) && wait <= Duration::from_secs(20),
+        "{e:?}"
+    );
+    assert_eq!(mock.log().count(Some("POST"), RECORDS), 1);
+    assert_eq!(control.txt_values(NAME), ["AAA"]);
+    control.restore_quota();
+
+    // The block after failed authentications, also for this valid token: `Retry-After` is read.
+    mock.log().clear();
+    control.block_failed_auth(3600, unix_now() + 3600);
+    let e = client.check(&[zone()]).await.unwrap_err();
+    assert_eq!(e.retry_after(), Some(Duration::from_secs(3600)), "{e:?}");
+    assert_eq!(mock.log().len(), 1);
+    control.restore_quota();
+    client.check(&[zone()]).await.unwrap();
 }
 
 /// Refusals carry the provider's message and its field errors; a 402 or 412 is `Rejected`.
@@ -2044,13 +2261,20 @@ async fn dnsimple_record_writes_are_sent_once() {
         assert_eq!(e.kind(), kind, "{status}: {e:?}");
         assert_eq!(mock.log().count(Some("PATCH"), RECORD), 1, "{status}");
     }
-    // An update answered 404: the record went away, nothing was written.
-    mock.faults().push(Fault::on("PATCH", RECORD).status(404));
+    // An update answered 404 after the record went away: nothing was written.
+    let id = control.records()[0].id;
+    let hook = control.clone();
+    mock.faults().push(
+        Fault::on("PATCH", RECORD)
+            .run(move || hook.delete_record(id))
+            .status(404),
+    );
     let e = client
         .set_rrset(&zone(), &retuned, Expect::Any)
         .await
         .unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+    client.set_rrset(&zone(), &set, Expect::Any).await.unwrap();
     for (fault, kind) in [
         (
             Fault::on("DELETE", RECORD).rate_limited("120"),

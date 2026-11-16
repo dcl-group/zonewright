@@ -329,16 +329,17 @@ application that wants one TTL everywhere passes it in `set_rrset`.
 
 Every network call has a timeout, retries are bounded (section 5.3), and polling is bounded:
 
-- Four providers complete writes asynchronously. After the write is accepted, the client polls the
+- Five providers complete writes asynchronously. After the write is accepted, the client polls the
   provider's operation until it finishes, at a configurable interval with a floor of 250 ms, for a
   fixed maximum number of polls:
 
-  | Provider     | What is polled         | Default interval | Maximum polls | Setting             |
-  | ------------ | ---------------------- | ---------------- | ------------- | ------------------- |
-  | Hetzner      | action status          | 1000 ms          | 120           | `action_poll_ms`    |
-  | Route 53     | change status `INSYNC` | 2000 ms          | 60            | `change_poll_ms`    |
-  | Yandex Cloud | operation `done`       | 1000 ms          | 60            | `operation_poll_ms` |
-  | Cloud.ru     | operation `done`       | 1000 ms          | 60            | `operation_poll_ms` |
+  | Provider         | What is polled         | Default interval | Maximum polls | Setting             |
+  | ---------------- | ---------------------- | ---------------- | ------------- | ------------------- |
+  | Hetzner          | action status          | 1000 ms          | 120           | `action_poll_ms`    |
+  | Route 53         | change status `INSYNC` | 2000 ms          | 60            | `change_poll_ms`    |
+  | Google Cloud DNS | change status `done`   | 1000 ms          | 120           | `change_poll_ms`    |
+  | Yandex Cloud     | operation `done`       | 1000 ms          | 60            | `operation_poll_ms` |
+  | Cloud.ru         | operation `done`       | 1000 ms          | 60            | `operation_poll_ms` |
 
 - An operation that finished with an error is `Error::Rejected` with the provider's message, or goes
   down the conditional-write path of section 3.4 (one re-run, then `Error::Conflict`) when the

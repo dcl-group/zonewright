@@ -6,7 +6,13 @@
 //!
 //! - authentication: `apikey` and `secretapikey` in the JSON body, or the headers `X-API-Key`
 //!   and `X-Secret-API-Key`; "Header auth takes effect only when no body credentials are
-//!   present". No key at all is `API_KEY_REQUIRED`, a wrong pair `INVALID_API_KEYS_001`;
+//!   present". No key at all is `API_KEY_REQUIRED`, a wrong pair `INVALID_API_KEYS_001`. The
+//!   headers are declared as parameters of the `GET` operations only, and the request schemas of
+//!   the DNS writes (`CreateDnsRequest`, `EditDnsRequest`) list the body keys as required; so by
+//!   default ([`WriteAuth::Body`]) the writes (`/dns/create`, `/dns/edit`, `/dns/delete`) take
+//!   the keys from the body only and answer a write without them `API_KEY_REQUIRED`, whatever
+//!   headers it carries. [`WriteAuth::BodyOrHeaders`] takes the general reading for the writes as
+//!   well;
 //! - every refusal is HTTP 400 with `{"status":"ERROR","code":…,"message":…}` ("Every refusal
 //!   now returns HTTP 400 with a proper code", changelog v3.20); `INVALID_DOMAIN` and
 //!   `API_ACCESS_DISABLED` name the account in `account`;
@@ -147,6 +153,16 @@ pub enum Paging {
     IgnoreStart,
 }
 
+/// Where the DNS writes take the keys from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteAuth {
+    /// From the JSON body only, as the writes' request schemas require (the default).
+    Body,
+    /// From the body, or from the headers when the body has none, as the description's
+    /// "Authentication" section reads in general.
+    BodyOrHeaders,
+}
+
 /// A domain of the account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Domain {
@@ -190,6 +206,7 @@ struct Inner {
     default_ns: Vec<Record>,
     next_id: u64,
     paging: Paging,
+    write_auth: WriteAuth,
 }
 
 impl Inner {
@@ -211,6 +228,7 @@ impl Inner {
             default_ns: Vec::new(),
             next_id: 100_000,
             paging: Paging::Documented,
+            write_auth: WriteAuth::Body,
         }
     }
 
@@ -420,7 +438,8 @@ impl Control {
     }
 
     /// Returns the mock to the seed it was started with: its keys and domains, all opted in to
-    /// API access, no records, identifiers counted from the start again, documented paging, an
+    /// API access, no records, identifiers counted from the start again, documented paging,
+    /// [`WriteAuth::Body`], an
     /// empty request log and no pending faults. Reports the removal of every rrset that was
     /// published.
     pub fn reset(&self) {
@@ -583,6 +602,11 @@ impl Control {
     pub fn set_paging(&self, paging: Paging) {
         lock(&self.state).paging = paging;
     }
+
+    /// Where the DNS writes take the keys from.
+    pub fn set_write_auth(&self, write_auth: WriteAuth) {
+        lock(&self.state).write_auth = write_auth;
+    }
 }
 
 // ---- Answers -----------------------------------------------------------------------------------
@@ -687,6 +711,23 @@ fn authorize(
             Value::Null,
         ))
     }
+}
+
+/// `Ok` when a DNS write carries the keys of the seed where [`WriteAuth`] takes them from.
+fn authorize_write(
+    state: &Shared,
+    headers: &HeaderMap,
+    body: &Map<String, Value>,
+) -> Result<(), Response> {
+    let body_only = lock(state).write_auth == WriteAuth::Body;
+    if body_only && !body.contains_key("apikey") && !body.contains_key("secretapikey") {
+        return Err(refusal(
+            "API_KEY_REQUIRED",
+            "No API key was provided.",
+            Value::Null,
+        ));
+    }
+    authorize(state, headers, body)
 }
 
 /// The domain of a `/dns/*` path, when it is in the account and opted in to API access.
@@ -989,7 +1030,7 @@ async fn create(
     if let Err(response) = known_members(&body, CREATE_MEMBERS) {
         return response;
     }
-    if let Err(response) = authorize(&state, &headers, &body) {
+    if let Err(response) = authorize_write(&state, &headers, &body) {
         return response;
     }
     let mut inner = lock(&state);
@@ -1103,7 +1144,7 @@ async fn edit(
     if let Err(response) = known_members(&body, CREATE_MEMBERS) {
         return response;
     }
-    if let Err(response) = authorize(&state, &headers, &body) {
+    if let Err(response) = authorize_write(&state, &headers, &body) {
         return response;
     }
     let mut inner = lock(&state);
@@ -1184,7 +1225,7 @@ async fn delete(
     if let Err(response) = known_members(&body, &["apikey", "secretapikey", "dryRun"]) {
         return response;
     }
-    if let Err(response) = authorize(&state, &headers, &body) {
+    if let Err(response) = authorize_write(&state, &headers, &body) {
         return response;
     }
     let mut inner = lock(&state);
@@ -1215,8 +1256,64 @@ async fn delete(
 
 #[cfg(test)]
 mod tests {
-    use super::{Inner, Record, Seed, given, quoted};
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Bytes;
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+
+    use super::{Inner, Record, Seed, WriteAuth, create, given, lock, quoted};
     use crate::changes::Changes;
+
+    /// A write that carries the keys only as headers is refused by default and taken under
+    /// `WriteAuth::BodyOrHeaders`; one with the keys in the body is taken either way.
+    #[tokio::test]
+    async fn porkbun_writes_take_the_keys_from_the_body() {
+        let seed = Seed::standard();
+        let state = Arc::new(Mutex::new(Inner::new(seed.clone(), Changes::new())));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_str(&seed.api_key).unwrap());
+        headers.insert(
+            "x-secret-api-key",
+            HeaderValue::from_str(&seed.secret_api_key).unwrap(),
+        );
+        let bare = Bytes::from(r#"{"type":"TXT","content":"a"}"#);
+        let answer = |response: axum::response::Response| async move {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        };
+        let refused = create(
+            State(state.clone()),
+            headers.clone(),
+            Path("example.org".to_owned()),
+            bare.clone(),
+        )
+        .await;
+        let (status, body) = answer(refused).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("API_KEY_REQUIRED"), "{body}");
+        let keyed = Bytes::from(
+            serde_json::json!({
+                "apikey": seed.api_key, "secretapikey": seed.secret_api_key,
+                "type": "TXT", "content": "b"
+            })
+            .to_string(),
+        );
+        let taken = create(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("example.org".to_owned()),
+            keyed,
+        )
+        .await;
+        assert_eq!(answer(taken).await.0, StatusCode::OK);
+        lock(&state).write_auth = WriteAuth::BodyOrHeaders;
+        let taken = create(State(state), headers, Path("example.org".to_owned()), bare).await;
+        assert_eq!(answer(taken).await.0, StatusCode::OK);
+    }
 
     fn record(name: &str, rtype: &str, content: &str, prio: Option<u32>) -> Record {
         Record {

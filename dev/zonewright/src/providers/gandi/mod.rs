@@ -6,9 +6,9 @@
 //!
 //! This version offers `check`, `list_zones`, the record-level operations (`list_rrsets`,
 //! `get_rrset`, `set_rrset`, `delete_rrset`) for A, AAAA, CNAME, MX, NS, SRV and TXT, and the
-//! TXT value operations on plain values. The TXT value operations use the API's value-level
-//! call, so they add one value and remove only the values that equal ours and never write a
-//! foreign one (see [`ValueGuarantee::PerValue`](crate::ValueGuarantee::PerValue)). The
+//! TXT value operations (values of 1 to 255 printable ASCII characters without quotes or
+//! backslashes). The TXT value operations use the API's value-level call, so they add one
+//! value and remove only the values that equal ours and never write a foreign one (see [`ValueGuarantee::PerValue`](crate::ValueGuarantee::PerValue)). The
 //! record-level operations read an rrset and then create it or replace it whole in one request;
 //! the API checks no condition, so a change made by another process in between is overwritten
 //! (see [`Preconditions::ReadThenWrite`](crate::Preconditions::ReadThenWrite)). The zone listing

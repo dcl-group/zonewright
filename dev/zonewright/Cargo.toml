@@ -16,8 +16,8 @@ all-features = true
 [features]
 default = []
 all-providers = [
-    "acme_dns", "beget", "cloud_ru", "cloudflare", "desec", "digitalocean", "dnsimple", "edgecenter", "gandi", "gcore", "hetzner",
-    "nicru", "porkbun", "regru", "rfc2136", "route53", "selectel_v2", "timeweb_cloud", "vk_cloud", "yandex_360",
+    "acme_dns", "azure_dns", "beget", "cloud_ru", "cloudflare", "desec", "digitalocean", "dnsimple", "edgecenter", "gandi", "gcore", "google_cloud", "hetzner",
+    "nicru", "ovh", "porkbun", "regru", "rfc2136", "route53", "selectel_v2", "timeweb_cloud", "vk_cloud", "yandex_360",
     "yandex_cloud",
 ]
 inspector = [
@@ -32,6 +32,7 @@ socks = ["reqwest?/socks"]
 platform-verifier = ["dep:rustls-platform-verifier"]
 
 acme_dns = ["__http"]
+azure_dns = ["__http"]
 beget = ["__http"]
 cloud_ru = ["__http"]
 cloudflare = ["__http"]
@@ -41,8 +42,10 @@ dnsimple = ["__http"]
 edgecenter = ["__http"]
 gandi = ["__http"]
 gcore = ["__http"]
+google_cloud = ["__http", "__crypto"]
 hetzner = ["__http"]
 nicru = ["__http", "__xml"]
+ovh = ["__http", "__crypto"]
 porkbun = ["__http"]
 regru = ["__http"]
 rfc2136 = ["__crypto", "dep:fastrand", "dep:serde_json", "dep:tracing", "tokio/net", "tokio/io-util"]

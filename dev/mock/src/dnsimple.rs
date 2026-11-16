@@ -57,7 +57,19 @@
 //! - the answers state TXT `content` exactly as written unless [`Control::set_txt_quoted`] makes
 //!   them wrap unquoted content in quotes, the form the TXT article describes for publishing;
 //!   which form the API answers is not documented;
-//! - no rate-limit headers are sent.
+//! - the `X-RateLimit-*` headers are sent only on the two refusals below, not on every answer;
+//! - the hourly quota is not counted: [`Control::exhaust_quota`] makes every authenticated
+//!   request get the documented quota answer until [`Control::restore_quota`], and
+//!   [`Control::block_failed_auth`] makes every request get the documented block answer until
+//!   [`Control::restore_quota`].
+//!
+//! The two documented refusals (Overview, "Rate limiting"): the exceeded quota is `429` with
+//! `{"message": "quota exceeded"}`, `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0` and
+//! `X-RateLimit-Reset` ("The time at which the current rate limit window in Unix time
+//! format"), without `Retry-After`; the block after too many failed authentications is `429` with
+//! a message that starts "Too many failed authentication attempts" and names the end of the block
+//! in ISO 8601, `Retry-After` in seconds, `X-RateLimit-Remaining: 0`, `X-RateLimit-Reset` and no
+//! `X-RateLimit-Limit`, also for a valid token.
 //!
 //! Error texts are invented.
 //!
@@ -229,6 +241,10 @@ struct Inner {
     page_cap: usize,
     paging: Paging,
     txt_quoted: bool,
+    /// The quota is exhausted until this Unix time.
+    quota_reset: Option<u64>,
+    /// Requests are blocked: `Retry-After` seconds and the Unix time the block ends.
+    auth_block: Option<(u64, u64)>,
 }
 
 impl Inner {
@@ -254,6 +270,8 @@ impl Inner {
             next_id: 1000,
             paging: Paging::Standard,
             txt_quoted: false,
+            quota_reset: None,
+            auth_block: None,
         }
     }
 
@@ -559,6 +577,14 @@ impl Control {
         });
     }
 
+    /// Deletes `zone` with its records, as another writer would.
+    pub fn remove_zone(&self, zone: &str) {
+        self.change(|inner| {
+            inner.zones.retain(|z| z.name != zone);
+            inner.records.retain(|r| r.zone != zone);
+        });
+    }
+
     /// Sets the `active` and `secondary` flags of `zone`.
     pub fn set_zone_flags(&self, zone: &str, active: bool, secondary: bool) {
         let mut inner = lock(&self.state);
@@ -588,6 +614,25 @@ impl Control {
     /// How listings page from now on ([`Paging`]).
     pub fn set_paging(&self, paging: Paging) {
         lock(&self.state).paging = paging;
+    }
+
+    /// Answers every authenticated request with the documented quota answer, its window ending
+    /// at `reset_unix` (module documentation).
+    pub fn exhaust_quota(&self, reset_unix: u64) {
+        lock(&self.state).quota_reset = Some(reset_unix);
+    }
+
+    /// Answers every request, also with a valid token, with the documented block after too many
+    /// failed authentications: `Retry-After: retry_after` and `X-RateLimit-Reset: reset_unix`.
+    pub fn block_failed_auth(&self, retry_after: u64, reset_unix: u64) {
+        lock(&self.state).auth_block = Some((retry_after, reset_unix));
+    }
+
+    /// Ends [`Control::exhaust_quota`] and [`Control::block_failed_auth`].
+    pub fn restore_quota(&self) {
+        let mut inner = lock(&self.state);
+        inner.quota_reset = None;
+        inner.auth_block = None;
     }
 
     /// Answers the `content` of a TXT record that does not start with a quote wrapped in
@@ -660,15 +705,67 @@ fn not_found() -> Response {
 /// Who the request is: `Ok(true)` for the account token, `Ok(false)` for a user token.
 fn authorize(state: &Shared, headers: &HeaderMap) -> Result<bool, Response> {
     let inner = lock(state);
+    if let Some((retry_after, reset)) = inner.auth_block {
+        let message = format!(
+            "Too many failed authentication attempts. Try again after {}.",
+            iso8601(reset)
+        );
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                ("retry-after", retry_after.to_string()),
+                ("x-ratelimit-remaining", "0".to_owned()),
+                ("x-ratelimit-reset", reset.to_string()),
+            ],
+            axum::Json(json!({ "message": message })),
+        )
+            .into_response());
+    }
     let given = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    match given {
-        Some(token) if token == inner.seed.token => Ok(true),
-        Some(token) if inner.seed.user_tokens.iter().any(|t| t == token) => Ok(false),
-        _ => Err(error(StatusCode::UNAUTHORIZED, "Authentication failed")),
+    let account_token = match given {
+        Some(token) if token == inner.seed.token => true,
+        Some(token) if inner.seed.user_tokens.iter().any(|t| t == token) => false,
+        _ => return Err(error(StatusCode::UNAUTHORIZED, "Authentication failed")),
+    };
+    if let Some(reset) = inner.quota_reset {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                ("x-ratelimit-limit", "2400".to_owned()),
+                ("x-ratelimit-remaining", "0".to_owned()),
+                ("x-ratelimit-reset", reset.to_string()),
+            ],
+            axum::Json(json!({ "message": "quota exceeded" })),
+        )
+            .into_response());
     }
+    Ok(account_token)
+}
+
+/// A Unix time as an ISO 8601 UTC timestamp, `2026-09-30T14:00:00Z`.
+fn iso8601(unix: u64) -> String {
+    let days = unix / 86_400;
+    let secs = unix % 86_400;
+    // Days since 1970-01-01 to a civil date (H. Hinnant, "chrono-Compatible Low-Level Date
+    // Algorithms", `civil_from_days`).
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    )
 }
 
 /// [`authorize`] and the account of the path: `404` unless it is the account the token
@@ -1140,6 +1237,13 @@ mod tests {
         assert_eq!(given("www", "example.org"), "www.example.org.");
         assert_eq!(relative("example.org.", "example.org"), "");
         assert_eq!(relative("a.b.example.org.", "example.org"), "a.b");
+    }
+
+    #[test]
+    fn unix_times_print_as_iso8601() {
+        assert_eq!(super::iso8601(0), "1970-01-01T00:00:00Z");
+        assert_eq!(super::iso8601(1_790_776_800), "2026-09-30T14:00:00Z");
+        assert_eq!(super::iso8601(951_782_400), "2000-02-29T00:00:00Z");
     }
 
     #[test]

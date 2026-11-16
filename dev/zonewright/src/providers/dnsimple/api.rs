@@ -190,8 +190,11 @@ pub(super) struct RecordPatch<'a> {
 pub(super) enum Written {
     /// The provider accepted the write.
     Done,
-    /// `404`: the zone, or for an update or a delete the record, does not exist (any more).
-    NotFound,
+    /// `404`, with the refusal as the provider stated it. The Overview gives the status two
+    /// meanings: "The requested resource doesn't exist or the authenticated account doesn't
+    /// have permissions to access the resource". The caller reads again to tell them apart and
+    /// returns the refusal when the read finds the zone or the record still there.
+    NotFound(Error),
 }
 
 /// What `GET /whoami` says about the token.
@@ -365,8 +368,8 @@ impl Api {
     }
 
     /// Creates a record. Sent once: a create is not idempotent, and a repeat after an unknown
-    /// outcome could add a second copy (design section 5.3). A `404` is [`Written::NotFound`]
-    /// (the zone does not exist); another refusal is an error.
+    /// outcome could add a second copy (design section 5.3). A `404` is [`Written::NotFound`];
+    /// another refusal is an error.
     // Source: Records, "Create a zone record": 201 with `data`, the record with its generated
     // `id`; 400 "if the record cannot be created"; OpenAPI `createZoneRecord`: 201, 400, 404.
     pub(super) async fn create_record(
@@ -391,7 +394,7 @@ impl Api {
             .send(&Request::new(Method::POST, url).json(record)?)
             .await?;
         if response.status() == 404 {
-            return Ok(Written::NotFound);
+            return Ok(Written::NotFound(self.http.reject(&response)));
         }
         if !response.is_success() {
             return Err(self.refusal(&response));
@@ -402,8 +405,7 @@ impl Api {
     }
 
     /// Changes the members of one record that `patch` names. Sent once: design section 5.3
-    /// retries only reads and deletes by identifier. A `404` is [`Written::NotFound`] (the
-    /// record, or the zone, does not exist any more).
+    /// retries only reads and deletes by identifier. A `404` is [`Written::NotFound`].
     // Source: Records, "Update a zone record": 200 with `data`; 400 "if the record cannot be
     // updated"; OpenAPI `updateZoneRecord`: 200, 400, 404.
     pub(super) async fn update_record(
@@ -429,7 +431,7 @@ impl Api {
             .send(&Request::new(Method::PATCH, url).json(patch)?)
             .await?;
         if response.status() == 404 {
-            return Ok(Written::NotFound);
+            return Ok(Written::NotFound(self.http.reject(&response)));
         }
         if !response.is_success() {
             return Err(self.refusal(&response));
@@ -455,7 +457,7 @@ impl Api {
             .send(&Request::new(Method::DELETE, url).idempotent())
             .await?;
         if response.status() == 404 {
-            return Ok(Written::NotFound);
+            return Ok(Written::NotFound(self.http.reject(&response)));
         }
         if !response.is_success() {
             return Err(self.refusal(&response));
@@ -484,10 +486,11 @@ impl Api {
     ///
     /// Complete or an error. Pages are fetched by number, from 1, while the page read is below
     /// `pagination.total_pages`. Every answer must state the page that was asked for in
-    /// `current_page`; `total_pages` and `total_entries` must stay the same from page to page
-    /// (items moved while the pages were read, so one may have been passed over); a page before
-    /// the last must not be empty and must not repeat the identifiers of the page before it; and
-    /// the items received must add up to `total_entries`. Anything else is `Error::Protocol`.
+    /// `current_page`; a page before the last must not be empty and must not repeat the
+    /// identifiers of the page before it; and the items received must add up to `total_entries`.
+    /// Anything else is `Error::Protocol`. When `total_pages` or `total_entries` change from page
+    /// to page, the zone changed while it was read and an item may have been passed over: that
+    /// is `Error::Transient`, since a repeat of the operation reads the zone again.
     /// At most [`pager::MAX_PAGES`] pages are read.
     // Source: Overview, "Pagination" (`current_page` "The page currently returned",
     // `total_entries` "The total number of entries available in the entire collection",
@@ -555,9 +558,13 @@ impl Api {
                     let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
                     let totals = (p.total_entries, p.total_pages);
                     if seen.totals.is_some_and(|first| first != totals) {
-                        return Err(protocol(
-                            "the provider's listing changed its number of items between pages",
-                        ));
+                        // The zone changed while it was read: a repeat reads it again.
+                        return Err(Error::Transient {
+                            detail: Detail::constant(
+                                "the zone changed while its listing was read page by page; \
+                                 nothing was written",
+                            ),
+                        });
                     }
                     seen.totals = Some(totals);
                     if page > 1 && !ids.is_empty() && ids == seen.last_ids {

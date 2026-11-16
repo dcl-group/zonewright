@@ -28,12 +28,11 @@ pub(super) const DEFAULT_TTL: u32 = 600;
 
 /// TTL range the client accepts, in seconds.
 // Source for the minimum: as for `DEFAULT_TTL`. An account whose minimum is lower than the
-// documented "typical" 600 cannot use the lower values through this client. Assumption (not
-// documented): the maximum; the documentation states none, and 86400 is the usual one-day
-// ceiling. Being wrong only refuses a TTL the API would accept; a value the API refuses comes
-// back as an error and writes nothing.
+// documented "typical" 600 cannot use the lower values through this client. No maximum is
+// documented (`ttl` is an integer), so RFC 2181's is taken and a lower limit of the provider is
+// left to the API: a value it refuses comes back as an error and writes nothing.
 pub(super) const TTL_MIN: u32 = 600;
-pub(super) const TTL_MAX: u32 = 86_400;
+pub(super) const TTL_MAX: u32 = 2_147_483_647;
 
 /// Settings of the Porkbun client: the non-secret part of its configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,7 +41,7 @@ pub(super) const TTL_MAX: u32 = 86_400;
 pub struct PorkbunConfig {
     /// API endpoint; default `https://api.porkbun.com/api/json/v3`.
     pub base_url: String,
-    /// TTL of a new record, in seconds: 600 to 86400, default 600.
+    /// TTL of a new record, in seconds: 600 to 2147483647, default 600.
     pub ttl: RrsetTtl,
 }
 
@@ -63,7 +62,7 @@ impl PorkbunConfig {
             RrsetTtl::Explicit(ttl) if (TTL_MIN..=TTL_MAX).contains(&ttl.as_secs()) => {
                 ttl.as_secs()
             }
-            RrsetTtl::Explicit(_) => return Err(config("ttl must be between 600 and 86400")),
+            RrsetTtl::Explicit(_) => return Err(config("ttl must be between 600 and 2147483647")),
             RrsetTtl::ProviderDefault => {
                 return Err(config(
                     "ttl cannot be provider_default: every record at the provider has a TTL of \

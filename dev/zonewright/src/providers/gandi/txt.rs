@@ -11,16 +11,23 @@
 //!   configured TTL. The documentation says what a create of an existing rrset is answered with
 //!   (`409`, or `200` when the values are the same): another writer created the rrset after the
 //!   read, nothing was overwritten, and the result is `Error::Conflict`;
-//! - add to an existing rrset: `PATCH` with `add_rrset_values` and no `rrset_ttl`, so the rrset
-//!   keeps its TTL (design section 3.6). The documented answer is `200` with the rrset; a `204`
-//!   ("no longer exists") after an add is an answer the client cannot interpret
-//!   (`Error::Protocol`), and a `404` means the rrset went away after the read
-//!   (`Error::Conflict`);
+//! - add to an existing rrset: `PATCH` with `add_rrset_values` and, when the read stated one,
+//!   `rrset_ttl` with the rrset's TTL as read. The reference does not say what a change without
+//!   `rrset_ttl` does to the TTL (kept, or set to a default); sending the TTL read keeps it under
+//!   either reading (design section 3.6), and is the form of the reference's only example. The
+//!   documented answer is `200` with the rrset; a `204` ("no longer exists") after an add is an
+//!   answer the client cannot interpret (`Error::Protocol`), and a `404` means the rrset went
+//!   away after the read (`Error::Conflict`);
 //! - remove: `PATCH` with `remove_rrset_values` holding the texts the API returned for the
-//!   records that hold our value. Removing the last value leaves no rrset ("the resource record
-//!   set no longer exists at the end of the operation", answer `204`), so no `DELETE` is ever
-//!   sent by these operations: a value another writer added after the read survives. A `404`
-//!   counts as done only after a new read no longer finds the value.
+//!   records that hold our value, and the TTL as read. Removing the last value leaves no rrset
+//!   ("the resource record set no longer exists at the end of the operation", answer `204`), so
+//!   no `DELETE` is ever sent by these operations: a value another writer added after the read
+//!   survives. A `404` counts as done only after a new read no longer finds the value.
+//!
+//! A `200` is a success only when the rrset it states holds the value added, or no longer holds
+//! the value removed (compared as decoded values, since the API may respell them); an answer
+//! without the values is confirmed by a new read. Otherwise the result is `Error::Protocol`: the
+//! client never reports a change it cannot see.
 //!
 //! lego reads the TXT rrset and writes it back whole with `PUT` (`AddTXTRecord`), and its cleanup
 //! deletes the whole TXT rrset at the name, values of other writers included; this client does
@@ -29,12 +36,14 @@
 //! What the `PATCH` does in the cases the client does not create is not documented: a value to
 //! add that is present, a value to remove that is absent, a missing rrset. The client sends a
 //! value to add only after a read that did not show it and a value to remove only after a read
-//! that did, so these cases arise only when another writer changed the rrset in between; the live
-//! test `gandi_live_assumptions` exercises the documented cases.
+//! that did, so these cases arise only when another writer changed the rrset in between; then a
+//! refusal is returned as the provider's refusal, and an answer the client can check is checked
+//! as above. The live test `gandi_live_assumptions` exercises the documented cases.
 //!
 //! TXT dialect: read and written by the rules of `content.rs`, which the record level follows
-//! too. Only plain values are accepted (`Capabilities::txt_plain_only`); each is written as one
-//! quoted string.
+//! too. A value is accepted exactly when `content::write_txt` can write it (one quoted string of
+//! 1 to 255 printable ASCII octets without `"` or `\`; spaces inside are allowed, as in the
+//! reference's own TXT example), checked before any request (`TxtBase::check_value`).
 
 use crate::error::Error;
 use crate::id::ProviderId;
@@ -61,6 +70,35 @@ impl TxtBase for Gandi {
 
     fn locks(&self) -> &NameLocks {
         &self.locks
+    }
+
+    /// The value must be one the client can write: the record level's rule (`content.rs`).
+    fn check_value(&self, value: &Txt) -> Result<(), Error> {
+        match content::write_txt(value) {
+            Some(_) => Ok(()),
+            None => Err(unwritable()),
+        }
+    }
+}
+
+fn unwritable() -> Error {
+    Error::InvalidInput {
+        detail: Detail::constant(
+            "the provider's encoding of this TXT value is not established: 1 to 255 printable \
+             ASCII characters without quotes or backslashes",
+        ),
+        code: None,
+    }
+}
+
+/// The TTL to send with a value-level change: the rrset's as read, when the read stated one.
+fn ttl_as_read(ttl: Option<RrsetTtl>) -> Option<u32> {
+    ttl.and_then(RrsetTtl::explicit).map(|ttl| ttl.as_secs())
+}
+
+fn unseen(what: &'static str) -> Error {
+    Error::Protocol {
+        detail: Detail::constant(what),
     }
 }
 
@@ -97,12 +135,9 @@ impl ValueCalls for Gandi {
         ttl: WriteTtl,
     ) -> Result<(), Error> {
         let rr = rr_name(zone, name)?;
-        let text = content::write_txt(value).ok_or(Error::InvalidInput {
-            detail: Detail::constant("the TXT value cannot be written in this dialect"),
-            code: None,
-        })?;
+        let text = content::write_txt(value).ok_or_else(unwritable)?;
         let values = [text];
-        match ttl {
+        let existing = match ttl {
             WriteTtl::New(requested) => {
                 // The provider has no default TTL a write can ask for (the capabilities refuse
                 // it before any request); the setting stands in for anything but a number.
@@ -110,18 +145,40 @@ impl ValueCalls for Gandi {
                     Some(RrsetTtl::Explicit(ttl)) => ttl.as_secs(),
                     None | Some(RrsetTtl::ProviderDefault) => self.ttl,
                 };
-                self.create_rrset(zone, &rr, TXT, &values, ttl).await
+                return self.create_rrset(zone, &rr, TXT, &values, ttl).await;
             }
-            WriteTtl::Existing(_) => match self.api.patch(zone, &rr, TXT, &values, &[]).await? {
-                Patched::Present => Ok(()),
-                Patched::Gone => Err(Error::Protocol {
-                    detail: Detail::constant(
-                        "the provider reported no rrset after a value was added to it",
-                    ),
-                }),
-                Patched::NotFound => Err(vanished()),
-                Patched::Refused(e) => Err(e),
-            },
+            WriteTtl::Existing(existing) => existing,
+        };
+        let stated = match self
+            .api
+            .patch(zone, &rr, TXT, &values, &[], ttl_as_read(existing))
+            .await?
+        {
+            Patched::Present(stated) => stated,
+            Patched::Gone => {
+                return Err(unseen(
+                    "the provider reported no rrset after a value was added to it",
+                ));
+            }
+            Patched::NotFound => return Err(vanished()),
+            Patched::Refused(e) => return Err(e),
+        };
+        let holds = match stated {
+            Some(now) => now
+                .iter()
+                .any(|t| content::read_txt(t).as_ref() == Some(value)),
+            None => self
+                .read(zone, name)
+                .await?
+                .iter()
+                .any(|record| record.value.as_ref() == Some(value)),
+        };
+        if holds {
+            Ok(())
+        } else {
+            Err(unseen(
+                "the provider accepted the value but the rrset does not hold it",
+            ))
         }
     }
 
@@ -139,21 +196,40 @@ impl ValueCalls for Gandi {
                 values.push(record.handle.clone());
             }
         }
-        match self.api.patch(zone, &rr, TXT, &[], &values).await? {
-            Patched::Present | Patched::Gone => Ok(()),
+        let ttl = ttl_as_read(records.first().and_then(|record| record.ttl));
+        // A record still holds our value: one of the texts sent, or the same value respelled.
+        let ours = |text: &str| {
+            values.iter().any(|sent| sent == text)
+                || records
+                    .iter()
+                    .any(|r| r.value.is_some() && content::read_txt(text) == r.value)
+        };
+        match self.api.patch(zone, &rr, TXT, &[], &values, ttl).await? {
+            Patched::Gone => Ok(()),
+            Patched::Present(Some(now)) => {
+                if now.iter().any(|text| ours(text)) {
+                    Err(unseen(
+                        "the provider accepted the removal but the rrset still holds the value",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
             Patched::Refused(e) => Err(e),
-            // The rrset, or the domain, is gone; it may have been created again with the value
-            // in it. Only a new read tells.
-            Patched::NotFound => {
+            // An answer without the values, or the rrset (or the domain) gone: the rrset may
+            // have been created again with the value in it. Only a new read tells.
+            answer @ (Patched::Present(None) | Patched::NotFound) => {
                 let now = self.read(zone, name).await?;
-                let still_there = records.iter().any(|ours| {
-                    ours.value.is_some() && now.iter().any(|record| record.value == ours.value)
-                });
-                if still_there {
-                    Err(Error::Conflict {
-                        detail: Detail::constant(
-                            "the TXT value was found again after its removal was answered \
-                             \"not found\"; the rrset changed between the read and the write",
+                if now.iter().any(|record| ours(&record.handle)) {
+                    Err(match answer {
+                        Patched::NotFound => Error::Conflict {
+                            detail: Detail::constant(
+                                "the TXT value was found again after its removal was answered \
+                                 \"not found\"; the rrset changed between the read and the write",
+                            ),
+                        },
+                        _ => unseen(
+                            "the provider accepted the removal but the rrset still holds the value",
                         ),
                     })
                 } else {

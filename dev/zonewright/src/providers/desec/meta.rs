@@ -77,9 +77,14 @@ const CAPABILITIES: Capabilities = Capabilities {
     add_txt_value: true,
     remove_txt_value: true,
     // Types the documentation lists as supported, whose records are "given in presentation
-    // format" (the client's `records.rs`). SOA cannot be read or written through the API; the
-    // DNSSEC types are managed by the provider; the other listed types (AFSDB, HINFO, LOC, …) have
-    // no canonical form in the crate beyond RFC 3597 and are listed, not read alone or written.
+    // format" (the client's `records.rs`). The documentation shows a value for A, AAAA, CNAME,
+    // MX, NS, TLSA and TXT; for CAA, DNAME, HTTPS, PTR, SRV, SSHFP and SVCB the only source is
+    // that general rule, so that the API's canonical text of those types reads back equal to the
+    // crate's (and a listed set written back is a no-op) is inferred, not observed, until the
+    // maintainer's live run (`desec_live_assumptions`). SOA cannot be read or written through the
+    // API; the DNSSEC types are managed by the provider; the other listed types (AFSDB, HINFO,
+    // LOC, …) have no canonical form in the crate beyond RFC 3597 and are listed, not read alone
+    // or written.
     record_types: TypeSet::Listed(&[
         RecordType::A,
         RecordType::AAAA,
@@ -106,7 +111,11 @@ const CAPABILITIES: Capabilities = Capabilities {
     preconditions: Preconditions::ReadThenWrite,
     // One POST or PATCH carries the whole rrset with its TTL.
     atomic_rrset_write: true,
-    // One TTL per rrset, at most 86400; the zone's `minimum_ttl` is the server's floor.
+    // One TTL per rrset, at most 86400. The floor is the zone's `minimum_ttl`, which the server
+    // sets per domain (documentation example 900; 3600 is what lego and dns-update assume): it is
+    // not a constant, so the client's floor is 1, and a TTL between 1 and the zone's minimum
+    // passes the client's checks and is refused by the API (`400`, `Error::Rejected`) at the cost
+    // of one write of the per-domain write quota.
     ttl: TtlSupport::PerRrset {
         min: 1,
         max: 86_400,

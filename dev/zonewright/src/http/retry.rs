@@ -6,7 +6,8 @@
 //!   answer. Back-off before attempt `n + 1` is `500 ms × n` plus a random 0–25 %.
 //! - A request that is not idempotent is sent once; whatever goes wrong becomes the error.
 //! - 429, and any answer the client's rate-limit classifier marks (`HttpBuilder::rate_limit`):
-//!   the wait comes from `Retry-After` (seconds or an HTTP date) or `RateLimit-Reset`. An
+//!   the wait comes from `Retry-After` (seconds or an HTTP date), a header the client declares
+//!   as a Unix time (`HttpBuilder::rate_reset_unix`), or `RateLimit-Reset`. An
 //!   idempotent request with attempts left sleeps for a wait of at most [`MAX_INLINE_WAIT`] and
 //!   retries, or uses the back-off when no wait is given; otherwise `Error::RateLimited`.
 //! - 401 to a request made with a token from a [`TokenSource`]: the token's generation is
@@ -427,8 +428,12 @@ impl Http {
             let rate_limited =
                 status == 429 || self.rate_limit.is_some_and(|classify| classify(&response));
             if rate_limited {
-                let wait = rate_wait(&response.headers, jiff::Timestamp::now())
-                    .map(|wait| wait.min(MAX_REPORTED_WAIT));
+                let wait = rate_wait(
+                    &response.headers,
+                    self.rate_reset_unix,
+                    jiff::Timestamp::now(),
+                )
+                .map(|wait| wait.min(MAX_REPORTED_WAIT));
                 match wait {
                     // A zero or past wait still backs off, so that a provider answering
                     // `Retry-After: 0` does not get three requests in a few milliseconds.
@@ -685,9 +690,14 @@ pub(crate) fn backoff(attempt: u32) -> Duration {
 const UNIX_TIME_THRESHOLD: u64 = 1_000_000_000;
 
 /// The wait a rate-limit answer asks for, counted from `now`: `Retry-After` as delta-seconds or
-/// an HTTP date, else `RateLimit-Reset` as delta-seconds or a Unix time. A time in the past is a
-/// wait of zero. `None` when no usable header is present.
-pub(crate) fn rate_wait(headers: &HeaderMap, now: jiff::Timestamp) -> Option<Duration> {
+/// an HTTP date, else the client's own header `reset_unix` as a Unix time
+/// (`HttpBuilder::rate_reset_unix`), else `RateLimit-Reset` as delta-seconds or a Unix time. A
+/// time in the past is a wait of zero. `None` when no usable header is present.
+pub(crate) fn rate_wait(
+    headers: &HeaderMap,
+    reset_unix: Option<&str>,
+    now: jiff::Timestamp,
+) -> Option<Duration> {
     let header = |name: &str| {
         headers
             .get(name)
@@ -708,10 +718,21 @@ pub(crate) fn rate_wait(headers: &HeaderMap, now: jiff::Timestamp) -> Option<Dur
             return Some(until(at));
         }
     }
+    let at_unix = |value: u64| {
+        jiff::Timestamp::from_second(i64::try_from(value).ok()?)
+            .ok()
+            .map(until)
+    };
+    if let Some(value) = reset_unix
+        .and_then(header)
+        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(at_unix)
+    {
+        return Some(value);
+    }
     let reset = header("ratelimit-reset")?.parse::<u64>().ok()?;
     if reset > UNIX_TIME_THRESHOLD {
-        let at = jiff::Timestamp::from_second(i64::try_from(reset).ok()?).ok()?;
-        Some(until(at))
+        at_unix(reset)
     } else {
         Some(Duration::from_secs(reset))
     }
@@ -744,16 +765,67 @@ mod tests {
         map
     }
 
+    /// [`rate_wait`] for a client that declares no header of its own.
+    fn rate_wait_of(headers: &HeaderMap, now: jiff::Timestamp) -> Option<Duration> {
+        rate_wait(headers, None, now)
+    }
+
     #[test]
-    fn rate_wait_reads_seconds_dates_and_resets() {
+    fn a_declared_reset_header_is_read_as_a_unix_time() {
         let now: jiff::Timestamp = "2026-11-06T08:49:00Z".parse().unwrap();
-        assert_eq!(rate_wait(&headers(&[]), now), None);
+        let in_100 = (now.as_second() + 100).to_string();
+        let past = (now.as_second() - 100).to_string();
+        let declared = Some("x-ratelimit-reset");
+        // Undeclared: the header means nothing, whatever it holds.
         assert_eq!(
-            rate_wait(&headers(&[("retry-after", " 7 ")]), now),
+            rate_wait(&headers(&[("x-ratelimit-reset", &in_100)]), None, now),
+            None
+        );
+        assert_eq!(
+            rate_wait(&headers(&[("x-ratelimit-reset", &in_100)]), declared, now),
+            Some(Duration::from_secs(100))
+        );
+        assert_eq!(
+            rate_wait(&headers(&[("x-ratelimit-reset", &past)]), declared, now),
+            Some(Duration::ZERO)
+        );
+        // `Retry-After` comes first; `RateLimit-Reset` is the fallback for an unusable value.
+        assert_eq!(
+            rate_wait(
+                &headers(&[("retry-after", "7"), ("x-ratelimit-reset", &in_100)]),
+                declared,
+                now
+            ),
             Some(Duration::from_secs(7))
         );
         assert_eq!(
             rate_wait(
+                &headers(&[("x-ratelimit-reset", "soon"), ("ratelimit-reset", "12")]),
+                declared,
+                now
+            ),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(
+            rate_wait(
+                &headers(&[("x-ratelimit-reset", "99999999999999999999")]),
+                declared,
+                now
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rate_wait_reads_seconds_dates_and_resets() {
+        let now: jiff::Timestamp = "2026-11-06T08:49:00Z".parse().unwrap();
+        assert_eq!(rate_wait_of(&headers(&[]), now), None);
+        assert_eq!(
+            rate_wait_of(&headers(&[("retry-after", " 7 ")]), now),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            rate_wait_of(
                 &headers(&[("retry-after", "Fri, 06 Nov 2026 08:49:37 GMT")]),
                 now
             ),
@@ -761,7 +833,7 @@ mod tests {
         );
         // A date in the past is no wait.
         assert_eq!(
-            rate_wait(
+            rate_wait_of(
                 &headers(&[("retry-after", "Fri, 06 Nov 2026 08:48:00 GMT")]),
                 now
             ),
@@ -769,7 +841,7 @@ mod tests {
         );
         // Unusable Retry-After: fall back to RateLimit-Reset.
         assert_eq!(
-            rate_wait(
+            rate_wait_of(
                 &headers(&[("retry-after", "soon"), ("ratelimit-reset", "12")]),
                 now
             ),
@@ -777,13 +849,13 @@ mod tests {
         );
         let reset = (now.as_second() + 100).to_string();
         assert_eq!(
-            rate_wait(&headers(&[("ratelimit-reset", &reset)]), now),
+            rate_wait_of(&headers(&[("ratelimit-reset", &reset)]), now),
             Some(Duration::from_secs(100))
         );
-        assert_eq!(rate_wait(&headers(&[("retry-after", "-1")]), now), None);
+        assert_eq!(rate_wait_of(&headers(&[("retry-after", "-1")]), now), None);
         // The obsolete RFC 850 date form is not read; without a reset header there is no wait.
         assert_eq!(
-            rate_wait(
+            rate_wait_of(
                 &headers(&[("retry-after", "Friday, 06-Nov-26 08:49:37 GMT")]),
                 now
             ),

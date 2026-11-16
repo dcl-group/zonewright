@@ -15,10 +15,15 @@
 //!   type's fields and the TTL the layer chose. A refusal `DUPLICATE_RECORD` is confirmed by a
 //!   new read: the value found there now was created by another writer after the read, and the
 //!   result is `Error::Conflict`; otherwise the refusal is the error;
-//! - update: `POST /dns/edit/{domain}/{id}`, sent once, with only the fields that change (a TTL,
-//!   or the value of a CNAME replaced in place); the record's `notes`, which the model does not
+//! - update: `POST /dns/edit/{domain}/{id}`, sent once, with the whole record: `name`, `type`,
+//!   and `content`, `ttl` and `prio` new where they change (a TTL, or the value of a CNAME
+//!   replaced in place) and as read otherwise; the record's `notes`, which the model does not
 //!   carry, are left out and so kept. `INVALID_RECORD_ID` means the record went away after the
 //!   read: nothing was written, `Error::Conflict`, and the caller's repeat reads again;
+//! - plan: a create whose `content` a record of the type at the name has already, or that the
+//!   plan creates twice, is refused with `Error::InvalidInput` before any write. The provider
+//!   refuses such a create as a duplicate, and for MX and SRV the priority is outside `content`:
+//!   changing only the priority of a value cannot be done by a create and a delete;
 //! - delete: `POST /dns/delete/{domain}/{id}`, repeated by the transport (idempotent). An
 //!   `INVALID_RECORD_ID` counts as done only when a new read finds no record with the value at
 //!   the name.
@@ -95,7 +100,7 @@ use crate::provider::ZoneListing;
 use crate::record::{Caa, Mx, RecordData, RecordType, RrsetTtl, Srv, Tlsa, Ttl, Txt, TxtDialect};
 use crate::redact::Detail;
 use crate::rrsets::{
-    self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Stored,
+    self, Listing, Neighbors, PerRecord, RecordUpdate, RecordsRead, RrsetBase, SetTtl, Step, Stored,
 };
 
 use super::api::{Created, NewRecord, Record, RecordEdit, Written};
@@ -296,11 +301,48 @@ fn protocol(text: &'static str) -> Error {
     }
 }
 
+/// One record as read: what an edit writes back unchanged and a delete names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Handle {
+    /// The identifier, when the listing states one.
+    id: Option<u64>,
+    /// `content` as read.
+    content: Option<String>,
+    /// `ttl` as read, when the listing states one the model can hold.
+    ttl: Option<u32>,
+    /// `prio` as read, when the listing states one.
+    prio: Option<u16>,
+}
+
+/// What the read hands to every write: what else is at the name, and the `content` of every
+/// record of the operation's type there.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadContext {
+    neighbors: Neighbors,
+    contents: Vec<String>,
+}
+
 /// The identifier of a record the layer wants to change or delete.
-fn identifier(record: &Stored<Option<u64>>) -> Result<u64, Error> {
+fn identifier(record: &Stored<Handle>) -> Result<u64, Error> {
     record
         .handle
+        .id
         .ok_or_else(|| protocol("the provider lists the record without an identifier"))
+}
+
+/// The refusal of a plan that creates a record whose `content` another record of the type at
+/// the name already has, or that the plan creates twice.
+// Source: the spec, "Error codes", `DUPLICATE_RECORD`: "A record with this exact name, type and
+// content already exists, so nothing was created." For MX and SRV the priority is not part of
+// `content` (`CreateDnsRequest.prio`), so a value that differs only in its priority would be
+// refused, and the record layer creates before it deletes: the plan could never complete.
+fn same_content() -> Error {
+    Error::InvalidInput {
+        detail: Detail::constant(
+            "the provider refuses a second record with the same name, type and content, and the              priority of an MX or SRV value is not part of its content: delete the rrset first              to change only the priority of a value",
+        ),
+        code: None,
+    }
 }
 
 impl Porkbun {
@@ -330,18 +372,20 @@ impl Porkbun {
 }
 
 impl PerRecord for Porkbun {
-    /// The record's identifier, when the listing states one.
-    type Handle = Option<u64>;
-    /// The domain's name is the key of every path; the read carries what else is at the name.
-    type Context = Neighbors;
+    /// The record as read.
+    type Handle = Handle;
+    /// The domain's name is the key of every path; the read carries what else is at the name and
+    /// the `content` of the records of the type.
+    type Context = ReadContext;
 
     async fn read(
         &self,
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-    ) -> Result<RecordsRead<Option<u64>, Neighbors>, Error> {
+    ) -> Result<RecordsRead<Handle, ReadContext>, Error> {
         let (records, neighbors) = self.records_at(zone, name, rtype).await?;
+        let contents = records.iter().filter_map(|r| r.content.clone()).collect();
         let records = records
             .iter()
             .map(|record| Stored {
@@ -349,13 +393,44 @@ impl PerRecord for Porkbun {
                 // The API documents no disabled records.
                 enabled: true,
                 ttl: record.ttl(),
-                handle: record.id(),
+                handle: Handle {
+                    id: record.id(),
+                    content: record.content.clone(),
+                    ttl: record.ttl().and_then(RrsetTtl::explicit).map(Ttl::as_secs),
+                    prio: record.prio().and_then(|p| u16::try_from(p).ok()),
+                },
             })
             .collect();
         Ok(RecordsRead {
-            context: neighbors,
+            context: ReadContext {
+                neighbors,
+                contents,
+            },
             records,
         })
+    }
+
+    /// Refuses, before any write, a plan with a create the provider would refuse as a duplicate
+    /// (see [`same_content`]).
+    fn check_plan(
+        &self,
+        _zone: &DomainName,
+        _name: &DomainName,
+        rtype: RecordType,
+        context: &ReadContext,
+        steps: &[Step<'_, Handle>],
+    ) -> Result<(), Error> {
+        let mut contents: Vec<String> = context.contents.clone();
+        for step in steps {
+            if let Step::Create { data, .. } = step {
+                let encoded = encode(rtype, data).ok_or_else(not_sendable)?;
+                if contents.contains(&encoded.content) {
+                    return Err(same_content());
+                }
+                contents.push(encoded.content);
+            }
+        }
+        Ok(())
     }
 
     async fn create(
@@ -363,7 +438,7 @@ impl PerRecord for Porkbun {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &Neighbors,
+        _context: &ReadContext,
         data: &RecordData,
         ttl: SetTtl,
     ) -> Result<(), Error> {
@@ -403,10 +478,10 @@ impl PerRecord for Porkbun {
     async fn update(
         &self,
         zone: &DomainName,
-        _name: &DomainName,
+        name: &DomainName,
         rtype: RecordType,
-        _context: &Neighbors,
-        record: &Stored<Option<u64>>,
+        _context: &ReadContext,
+        record: &Stored<Handle>,
         update: &RecordUpdate<'_>,
     ) -> Result<(), Error> {
         if update.enable {
@@ -414,14 +489,39 @@ impl PerRecord for Porkbun {
             return Err(protocol("the provider has no disabled records to enable"));
         }
         let id = identifier(record)?;
-        let encoded = match update.data {
-            Some(data) => Some(encode(rtype, data).ok_or_else(not_sendable)?),
-            None => None,
-        };
+        // The whole record goes out (`api::RecordEdit`): the new value or the one read, and so
+        // for the TTL and the priority.
+        let (content, prio) =
+            match update.data {
+                Some(data) => {
+                    let encoded = encode(rtype, data).ok_or_else(not_sendable)?;
+                    (encoded.content, encoded.prio)
+                }
+                None => (
+                    record.handle.content.clone().ok_or_else(|| {
+                        protocol("the provider lists the record without its value")
+                    })?,
+                    record.handle.prio,
+                ),
+            };
+        let prioritized = matches!(rtype, RecordType::MX | RecordType::SRV);
+        if prioritized && prio.is_none() {
+            return Err(protocol(
+                "the provider lists the record without a usable priority, so it cannot be \
+                 written back",
+            ));
+        }
+        let type_name = rtype.to_string();
         let edit = RecordEdit {
-            content: encoded.as_ref().map(|e| e.content.as_str()),
-            ttl: update.ttl.and_then(RrsetTtl::explicit).map(Ttl::as_secs),
-            prio: encoded.as_ref().and_then(|e| e.prio),
+            name: relative(name, zone)?,
+            rtype: &type_name,
+            content: &content,
+            ttl: update
+                .ttl
+                .and_then(RrsetTtl::explicit)
+                .map(Ttl::as_secs)
+                .or(record.handle.ttl),
+            prio: if prioritized { prio } else { None },
         };
         match self.api.edit(zone, id, &edit).await? {
             Written::Done => Ok(()),
@@ -437,8 +537,8 @@ impl PerRecord for Porkbun {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &Neighbors,
-        record: &Stored<Option<u64>>,
+        _context: &ReadContext,
+        record: &Stored<Handle>,
     ) -> Result<(), Error> {
         match self.api.delete(zone, identifier(record)?).await? {
             Written::Done => Ok(()),
@@ -461,12 +561,12 @@ impl PerRecord for Porkbun {
         }
     }
 
-    fn holds_cname(&self, _rtype: RecordType, context: &Neighbors) -> Option<bool> {
-        context.holds_cname()
+    fn holds_cname(&self, _rtype: RecordType, context: &ReadContext) -> Option<bool> {
+        context.neighbors.holds_cname()
     }
 
-    fn holds_other_data(&self, _rtype: RecordType, context: &Neighbors) -> Option<bool> {
-        context.holds_other_data()
+    fn holds_other_data(&self, _rtype: RecordType, context: &ReadContext) -> Option<bool> {
+        context.neighbors.holds_other_data()
     }
 }
 

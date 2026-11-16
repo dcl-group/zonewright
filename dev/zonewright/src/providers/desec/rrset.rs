@@ -54,6 +54,7 @@ impl Desec {
         records: &[String],
         ttl: u32,
     ) -> Result<(), Error> {
+        check_size(records)?;
         let refusal = match self.api.create(zone, name, rtype, ttl, records).await? {
             Written::Done => return Ok(()),
             Written::NotFound => return Err(vanished()),
@@ -78,6 +79,7 @@ impl Desec {
         records: &[String],
         ttl: u32,
     ) -> Result<(), Error> {
+        check_size(records)?;
         match self.api.change(zone, name, rtype, ttl, records).await? {
             Written::Done => Ok(()),
             Written::NotFound => Err(vanished()),
@@ -108,6 +110,26 @@ impl Desec {
             Written::Refused(e) => Err(e),
         }
     }
+}
+
+/// Longest JSON encoding of the `records` array the API accepts, in characters.
+// Source: RRsets, field `records`: "the maximum length of the array is 64,000 (after JSON
+// encoding)". Counted here as the length of the compact encoding `serde_json` produces, which
+// is what the client sends.
+const MAX_ENCODED_RECORDS: usize = 64_000;
+
+/// Refuses a record list the API would refuse for its size, before the write.
+fn check_size(records: &[String]) -> Result<(), Error> {
+    let encoded = serde_json::to_string(records).map_or(usize::MAX, |text| text.chars().count());
+    if encoded > MAX_ENCODED_RECORDS {
+        return Err(Error::InvalidInput {
+            detail: Detail::constant(
+                "the records of a deSEC rrset are limited to 64,000 characters after JSON encoding",
+            ),
+            code: None,
+        });
+    }
+    Ok(())
 }
 
 /// A write addressed a domain or an rrset that no longer exists: it changed after the read, and

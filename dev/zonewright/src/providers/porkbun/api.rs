@@ -5,10 +5,10 @@
 //! Sources (hard rule 3), read 2026-11-16:
 //!
 //! - [Spec]: the OpenAPI description, <https://porkbun.com/api/json/v3/spec>, version 3.79
-//!   ("the spec" below): the base URL (`servers`), authentication (`securitySchemes`
-//!   `X-API-Key` and `X-Secret-API-Key`, applied to every operation by the top-level
-//!   `security`; the description's "Authentication": the keys in the JSON body or as these two
-//!   headers, "Header auth takes effect only when no body credentials are present"), the
+//!   ("the spec" below): the base URL (`servers`), authentication (the description's
+//!   "Authentication": the keys in the JSON body, "the standard method", or as the headers
+//!   `X-API-Key` and `X-Secret-API-Key`, "Header auth takes effect only when no body credentials
+//!   are present"; the header parameters of the `GET` operations), the
 //!   operations `GET /ping`, `GET /domain/listAll`, `GET /dns/retrieve/{domain}`,
 //!   `POST /dns/create/{domain}`, `POST /dns/edit/{domain}/{id}` and
 //!   `POST /dns/delete/{domain}/{id}` with their schemas (`DnsRecordsResponse`,
@@ -37,22 +37,23 @@
 //!
 //! # Credentials
 //!
-//! The client sends the two keys as the documented headers `X-API-Key` and `X-Secret-API-Key`
-//! and never in a request body, on every call. The spec documents both ways for every operation
-//! and lego's client uses the body; the headers are chosen because a request body is ordinary
-//! data (logged by proxies, echoed by APIs that quote the request), while the transport marks
-//! both header values sensitive and builds them in wiped memory. Both keys are registered with
-//! the client's scrubber, so an answer that echoes either one has it replaced before it reaches
-//! an error. Reads use `GET` (the spec: "All read-only endpoints accept `GET` requests", "Supports
-//! both GET (with header auth) and POST"); writes use `POST` with a JSON body that holds only the
-//! record's fields, `{}` for the delete (the spec's `INVALID_OR_EMPTY_JSON`: "Request body is
-//! missing or not valid JSON").
+//! Reads (`GET`) carry the two keys as the headers `X-API-Key` and `X-Secret-API-Key`, which the
+//! spec declares as parameters of exactly these `GET` operations, with code samples ("Supports
+//! both GET (with header auth) and POST (with body or header auth)"; "Header authentication —
+//! ... no JSON body required for read operations"). The transport marks both header values
+//! sensitive and builds them in wiped memory.
 //!
-//! Assumption (not documented by an example): that the write operations take the header
-//! credentials. The spec states the headers for every operation, and its examples of header
-//! authentication on a `POST` are other operations (`/domain/create`, the "Idempotency"
-//! section). If the API refused them, every write would fail with `Error::Auth`, and nothing
-//! would be written. `porkbun_live_assumptions` checks it.
+//! Writes (`POST`) carry the keys as `apikey` and `secretapikey` in the JSON body and send no key
+//! header: the request schemas of the writes list both as required members
+//! (`CreateDnsRequest.required`, `EditDnsRequest.required`; the delete's body is the
+//! `AuthRequest`), the description calls the body "the standard method", every code sample of a
+//! `POST` puts the keys there, and lego's client (nrdcg/porkbun `authRequest.MarshalJSON`) and
+//! dns-update (`src/providers/porkbun.rs` lines 36 to 40) do the same. The body is encoded
+//! straight into a buffer that is wiped when the request is dropped
+//! ([`Request::json`](crate::http::Request::json)); the transport never writes a body to
+//! `tracing`, and `Debug` of a request shows its method and path only. Both keys are registered
+//! with the client's scrubber, so an answer that echoes the body, or either key in it, has them
+//! replaced before it reaches an error.
 //!
 //! # Answers
 //!
@@ -67,6 +68,7 @@ use std::sync::Mutex;
 
 use reqwest::Method;
 use reqwest::header::{HeaderName, HeaderValue};
+use secrecy::{ExposeSecret as _, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -224,7 +226,7 @@ impl Domain {
 // Source: the spec, `CreateDnsRequest`: `name` ("Subdomain for the record (e.g. 'www', '*' for
 // wildcard, blank for root). Do not include the domain name itself."), `type` and `content`
 // (required), `ttl` (integer), `prio` (integer, "Priority for MX and SRV records. Defaults to 0
-// if omitted."). The keys are sent in headers, not here (module documentation).
+// if omitted."). `Api::write` puts the keys in front of these members.
 #[derive(Serialize)]
 pub(super) struct NewRecord<'a> {
     /// The owner name relative to the domain, empty for the apex.
@@ -241,19 +243,27 @@ pub(super) struct NewRecord<'a> {
     pub(super) prio: Option<u16>,
 }
 
-/// The body of `POST /dns/edit/{domain}/{id}`: only the fields that change.
-// Source: the spec, `/dns/edit`: "Send only the fields you want to change: any field left out
-// keeps its current value"; `EditDnsRequest` (`content`, `ttl`, `prio`, `notes`, all
-// optional). Left out, `notes` keeps the record's notes.
-#[derive(Default, Serialize)]
+/// The body of `POST /dns/edit/{domain}/{id}`: the whole record, changed fields with their new
+/// values and the others as read, but `notes`.
+// Source: the spec, `EditDnsRequest` (`name`, `type`, `content`, `ttl`, `prio`, `notes`, all
+// optional), and `/dns/edit`: "Send only the fields you want to change: any field left out keeps
+// its current value". Before v3.48 (the spec's changelog) the edit "replaced the whole record:
+// leaving out `name` moved a subdomain record to the apex and reset `ttl` and `prio`, and leaving
+// out `type` failed". Sending every field the record has is correct under both behaviors.
+// `notes` is left out, which keeps them ("omit or pass null to leave unchanged").
+#[derive(Serialize)]
 pub(super) struct RecordEdit<'a> {
-    /// The new value; left out when it stays.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) content: Option<&'a str>,
-    /// The new TTL; left out when it stays.
+    /// The owner name relative to the domain, empty for the apex.
+    pub(super) name: &'a str,
+    /// The record type, unchanged.
+    #[serde(rename = "type")]
+    pub(super) rtype: &'a str,
+    /// The value: the new one, or the one read.
+    pub(super) content: &'a str,
+    /// The TTL: the new one, or the one read; left out when the read stated none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ttl: Option<u32>,
-    /// The new priority; left out when it stays.
+    /// The priority of MX and SRV records: the new one, or the one read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) prio: Option<u16>,
 }
@@ -329,12 +339,16 @@ struct Refusal {
     error: Error,
 }
 
-/// The client's handle on the API: the transport, the endpoint and the API key header.
+/// The client's handle on the API: the transport, the endpoint and the keys.
 pub(super) struct Api {
     http: Http,
     base: Endpoint,
-    /// `X-API-Key` with the API key, marked sensitive.
+    /// `X-API-Key` with the API key, marked sensitive, for reads.
     key: HeaderValue,
+    /// The API key, for the body of writes.
+    api_key: SecretString,
+    /// The secret API key, for the body of writes.
+    secret_api_key: SecretString,
 }
 
 impl fmt::Debug for Api {
@@ -346,21 +360,47 @@ impl fmt::Debug for Api {
 }
 
 impl Api {
-    /// The API at `base`. `http` sends the secret API key with every request; `api_key` is sent
-    /// as its own header. `None` when the API key cannot be a header value.
-    pub(super) fn new(http: Http, base: Endpoint, api_key: &str) -> Option<Api> {
+    /// The API at `base`. `http` sends the secret API key header with every read; the API key
+    /// header is added per read; writes carry both keys in the body. `None` when the API key
+    /// cannot be a header value.
+    pub(super) fn new(
+        http: Http,
+        base: Endpoint,
+        api_key: &str,
+        secret_api_key: &str,
+    ) -> Option<Api> {
         let key = sensitive_value("", api_key.as_bytes())?;
-        Some(Api { http, base, key })
+        Some(Api {
+            http,
+            base,
+            key,
+            api_key: SecretString::from(api_key.to_owned()),
+            secret_api_key: SecretString::from(secret_api_key.to_owned()),
+        })
     }
 
-    /// A request with the API key header; the transport adds the secret API key header.
-    fn request(&self, method: Method, url: reqwest::Url) -> Request {
-        let request = if method == Method::GET {
-            Request::get(url)
-        } else {
-            Request::new(method, url)
-        };
-        request.header(API_KEY_HEADER, self.key.clone())
+    /// A read: `GET` with the API key header; the transport adds the secret API key header.
+    fn read(&self, url: reqwest::Url) -> Request {
+        Request::get(url).header(API_KEY_HEADER, self.key.clone())
+    }
+
+    /// A write: `POST` with both keys as the first members of the JSON body, followed by the
+    /// members of `fields`, and no key header (module documentation).
+    // Source: the spec, `CreateDnsRequest`, `EditDnsRequest` and `AuthRequest` (`apikey`,
+    // `secretapikey`); "Header auth takes effect only when no body credentials are present".
+    fn write<T: Serialize>(&self, url: reqwest::Url, fields: &T) -> Result<Request, Error> {
+        #[derive(Serialize)]
+        struct Authed<'a, T> {
+            apikey: &'a str,
+            secretapikey: &'a str,
+            #[serde(flatten)]
+            fields: &'a T,
+        }
+        Request::new(Method::POST, url).anonymous().json(&Authed {
+            apikey: self.api_key.expose_secret(),
+            secretapikey: self.secret_api_key.expose_secret(),
+            fields,
+        })
     }
 
     /// `GET /ping` with the keys: a success with `credentialsValid: true` proves that the keys
@@ -375,7 +415,7 @@ impl Api {
             credentials_valid: Option<bool>,
         }
         let url = self.base.url().path("/ping").build()?;
-        let response = self.http.send(&self.request(Method::GET, url)).await?;
+        let response = self.http.send(&self.read(url)).await?;
         let pong: Pong = self
             .success(
                 &response,
@@ -404,7 +444,7 @@ impl Api {
             .path("/domain/listAll")
             .query("domain", zone.without_dot())
             .build()?;
-        let response = self.http.send(&self.request(Method::GET, url)).await?;
+        let response = self.http.send(&self.read(url)).await?;
         let list: DomainList = self
             .success(
                 &response,
@@ -452,7 +492,7 @@ impl Api {
                     .path("/domain/listAll")
                     .query("start", &start.to_string())
                     .build()?;
-                let response = self.http.send(&self.request(Method::GET, url)).await?;
+                let response = self.http.send(&self.read(url)).await?;
                 let list: DomainList = self
                     .success(
                         &response,
@@ -504,7 +544,7 @@ impl Api {
             .path("/dns/retrieve")
             .segment(zone.without_dot())
             .build()?;
-        let response = self.http.send(&self.request(Method::GET, url)).await?;
+        let response = self.http.send(&self.read(url)).await?;
         let records: Records = self
             .success(
                 &response,
@@ -530,10 +570,7 @@ impl Api {
             .path("/dns/create")
             .segment(zone.without_dot())
             .build()?;
-        let response = self
-            .http
-            .send(&self.request(Method::POST, url).json(record)?)
-            .await?;
+        let response = self.http.send(&self.write(url, record)?).await?;
         match self.success::<Status>(
             &response,
             Some(zone),
@@ -559,24 +596,22 @@ impl Api {
         edit: &RecordEdit<'_>,
     ) -> Result<Written, Error> {
         let url = self.record_url("/dns/edit", zone, id).build()?;
-        let response = self
-            .http
-            .send(&self.request(Method::POST, url).json(edit)?)
-            .await?;
+        let response = self.http.send(&self.write(url, edit)?).await?;
         self.written(&response, zone)
     }
 
     /// Deletes one record by its identifier. Idempotent: repeating it leaves the same state, so
     /// the transport may retry it; a repeat after the record went is answered
-    /// `INVALID_RECORD_ID`, which the caller confirms by a new read.
-    // Source: the spec, `/dns/delete/{domain}/{id}`: "Delete a specific DNS record"; 200
-    // `BasicResponse`; 400 with the `ErrorResponse`.
+    /// `INVALID_RECORD_ID`, which the caller confirms by a new read. The body holds the keys
+    /// only.
+    // Source: the spec, `/dns/delete/{domain}/{id}`: "Delete a specific DNS record", the body
+    // `AuthRequest`; 200 `BasicResponse`; 400 with the `ErrorResponse`.
     pub(super) async fn delete(&self, zone: &DomainName, id: u64) -> Result<Written, Error> {
         let url = self.record_url("/dns/delete", zone, id).build()?;
-        let empty = serde_json::Map::new();
+        let keys_only = serde_json::Map::new();
         let response = self
             .http
-            .send(&self.request(Method::POST, url).json(&empty)?.idempotent())
+            .send(&self.write(url, &keys_only)?.idempotent())
             .await?;
         self.written(&response, zone)
     }

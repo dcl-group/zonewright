@@ -33,8 +33,9 @@ use super::config::{self, PorkbunConfig, PorkbunCredentials};
 
 /// The Porkbun DNS client (API v3).
 ///
-/// Authenticates with the API key and the secret API key, sent as the headers `X-API-Key` and
-/// `X-Secret-API-Key` with every request and never in a body. The native unit is the
+/// Authenticates with the API key and the secret API key: as the headers `X-API-Key` and
+/// `X-Secret-API-Key` on the reads (`GET`), as `apikey` and `secretapikey` in the JSON body of
+/// the writes (`POST`), as the provider documents each. The native unit is the
 /// individual record with an identifier: TXT value operations create one record for the value
 /// being added and delete only the records that hold the value being removed, under the
 /// per-name lock of the [`Context`]. Values of other writers are never part of a request
@@ -97,7 +98,7 @@ impl Porkbun {
             .code(api::error_code)
             .rate_limit(api::throttled)
             .build()?;
-        let api = Api::new(http, settings.api, key).ok_or_else(|| {
+        let api = Api::new(http, settings.api, key, secret).ok_or_else(|| {
             config::config("api_key contains a character that cannot be sent in an HTTP header")
         })?;
         Ok(Porkbun {

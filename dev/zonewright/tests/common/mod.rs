@@ -134,6 +134,28 @@ pub fn sample_config(id: ProviderId) -> (&'static str, &'static str) {
             r#"{"base_url":"http://127.0.0.1:9/api/json/v3"}"#,
             r#"{"api_key":"pk1_test-only-key","secret_api_key":"sk1_test-only-secret"}"#,
         ),
+        ProviderId::AzureDns => (
+            r#"{"tenant_id":"test-tenant.example","client_id":"zw-test-client","subscription_id":"00000000-0000-0000-0000-000000000001","resource_group":"zw-test-rg","management_url":"http://127.0.0.1:9","login_url":"http://127.0.0.1:9"}"#,
+            r#"{"client_secret":"test-only-secret"}"#,
+        ),
+        ProviderId::GoogleCloud => {
+            // A valid configuration needs an RSA key that parses. No key is stored in the
+            // repository: the mock generates one per test process.
+            static CONFIG: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+            let (settings, credentials) = CONFIG.get_or_init(|| {
+                let seed = zonewright_mock::google_cloud::Seed::standard();
+                let key = seed.key_file(&zonewright_mock::google_cloud::test_key().private_pem);
+                (
+                    r#"{"project_id":"zw-test-project","dns_url":"http://127.0.0.1:9/dns/v1","token_url":"http://127.0.0.1:9/token"}"#.to_owned(),
+                    serde_json::json!({ "service_account_key": key }).to_string(),
+                )
+            });
+            (settings.as_str(), credentials.as_str())
+        }
+        ProviderId::Ovh => (
+            r#"{"application_key":"test-only-ak","base_url":"http://127.0.0.1:9/1.0"}"#,
+            r#"{"application_secret":"test-only-as","consumer_key":"test-only-ck"}"#,
+        ),
         _ => panic!("no sample configuration for {id}"),
     }
 }

@@ -20,7 +20,23 @@ All notable changes to this crate are recorded in this file. The format follows
   operations over Gandi LiveDNS (API v5) with a personal access token, with the mock `GandiMock`.
   Not verified against the live API.
 - Porkbun (`porkbun`) client: TXT value and record-level operations over the Porkbun API v3, with
-  the mock `PorkbunMock`. Not verified against the live API.
+  the mock `PorkbunMock`; the keys travel in the body of writes and in the headers of reads. A
+  change of only the priority of an MX or SRV value is refused. Not verified against the live API.
+- OVHcloud (`ovh`) client: TXT value and record-level operations over the OVHcloud API's
+  `/domain/zone` endpoints, with signed requests and a zone refresh after every write, and the mock
+  `OvhMock`. Not verified against the live API.
+- Google Cloud DNS (`google_cloud`) client: service account key authentication (RS256 JWT), public
+  managed zones, record-level operations for A, AAAA, CAA, CNAME, MX, NS, SOA (read only), SRV, TLSA
+  and TXT, and TXT value operations on plain values, every write an atomic change conditional on the
+  rrset as read, with the mock `GoogleCloudMock`. Not verified against the live API.
+- Azure DNS (`azure_dns`) client: public zones of a resource group through Azure Resource Manager,
+  authenticated as a service principal with a client secret; record-level operations for A, AAAA,
+  CAA, CNAME, MX, NS, PTR, SRV and TXT (SOA read only) and TXT value operations, every write
+  conditional on the record set's etag, with the mock `AzureDnsMock`. Not verified against the live
+  API.
+- `zonewright-mock`: mocks for the nine new providers (`GcoreMock`, `EdgeCenterMock`, `DesecMock`,
+  `DnsimpleMock`, `GandiMock`, `PorkbunMock`, `OvhMock`, `GoogleCloudMock`, `AzureDnsMock`), each
+  with change reporting, `start_on` and `reset`.
 
 ## 0.2.2 - 2026-11-16
 

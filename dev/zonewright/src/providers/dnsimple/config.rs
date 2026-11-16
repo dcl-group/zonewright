@@ -25,12 +25,14 @@ pub(super) const DEFAULT_BASE_URL: &str = "https://api.dnsimple.com/v2";
 pub(super) const DEFAULT_TTL: u32 = 120;
 
 /// TTL range the client accepts, in seconds.
-// Source: https://support.dnsimple.com/articles/what-minimum-time-to-live/ ("the record editor
-// lets you choose a TTL from 1 minute to 3 days"; "Through the web interface, you can select a
-// TTL as low as 1 minute (60 seconds)"). Assumption (not documented for the API): that the API
-// accepts the same range. The OpenAPI description states only `minimum: 0` for `TTL`; the
-// editor's range is the narrower reading. Being wrong only refuses a TTL the API would accept; a
-// value the API refuses comes back as `Error::Rejected` and writes nothing.
+// Both bounds are assumed from the web record editor; the API is not documented to enforce
+// either. Sources: https://support.dnsimple.com/articles/what-minimum-time-to-live/ — the
+// minimum, 60: "Through the web interface, you can select a TTL as low as 1 minute (60
+// seconds)"; the maximum, 259200: "the record editor lets you choose a TTL from 1 minute to 3
+// days", the longest entry of its list being "3 days". For the API the OpenAPI description
+// (`TTL`) states only `minimum: 0` and no maximum. The editor's range is the narrower reading:
+// being wrong only refuses a TTL the API would accept; a value the API refuses comes back as
+// `Error::Rejected` and writes nothing.
 pub(super) const TTL_MIN: u32 = 60;
 pub(super) const TTL_MAX: u32 = 259_200;
 
@@ -47,7 +49,10 @@ pub struct DnsimpleConfig {
     pub base_url: String,
     /// The numeric identifier of the account whose zones the client manages. Required with a
     /// user token; with an account token, `None` reads it from the token's identity (`whoami`)
-    /// once per client, and a value given must be the token's account.
+    /// once per client, and a value given must be the token's account. Only `check` compares
+    /// the value with the token's account (it reads the identity anyway); other operations use
+    /// it as given, and under an account the token cannot reach the provider answers `404`,
+    /// reported as `Error::ZoneNotFound`.
     pub account_id: Option<u64>,
     /// TTL of a new record, in seconds: 60 to 259200, default 120.
     pub ttl: RrsetTtl,

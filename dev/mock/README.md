@@ -145,29 +145,32 @@ server of its own subscribes to the changes instead and mirrors them itself.
 
 ## Mocks
 
-| Module          | Provider      | Handle             |
-| --------------- | ------------- | ------------------ |
-| `acme_dns`      | acme-dns      | `AcmeDnsMock`      |
-| `beget`         | Beget         | `BegetMock`        |
-| `cloud_ru`      | Cloud.ru      | `CloudRuMock`      |
-| `cloudflare`    | Cloudflare    | `CloudflareMock`   |
-| `desec`         | deSEC         | `DesecMock`        |
-| `digitalocean`  | DigitalOcean  | `DigitalOceanMock` |
-| `dnsimple`      | DNSimple      | `DnsimpleMock`     |
-| `edgecenter`    | EdgeCenter    | `EdgeCenterMock`   |
-| `gandi`         | Gandi         | `GandiMock`        |
-| `gcore`         | Gcore         | `GcoreMock`        |
-| `hetzner`       | Hetzner       | `HetznerMock`      |
-| `nicru`         | nic.ru        | `NicruMock`        |
-| `porkbun`       | Porkbun       | `PorkbunMock`      |
-| `regru`         | reg.ru        | `RegruMock`        |
-| `rfc2136`       | RFC 2136      | `Rfc2136Mock`      |
-| `route53`       | Route 53      | `Route53Mock`      |
-| `selectel_v2`   | Selectel v2   | `SelectelV2Mock`   |
-| `timeweb_cloud` | Timeweb Cloud | `TimewebCloudMock` |
-| `vk_cloud`      | VK Cloud      | `VkCloudMock`      |
-| `yandex_360`    | Yandex 360    | `Yandex360Mock`    |
-| `yandex_cloud`  | Yandex Cloud  | `YandexCloudMock`  |
+| Module          | Provider         | Handle             |
+| --------------- | ---------------- | ------------------ |
+| `acme_dns`      | acme-dns         | `AcmeDnsMock`      |
+| `azure_dns`     | Azure DNS        | `AzureDnsMock`     |
+| `beget`         | Beget            | `BegetMock`        |
+| `cloud_ru`      | Cloud.ru         | `CloudRuMock`      |
+| `cloudflare`    | Cloudflare       | `CloudflareMock`   |
+| `desec`         | deSEC            | `DesecMock`        |
+| `digitalocean`  | DigitalOcean     | `DigitalOceanMock` |
+| `dnsimple`      | DNSimple         | `DnsimpleMock`     |
+| `edgecenter`    | EdgeCenter       | `EdgeCenterMock`   |
+| `gandi`         | Gandi            | `GandiMock`        |
+| `gcore`         | Gcore            | `GcoreMock`        |
+| `google_cloud`  | Google Cloud DNS | `GoogleCloudMock`  |
+| `hetzner`       | Hetzner          | `HetznerMock`      |
+| `nicru`         | nic.ru           | `NicruMock`        |
+| `ovh`           | OVHcloud         | `OvhMock`          |
+| `porkbun`       | Porkbun          | `PorkbunMock`      |
+| `regru`         | reg.ru           | `RegruMock`        |
+| `rfc2136`       | RFC 2136         | `Rfc2136Mock`      |
+| `route53`       | Route 53         | `Route53Mock`      |
+| `selectel_v2`   | Selectel v2      | `SelectelV2Mock`   |
+| `timeweb_cloud` | Timeweb Cloud    | `TimewebCloudMock` |
+| `vk_cloud`      | VK Cloud         | `VkCloudMock`      |
+| `yandex_360`    | Yandex 360       | `Yandex360Mock`    |
+| `yandex_cloud`  | Yandex Cloud     | `YandexCloudMock`  |
 
 The RFC 2136 mock is a DNS server that accepts signed dynamic updates, on TCP and UDP, not an HTTP
 server.

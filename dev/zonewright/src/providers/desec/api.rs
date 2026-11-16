@@ -313,7 +313,10 @@ impl Api {
     // Source: RRsets, "Modifying an RRset": `PATCH` on the rrset's endpoint, "the API returns
     // `200 OK` with the updated RRset". What it answers for an rrset that does not exist is not
     // documented; `404`, as for a read of one, is taken as "gone since the read": an assumption,
-    // not observed against the live API.
+    // not observed against the live API, and an open question: the crate's public API cannot
+    // order a change after another writer's delete, so no live test settles it (a manual `PATCH`
+    // of a missing rrset does). Any other refusal is returned as it is, and an answer that
+    // created the rrset would be a success with the records intended.
     pub(super) async fn change(
         &self,
         zone: &DomainName,
@@ -384,12 +387,15 @@ impl Api {
     /// (or previous) page are given in the `Link:` response header", with opaque cursors; "On the
     /// … last page, the `Link:` header will not contain a … `next` link".
     ///
-    /// The listing ends at a page without a `next` link, or at an empty page. Only the `cursor`
-    /// of the `next` link is taken (nrdcg `pagination.go` does the same); the URL itself is never
+    /// The listing ends at a page without a `next` link. Every `Link` field line is read (a
+    /// list-valued header may arrive as several, RFC 9110 section 5.3; the documentation prints
+    /// the three links on three lines); a field that is not readable text or not in the form of
+    /// RFC 8288 is `Error::Protocol`, never taken for "no next page". Only the `cursor` of the
+    /// `next` link is taken (nrdcg `pagination.go` does the same); the URL itself is never
     /// requested (design section 5.4). No page size is sent: none is documented as a parameter.
-    /// A `next` link without a cursor, a cursor equal to the one just used, and a page that
-    /// repeats the one before it are `Error::Protocol`, and `pager::collect` stops at its page
-    /// limit.
+    /// A `next` link without a cursor, an empty page with a `next` link, a cursor equal to the
+    /// one just used, and a page that repeats the one before it are `Error::Protocol`, and
+    /// `pager::collect` stops at its page limit.
     async fn list<T, U>(&self, url: U, zone: Option<&DomainName>) -> Result<Vec<T>, Error>
     where
         T: DeserializeOwned,
@@ -423,11 +429,17 @@ impl Api {
                     }
                     *previous = Some(items.clone());
                 }
-                let next = if items.is_empty() {
-                    None
-                } else {
-                    next_cursor(response.header("link"), &request)?
-                };
+                let link = response.header_fields("link")?.join(", ");
+                let next = next_cursor((!link.is_empty()).then_some(link.as_str()), &request)?;
+                // Under the documented paging an empty page is the last one; one that still
+                // names a next page is a listing the client cannot trust to be complete.
+                if items.is_empty() && next.is_some() {
+                    return Err(Error::Protocol {
+                        detail: Detail::constant(
+                            "the provider's listing answered an empty page that names a next page",
+                        ),
+                    });
+                }
                 let items: Vec<T> =
                     serde_json::from_value(Value::Array(items)).map_err(|_| malformed_listing())?;
                 Ok(Page { items, next })

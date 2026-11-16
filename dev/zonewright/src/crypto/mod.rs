@@ -1,11 +1,11 @@
 //! Cryptographic helpers for provider authentication. Backend: `aws-lc-rs` only.
 //!
-//! Private to the crate: TSIG for RFC 2136 uses the HMAC functions, Route 53 uses `sigv4`, and
-//! Yandex Cloud uses `Ps256Key`. Nothing here is part of the public API. Each part is compiled
-//! with the provider that uses it.
+//! Private to the crate: TSIG for RFC 2136 uses the HMAC functions, Route 53 uses `sigv4`,
+//! Yandex Cloud uses `Ps256Key` and Google Cloud DNS uses `Rs256Key`. Nothing here is part of the
+//! public API. Each part is compiled with the provider that uses it.
 //!
-//! `Ps256Key` reads PEM with `rustls-pki-types`, a dependency of the internal `__http` feature,
-//! which Yandex Cloud enables.
+//! `Ps256Key` and `Rs256Key` read PEM (`rsa_pem`) with `rustls-pki-types`, a dependency of the
+//! internal `__http` feature, which Yandex Cloud and Google Cloud DNS enable.
 
 // Design section 9.2: the helpers here are shared by several providers and not all of them are
 // used by each, so builds without `all-providers` allow unused code; the build with all
@@ -15,6 +15,10 @@
 mod hmac;
 #[cfg(feature = "yandex_cloud")]
 mod ps256;
+#[cfg(feature = "google_cloud")]
+mod rs256;
+#[cfg(any(feature = "google_cloud", feature = "yandex_cloud"))]
+mod rsa_pem;
 #[cfg(feature = "route53")]
 pub(crate) mod sigv4;
 
@@ -26,6 +30,8 @@ pub(crate) use hmac::{
 };
 #[cfg(feature = "yandex_cloud")]
 pub(crate) use ps256::Ps256Key;
+#[cfg(feature = "google_cloud")]
+pub(crate) use rs256::Rs256Key;
 
 use aws_lc_rs::digest;
 
@@ -56,6 +62,19 @@ pub(crate) enum KeyError {
 pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     let digest = digest::digest(&digest::SHA256, data);
     let mut out = [0u8; 32];
+    for (dst, src) in out.iter_mut().zip(digest.as_ref()) {
+        *dst = *src;
+    }
+    out
+}
+
+/// SHA-1 (FIPS 180-4), for the OVHcloud request signature, whose formula the provider fixes
+/// (`"$1$" + SHA1_HEX(...)`). Not for any new use: SHA-1 is kept by the backend for legacy
+/// protocols only.
+#[cfg(feature = "ovh")]
+pub(crate) fn sha1(data: &[u8]) -> [u8; 20] {
+    let digest = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, data);
+    let mut out = [0u8; 20];
     for (dst, src) in out.iter_mut().zip(digest.as_ref()) {
         *dst = *src;
     }
@@ -100,6 +119,28 @@ mod tests {
         assert_eq!(
             hex_lower(&sha256(b"abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// RFC 3174 section 7.3, TEST1 ("abc"), TEST2 (the 56-byte message) and TEST3 (one million
+    /// times "a"); the same values are the SHA-1 examples of NIST CSRC "Cryptographic Standards
+    /// and Guidelines: Examples with Intermediate Values".
+    #[cfg(feature = "ovh")]
+    #[test]
+    fn sha1_rfc3174_examples() {
+        assert_eq!(
+            hex_lower(&sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            hex_lower(&sha1(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
+            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+        );
+        assert_eq!(
+            hex_lower(&sha1(&vec![b'a'; 1_000_000])),
+            "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
         );
     }
 

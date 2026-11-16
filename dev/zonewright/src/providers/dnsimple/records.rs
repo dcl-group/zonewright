@@ -328,6 +328,19 @@ impl Dnsimple {
     }
 }
 
+impl Dnsimple {
+    /// The error of a create answered `404`: `ZoneNotFound` when a read of the zone is answered
+    /// `404` too, otherwise the create's refusal as the provider stated it (the Overview: 404 is
+    /// "doesn't exist or ... doesn't have permissions to access the resource").
+    pub(super) async fn create_refused(&self, zone: &DomainName, refusal: Error) -> Error {
+        match self.api.zone(zone).await {
+            Ok(None) => Error::zone_not_found(zone.clone()),
+            Ok(Some(_)) => refusal,
+            Err(e) => e,
+        }
+    }
+}
+
 impl RrsetBase for Dnsimple {
     fn provider(&self) -> ProviderId {
         ProviderId::Dnsimple
@@ -414,15 +427,15 @@ impl PerRecord for Dnsimple {
         };
         match self.api.create_record(zone, &record).await? {
             Written::Done => Ok(()),
-            // The zone does not exist (any more): nothing was written.
-            Written::NotFound => Err(Error::zone_not_found(zone.clone())),
+            // Nothing was written; the zone is gone, or the token may not write to it.
+            Written::NotFound(refusal) => Err(self.create_refused(zone, refusal).await),
         }
     }
 
     async fn update(
         &self,
         zone: &DomainName,
-        _name: &DomainName,
+        name: &DomainName,
         rtype: RecordType,
         _context: &(),
         record: &Stored<Handle>,
@@ -452,10 +465,20 @@ impl PerRecord for Dnsimple {
             .await?
         {
             Written::Done => Ok(()),
-            // The record, or the zone, went away after the read; nothing was written.
-            Written::NotFound => Err(Error::Conflict {
-                detail: Detail::constant("the record was removed between the read and the update"),
-            }),
+            // Nothing was written. The record went away after the read, or it is still there
+            // and the token may not change it: a new read tells them apart.
+            Written::NotFound(refusal) => {
+                let now = self.records_at(zone, name, rtype).await?;
+                if now.iter().any(|r| r.id == record.handle.id) {
+                    Err(refusal)
+                } else {
+                    Err(Error::Conflict {
+                        detail: Detail::constant(
+                            "the record was removed between the read and the update",
+                        ),
+                    })
+                }
+            }
         }
     }
 
@@ -473,11 +496,14 @@ impl PerRecord for Dnsimple {
         match self.api.delete_record(zone, record.handle.id).await? {
             Written::Done => Ok(()),
             // The record is gone, or the zone is and was created again with the value under a
-            // new identifier. Only a new read tells them apart (the record layer's rule for a
-            // per-record API, design sections 3.5 and 3.8).
-            Written::NotFound => {
-                let now = <Self as PerRecord>::read(self, zone, name, rtype).await?;
-                if now.records.iter().any(|r| r.data == record.data) {
+            // new identifier, or the record is still there and the token may not delete it.
+            // Only a new read tells them apart (the record layer's rule for a per-record API,
+            // design sections 3.5 and 3.8).
+            Written::NotFound(refusal) => {
+                let now = self.records_at(zone, name, rtype).await?;
+                if now.iter().any(|r| r.id == record.handle.id) {
+                    Err(refusal)
+                } else if now.iter().any(|r| read_record(rtype, r) == record.data) {
                     Err(Error::Conflict {
                         detail: Detail::constant(
                             "the record was found again after its delete was answered \"not \

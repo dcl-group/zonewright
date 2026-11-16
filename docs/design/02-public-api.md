@@ -170,12 +170,21 @@ spelling can drift from a persisted one without a compile error.
 | Variant        | String          | Cargo feature   |
 | -------------- | --------------- | --------------- |
 | `AcmeDns`      | `acme_dns`      | `acme_dns`      |
+| `AzureDns`     | `azure_dns`     | `azure_dns`     |
 | `Beget`        | `beget`         | `beget`         |
 | `CloudRu`      | `cloud_ru`      | `cloud_ru`      |
 | `Cloudflare`   | `cloudflare`    | `cloudflare`    |
+| `Desec`        | `desec`         | `desec`         |
 | `DigitalOcean` | `digitalocean`  | `digitalocean`  |
+| `Dnsimple`     | `dnsimple`      | `dnsimple`      |
+| `EdgeCenter`   | `edgecenter`    | `edgecenter`    |
+| `Gandi`        | `gandi`         | `gandi`         |
+| `Gcore`        | `gcore`         | `gcore`         |
+| `GoogleCloud`  | `google_cloud`  | `google_cloud`  |
 | `Hetzner`      | `hetzner`       | `hetzner`       |
 | `Nicru`        | `nicru`         | `nicru`         |
+| `Ovh`          | `ovh`           | `ovh`           |
+| `Porkbun`      | `porkbun`       | `porkbun`       |
 | `Regru`        | `regru`         | `regru`         |
 | `Rfc2136`      | `rfc2136`       | `rfc2136`       |
 | `Route53`      | `route53`       | `route53`       |
@@ -289,9 +298,9 @@ required settings.
 
 Rules that hold for every provider module:
 
-- Type names are the provider ID in upper camel case: `AcmeDns`, `CloudRu`, `DigitalOcean`,
-  `Rfc2136`, `SelectelV2`, `TimewebCloud`, `VkCloud`, `Yandex360`, `YandexCloud`, with `…Config` and
-  `…Credentials`.
+- Type names are the provider ID in upper camel case: `AcmeDns`, `AzureDns`, `CloudRu`,
+  `DigitalOcean`, `EdgeCenter`, `GoogleCloud`, `Rfc2136`, `SelectelV2`, `TimewebCloud`, `VkCloud`,
+  `Yandex360`, `YandexCloud`, with `…Config` and `…Credentials`.
 - Two ways to build a client, giving the same result. An application that stores
   `(provider ID, settings JSON, credentials JSON)` calls `AnyProvider::from_json`. An application
   with typed values builds `…Config` and `…Credentials` and calls `…::new`, then `AnyProvider::from`

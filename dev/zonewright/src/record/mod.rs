@@ -24,6 +24,9 @@ pub use rrset::RrSet;
 #[cfg(any(
     feature = "selectel_v2",
     feature = "digitalocean",
+    feature = "ovh",
+    feature = "google_cloud",
+    feature = "azure_dns",
     feature = "porkbun",
     feature = "gandi",
     feature = "dnsimple",
@@ -55,6 +58,7 @@ pub use txt::Txt;
     feature = "cloudflare",
     feature = "digitalocean",
     feature = "dnsimple",
+    feature = "ovh",
     feature = "gandi",
     feature = "hetzner",
     feature = "porkbun",

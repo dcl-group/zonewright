@@ -169,6 +169,7 @@ pub mod proxy;
 pub mod socks;
 
 pub mod acme_dns;
+pub mod azure_dns;
 pub mod beget;
 pub mod cloud_ru;
 pub mod cloudflare;
@@ -179,8 +180,10 @@ pub mod edgecenter;
 pub mod gandi;
 pub mod gcore;
 mod gcore_shared;
+pub mod google_cloud;
 pub mod hetzner;
 pub mod nicru;
+pub mod ovh;
 pub mod porkbun;
 pub mod regru;
 pub mod rfc2136;

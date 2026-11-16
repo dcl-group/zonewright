@@ -281,6 +281,23 @@ impl Response {
         self.headers.get(name).and_then(|v| v.to_str().ok())
     }
 
+    /// Every field line of header `name` as text, in the order received: an empty list when the
+    /// header is absent, `Error::Protocol` when a value is not visible ASCII. For a list-valued
+    /// header (RFC 9110 section 5.3) that may arrive as several field lines, such as `Link`.
+    pub(crate) fn header_fields(&self, name: &str) -> Result<Vec<&str>, Error> {
+        self.headers
+            .get_all(name)
+            .iter()
+            .map(|value| {
+                value.to_str().map_err(|_| Error::Protocol {
+                    detail: Detail::constant(
+                        "a header of the provider's answer is not visible ASCII text",
+                    ),
+                })
+            })
+            .collect()
+    }
+
     /// The body.
     pub(crate) fn body(&self) -> &[u8] {
         &self.body
@@ -424,6 +441,36 @@ mod tests {
         assert_eq!(json_strings(body).as_deref(), Some("c; e\"; a+b"));
         assert_eq!(json_strings(b"not json"), None);
         assert_eq!(json_strings(b"{\"n\":1}"), None);
+    }
+
+    #[test]
+    fn header_fields_are_every_field_line() {
+        let mut headers = HeaderMap::new();
+        headers.append("link", HeaderValue::from_static("<a>; rel=\"first\""));
+        headers.append("link", HeaderValue::from_static("<b>; rel=\"next\""));
+        let response = Response {
+            status: 200,
+            headers,
+            body: Bytes::new(),
+            token_generation: None,
+        };
+        assert_eq!(
+            response.header_fields("Link").unwrap(),
+            ["<a>; rel=\"first\"", "<b>; rel=\"next\""]
+        );
+        assert_eq!(response.header("link"), Some("<a>; rel=\"first\""));
+        assert!(response.header_fields("x-absent").unwrap().is_empty());
+        let mut headers = HeaderMap::new();
+        headers.append("link", HeaderValue::from_static("<a>"));
+        headers.append("link", HeaderValue::from_bytes(b"<\xe9>").unwrap());
+        let response = Response {
+            status: 200,
+            headers,
+            body: Bytes::new(),
+            token_generation: None,
+        };
+        let e = response.header_fields("link").unwrap_err();
+        assert_eq!(e.kind(), crate::error::ErrorKind::Protocol);
     }
 
     #[test]

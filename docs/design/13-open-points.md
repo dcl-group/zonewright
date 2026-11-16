@@ -52,6 +52,15 @@ numbers never change.
 | 28   | Timeweb Cloud names in a subdomain listing    | Open: live run | Timeweb Cloud                |
 | 29   | Beget answer for a name without records       | Open: live run | Beget                        |
 | 30   | reg.ru TXT text alphabet                      | Open: live run | reg.ru                       |
+| 31   | Live check of the Gcore client                | Open: live run | Gcore                        |
+| 32   | Live check of the EdgeCenter client           | Open: live run | EdgeCenter                   |
+| 33   | Live check of the deSEC client                | Open: live run | deSEC                        |
+| 34   | Live check of the DNSimple client             | Open: live run | DNSimple                     |
+| 35   | Live check of the Gandi client                | Open: live run | Gandi                        |
+| 36   | Live check of the Porkbun client              | Open: live run | Porkbun                      |
+| 37   | Live check of the OVHcloud client             | Open: live run | OVHcloud                     |
+| 38   | Live check of the Google Cloud DNS client     | Open: live run | Google Cloud DNS             |
+| 39   | Live check of the Azure DNS client            | Open: live run | Azure DNS                    |
 
 #### Open: needs a live run
 
@@ -146,6 +155,113 @@ the text of a TXT record and names the refusal `TEXT_CONTAINS_INVALID_CHARACTERS
 base64url text and usually contains `-` or `_`. The client sends such a value as it is and reports
 the API's refusal as `Error::InvalidInput`. If the live API enforces the documented alphabet, most
 DNS-01 values cannot be added at reg.ru. One add of a value with `-` and `_` settles it.
+
+**31.** **Live check of the Gcore client.** `live_gcore_assumptions` (ignored) is the run. What only
+the live API settles: a missing rrset or zone answers 404 (Gcore documents only 400); a PUT replaces
+the whole record list; names in `content` carry no trailing dot; TXT `content` is one raw string;
+the MX and CAA forms as dns-update and the SDK write them hold, against the specification's own MX
+example; `total_amount` is the total count and the server's default page size is used; the TTL
+range, and that the plan's minimum is refused with 400; what Gcore answers to a create of an
+existing rrset; whether the auth word is case-sensitive (`APIKey` or `apikey`); writes to disabled
+or secondary zones; that dynamic rrsets are exactly those with non-empty pickers, filters or meta,
+and whether a plain rrset carries `filter_set_id`; how `*` in a path is treated.
+
+**32.** **Live check of the EdgeCenter client.** `live_edgecenter_assumptions` (ignored) is the run.
+The assumptions are those of item 31, with these of its own: the shape of the zone answer (wrapped
+or flat). The `409` EdgeCenter documents for a create of an existing rrset is handled as `Conflict`.
+
+**33.** **Live check of the deSEC client.** `desec_live_assumptions` (ignored; environment
+`ZONEWRIGHT_LIVE_DESEC_*`; it paces writes 4.1 s apart, about 40 writes, run it at most once an
+hour) is the run. Settled by it: the content form of CAA, DNAME, HTTPS, PTR, SRV, SSHFP and SVCB,
+for which only the general presentation-format rule is documented (the API's canonical text must
+read back equal to the crate's; HTTPS and SVCB parameter spelling and long hex are the likeliest to
+differ; the mock canonicalizes only A, AAAA, names, MX, SRV, CAA and TXT); TXT values with a space,
+`"`, `\`, non-ASCII bytes and over 255 octets; a wildcard subname percent-encoded in a path; a
+refused create of an existing rrset as `400`; and, with a scoped token, that a policy-restricted
+token can list domains. Not covered by any step: what a `PATCH` of a missing rrset answers (`404`
+assumed, taken as `Conflict`; a manual request settles it), the answers to an invalid token and to
+an `allowed_subnets` violation.
+
+**34.** **Live check of the DNSimple client.** `dnsimple_live_assumptions` (ignored) is the run.
+Settled by it: the TTL range 60 to 259200, both bounds from the web editor (the API documents only a
+minimum of 0; the test writes 60); that `per_page=100` is accepted on `/zones` and
+`/zones/:zone/records`; that `total_entries` counts the items under the `type` filter; host names in
+`content` as absolute names, written without the dot; TXT `content` as answered; SRV `content` as
+`<weight> <port> <target>` and CAA `content` as `flags tag "value"` (dns-update and the support
+article); that a record created without `regions` answers `["global"]` or `[]`; that a PATCH with
+only `ttl` or only `content` keeps the other members. Not covered: the `404` answers of update and
+delete, and the status a scoped token without write permission gets; whether a scoped token can call
+`whoami`; records of a secondary or inactive zone; the quota answer (`X-RateLimit-Reset`, no
+`Retry-After`; it needs 2400 requests in an hour).
+
+**35.** **Live check of the Gandi client.** `gandi_live_assumptions` (ignored;
+`ZONEWRIGHT_LIVE_GANDI_PREFIX`) is the run. Settled by it: a `PATCH` with `rrset_ttl` set to the
+rrset's TTL leaves it so and answers `200` with the rrset, and removing the last value answers `204`
+and leaves no rrset; `404` for a domain that is not the account's (not 403); names in MX, NS and SRV
+values come back with the trailing dot (the single-rrset example shows one without it: if the API
+strips it, every such value reads as non-canonical); a quoted TXT value with a space is returned as
+written; `*` in a path (`%2A`) addresses a wildcard owner; the default page size, the meaning of
+`Total-Count` and an empty page past the last; a create racing another create gives `Created`,
+`Replaced` or `Conflict`, never `Rejected`. Not covered: whether record routes need `sharing_id` for
+another organization's domain, which token scopes are needed, the status of a refused body and of
+rate limiting, what the `PATCH` does with a duplicate add or an absent remove (the client fails
+safely under each reading the mock offers).
+
+**36.** **Live check of the Porkbun client.** `porkbun_live_assumptions` (ignored) is the run.
+Settled by it: the `GET` reads take the keys as the headers `X-API-Key` and `X-Secret-API-Key` and
+`/ping` answers `credentialsValid: true`; `/dns/retrieve` states names fully qualified, for the apex
+and for a wildcard as well; the `content` forms the client writes read back as written (host names
+without the dot, SRV `weight port target`, CAA `flags tag "value"`, TLSA
+`usage selector matching hex`, TXT the value itself; CAA and TLSA rest on dns-update's code alone);
+a TTL of 600 is accepted and an edit of the whole record with a new `ttl` changes only the TTL; a
+delete of a record already gone is answered `INVALID_RECORD_ID`. Not exercised: that a TTL below an
+account's minimum is refused rather than raised, the real maximum TTL, and that only the last page
+of `/domain/listAll` holds fewer than 1000 domains.
+
+**37.** **Live check of the OVHcloud client.** `ovh_live_assumptions` (ignored) is the run; the
+consumer key needs GET, POST, PUT and DELETE on `/domain/zone/*` (inferred from the endpoints; lego
+names only POST and DELETE). Settled by it: the host `api.eu.ovhcloud.com` serves `/domain/zone`
+(the CA and US hosts are not checked); the signature over the URL as sent, with the percent-encoded
+query, is accepted; the `subDomain` filter never leaves out a record whose name equals it (names
+with `_` and `*` included) and the `fieldType` filter matches the type; `subDomain` of a record is
+answered relative to the zone, `""` or `null` at the apex; TXT `target` quoted or as the value reads
+the same; host names in `target` are absolute, written with the dot; CAA as
+`0 issue "letsencrypt.org"` and TLSA as `3 1 1 <hex>` are accepted and read back equal; TTL 60 is
+accepted and a PUT with `target`, `ttl` and `subDomain` changes the TTL; a refresh of a zone without
+staged changes succeeds. Not covered: the TTL upper bound 86400, what `ttl` `0` and `null` mean on
+read, whether a PUT without `ttl` leaves the TTL, the status and `class` of an unknown zone and of
+the signature and key failures, how long a refreshed zone takes to be served (60 s assumed), and
+when a new record becomes readable (the client waits 7 s at most).
+
+**38.** **Live check of the Google Cloud DNS client.** `google_cloud_live_assumptions` and the two
+`live_google_cloud_*` tests (ignored) are the run. Settled by it: a missing managed zone is answered
+`404` by `managedZones.get` (and by `rrsets.list`, which is not probed live); `rrsets.list` with
+`name` and `type` answers a missing rrset with an empty list; a failed deletion match and an
+addition of an existing rrset are refused synchronously with some 4xx (the client re-reads whatever
+the status; the test races two clients and prints the outcomes); `changes.create` answers `pending`
+or `done` and `changes.get` answers it by `id`; a plain TXT value written quoted reads back to the
+same value, also with spaces and 300 characters; a managed zone without `visibility` is public
+unless it has `privateVisibilityConfig` (lego's reading); TTL range 1 to 2147483647 (not probed
+beyond 120). Not live steps: the conservative refusals (values needing backslash escapes, TXT rrdata
+over 1000 characters, rrsets with `signatureRrdatas`, zones with forwarding, peering, reverse-lookup
+or service-directory configuration, a change with an unknown status).
+
+**39.** **Live check of the Azure DNS client.** `azure_dns_live_assumptions` (ignored) is the run.
+Settled by it: the scope `https://management.azure.com//.default` is accepted for the client
+credentials grant; `GET` of a missing record set is `404` (lego relies on it) and of a zone the
+resource group does not hold is `404` (not documented); a space in a TXT string stands for itself,
+and 300 octets split into 255 and 45 read back as one value; names in CNAME, MX, SRV, NS and PTR
+records written without the trailing dot read back as the same absolute names, and CAA values
+round-trip; a wildcard name percent-encoded in a path is decoded; `If-Match` and `If-None-Match: *`
+are enforced (two clients adding values to one name at once never lose a value; the losers end in
+`Conflict`); the listing of a zone holds every set created. Not covered: the status and code of a
+failed condition (the client does not depend on them); whether a `nextLink`'s `$skipToken` works
+with the client's own path and `api-version` (needs a zone with over 100 record sets or a resource
+group with over 100 zones); whether the service returns TXT strings with RFC 1035 escapes it applied
+on write; whether a record set can have an empty record list; national clouds (the China identity
+host is `login.partner.microsoftonline.cn` on the national-cloud page and `login.chinacloudapi.cn`
+in the Go SDK, and the scope for the US Government and China Resource Manager is not stated; both
+are settings, `login_url` and `scope`).
 
 #### Open: needs the maintainer's decision
 
