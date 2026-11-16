@@ -1468,6 +1468,50 @@ async fn route53_unreadable_answer_to_an_accepted_change_is_transient() {
     }
 }
 
+/// A `GetChange` answer whose status is neither `PENDING` nor `INSYNC`, or that carries no
+/// status, ends the add with `Transient` at that look: the batch was accepted and its outcome is
+/// unknown (design section 3.7). Polling stops there, and the batch was applied.
+#[tokio::test]
+async fn route53_unexpected_change_status_is_transient() {
+    let (mock, client) = setup().await;
+    let bodies = [
+        format!(
+            "<GetChangeResponse xmlns=\"{XMLNS}\"><ChangeInfo><Id>C1</Id>\
+             <Status>DONE</Status></ChangeInfo></GetChangeResponse>"
+        ),
+        format!(
+            "<GetChangeResponse xmlns=\"{XMLNS}\"><ChangeInfo><Id>C1</Id>\
+             <Status>insync</Status></ChangeInfo></GetChangeResponse>"
+        ),
+        format!(
+            "<GetChangeResponse xmlns=\"{XMLNS}\"><ChangeInfo><Id>C1</Id>\
+             </ChangeInfo></GetChangeResponse>"
+        ),
+        "<ErrorResponse/>".to_owned(),
+    ];
+    for (i, body) in bodies.into_iter().enumerate() {
+        let value = format!("status-{i}");
+        let writes_before = writes(&mock);
+        let looks_before = mock.log().count(Some("GET"), STATUS);
+        mock.faults()
+            .push(Fault::on("GET", STATUS).respond(200, body.clone()));
+        let e = add(&client, &value).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Transient, "{body}: {e:?}");
+        assert!(e.is_retryable(), "{body}");
+        assert_eq!(writes(&mock), writes_before + 1, "{body}");
+        assert_eq!(
+            mock.log().count(Some("GET"), STATUS),
+            looks_before + 1,
+            "{body}"
+        );
+        assert_eq!(
+            add(&client, &value).await.unwrap(),
+            AddOutcome::AlreadyPresent,
+            "{body}"
+        );
+    }
+}
+
 // ---- Authentication ----------------------------------------------------------------------------
 
 /// A wrong secret, an unknown access key and missing credentials keys.

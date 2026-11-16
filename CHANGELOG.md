@@ -18,6 +18,11 @@ All notable changes to this crate are recorded in this file. The format follows
 - `zonewright-mock`: the RFC 2136 mock's BADTIME answer carries the client's time in Time Signed, as
   RFC 8945 section 5.2.3 requires.
 - RFC 2136: the refusal text for a name that holds a CNAME no longer contains a run of spaces.
+- Route 53: a change status other than `PENDING` or `INSYNC` after an accepted change is
+  `Error::Transient` (the outcome is unknown), not `Error::Protocol`.
+- Hetzner: an action with a status other than `running`, `success` or `error`, and a 2xx answer to a
+  write that does not name an action in the expected form, are `Error::Transient` (the write was
+  accepted and its outcome is unknown), not `Error::Protocol`.
 
 ## 0.1.0 - 2026-11-16
 

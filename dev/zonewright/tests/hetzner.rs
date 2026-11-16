@@ -1211,9 +1211,10 @@ async fn hetzner_failed_action_message_is_scrubbed() {
     assert_clean("failed action", &text, &[CANARY_TOKEN]);
 }
 
-/// A look at the action that fails, or answers something else, ends the wait: the write was
-/// accepted and its outcome is unknown (`Transient`), or the answer is not understood
-/// (`Protocol`). The repeat reads the state first.
+/// A look at the action that fails, or answers something the client cannot read, ends the wait:
+/// the write was accepted and its outcome is unknown (`Transient`, design section 3.7). The same
+/// holds for the action the write itself returned, and for a write answered without an action.
+/// The repeat reads the state first.
 #[tokio::test]
 async fn hetzner_action_look_failures() {
     let (mock, client) = setup().await;
@@ -1226,13 +1227,13 @@ async fn hetzner_action_look_failures() {
     assert_eq!(mock.log().count(Some("GET"), ACTION), 3);
     assert_eq!(mock.control().txt_values(RR), [quoted("AAA")]);
 
-    // An unknown status is an answer the client cannot interpret; an action other than the one
-    // asked for, or an answer without one, ends the wait like any failed look.
+    // An unknown status, an action other than the one asked for, or an answer without one ends
+    // the wait like any failed look.
     for (body, what, kind) in [
         (
             r#"{"action":{"id":5003,"status":"weird","error":null}}"#,
             "status",
-            ErrorKind::Protocol,
+            ErrorKind::Transient,
         ),
         (
             r#"{"action":{"id":1,"status":"success","error":null}}"#,
@@ -1246,11 +1247,20 @@ async fn hetzner_action_look_failures() {
         let e = add(&client, what).await.unwrap_err();
         assert_eq!(e.kind(), kind, "{what}: {e:?}");
     }
+    // The action the write returned has an unknown status: it is not polled.
+    let looks = mock.log().count(Some("GET"), ACTION);
+    mock.faults().push(Fault::on("POST", ADD).respond(
+        201,
+        r#"{"action":{"id":5003,"status":"weird","error":null}}"#,
+    ));
+    let e = add(&client, "unpolled").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(mock.log().count(Some("GET"), ACTION), looks);
     // A write answered without an action.
     mock.faults()
         .push(Fault::on("POST", ADD).respond(201, r#"{"action":null}"#));
     let e = add(&client, "BBB").await.unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
 }
 
 // ---- Requests, names and TTLs ------------------------------------------------------------------

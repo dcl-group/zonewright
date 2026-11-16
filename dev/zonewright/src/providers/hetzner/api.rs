@@ -591,8 +591,9 @@ impl Api {
         if !response.is_success() {
             return Err(self.refusal(&response));
         }
-        let created: Created =
-            response.json("the provider's answer to a write is not in the expected form")?;
+        let created: Created = response
+            .json("the provider's answer to a write is not in the expected form")
+            .map_err(|_| accepted_unreadable())?;
         Ok(Some(created.action))
     }
 
@@ -619,8 +620,9 @@ impl Api {
         if !response.is_success() {
             return Err(self.refusal(&response));
         }
-        let deleted: Deleted =
-            response.json("the provider's answer to a write is not in the expected form")?;
+        let deleted: Deleted = response
+            .json("the provider's answer to a write is not in the expected form")
+            .map_err(|_| accepted_unreadable())?;
         Ok(Some(deleted.action))
     }
 
@@ -650,8 +652,9 @@ impl Api {
         if !response.is_success() {
             return Err(self.refusal(&response));
         }
-        let created: Created =
-            response.json("the provider's answer to a write is not in the expected form")?;
+        let created: Created = response
+            .json("the provider's answer to a write is not in the expected form")
+            .map_err(|_| accepted_unreadable())?;
         Ok(Some(created.action))
     }
 
@@ -690,20 +693,23 @@ impl Api {
     // hetznerv1.go:187 to 209.
     pub(super) async fn wait(&self, poller: &Poller, action: Action) -> Result<(), Error> {
         let id = action.id;
-        match self.step(action) {
+        match self.step(action)? {
             PollStep::Done(()) => Ok(()),
             PollStep::Failed(e) => Err(e),
             PollStep::Pending => {
                 poller
-                    .run(|| async { Ok(self.step(self.get_action(id).await?)) })
+                    .run(|| async { self.step(self.get_action(id).await?) })
                     .await
             }
         }
     }
 
-    /// What one look at an action says.
-    fn step(&self, action: Action) -> PollStep<()> {
-        match action.status.as_str() {
+    /// What one look at an action says. An action whose status is none of `running`,
+    /// `success` and `error` is `Error::Transient`: the write was accepted and its state cannot
+    /// be read, so the outcome is unknown (design section 3.7). It is built as `Transient` here
+    /// because the action the write returned is evaluated outside the poller.
+    fn step(&self, action: Action) -> Result<PollStep<()>, Error> {
+        Ok(match action.status.as_str() {
             "running" => PollStep::Pending,
             "success" => PollStep::Done(()),
             "error" => {
@@ -718,8 +724,15 @@ impl Api {
                         .detail(&format!("the action failed: {code}: {message}")),
                 })
             }
-            _ => PollStep::Failed(protocol("the provider's action has an unknown status")),
-        }
+            _ => {
+                return Err(Error::Transient {
+                    detail: Detail::constant(
+                        "the provider accepted the change, but its action has an unknown \
+                         status; the outcome is unknown",
+                    ),
+                });
+            }
+        })
     }
 
     /// `/zones/{id}/rrsets/{rr_name}/{rr_type}`. The apex is written as the literal `@` of the
@@ -780,6 +793,18 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer)
+}
+
+/// A 2xx answer to a write whose action cannot be read: the provider accepted the change, so
+/// the outcome is unknown, which is `Error::Transient`, not `Error::Protocol` (design section
+/// 3.7).
+fn accepted_unreadable() -> Error {
+    Error::Transient {
+        detail: Detail::constant(
+            "the provider accepted the change, but its answer does not name an action in the \
+             expected form; the outcome is unknown",
+        ),
+    }
 }
 
 fn protocol(text: &'static str) -> Error {

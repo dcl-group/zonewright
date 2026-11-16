@@ -339,8 +339,10 @@ Every network call has a timeout, retries are bounded (section 5.3), and polling
 - An operation that finished with an error is `Error::Rejected` with the provider's message, or goes
   down the conditional-write path of section 3.4 (one re-run, then `Error::Conflict`) when the
   provider reports that its condition on the old set did not hold.
-- An operation still running after the last poll, or a poll that fails, is `Error::Transient`: the
-  write was accepted and its outcome is unknown. Repeating the call is safe.
+- An operation still running after the last poll, a poll that fails, or an accepted write whose
+  answer cannot be read (no operation, change or action in the expected form, or a status the client
+  does not know) is `Error::Transient`: the write was accepted and its outcome is unknown. Repeating
+  the call is safe.
 - The operation returns only after the provider-side operation is done. It never waits for DNS
   propagation.
 

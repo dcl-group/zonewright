@@ -840,7 +840,9 @@ impl Api {
         Ok(Submitted::Done)
     }
 
-    /// One look at a change: `PENDING` or `INSYNC`.
+    /// One look at a change: `PENDING` or `INSYNC`. Any other answer is `Error::Transient`: the
+    /// batch was accepted, so a status the client cannot read leaves the outcome unknown
+    /// (design section 3.7), and polling stops at that look.
     // Source: API reference, `GetChange`: `GET /2013-04-01/change/{Id}`; "PENDING indicates that
     // the changes in this request have not propagated"; "INSYNC indicates that the changes have
     // propagated to all Route 53 DNS servers"; `NoSuchChange`, 404.
@@ -858,11 +860,16 @@ impl Api {
             .then(|| child(root, "ChangeInfo"))
             .flatten()
             .and_then(|info| child_text(info, "Status"));
-        Ok(match status.as_deref() {
-            Some(INSYNC) => PollStep::Done(()),
-            Some(PENDING) => PollStep::Pending,
-            _ => PollStep::Failed(protocol("the change status is not in the expected form")),
-        })
+        match status.as_deref() {
+            Some(INSYNC) => Ok(PollStep::Done(())),
+            Some(PENDING) => Ok(PollStep::Pending),
+            _ => Err(Error::Transient {
+                detail: Detail::constant(
+                    "the provider accepted the change, but its change status is not in the \
+                     expected form; the outcome is unknown",
+                ),
+            }),
+        }
     }
 
     /// The messages of an `InvalidChangeBatch` answer, scrubbed, or `None` for another answer.
