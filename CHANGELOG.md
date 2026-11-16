@@ -6,6 +6,12 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.2 - 2026-11-16
+
+Compatible with 0.2.1.
+
 ### Added
 
 - `rfc2136`: `list_rrsets` by zone transfer (AXFR, RFC 5936) over TCP, signed with the client's TSIG
