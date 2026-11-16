@@ -6,6 +6,13 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.3 - 2026-11-16
+
+Compatible with 0.2.2. Nine provider clients are added; none of them is verified against the live
+API yet.
+
 ### Added
 
 - Gcore (`gcore`) and EdgeCenter (`edgecenter`) clients: TXT value and record-level operations over

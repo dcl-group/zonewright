@@ -13,7 +13,7 @@ desired-state diffing, no scheduling, no audit and no metrics.
 
 ## Status
 
-Version 0.2.2. The provider clients are implemented and tested against mocks. One client, Selectel
+Version 0.2.3. The provider clients are implemented and tested against mocks. One client, Selectel
 v2, is verified against the live API for TXT values, zone listing and the connection check; its
 record operations and the other clients are not yet.
 
