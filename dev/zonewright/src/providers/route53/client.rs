@@ -13,6 +13,7 @@ use crate::http::{Http, ZoneCache};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
+use crate::operation::Call;
 use crate::provider::{
     AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
     ZoneInfo, ZoneListing,
@@ -236,62 +237,72 @@ impl Provider for Route53 {
         zones: impl IntoIterator<Item = &'a DomainName> + Send,
     ) -> Result<CheckReport, Error> {
         let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
-        let zones = zones.as_slice();
-        if zones.is_empty() {
-            self.api.probe().await?;
-        }
-        let mut checks = Vec::with_capacity(zones.len());
-        for zone in zones {
-            checks.push(self.check_zone(zone).await?);
-        }
-        Ok(CheckReport::new(true, checks))
+        Call::check(zones.len())
+            .observe(self, async {
+                let zones = zones.as_slice();
+                if zones.is_empty() {
+                    self.api.probe().await?;
+                }
+                let mut checks = Vec::with_capacity(zones.len());
+                for zone in zones {
+                    checks.push(self.check_zone(zone).await?);
+                }
+                Ok(CheckReport::new(true, checks))
+            })
+            .await
     }
 
     /// The public hosted zones of the account, all pages; with `hosted_zone_id`, that zone
     /// only. A name held by several public zones is listed once and not cached.
     async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
-        if let Some(id) = &self.hosted_zone_id {
-            let hz = self
-                .api
-                .hosted_zone(id)
-                .await?
-                .ok_or_else(|| config_error(OVERRIDE_MISSING))?;
-            if hz.private {
-                return Err(config_error(OVERRIDE_PRIVATE));
-            }
-            return Ok(hz
-                .name
-                .map(|name| {
-                    self.zones.insert(&name, &hz.id);
-                    ZoneInfo::new(name)
-                })
-                .into_iter()
-                .collect());
-        }
-        let mut names: BTreeMap<DomainName, Vec<String>> = BTreeMap::new();
-        for hz in self.api.all_zones().await? {
-            if hz.private {
-                continue;
-            }
-            if let Some(name) = hz.name {
-                names.entry(name).or_default().push(hz.id);
-            }
-        }
-        Ok(names
-            .into_iter()
-            .map(|(name, ids)| {
-                if let [id] = ids.as_slice() {
-                    self.zones.insert(&name, id);
+        Call::list_zones()
+            .observe(self, async {
+                if let Some(id) = &self.hosted_zone_id {
+                    let hz = self
+                        .api
+                        .hosted_zone(id)
+                        .await?
+                        .ok_or_else(|| config_error(OVERRIDE_MISSING))?;
+                    if hz.private {
+                        return Err(config_error(OVERRIDE_PRIVATE));
+                    }
+                    return Ok(hz
+                        .name
+                        .map(|name| {
+                            self.zones.insert(&name, &hz.id);
+                            ZoneInfo::new(name)
+                        })
+                        .into_iter()
+                        .collect());
                 }
-                ZoneInfo::new(name)
+                let mut names: BTreeMap<DomainName, Vec<String>> = BTreeMap::new();
+                for hz in self.api.all_zones().await? {
+                    if hz.private {
+                        continue;
+                    }
+                    if let Some(name) = hz.name {
+                        names.entry(name).or_default().push(hz.id);
+                    }
+                }
+                Ok(names
+                    .into_iter()
+                    .map(|(name, ids)| {
+                        if let [id] = ids.as_slice() {
+                            self.zones.insert(&name, id);
+                        }
+                        ZoneInfo::new(name)
+                    })
+                    .collect())
             })
-            .collect())
+            .await
     }
 
     /// Every rrset of the zone, all pages. Alias and routing-policy sets are reported in
     /// `skipped` (see the record-level module).
     async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
-        self.list_zone(zone).await
+        Call::list_rrsets(zone)
+            .observe(self, self.list_zone(zone))
+            .await
     }
 
     async fn get_rrset(
@@ -300,7 +311,9 @@ impl Provider for Route53 {
         name: &DomainName,
         rtype: RecordType,
     ) -> Result<Option<RrSet>, Error> {
-        rrsets::get_whole_set(self, zone, name, rtype).await
+        Call::get_rrset(zone, name, rtype)
+            .observe(self, rrsets::get_whole_set(self, zone, name, rtype))
+            .await
     }
 
     async fn set_rrset(
@@ -309,7 +322,9 @@ impl Provider for Route53 {
         rrset: &RrSet,
         expect: Expect<'_>,
     ) -> Result<SetOutcome, Error> {
-        rrsets::set_whole_set(self, zone, rrset, expect).await
+        Call::set_rrset(zone, rrset)
+            .observe(self, rrsets::set_whole_set(self, zone, rrset, expect))
+            .await
     }
 
     async fn delete_rrset(
@@ -319,7 +334,12 @@ impl Provider for Route53 {
         rtype: RecordType,
         expect: Expect<'_>,
     ) -> Result<DeleteOutcome, Error> {
-        rrsets::delete_whole_set(self, zone, name, rtype, expect).await
+        Call::delete_rrset(zone, name, rtype)
+            .observe(
+                self,
+                rrsets::delete_whole_set(self, zone, name, rtype, expect),
+            )
+            .await
     }
 
     async fn add_txt_value(
@@ -329,7 +349,9 @@ impl Provider for Route53 {
         value: &Txt,
         ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
-        values::add_whole_set(self, zone, name, value, ttl).await
+        Call::add_txt_value(zone, name)
+            .observe(self, values::add_whole_set(self, zone, name, value, ttl))
+            .await
     }
 
     async fn remove_txt_value(
@@ -338,7 +360,9 @@ impl Provider for Route53 {
         name: &DomainName,
         value: &Txt,
     ) -> Result<RemoveOutcome, Error> {
-        values::remove_whole_set(self, zone, name, value).await
+        Call::remove_txt_value(zone, name)
+            .observe(self, values::remove_whole_set(self, zone, name, value))
+            .await
     }
 }
 

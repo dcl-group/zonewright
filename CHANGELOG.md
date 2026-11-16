@@ -14,6 +14,13 @@ All notable changes to this crate are recorded in this file. The format follows
   reg.ru, RFC 2136 (the RCODE mnemonic of RFC 2136 section 2.2, or its number), Route 53, Timeweb
   Cloud, Yandex 360, Yandex Cloud. A code is kept or dropped, never altered, and never carries a
   credential.
+- Every call of a `Provider` method on a client of the crate emits one `tracing` event when it
+  completes, with the typed client and through `AnyProvider` alike: level `DEBUG`, target
+  `zonewright::operation`, message `provider operation`. Fields: `provider`, `operation`, `zone` (or
+  `zones`, the count, for `check`), `name` and `rtype` where the operation has them, `outcome` (`ok`
+  or the error kind), `code` (the provider code, when present) and `elapsed_ms`. Record values,
+  TTLs, error text, configuration and request or response data are never included. An implementation
+  of `Provider` outside the crate emits nothing.
 - `rfc2136`: TSIG algorithm `hmac-sha384` (RFC 8945 section 6), next to `hmac-sha256` and
   `hmac-sha512`.
 - `zonewright-mock`: the RFC 2136 mock verifies and signs `hmac-sha384`; `Seed::standard()` gains

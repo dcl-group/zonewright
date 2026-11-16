@@ -19,7 +19,8 @@ use crate::redact::Detail;
 ///
 /// The trait is not sealed: an application can implement it for a test double. Everything an
 /// implementation has to return can be built outside the crate through the `new` constructors of
-/// the report types and the constructor functions of [`Error`].
+/// the report types and the constructor functions of [`Error`]. Such an implementation emits no
+/// operation event (see "Observability" in the crate documentation); the crate's own clients do.
 ///
 /// Every operation that takes a zone and a name checks, before any network request and in this
 /// order: that the operation and the record type are supported; that the zone is neither the root

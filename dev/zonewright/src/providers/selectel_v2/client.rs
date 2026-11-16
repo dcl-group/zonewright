@@ -40,6 +40,7 @@ use crate::http::{Http, Keystone, ZoneCache, path_id};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
+use crate::operation::Call;
 use crate::provider::{
     AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
     ZoneInfo, ZoneListing,
@@ -230,44 +231,55 @@ impl Provider for SelectelV2 {
         zones: impl IntoIterator<Item = &'a DomainName> + Send,
     ) -> Result<CheckReport, Error> {
         let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
-        let zones = zones.as_slice();
-        self.api.authenticate().await?;
-        let mut checks = Vec::with_capacity(zones.len());
-        for zone in zones {
-            checks.push(self.check_zone(zone).await?);
-        }
-        Ok(CheckReport::new(true, checks))
+        Call::check(zones.len())
+            .observe(self, async {
+                let zones = zones.as_slice();
+                self.api.authenticate().await?;
+                let mut checks = Vec::with_capacity(zones.len());
+                for zone in zones {
+                    checks.push(self.check_zone(zone).await?);
+                }
+                Ok(CheckReport::new(true, checks))
+            })
+            .await
     }
 
     /// Every enabled zone of the configured project, all pages. Zones of other projects that
     /// the API lists are left out; with a project given by name, its ID is the one the identity
     /// service states for the token. The identifiers are cached.
     async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
-        let zones = self.api.zones(None).await?;
-        let project = self.own_project()?;
-        let project = Some(project.as_str());
-        let mut names = BTreeSet::new();
-        for zone in zones {
-            let foreign = zone
-                .project_id
-                .as_deref()
-                .is_some_and(|owner| Some(owner) != project);
-            if zone.disabled == Some(true) || foreign {
-                continue;
-            }
-            let (Ok(name), Ok(id)) = (DomainName::parse(&zone.name), path_id(&zone.id)) else {
-                continue;
-            };
-            self.zones.insert(&name, id);
-            names.insert(name);
-        }
-        Ok(names.into_iter().map(ZoneInfo::new).collect())
+        Call::list_zones()
+            .observe(self, async {
+                let zones = self.api.zones(None).await?;
+                let project = self.own_project()?;
+                let project = Some(project.as_str());
+                let mut names = BTreeSet::new();
+                for zone in zones {
+                    let foreign = zone
+                        .project_id
+                        .as_deref()
+                        .is_some_and(|owner| Some(owner) != project);
+                    if zone.disabled == Some(true) || foreign {
+                        continue;
+                    }
+                    let (Ok(name), Ok(id)) = (DomainName::parse(&zone.name), path_id(&zone.id))
+                    else {
+                        continue;
+                    };
+                    self.zones.insert(&name, id);
+                    names.insert(name);
+                }
+                Ok(names.into_iter().map(ZoneInfo::new).collect())
+            })
+            .await
     }
 
     /// Every rrset of the zone, all pages. Rrsets of types outside the record-level type list
     /// (DNAME, HTTPS, SVCB) are listed too; what the model cannot hold is in `skipped`.
     async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
-        self.list_zone(zone).await
+        Call::list_rrsets(zone)
+            .observe(self, self.list_zone(zone))
+            .await
     }
 
     async fn get_rrset(
@@ -276,7 +288,9 @@ impl Provider for SelectelV2 {
         name: &DomainName,
         rtype: RecordType,
     ) -> Result<Option<RrSet>, Error> {
-        rrsets::get_whole_set(self, zone, name, rtype).await
+        Call::get_rrset(zone, name, rtype)
+            .observe(self, rrsets::get_whole_set(self, zone, name, rtype))
+            .await
     }
 
     async fn set_rrset(
@@ -285,7 +299,9 @@ impl Provider for SelectelV2 {
         rrset: &RrSet,
         expect: Expect<'_>,
     ) -> Result<SetOutcome, Error> {
-        rrsets::set_whole_set(self, zone, rrset, expect).await
+        Call::set_rrset(zone, rrset)
+            .observe(self, rrsets::set_whole_set(self, zone, rrset, expect))
+            .await
     }
 
     async fn delete_rrset(
@@ -295,7 +311,12 @@ impl Provider for SelectelV2 {
         rtype: RecordType,
         expect: Expect<'_>,
     ) -> Result<DeleteOutcome, Error> {
-        rrsets::delete_whole_set(self, zone, name, rtype, expect).await
+        Call::delete_rrset(zone, name, rtype)
+            .observe(
+                self,
+                rrsets::delete_whole_set(self, zone, name, rtype, expect),
+            )
+            .await
     }
 
     async fn add_txt_value(
@@ -305,7 +326,9 @@ impl Provider for SelectelV2 {
         value: &Txt,
         ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
-        values::add_whole_set(self, zone, name, value, ttl).await
+        Call::add_txt_value(zone, name)
+            .observe(self, values::add_whole_set(self, zone, name, value, ttl))
+            .await
     }
 
     async fn remove_txt_value(
@@ -314,7 +337,9 @@ impl Provider for SelectelV2 {
         name: &DomainName,
         value: &Txt,
     ) -> Result<RemoveOutcome, Error> {
-        values::remove_whole_set(self, zone, name, value).await
+        Call::remove_txt_value(zone, name)
+            .observe(self, values::remove_whole_set(self, zone, name, value))
+            .await
     }
 }
 

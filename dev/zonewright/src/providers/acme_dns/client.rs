@@ -21,8 +21,12 @@ use crate::http::{Http, SendError};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, ZoneCheck};
-use crate::record::{RrsetTtl, Txt};
+use crate::operation::Call;
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, RrsetTtl, Txt};
 use crate::redact::Detail;
 
 use super::api::{self, Api};
@@ -111,6 +115,94 @@ impl AcmeDns {
     fn registration(&self, name: &DomainName) -> Option<&Registration> {
         self.registrations.iter().find(|r| &r.fulldomain == name)
     }
+
+    /// The report of `check` for `zones` (the `check` of the `Provider` implementation below).
+    fn check_zones(&self, zones: &[DomainName]) -> CheckReport {
+        let checks = zones
+            .iter()
+            .map(|zone| {
+                let found = self
+                    .registrations
+                    .iter()
+                    .any(|r| r.fulldomain.is_within(zone));
+                let detail = if found {
+                    Detail::constant(UNTESTED)
+                } else {
+                    Detail::constant(
+                        "no acme-dns registration is configured in this zone; the credentials \
+                         were not tested",
+                    )
+                };
+                ZoneCheck::new(zone.clone(), found, Some(detail))
+            })
+            .collect();
+        CheckReport::new(false, checks)
+    }
+
+    /// The work of `add_txt_value` (the `add_txt_value` of the `Provider` implementation below).
+    async fn add(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        value: &Txt,
+        ttl: Option<RrsetTtl>,
+    ) -> Result<AddOutcome, Error> {
+        if zone.is_root() || zone.is_wildcard() {
+            return Err(invalid("the zone must not be the root or a wildcard name"));
+        }
+        if !name.is_within(zone) {
+            return Err(Error::name_outside_zone(name.clone(), zone.clone()));
+        }
+        if matches!(ttl, Some(RrsetTtl::Explicit(_))) {
+            return Err(invalid(
+                "the provider chooses the TTL; a requested TTL cannot be honored",
+            ));
+        }
+        let Some(text) = acceptable(value) else {
+            return Err(invalid(
+                "acme-dns accepts only a value of exactly 43 characters of the base64url \
+                 alphabet (A-Z, a-z, 0-9, - and _)",
+            ));
+        };
+        let Some(registration) = self.registration(name) else {
+            return Err(invalid(
+                "no configured acme-dns registration has this name as its fulldomain; the \
+                 challenge name must be a CNAME to the fulldomain of a registration",
+            ));
+        };
+
+        let _guard = self.locks.lock(name).await;
+        let server = self.api.server();
+        // Wait out the pace before anything is recorded: a future dropped while it waits leaves
+        // no trace in the memory.
+        if let Some(at) = self.state.pace(server, name) {
+            tokio::time::sleep_until(at).await;
+        }
+        let begin = self.state.begin(server, name, text, Instant::now());
+        if !begin.send {
+            // This process sent the value recently (or an unconfirmed send is still pending next
+            // to a live neighbor): a repeat would be written into the other slot.
+            return Ok(AddOutcome::Accepted);
+        }
+        if begin.displaced.is_some() {
+            tracing::warn!(
+                provider = "acme_dns",
+                "acme-dns keeps two values per registration: this send displaces the oldest \
+                 value this process sent for the name"
+            );
+        }
+        let result = self.api.store(registration, text).await;
+        let outcome = match &result {
+            Ok(()) => Outcome::Confirmed,
+            Err(e) if refused(e) => Outcome::Refused,
+            Err(_) => Outcome::Unknown,
+        };
+        self.state
+            .finish(server, name, text, outcome, begin.displaced, Instant::now());
+        result
+            .map(|()| AddOutcome::Accepted)
+            .map_err(SendError::into_error)
+    }
 }
 
 /// The value as text, if it is one the server accepts.
@@ -177,26 +269,9 @@ impl Provider for AcmeDns {
         zones: impl IntoIterator<Item = &'a DomainName> + Send,
     ) -> Result<CheckReport, Error> {
         let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
-        let zones = zones.as_slice();
-        let checks = zones
-            .iter()
-            .map(|zone| {
-                let found = self
-                    .registrations
-                    .iter()
-                    .any(|r| r.fulldomain.is_within(zone));
-                let detail = if found {
-                    Detail::constant(UNTESTED)
-                } else {
-                    Detail::constant(
-                        "no acme-dns registration is configured in this zone; the credentials \
-                         were not tested",
-                    )
-                };
-                ZoneCheck::new(zone.clone(), found, Some(detail))
-            })
-            .collect();
-        Ok(CheckReport::new(false, checks))
+        Call::check(zones.len())
+            .observe(self, async { Ok(self.check_zones(&zones)) })
+            .await
     }
 
     /// Stores `value` in the registration whose `fulldomain` is `name`; always `Accepted`.
@@ -213,61 +288,56 @@ impl Provider for AcmeDns {
         value: &Txt,
         ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
-        if zone.is_root() || zone.is_wildcard() {
-            return Err(invalid("the zone must not be the root or a wildcard name"));
-        }
-        if !name.is_within(zone) {
-            return Err(Error::name_outside_zone(name.clone(), zone.clone()));
-        }
-        if matches!(ttl, Some(RrsetTtl::Explicit(_))) {
-            return Err(invalid(
-                "the provider chooses the TTL; a requested TTL cannot be honored",
-            ));
-        }
-        let Some(text) = acceptable(value) else {
-            return Err(invalid(
-                "acme-dns accepts only a value of exactly 43 characters of the base64url \
-                 alphabet (A-Z, a-z, 0-9, - and _)",
-            ));
-        };
-        let Some(registration) = self.registration(name) else {
-            return Err(invalid(
-                "no configured acme-dns registration has this name as its fulldomain; the \
-                 challenge name must be a CNAME to the fulldomain of a registration",
-            ));
-        };
+        Call::add_txt_value(zone, name)
+            .observe(self, self.add(zone, name, value, ttl))
+            .await
+    }
 
-        let _guard = self.locks.lock(name).await;
-        let server = self.api.server();
-        // Wait out the pace before anything is recorded: a future dropped while it waits leaves
-        // no trace in the memory.
-        if let Some(at) = self.state.pace(server, name) {
-            tokio::time::sleep_until(at).await;
-        }
-        let begin = self.state.begin(server, name, text, Instant::now());
-        if !begin.send {
-            // This process sent the value recently (or an unconfirmed send is still pending next
-            // to a live neighbor): a repeat would be written into the other slot.
-            return Ok(AddOutcome::Accepted);
-        }
-        if begin.displaced.is_some() {
-            tracing::warn!(
-                provider = "acme_dns",
-                "acme-dns keeps two values per registration: this send displaces the oldest \
-                 value this process sent for the name"
-            );
-        }
-        let result = self.api.store(registration, text).await;
-        let outcome = match &result {
-            Ok(()) => Outcome::Confirmed,
-            Err(e) if refused(e) => Outcome::Refused,
-            Err(_) => Outcome::Unknown,
-        };
-        self.state
-            .finish(server, name, text, outcome, begin.displaced, Instant::now());
-        result
-            .map(|()| AddOutcome::Accepted)
-            .map_err(SendError::into_error)
+    async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
+        Call::list_zones().unsupported(self).await
+    }
+
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        Call::list_rrsets(zone).unsupported(self).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        Call::get_rrset(zone, name, rtype).unsupported(self).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        _expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        Call::set_rrset(zone, rrset).unsupported(self).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        _expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        Call::delete_rrset(zone, name, rtype)
+            .unsupported(self)
+            .await
+    }
+
+    async fn remove_txt_value(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        _value: &Txt,
+    ) -> Result<RemoveOutcome, Error> {
+        Call::remove_txt_value(zone, name).unsupported(self).await
     }
 }
 

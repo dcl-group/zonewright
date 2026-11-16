@@ -12,6 +12,7 @@ use crate::http::{Http, ZoneCache, path_id};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
+use crate::operation::Call;
 use crate::provider::{
     AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
     ZoneInfo, ZoneListing,
@@ -178,35 +179,46 @@ impl Provider for Cloudflare {
         zones: impl IntoIterator<Item = &'a DomainName> + Send,
     ) -> Result<CheckReport, Error> {
         let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
-        let zones = zones.as_slice();
-        self.api.probe().await?;
-        let mut checks = Vec::with_capacity(zones.len());
-        for zone in zones {
-            checks.push(self.check_zone(zone).await?);
-        }
-        Ok(CheckReport::new(true, checks))
+        Call::check(zones.len())
+            .observe(self, async {
+                let zones = zones.as_slice();
+                self.api.probe().await?;
+                let mut checks = Vec::with_capacity(zones.len());
+                for zone in zones {
+                    checks.push(self.check_zone(zone).await?);
+                }
+                Ok(CheckReport::new(true, checks))
+            })
+            .await
     }
 
     /// Every active zone the token can see, all pages. The identifiers are cached.
     async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
-        let mut names = BTreeSet::new();
-        for zone in self.api.zones(None).await? {
-            if !zone.is_active() {
-                continue;
-            }
-            let (Ok(name), Ok(id)) = (DomainName::parse(&zone.name), path_id(&zone.id)) else {
-                continue;
-            };
-            self.zones.insert(&name, id);
-            names.insert(name);
-        }
-        Ok(names.into_iter().map(ZoneInfo::new).collect())
+        Call::list_zones()
+            .observe(self, async {
+                let mut names = BTreeSet::new();
+                for zone in self.api.zones(None).await? {
+                    if !zone.is_active() {
+                        continue;
+                    }
+                    let (Ok(name), Ok(id)) = (DomainName::parse(&zone.name), path_id(&zone.id))
+                    else {
+                        continue;
+                    };
+                    self.zones.insert(&name, id);
+                    names.insert(name);
+                }
+                Ok(names.into_iter().map(ZoneInfo::new).collect())
+            })
+            .await
     }
 
     /// Every record of the zone, all pages, grouped into rrsets. Types outside the record-level
     /// type list are listed too.
     async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
-        self.list_zone(zone).await
+        Call::list_rrsets(zone)
+            .observe(self, self.list_zone(zone))
+            .await
     }
 
     async fn get_rrset(
@@ -215,7 +227,9 @@ impl Provider for Cloudflare {
         name: &DomainName,
         rtype: RecordType,
     ) -> Result<Option<RrSet>, Error> {
-        rrsets::get_per_record(self, zone, name, rtype).await
+        Call::get_rrset(zone, name, rtype)
+            .observe(self, rrsets::get_per_record(self, zone, name, rtype))
+            .await
     }
 
     async fn set_rrset(
@@ -224,7 +238,9 @@ impl Provider for Cloudflare {
         rrset: &RrSet,
         expect: Expect<'_>,
     ) -> Result<SetOutcome, Error> {
-        rrsets::set_per_record(self, zone, rrset, expect).await
+        Call::set_rrset(zone, rrset)
+            .observe(self, rrsets::set_per_record(self, zone, rrset, expect))
+            .await
     }
 
     async fn delete_rrset(
@@ -234,7 +250,12 @@ impl Provider for Cloudflare {
         rtype: RecordType,
         expect: Expect<'_>,
     ) -> Result<DeleteOutcome, Error> {
-        rrsets::delete_per_record(self, zone, name, rtype, expect).await
+        Call::delete_rrset(zone, name, rtype)
+            .observe(
+                self,
+                rrsets::delete_per_record(self, zone, name, rtype, expect),
+            )
+            .await
     }
 
     async fn add_txt_value(
@@ -244,7 +265,9 @@ impl Provider for Cloudflare {
         value: &Txt,
         ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
-        values::add_per_record(self, zone, name, value, ttl).await
+        Call::add_txt_value(zone, name)
+            .observe(self, values::add_per_record(self, zone, name, value, ttl))
+            .await
     }
 
     async fn remove_txt_value(
@@ -253,7 +276,9 @@ impl Provider for Cloudflare {
         name: &DomainName,
         value: &Txt,
     ) -> Result<RemoveOutcome, Error> {
-        values::remove_per_record(self, zone, name, value).await
+        Call::remove_txt_value(zone, name)
+            .observe(self, values::remove_per_record(self, zone, name, value))
+            .await
     }
 }
 

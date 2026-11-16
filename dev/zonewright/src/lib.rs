@@ -28,6 +28,36 @@
 //! not part of the public API.
 //!
 //! Every provider client needs a `tokio` runtime.
+//!
+//! # Observability
+//!
+//! The crate emits `tracing` events only; it installs no subscriber.
+//!
+//! Every call of a [`Provider`] method on a client of this crate emits exactly one event when it
+//! completes, whether the call goes to the typed client or through [`AnyProvider`]: level
+//! `DEBUG`, target `zonewright::operation`, message `provider operation`, with these fields:
+//!
+//! - `provider`: the provider ID ([`ProviderId::as_str`]).
+//! - `operation`: the method ([`Operation::as_str`]: `check`, `list_zones`, `add_txt_value`, ...).
+//! - `zones`: for `check`, the number of zones given.
+//! - `zone`: the zone, for every operation that takes one.
+//! - `name` and `rtype`: the owner name and the record type, for the operations on one rrset
+//!   (`rtype` is `TXT` for the TXT value operations).
+//! - `outcome`: `ok`, or the error's kind ([`ErrorKind::as_str`]).
+//! - `code`: the provider's code for a refusal ([`Error::provider_code`]), when there is one.
+//! - `elapsed_ms`: the wall time of the call in milliseconds.
+//!
+//! A failed operation is reported at `DEBUG` as well: the error goes to the caller, who decides
+//! how loud it is. An unsupported operation is reported too, with `outcome` `unsupported`. The
+//! event never carries a record value or any other record data, a TTL, the text of an error, the
+//! client's configuration, or anything from a request or a response; zone and owner names are
+//! not secrets and are included. An implementation of [`Provider`] outside the crate emits
+//! nothing.
+//!
+//! Below the operation, the HTTP transport emits one `DEBUG` event per attempt (target
+//! `zonewright::http`: method, path without the query string, status, attempt, duration) and the
+//! RFC 2136 client one per DNS exchange (target `zonewright::rfc2136`). Request and response
+//! bodies and headers are never written to `tracing`, at any level.
 
 pub mod dns01;
 #[cfg(feature = "inspector")]
@@ -63,6 +93,26 @@ mod redact;
     feature = "yandex_cloud"
 ))]
 mod values;
+
+// The operation event of every client's trait methods; compiled with every provider client.
+#[cfg(any(
+    feature = "acme_dns",
+    feature = "beget",
+    feature = "cloud_ru",
+    feature = "cloudflare",
+    feature = "digitalocean",
+    feature = "hetzner",
+    feature = "nicru",
+    feature = "regru",
+    feature = "rfc2136",
+    feature = "route53",
+    feature = "selectel_v2",
+    feature = "timeweb_cloud",
+    feature = "vk_cloud",
+    feature = "yandex_360",
+    feature = "yandex_cloud"
+))]
+mod operation;
 
 // The record-level layer is the shared implementation of the clients' record-level operations;
 // compiled with the providers whose clients implement them.

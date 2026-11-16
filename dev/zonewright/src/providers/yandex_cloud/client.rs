@@ -13,6 +13,7 @@ use crate::http::{Http, ZoneCache, path_id, poll_interval};
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
+use crate::operation::Call;
 use crate::provider::{
     AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
     ZoneInfo, ZoneListing,
@@ -228,53 +229,63 @@ impl Provider for YandexCloud {
         zones: impl IntoIterator<Item = &'a DomainName> + Send,
     ) -> Result<CheckReport, Error> {
         let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
-        let zones = zones.as_slice();
-        self.api.authenticate().await?;
-        let mut checks = Vec::with_capacity(zones.len());
-        for zone in zones {
-            checks.push(self.check_zone(zone).await?);
-        }
-        Ok(CheckReport::new(true, checks))
+        Call::check(zones.len())
+            .observe(self, async {
+                let zones = zones.as_slice();
+                self.api.authenticate().await?;
+                let mut checks = Vec::with_capacity(zones.len());
+                for zone in zones {
+                    checks.push(self.check_zone(zone).await?);
+                }
+                Ok(CheckReport::new(true, checks))
+            })
+            .await
     }
 
     /// The public zones of the folder, all pages, and the zones of `zone_ids` whose ID matches
     /// their name. A name held by more than one public zone of the folder is listed once and not
     /// cached. The identifiers are cached.
     async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
-        let mut found: BTreeMap<DomainName, Vec<String>> = BTreeMap::new();
-        if let Some(folder) = &self.folder {
-            for zone in self.api.zones(folder).await? {
-                if !zone.is_public() {
-                    continue;
+        Call::list_zones()
+            .observe(self, async {
+                let mut found: BTreeMap<DomainName, Vec<String>> = BTreeMap::new();
+                if let Some(folder) = &self.folder {
+                    for zone in self.api.zones(folder).await? {
+                        if !zone.is_public() {
+                            continue;
+                        }
+                        let (Some(name), Ok(id)) = (zone.zone_name(), path_id(&zone.id)) else {
+                            continue;
+                        };
+                        found.entry(name).or_default().push(id.to_owned());
+                    }
                 }
-                let (Some(name), Ok(id)) = (zone.zone_name(), path_id(&zone.id)) else {
-                    continue;
-                };
-                found.entry(name).or_default().push(id.to_owned());
-            }
-        }
-        for (name, id) in &self.configured {
-            if let Some(zone) = self.api.zone(id).await?
-                && zone.zone_name().as_ref() == Some(name)
-            {
-                // A configured ID is the one used, whatever the folder holds.
-                found.insert(name.clone(), vec![id.clone()]);
-            }
-        }
-        let mut names = BTreeSet::new();
-        for (name, ids) in found {
-            if let [id] = ids.as_slice() {
-                self.zones.insert(&name, id);
-            }
-            names.insert(name);
-        }
-        Ok(names.into_iter().map(ZoneInfo::new).collect())
+                for (name, id) in &self.configured {
+                    if let Some(zone) = self.api.zone(id).await?
+                        && zone.zone_name().as_ref() == Some(name)
+                    {
+                        // A configured ID is the one used, whatever the folder holds.
+                        found.insert(name.clone(), vec![id.clone()]);
+                    }
+                }
+                let mut names = BTreeSet::new();
+                for (name, ids) in found {
+                    if let [id] = ids.as_slice() {
+                        self.zones.insert(&name, id);
+                    }
+                    names.insert(name);
+                }
+                Ok(names.into_iter().map(ZoneInfo::new).collect())
+            })
+            .await
     }
 
     /// Every record set of the zone, all pages. Record sets of types outside the record-level
     /// type list are listed too; what the model cannot hold is in `skipped`.
     async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
-        self.list_zone(zone).await
+        Call::list_rrsets(zone)
+            .observe(self, self.list_zone(zone))
+            .await
     }
 
     async fn get_rrset(
@@ -283,7 +294,9 @@ impl Provider for YandexCloud {
         name: &DomainName,
         rtype: RecordType,
     ) -> Result<Option<RrSet>, Error> {
-        rrsets::get_whole_set(self, zone, name, rtype).await
+        Call::get_rrset(zone, name, rtype)
+            .observe(self, rrsets::get_whole_set(self, zone, name, rtype))
+            .await
     }
 
     async fn set_rrset(
@@ -292,7 +305,9 @@ impl Provider for YandexCloud {
         rrset: &RrSet,
         expect: Expect<'_>,
     ) -> Result<SetOutcome, Error> {
-        rrsets::set_whole_set(self, zone, rrset, expect).await
+        Call::set_rrset(zone, rrset)
+            .observe(self, rrsets::set_whole_set(self, zone, rrset, expect))
+            .await
     }
 
     async fn delete_rrset(
@@ -302,7 +317,12 @@ impl Provider for YandexCloud {
         rtype: RecordType,
         expect: Expect<'_>,
     ) -> Result<DeleteOutcome, Error> {
-        rrsets::delete_whole_set(self, zone, name, rtype, expect).await
+        Call::delete_rrset(zone, name, rtype)
+            .observe(
+                self,
+                rrsets::delete_whole_set(self, zone, name, rtype, expect),
+            )
+            .await
     }
 
     async fn add_txt_value(
@@ -312,7 +332,9 @@ impl Provider for YandexCloud {
         value: &Txt,
         ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
-        values::add_whole_set(self, zone, name, value, ttl).await
+        Call::add_txt_value(zone, name)
+            .observe(self, values::add_whole_set(self, zone, name, value, ttl))
+            .await
     }
 
     async fn remove_txt_value(
@@ -321,7 +343,9 @@ impl Provider for YandexCloud {
         name: &DomainName,
         value: &Txt,
     ) -> Result<RemoveOutcome, Error> {
-        values::remove_whole_set(self, zone, name, value).await
+        Call::remove_txt_value(zone, name)
+            .observe(self, values::remove_whole_set(self, zone, name, value))
+            .await
     }
 }
 

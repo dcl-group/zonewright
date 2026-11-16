@@ -17,8 +17,10 @@ use crate::error::Error;
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
+use crate::operation::Call;
 use crate::provider::{
     AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
 };
 use crate::record::{RecordType, RrSet, RrsetTtl, Txt};
 use crate::redact::Detail;
@@ -124,20 +126,24 @@ impl Provider for Rfc2136 {
         zones: impl IntoIterator<Item = &'a DomainName> + Send,
     ) -> Result<CheckReport, Error> {
         let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
-        let zones = zones.as_slice();
-        if zones.is_empty() {
-            let query = Builder::query(&DomainName::root(), TYPE_SOA).finish()?;
-            let answer = self.transport.exchange(&query, "check").await?;
-            if answer.rcode() == rcode::SERVFAIL {
-                return Err(rcode_error(rcode::SERVFAIL));
-            }
-            return Ok(CheckReport::new(true, Vec::new()));
-        }
-        let mut checks = Vec::with_capacity(zones.len());
-        for zone in zones {
-            checks.push(self.check_zone(zone).await?);
-        }
-        Ok(CheckReport::new(true, checks))
+        Call::check(zones.len())
+            .observe(self, async {
+                let zones = zones.as_slice();
+                if zones.is_empty() {
+                    let query = Builder::query(&DomainName::root(), TYPE_SOA).finish()?;
+                    let answer = self.transport.exchange(&query, "check").await?;
+                    if answer.rcode() == rcode::SERVFAIL {
+                        return Err(rcode_error(rcode::SERVFAIL));
+                    }
+                    return Ok(CheckReport::new(true, Vec::new()));
+                }
+                let mut checks = Vec::with_capacity(zones.len());
+                for zone in zones {
+                    checks.push(self.check_zone(zone).await?);
+                }
+                Ok(CheckReport::new(true, checks))
+            })
+            .await
     }
 
     async fn get_rrset(
@@ -146,7 +152,9 @@ impl Provider for Rfc2136 {
         name: &DomainName,
         rtype: RecordType,
     ) -> Result<Option<RrSet>, Error> {
-        rrsets::get_whole_set(self, zone, name, rtype).await
+        Call::get_rrset(zone, name, rtype)
+            .observe(self, rrsets::get_whole_set(self, zone, name, rtype))
+            .await
     }
 
     async fn set_rrset(
@@ -155,10 +163,14 @@ impl Provider for Rfc2136 {
         rrset: &RrSet,
         expect: Expect<'_>,
     ) -> Result<SetOutcome, Error> {
-        if self.set_target_valid(zone, rrset) {
-            self.check_size(zone, rrset, expect)?;
-        }
-        rrsets::set_whole_set(self, zone, rrset, expect).await
+        Call::set_rrset(zone, rrset)
+            .observe(self, async {
+                if self.set_target_valid(zone, rrset) {
+                    self.check_size(zone, rrset, expect)?;
+                }
+                rrsets::set_whole_set(self, zone, rrset, expect).await
+            })
+            .await
     }
 
     async fn delete_rrset(
@@ -168,7 +180,12 @@ impl Provider for Rfc2136 {
         rtype: RecordType,
         expect: Expect<'_>,
     ) -> Result<DeleteOutcome, Error> {
-        rrsets::delete_whole_set(self, zone, name, rtype, expect).await
+        Call::delete_rrset(zone, name, rtype)
+            .observe(
+                self,
+                rrsets::delete_whole_set(self, zone, name, rtype, expect),
+            )
+            .await
     }
 
     async fn add_txt_value(
@@ -178,7 +195,9 @@ impl Provider for Rfc2136 {
         value: &Txt,
         ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
-        values::add_per_record(self, zone, name, value, ttl).await
+        Call::add_txt_value(zone, name)
+            .observe(self, values::add_per_record(self, zone, name, value, ttl))
+            .await
     }
 
     async fn remove_txt_value(
@@ -187,7 +206,17 @@ impl Provider for Rfc2136 {
         name: &DomainName,
         value: &Txt,
     ) -> Result<RemoveOutcome, Error> {
-        values::remove_per_record(self, zone, name, value).await
+        Call::remove_txt_value(zone, name)
+            .observe(self, values::remove_per_record(self, zone, name, value))
+            .await
+    }
+
+    async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
+        Call::list_zones().unsupported(self).await
+    }
+
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        Call::list_rrsets(zone).unsupported(self).await
     }
 }
 

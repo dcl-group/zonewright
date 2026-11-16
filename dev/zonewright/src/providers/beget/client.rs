@@ -20,8 +20,12 @@ use crate::http::Http;
 use crate::id::ProviderId;
 use crate::locks::NameLocks;
 use crate::name::DomainName;
-use crate::provider::{AddOutcome, CheckReport, Provider, RemoveOutcome, ZoneCheck, ZoneInfo};
-use crate::record::{RrsetTtl, Txt};
+use crate::operation::Call;
+use crate::provider::{
+    AddOutcome, CheckReport, DeleteOutcome, Expect, Provider, RemoveOutcome, SetOutcome, ZoneCheck,
+    ZoneInfo, ZoneListing,
+};
+use crate::record::{RecordType, RrSet, RrsetTtl, Txt};
 use crate::redact::Detail;
 use crate::values;
 
@@ -149,19 +153,27 @@ impl Provider for Beget {
         zones: impl IntoIterator<Item = &'a DomainName> + Send,
     ) -> Result<CheckReport, Error> {
         let zones: Vec<DomainName> = zones.into_iter().cloned().collect();
-        let zones = zones.as_slice();
-        let domains: BTreeSet<DomainName> = self.api.domains().await?.into_iter().collect();
-        let mut checks = Vec::with_capacity(zones.len());
-        for zone in zones {
-            checks.push(self.check_zone(zone, &domains).await?);
-        }
-        Ok(CheckReport::new(true, checks))
+        Call::check(zones.len())
+            .observe(self, async {
+                let zones = zones.as_slice();
+                let domains: BTreeSet<DomainName> = self.api.domains().await?.into_iter().collect();
+                let mut checks = Vec::with_capacity(zones.len());
+                for zone in zones {
+                    checks.push(self.check_zone(zone, &domains).await?);
+                }
+                Ok(CheckReport::new(true, checks))
+            })
+            .await
     }
 
     /// The domains of the account.
     async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
-        let names: BTreeSet<DomainName> = self.api.domains().await?.into_iter().collect();
-        Ok(names.into_iter().map(ZoneInfo::new).collect())
+        Call::list_zones()
+            .observe(self, async {
+                let names: BTreeSet<DomainName> = self.api.domains().await?.into_iter().collect();
+                Ok(names.into_iter().map(ZoneInfo::new).collect())
+            })
+            .await
     }
 
     async fn add_txt_value(
@@ -171,7 +183,9 @@ impl Provider for Beget {
         value: &Txt,
         ttl: Option<RrsetTtl>,
     ) -> Result<AddOutcome, Error> {
-        values::add_whole_set(self, zone, name, value, ttl).await
+        Call::add_txt_value(zone, name)
+            .observe(self, values::add_whole_set(self, zone, name, value, ttl))
+            .await
     }
 
     async fn remove_txt_value(
@@ -180,7 +194,43 @@ impl Provider for Beget {
         name: &DomainName,
         value: &Txt,
     ) -> Result<RemoveOutcome, Error> {
-        values::remove_whole_set(self, zone, name, value).await
+        Call::remove_txt_value(zone, name)
+            .observe(self, values::remove_whole_set(self, zone, name, value))
+            .await
+    }
+
+    async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
+        Call::list_rrsets(zone).unsupported(self).await
+    }
+
+    async fn get_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+    ) -> Result<Option<RrSet>, Error> {
+        Call::get_rrset(zone, name, rtype).unsupported(self).await
+    }
+
+    async fn set_rrset(
+        &self,
+        zone: &DomainName,
+        rrset: &RrSet,
+        _expect: Expect<'_>,
+    ) -> Result<SetOutcome, Error> {
+        Call::set_rrset(zone, rrset).unsupported(self).await
+    }
+
+    async fn delete_rrset(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        rtype: RecordType,
+        _expect: Expect<'_>,
+    ) -> Result<DeleteOutcome, Error> {
+        Call::delete_rrset(zone, name, rtype)
+            .unsupported(self)
+            .await
     }
 }
 

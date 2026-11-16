@@ -204,6 +204,56 @@ and `max_questions_per_round` (default 1024) for the servers × questions of one
 carry the AA flag; `accept_static_without_aa` lifts that for the servers of a static list only, for
 example a test DNS server that never sets it.
 
+### DNS-01 for a delegated challenge
+
+When `_acme-challenge.www.example.org` is a CNAME into another zone, the TXT value belongs at the
+end of the chain, possibly at another provider. The helpers in `zonewright::dns01` cover the three
+steps; none of them talks to a provider:
+
+1. `dns01::challenge_name(&identifier)` gives the challenge name (a leading wildcard label is
+   dropped).
+2. `dns01::follow_cname(&lookup, &name, max_links)` follows the CNAME records and returns a
+   `CnameChain`; `chain.effective()` is the name to write at. `lookup` is anything that implements
+   `dns01::CnameLookup`; with the `inspector` feature the `Inspector` does, by asking its resolvers.
+3. `dns01::select_zone(&effective, &zones)` picks, from the application's own list of
+   `(zone, payload)` pairs, the zone with the most labels that contains the name. The payload is
+   whatever the application attaches to a zone, for example which account holds it.
+
+The value is then added with `add_txt_value(&zone, &effective, &value, None)` at the client of that
+account and removed with `remove_txt_value` after validation.
+
+### Timeouts and cancellation
+
+Every network call has a timeout (`ContextOptions::connect_timeout` and `request_timeout`), and only
+idempotent requests are retried, a bounded number of times. An operation as a whole has no deadline
+of its own: an application that wants one wraps the call in its own timeout and drops the future.
+Dropping is safe. After a dropped or failed write the outcome at the provider is unknown, and
+repeating the same call converges on the same state: a repeated `add_txt_value` answers
+`AlreadyPresent`, a repeated `remove_txt_value` `NotPresent`, a repeated `set_rrset` `Unchanged`.
+One provider needs care: nic.ru stages changes and publishes them with a commit, and a zone left
+with staged changes by an operation that was dropped in mid-request is refused by later operations
+until the staged changes are committed or rolled back in the provider's panel.
+
+## What the crate does not do
+
+These are left to the application on purpose, and are not planned:
+
+- **Desired state.** No "make the zone look like this file", no diff between desired and actual
+  records, no dry run. The crate reads and writes rrsets; deciding which is the application's work.
+- **Ownership markers.** The crate does not tag the records it wrote and does not track which
+  records are whose. The TXT value operations never remove a value they were not asked to remove.
+- **ACME.** No orders, no account keys, no challenge lifecycle, no CAA policy check before issuance.
+  The crate adds and removes the TXT value and can watch it propagate.
+- **Persistence and secrets at rest.** Nothing is written to disk. The application stores its
+  provider accounts and encrypts their credentials.
+- **Scheduling, audit and metrics.** The crate emits `tracing` events and nothing else.
+- **Several providers at once.** No secondary-DNS fan-out and no cross-provider transaction; each
+  client talks to one account.
+- **Creating and deleting zones.** Zones are listed, never created or removed.
+- **DNSSEC.** The inspector does not validate signatures, and nothing signs a zone.
+- **Provider-specific constructs that are not rrsets**, such as Route 53 alias and routing-policy
+  record sets: they are reported when listed and never written.
+
 ## Testing an ACME application
 
 The crate [`zonewright-mock`](https://crates.io/crates/zonewright-mock) has a stateful mock of every
@@ -279,9 +329,16 @@ provider or `rfc2136` is enabled.
 Tokens, keys and passwords are held in `secrecy` wrappers and are not printed by `Debug` or
 `Display`. Credentials are passed in as `SecretString`. The text of an `Error` is redacted, and
 provider responses that echo a credential do not reach error text. The crate emits `tracing` events
-only (no `metrics` or `prometheus`); an HTTP event carries the method, the path without the query
-string, the status code and the duration, and request and response bodies and headers are never
-logged.
+only (no `metrics` or `prometheus`) and installs no subscriber.
+
+Each provider operation (`check`, `list_zones`, `add_txt_value` and the others) emits one `DEBUG`
+event with target `zonewright::operation` when it completes. The event names the provider, the
+operation, the zone, the owner name and record type where there are any, the outcome (`ok` or the
+error kind), the provider's error code when there is one, and the elapsed milliseconds. Below that,
+the HTTP transport logs one `DEBUG` event per attempt (`zonewright::http`: the method, the path
+without the query string, the status code and the duration) and the RFC 2136 client one per DNS
+exchange (`zonewright::rfc2136`). Record values, TTLs, error text, credentials, and request and
+response bodies and headers are never logged.
 
 ## MSRV and versioning
 

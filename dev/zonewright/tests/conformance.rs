@@ -1263,6 +1263,136 @@ fn provider_sources_contain(id: ProviderId, needle: &str) -> bool {
         .any(|path| std::fs::read_to_string(path).unwrap().contains(needle))
 }
 
+/// The methods of the `impl Provider for` block in `text`: method name -> body, the body being
+/// the lines after the signature up to the method's closing brace at four spaces of indentation.
+fn provider_impl_methods(text: &str) -> BTreeMap<String, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .position(|l| l.starts_with("impl Provider for "))
+    else {
+        return BTreeMap::new();
+    };
+    let end = lines[start..]
+        .iter()
+        .position(|l| *l == "}")
+        .map_or(lines.len(), |at| start + at);
+    let mut methods = BTreeMap::new();
+    let mut at = start;
+    while at < end {
+        let line = lines[at].trim_start();
+        let name = line
+            .strip_prefix("async fn ")
+            .or_else(|| line.strip_prefix("fn "))
+            .and_then(|rest| rest.split(['(', '<']).next());
+        let Some(name) = name.filter(|_| lines[at].starts_with("    ")) else {
+            at += 1;
+            continue;
+        };
+        let close = lines[at..end]
+            .iter()
+            .position(|l| *l == "    }")
+            .map_or(end, |offset| at + offset);
+        methods.insert(name.to_owned(), lines[at..close].join("\n"));
+        at = close + 1;
+    }
+    methods
+}
+
+/// Whether a method body reports its call through the operation event: it names the call with
+/// the constructor of its own name and runs it through `observe` or `unsupported`.
+/// Whitespace is ignored, so that the formatter's line breaks do not matter.
+fn routes_through_the_operation_event(method: &str, body: &str) -> bool {
+    let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    body.contains(&format!("Call::{method}("))
+        && (body.contains(".observe(self,") || body.contains(".unsupported(self)"))
+}
+
+/// Every client implements every method of `Provider`, and each of them runs through the
+/// operation event (design section 5.6): the trait's default bodies emit nothing, so a method a
+/// client leaves to the default would go unreported. `AnyProvider` forwards and emits nothing
+/// itself, so that a call through it is reported once. All misses are reported together.
+#[test]
+fn provider_methods_emit_the_operation_event() {
+    let mut missing: Vec<String> = Vec::new();
+    for &id in ProviderId::ALL {
+        let mut files = Vec::new();
+        rust_files(
+            &manifest_dir().join("src/providers").join(id.as_str()),
+            &mut files,
+        );
+        let impls: Vec<(PathBuf, BTreeMap<String, String>)> = files
+            .into_iter()
+            .filter_map(|path| {
+                let text = std::fs::read_to_string(&path).unwrap();
+                text.contains("impl Provider for ")
+                    .then(|| (path, provider_impl_methods(&text)))
+            })
+            .collect();
+        let [(path, methods)] = impls.as_slice() else {
+            missing.push(format!(
+                "{}: expected one `impl Provider for` in its module, found {}",
+                id.as_str(),
+                impls.len()
+            ));
+            continue;
+        };
+        for op in OPERATIONS {
+            let method = op.as_str();
+            match methods.get(method) {
+                None => missing.push(format!(
+                    "{}: fn {method} is not implemented (the default emits no event)",
+                    path.display()
+                )),
+                Some(body) if !routes_through_the_operation_event(method, body) => {
+                    missing.push(format!(
+                        "{}: fn {method} does not run through Call::{method}(..).observe(self, ..) \
+                         or .unsupported(self)",
+                        path.display()
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    let forward = std::fs::read_to_string(manifest_dir().join("src/providers/mod.rs")).unwrap();
+    if forward.contains("Call::") {
+        missing.push("src/providers/mod.rs: AnyProvider must not emit an event of its own".into());
+    }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
+}
+
+#[test]
+fn the_operation_event_scan_reads_methods() {
+    let text = "impl Provider for X {\n    fn id(&self) -> ProviderId {\n        X\n    }\n\n    \
+                async fn check<'a>(\n        &self,\n    ) -> R {\n        let z = 1;\n        \
+                Call::check(z)\n            .observe(self, async { Ok(()) })\n            \
+                .await\n    }\n\n    async fn list_zones(&self) -> R {\n        \
+                self.list().await\n    }\n}\n\nfn other() {\n    Call::list_zones()\n}\n";
+    let methods = provider_impl_methods(text);
+    assert_eq!(
+        methods.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["check", "id", "list_zones"]
+    );
+    assert!(routes_through_the_operation_event(
+        "check",
+        &methods["check"]
+    ));
+    assert!(!routes_through_the_operation_event(
+        "list_zones",
+        &methods["list_zones"]
+    ));
+    // The constructor of another method does not count.
+    assert!(!routes_through_the_operation_event(
+        "list_zones",
+        "        Call::check(1).observe(self, work).await"
+    ));
+    assert!(routes_through_the_operation_event(
+        "list_zones",
+        "        Call::list_zones().unsupported(self).await"
+    ));
+}
+
 /// Every provider defines the tests that sections 12.2 and 12.3 require in its own test file.
 /// Every missing test of every provider is reported together.
 #[test]
