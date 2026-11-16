@@ -10,6 +10,8 @@ All notable changes to this crate are recorded in this file. The format follows
 
 - Inspector: the TTL reported for an rrset counts a record's TTL with the most significant bit set
   as zero before the smallest TTL is taken (RFC 2181 section 8).
+- nic.ru: a TXT value operation refuses a zone whose record listing reports staged changes made
+  after the zone lookup, as the record-level operations do.
 
 ## 0.1.0 - 2026-11-16
 

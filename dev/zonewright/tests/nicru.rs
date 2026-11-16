@@ -1066,6 +1066,43 @@ async fn nicru_refuses_foreign_uncommitted_changes() {
     assert!(detail.as_str().contains("did not make"), "{detail}");
 }
 
+/// A foreign edit staged between the zone lookup and the record listing of a TXT value
+/// operation, on a zone that was clean when it was looked up, is seen in the listing's
+/// `has-changes`: the add and the removal are `Rejected`, nothing is staged, committed or rolled
+/// back, and the foreign edit stays staged.
+#[tokio::test]
+async fn nicru_txt_refuses_changes_staged_after_the_zone_lookup() {
+    for adding in [true, false] {
+        let (mock, client) = setup().await;
+        let control = mock.control();
+        control.insert_record("example.org", REL, "TXT", "AAA", None);
+        let hook = control.clone();
+        // A hook runs before the request reaches the mock, so the zone lookup answered clean
+        // and only the record listing sees the staged edit.
+        mock.faults().push(
+            Fault::on("GET", RECORDS)
+                .run(move || {
+                    hook.stage_record("example.org", "late", "TXT", "pending", None);
+                })
+                .pass(),
+        );
+        let e = if adding {
+            add(&client, "BBB").await.map(drop).unwrap_err()
+        } else {
+            remove(&client, "AAA").await.map(drop).unwrap_err()
+        };
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{adding}: {e:?}");
+        assert!(e.to_string().contains("did not make"), "{adding}: {e}");
+        assert_eq!(mock.log().count(Some("GET"), RECORDS), 1, "{adding}");
+        assert_eq!(writes(&mock) + rollbacks(&mock), 0, "{adding}");
+        assert_eq!(control.staged_txt(REL), ["AAA"], "{adding}");
+        assert_eq!(control.published_txt(REL), ["AAA"], "{adding}");
+        assert_eq!(control.staged_txt("late"), ["pending"], "{adding}");
+        assert!(control.published_txt("late").is_empty(), "{adding}");
+        assert!(control.has_changes("example.org"), "{adding}");
+    }
+}
+
 /// A commit of our own edit that fails is tried again at once; one that fails three times
 /// leaves the edit staged and the zone marked as ours, and the operation is retryable. The next
 /// operation commits the edit instead of refusing the zone as one with foreign changes.

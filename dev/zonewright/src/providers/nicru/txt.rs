@@ -57,7 +57,7 @@ use crate::redact::Detail;
 use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
 use super::api::TXT;
-use super::client::Nicru;
+use super::client::{Nicru, rejected};
 use super::records::{api_ttl, read_ttl};
 
 /// How TXT text is read.
@@ -150,11 +150,13 @@ impl PerRecord for Op<'_> {
         // section 11.3, points b and c).
         self.client.settle_leftovers(zone, &target, false).await?;
         *self.service.lock().unwrap_or_else(PoisonError::into_inner) = Some(target.service.clone());
-        let records = self
-            .client
-            .api
-            .records(&target.service, zone)
-            .await?
+        let listing = self.client.api.records(&target.service, zone).await?;
+        if listing.has_changes == Some(true) {
+            // Staged after the zone lookup: not by this process, which holds the zone lock and
+            // has settled its own.
+            return Err(rejected(FOREIGN_CHANGES));
+        }
+        let records = listing
             .records
             .into_iter()
             .filter(|rr| rr.rtype.eq_ignore_ascii_case(TXT) && rr.owner.as_ref() == Some(name))
