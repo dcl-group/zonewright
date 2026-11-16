@@ -20,6 +20,17 @@ All notable changes to this crate are recorded in this file. The format follows
   listen on an address other than loopback (for an isolated test network shared with an ACME
   server), and `Control::reset()` to return a provider mock to its seed.
 - `zonewright-mock`: `dns::Data::caa` and `dns::DnsMock::set_authoritative_answers`.
+- `ContextOptions::trust_roots` (`TrustRoots::Mozilla` by default, `Platform`, `None`) chooses the
+  certificate authorities a `Context` trusts. `TrustRoots::None` trusts only the roots the options
+  add; with none, `Context::new` is `Error::Config`. `TrustRoots::Platform` without the
+  `platform-verifier` feature is `Error::Config`.
+- `ContextOptions::russian_trusted_root` (default false) trusts the Russian Trusted Root CA of the
+  Ministry of Digital Development of Russia, compiled into the crate, in addition to `trust_roots`;
+  `extra_root_certificates` are trusted in addition to both.
+- Cargo features `platform-verifier` and `socks`, enabled by no other feature (not by
+  `all-providers`). `rustls-platform-verifier` is a direct dependency only with the first; it stays
+  in the dependency tree through `reqwest`, which has no rustls feature without it, but is not used
+  without the feature.
 
 ### Changed
 
@@ -29,6 +40,15 @@ All notable changes to this crate are recorded in this file. The format follows
   wire decoding. Values 0.1.0 accepted are now refused. A provider read keeps such a value as
   non-canonical data, the inspector reports the answer as failed, and a stored `RrSet` holding such
   a value as canonical text no longer deserializes.
+- The default trust anchors of HTTPS are now Mozilla's root certificates compiled into the crate
+  (`TrustRoots::Mozilla`, from `webpki-roots`); the operating system's trust store is no longer
+  read. To keep the 0.1 behavior, enable the new cargo feature `platform-verifier` and set
+  `ContextOptions::trust_roots = TrustRoots::Platform`. A corporate or internal certificate
+  authority known only to the system store needs one of those, or its root in
+  `extra_root_certificates`.
+- SOCKS5 proxies need the new cargo feature `socks`. Without it a `socks5://` or `socks5h://` proxy
+  URL is `Error::Config`. `reqwest` is no longer built with its `socks` feature unless this feature
+  is on.
 
 ### Fixed
 

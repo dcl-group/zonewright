@@ -171,3 +171,13 @@ warnings denied; a build with the MSRV toolchain. Workspace lints: `unsafe_code 
 inherit the workspace lints; it sets `unsafe_code` and `missing_docs` itself); `clippy.toml` allows
 unwrap, expect, panic, indexing, `dbg!` and printing in test code. The gates are run by hand from
 `dev/`; no CI configuration is part of the repository.
+
+Two public features change which transport tests exist. The SOCKS5 tests (`src/http/proxy.rs`,
+`src/http/proxy_tests.rs`, `tests/transport.rs`) are compiled with `socks`, and the tests of the
+platform verifier (its construction and a host without CA certificates, `src/http/tls.rs` and
+`src/http/tests.rs`) with `platform-verifier`; without the feature, tests that the refusal is
+`Error::Config` naming the feature are compiled instead. `cargo test --all-features` runs the first
+kind, `cargo test --features <one provider>` the second. The trust tests use certificate authorities
+generated at test time and the compiled-in roots only; nothing connects to a real host, and the
+tests of the Russian root (`src/http/roots.rs`) read the file in the crate and never compare its
+expiry with the current date.

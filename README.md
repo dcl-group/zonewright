@@ -31,11 +31,13 @@ zonewright = { version = "0.1", features = ["cloudflare", "inspector"] }
 No feature is enabled by default. A provider that is not compiled in is still a valid `ProviderId`;
 building a client for it returns an `Error` of kind `NotCompiled`.
 
-| Feature          | Enables                                                                |
-| ---------------- | ---------------------------------------------------------------------- |
-| one per provider | The client of that provider, named by its ID (`cloudflare`, `route53`) |
-| `all-providers`  | Every provider client                                                  |
-| `inspector`      | The propagation inspector                                              |
+| Feature             | Enables                                                                |
+| ------------------- | ---------------------------------------------------------------------- |
+| one per provider    | The client of that provider, named by its ID (`cloudflare`, `route53`) |
+| `all-providers`     | Every provider client                                                  |
+| `inspector`         | The propagation inspector                                              |
+| `socks`             | SOCKS5 proxies (`socks5://`, `socks5h://`) in `ContextOptions::proxy`  |
+| `platform-verifier` | The operating system's trust store, as `TrustRoots::Platform`          |
 
 The provider IDs are listed in
 [`PROVIDERS.md`](https://github.com/dcl-group/zonewright/blob/main/PROVIDERS.md).
@@ -205,16 +207,39 @@ example a test DNS server that never sets it.
 
 HTTP clients use `reqwest` with `rustls` and `aws-lc-rs`. The crate builds its own TLS configuration
 for its requests and never installs a process-wide crypto provider; if the application needs one for
-its own TLS, the application installs it. Server certificates are verified against the platform's
-trust store plus any DER-encoded certificates the application passes in
-`ContextOptions::extra_root_certificates`. Proxy environment variables are ignored; a proxy is used
-only when set in `ContextOptions::proxy`. It may be an HTTP or HTTPS proxy (requests to HTTPS
-endpoints go through it in a `CONNECT` tunnel) or a SOCKS5 proxy (`socks5://`, `socks5h://`); the
-provider's certificate is verified as without it, and the hosts listed in `HttpProxy::exclusions`
-are reached directly. With an `http://` or SOCKS5 proxy the proxy credentials travel to the proxy
-unencrypted; the provider traffic stays inside TLS. A proxy that refuses its credentials gives
-`Error::ProxyAuth`. `ring`, OpenSSL and `native-tls` are not in the dependency tree. Building needs
-a C compiler (for `aws-lc-rs`) when an HTTP provider or `rfc2136` is enabled.
+its own TLS, the application installs it.
+
+Server certificates are verified against the certificate authorities `ContextOptions` selects. By
+default (`TrustRoots::Mozilla`) these are Mozilla's root certificates, compiled into the crate; the
+operating system's trust store is not read. With the `platform-verifier` feature,
+`TrustRoots::Platform` uses the operating system's trust store instead, as version 0.1 did.
+`TrustRoots::None` trusts only the certificates the options add, for an application that must trust
+a fixed set. `ContextOptions::russian_trusted_root` adds the Russian Trusted Root CA, which the
+crate carries and which neither Mozilla's list nor a typical system store has; it is off by default,
+because every additional authority can issue certificates for any provider's host. DER-encoded
+certificates in `ContextOptions::extra_root_certificates` are trusted in addition to all of these.
+
+```rust
+use zonewright::{Context, ContextOptions, TrustRoots};
+
+fn main() -> Result<(), zonewright::Error> {
+    let mut options = ContextOptions::default();
+    options.trust_roots = TrustRoots::Mozilla; // the default
+    options.russian_trusted_root = true;
+    let _ctx = Context::new(options)?;
+    Ok(())
+}
+```
+
+Proxy environment variables are ignored; a proxy is used only when set in `ContextOptions::proxy`.
+It may be an HTTP or HTTPS proxy (requests to HTTPS endpoints go through it in a `CONNECT` tunnel)
+or, with the `socks` feature, a SOCKS5 proxy (`socks5://`, `socks5h://`; without the feature
+`Context::new` refuses such a URL); the provider's certificate is verified as without it, and the
+hosts listed in `HttpProxy::exclusions` are reached directly. With an `http://` or SOCKS5 proxy the
+proxy credentials travel to the proxy unencrypted; the provider traffic stays inside TLS. A proxy
+that refuses its credentials gives `Error::ProxyAuth`. `ring`, OpenSSL and `native-tls` are not in
+the dependency tree. Building needs a C compiler (for `aws-lc-rs`) when an HTTP provider or
+`rfc2136` is enabled.
 
 ## Secrets and logging
 

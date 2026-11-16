@@ -209,9 +209,12 @@ mode. This design replaces it by resolver-based discovery and static lists (sect
 **9.** **Order of record-level work.** Settled in the code: every provider whose API allows it has
 record-level operations (section 11.2). What remains is Beget, point 20.
 
-**10.** **Trust anchors.** Settled in the code: the crate trusts the platform's roots plus the
-certificates passed in `ContextOptions::extra_root_certificates` and ships none of its own. Settled:
-`ContextOptions::extra_root_certificates` is in `src/context.rs`.
+**10.** **Trust anchors.** Settled (decided by the maintainer on 2026-11-16, section 5.1): the
+application chooses the set with `ContextOptions::trust_roots`. The default is Mozilla's root
+certificates compiled into the crate; the operating system's store is used only with the
+`platform-verifier` feature and `TrustRoots::Platform`; the Russian Trusted Root CA is compiled in
+and trusted only with `ContextOptions::russian_trusted_root`; the certificates of
+`ContextOptions::extra_root_certificates` are trusted in addition.
 
 **11.** **Strict settings.** Settled in the code: every `…Config` refuses unknown keys
 (`deny_unknown_fields`), so an application strips its own keys before calling the crate.

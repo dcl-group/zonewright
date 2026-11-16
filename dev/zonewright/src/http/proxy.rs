@@ -21,9 +21,14 @@
 //!   scheme, a host name of letters, digits, `.`, `-` and `_` or an IP literal, a port, and user
 //!   info made of unreserved characters and percent escapes, all of which both parsers accept.
 //! - Proxy URL schemes: `http` and `https`; `socks5` and `socks5h` with `reqwest`'s `socks`
-//!   feature, which the crate enables and which pulls in no crate (`reqwest` `Cargo.toml`,
-//!   `socks = []`; the SOCKS client is `hyper-util`'s `SocksV5`, part of its `client-proxy`
-//!   feature that `reqwest` always enables). `socks4` and `socks4a` are refused here.
+//!   feature, which pulls in no crate (`reqwest` `Cargo.toml`, `socks = []`; the SOCKS client is
+//!   `hyper-util`'s `SocksV5`, part of its `client-proxy` feature that `reqwest` always enables).
+//!   The crate enables it only through its own feature `socks`, so that an application without
+//!   SOCKS5 proxies does not get it in every `reqwest` client of its build (Cargo unifies
+//!   features). Without that feature a `socks5` or `socks5h` URL is still parsed and checked like
+//!   any other, credentials included, and then refused with a text that names the feature; the
+//!   SOCKS code here stays compiled, as part of that check. `socks4` and `socks4a` are refused in
+//!   every build.
 //! - An `https://` target behind an HTTP proxy goes through a `CONNECT` tunnel (`hyper-util`
 //!   `client/legacy/connect/proxy/tunnel.rs`), and the TLS session with the target runs inside it
 //!   with the crate's `ClientConfig`. The TLS connection to an `https://` proxy uses a clone of
@@ -191,6 +196,13 @@ impl ProxySetting {
                 (None, route, secrets)
             }
         };
+        // Last, so that every other problem of a SOCKS5 setting is reported as in a build with
+        // the feature.
+        if kind == ProxyKind::Socks && !cfg!(feature = "socks") {
+            return Err(config(
+                "proxy.url uses SOCKS5, which needs the `socks` feature of this crate",
+            ));
+        }
         Ok(ProxySetting {
             kind,
             loopback,
@@ -597,6 +609,7 @@ mod tests {
                 true,
                 ProxyKind::Http,
             ),
+            #[cfg(feature = "socks")]
             (
                 "socks5://127.0.0.1:1080",
                 "socks5://127.0.0.1:1080",
@@ -604,6 +617,7 @@ mod tests {
                 false,
                 ProxyKind::Socks,
             ),
+            #[cfg(feature = "socks")]
             (
                 "SOCKS5H://127.1",
                 "socks5h://127.0.0.1:1080",
@@ -611,6 +625,7 @@ mod tests {
                 false,
                 ProxyKind::Socks,
             ),
+            #[cfg(feature = "socks")]
             (
                 "socks5h://[::1]:9050/",
                 "socks5h://[::1]:9050",
@@ -618,6 +633,7 @@ mod tests {
                 false,
                 ProxyKind::Socks,
             ),
+            #[cfg(feature = "socks")]
             (
                 "socks5://127.0.0.1:80",
                 "socks5://127.0.0.1:80",
@@ -625,6 +641,7 @@ mod tests {
                 false,
                 ProxyKind::Socks,
             ),
+            #[cfg(feature = "socks")]
             (
                 "socks5://Socks.Example.Test",
                 "socks5://socks.example.test:1080",
@@ -726,6 +743,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "socks")]
     #[test]
     fn socks_credentials_go_into_the_route_only() {
         let password = "pa55: w@rd/+é%";
@@ -932,17 +950,24 @@ mod tests {
 
     #[test]
     fn routes_follow_the_exclusions() {
-        let setting = ProxySetting::parse(
-            &proxy("socks5://127.0.0.1:1080")
-                .with_exclusions(vec!["127.0.0.1".to_owned(), "*.example.org".to_owned()]),
-            false,
-        )
-        .unwrap();
-        let route = |raw: &str| setting.route_for(&Url::parse(raw).unwrap());
-        assert_eq!(route("http://127.0.0.1:1/x"), None);
-        assert_eq!(route("https://api.example.org/x"), None);
-        assert_eq!(route("https://example.org/x"), Some(ProxyKind::Socks));
-        assert_eq!(route("http://[::1]:1/x"), Some(ProxyKind::Socks));
+        let cases = [
+            ("http://127.0.0.1:3128", ProxyKind::Http),
+            #[cfg(feature = "socks")]
+            ("socks5://127.0.0.1:1080", ProxyKind::Socks),
+        ];
+        for (raw, kind) in cases {
+            let setting = ProxySetting::parse(
+                &proxy(raw)
+                    .with_exclusions(vec!["127.0.0.1".to_owned(), "*.example.org".to_owned()]),
+                false,
+            )
+            .unwrap();
+            let route = |raw: &str| setting.route_for(&Url::parse(raw).unwrap());
+            assert_eq!(route("http://127.0.0.1:1/x"), None);
+            assert_eq!(route("https://api.example.org/x"), None);
+            assert_eq!(route("https://example.org/x"), Some(kind));
+            assert_eq!(route("http://[::1]:1/x"), Some(kind));
+        }
         let e = ProxySetting::parse(
             &proxy("http://127.0.0.1:3128").with_exclusions(vec!["*".to_owned()]),
             false,
@@ -950,6 +975,44 @@ mod tests {
         .err()
         .unwrap();
         assert!(e.to_string().contains("proxy.exclusions[0]"), "{e}");
+    }
+
+    /// Without the `socks` feature a SOCKS5 URL is refused with a text naming the feature, after
+    /// every other check: a setting that is wrong for another reason gets that reason.
+    #[cfg(not(feature = "socks"))]
+    #[test]
+    fn socks5_needs_the_feature() {
+        for raw in [
+            "socks5://127.0.0.1:1080",
+            "socks5h://[::1]:9050",
+            "SOCKS5H://127.1",
+        ] {
+            for p in [
+                proxy(raw),
+                proxy(raw)
+                    .with_credentials("u".into(), SecretString::from("cr3d-canary".to_owned())),
+            ] {
+                let e = ProxySetting::parse(&p, true).err().unwrap();
+                assert_eq!(e.kind(), ErrorKind::Config, "{raw}");
+                let text = format!("{e} {e:?}");
+                assert!(text.contains("the `socks` feature"), "{raw}: {text}");
+                assert!(!text.contains("canary"), "{text}");
+            }
+        }
+        for (p, key) in [
+            (proxy("socks5://u:pw@127.0.0.1:1080"), "user info"),
+            (proxy("socks5://127.0.0.1:1080/x"), "a path"),
+            (proxy("socks5://192.0.2.1:1080"), "loopback"),
+            (
+                proxy("socks5://127.0.0.1:1080")
+                    .with_credentials("u".into(), SecretString::from(String::new())),
+                "both proxy.username and proxy.password",
+            ),
+        ] {
+            let e = ProxySetting::parse(&p, true).err().unwrap();
+            assert_eq!(e.kind(), ErrorKind::Config);
+            assert!(e.to_string().contains(key), "{e}");
+        }
     }
 
     #[test]

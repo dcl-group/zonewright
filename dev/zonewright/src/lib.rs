@@ -22,8 +22,10 @@
 //!
 //! No feature is enabled by default. Each provider is its own feature, named like its ID
 //! (`cloudflare`, `selectel_v2`, ...); `all-providers` enables them all. `inspector` enables the
-//! propagation inspector. Features whose names start with two underscores are internal and not
-//! part of the public API.
+//! propagation inspector. `socks` enables SOCKS5 proxies ([`HttpProxy`]), and
+//! `platform-verifier` the operating system's trust store ([`TrustRoots::Platform`]); neither is
+//! enabled by another feature. Features whose names start with two underscores are internal and
+//! not part of the public API.
 //!
 //! Every provider client needs a `tokio` runtime.
 
@@ -87,7 +89,12 @@ mod http;
 #[cfg(feature = "__crypto")]
 mod crypto;
 
-pub use context::{Context, ContextOptions, HttpProxy};
+// `platform-verifier` without an HTTP provider builds the dependency but has no transport to use
+// it in; this keeps Cargo's `unused_dependencies` lint quiet in that build.
+#[cfg(all(feature = "platform-verifier", not(feature = "__http")))]
+use rustls_platform_verifier as _;
+
+pub use context::{Context, ContextOptions, HttpProxy, TrustRoots};
 pub use error::{Error, ErrorKind, Operation};
 pub use id::{ProviderId, UnknownProviderId};
 pub use meta::{

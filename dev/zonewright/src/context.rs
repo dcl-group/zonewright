@@ -50,10 +50,11 @@ impl fmt::Debug for Context {
 }
 
 impl Context {
-    /// Builds the shared state. Fails with [`Error::Config`] when an option is invalid,
-    /// including an entry of [`ContextOptions::extra_root_certificates`] that is not a
-    /// DER-encoded certificate (checked in builds with an HTTP provider, the only ones that use
-    /// it).
+    /// Builds the shared state. Fails with [`Error::Config`] when an option is invalid. In builds
+    /// with an HTTP provider, the only ones that use them, that includes the trust settings: an
+    /// entry of [`ContextOptions::extra_root_certificates`] that is not a DER-encoded
+    /// certificate, [`TrustRoots::Platform`] without the `platform-verifier` feature, and
+    /// [`TrustRoots::None`] with no root certificate added by the options.
     ///
     /// Builds no connection and needs no `tokio` runtime. No process-wide TLS crypto provider is
     /// installed or consulted.
@@ -135,16 +136,35 @@ pub struct ContextOptions {
     pub connect_timeout: Duration,
     /// Limit for one HTTP request from start to the end of the body. Default 30 s.
     pub request_timeout: Duration,
-    /// DER-encoded certificates trusted in addition to the platform's roots.
+    /// The certificate authorities trusted for HTTPS, to provider endpoints and to an `https://`
+    /// proxy. Default [`TrustRoots::Mozilla`].
+    pub trust_roots: TrustRoots,
+    /// Trust the Russian Trusted Root CA compiled into the crate, in addition to the set
+    /// [`trust_roots`](ContextOptions::trust_roots) selects. Default false.
+    ///
+    /// The root certificate of the Ministry of Digital Development and Communications of the
+    /// Russian Federation (subject `C=RU, O=The Ministry of Digital Development and
+    /// Communications, CN=Russian Trusted Root CA`, SHA-256 fingerprint
+    /// `D2:6D:2D:02:31:B7:C3:9F:92:CC:73:85:12:BA:54:10:35:19:E4:40:5D:68:B5:BD:70:3E:97:88:CA:8E:CF:31`,
+    /// valid until 2032-02-27). Neither Mozilla's list nor a typical operating system's store has
+    /// it.
+    ///
+    /// Every additional authority can issue a certificate the context accepts for any host, the
+    /// hosts of other providers included. An application that needs this root for some
+    /// providers only builds two contexts.
+    pub russian_trusted_root: bool,
+    /// DER-encoded certificates trusted in addition to the set
+    /// [`trust_roots`](ContextOptions::trust_roots) selects (and to the Russian root when
+    /// [`russian_trusted_root`](ContextOptions::russian_trusted_root) is set). Default empty.
     pub extra_root_certificates: Vec<Vec<u8>>,
     /// Refuse to connect to anything but loopback addresses. For tests. Default false.
     ///
     /// With a [`proxy`](ContextOptions::proxy), the proxy must be a loopback IP literal as well;
     /// the policy for request URLs is unchanged.
     pub loopback_only: bool,
-    /// The proxy, HTTP or SOCKS5, every HTTP provider request of the context goes through,
-    /// except requests to its [exclusions](HttpProxy::exclusions). Default `None`: requests go
-    /// directly to the provider.
+    /// The proxy, HTTP or SOCKS5 (with the `socks` feature), every HTTP provider request of the
+    /// context goes through, except requests to its [exclusions](HttpProxy::exclusions). Default
+    /// `None`: requests go directly to the provider.
     ///
     /// Only this setting configures a proxy. The environment (`HTTP_PROXY`, `HTTPS_PROXY`,
     /// `ALL_PROXY`, `NO_PROXY` and their lowercase forms) and the system proxy configuration are
@@ -164,6 +184,8 @@ impl Default for ContextOptions {
             user_agent_suffix: None,
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
+            trust_roots: TrustRoots::Mozilla,
+            russian_trusted_root: false,
             extra_root_certificates: Vec::new(),
             loopback_only: false,
             proxy: None,
@@ -171,19 +193,49 @@ impl Default for ContextOptions {
     }
 }
 
+/// The certificate authorities a [`Context`] trusts for HTTPS, before
+/// [`ContextOptions::russian_trusted_root`] and [`ContextOptions::extra_root_certificates`]
+/// are added.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TrustRoots {
+    /// The root certificates of Mozilla's CA program, compiled into the crate. The operating
+    /// system's trust store is not read.
+    ///
+    /// The set is the one of the `webpki-roots` release the crate is built with: it changes with
+    /// a dependency update, not with the operating system. Certificate revocation is not
+    /// checked.
+    #[default]
+    Mozilla,
+    /// The operating system's trust store, through its certificate verifier. Needs the cargo
+    /// feature `platform-verifier`; without it, building the `Context` fails with `Error::Config`.
+    ///
+    /// The Russian root and the extra roots of the options are passed to the platform verifier
+    /// as additional roots. Revocation is checked as far as the platform checks it. On a
+    /// Unix-like system without CA certificates the context still builds, with a warning, and
+    /// every HTTPS request fails with `Error::Config`.
+    Platform,
+    /// No built-in set: only the roots the options add. Building the `Context` fails with
+    /// `Error::Config` when they add none.
+    None,
+}
+
 /// A proxy for the provider requests of a [`Context`] ([`ContextOptions::proxy`]): an HTTP proxy
 /// or a SOCKS5 proxy.
 ///
 /// Supported schemes of [`url`](HttpProxy::url): `http`, `https`, `socks5` and `socks5h`.
+/// `socks5` and `socks5h` need the cargo feature `socks`. Without it such a URL is checked like
+/// any other and then refused by [`Context::new`] with [`Error::Config`](crate::Error::Config),
+/// whose text names the feature; this type and its constructors are the same in every build.
 ///
 /// Through an HTTP proxy (`http://` or `https://`), a request to an `https://` provider endpoint
 /// goes through a `CONNECT` tunnel (RFC 9110 section 9.3.6): the proxy sees the host and port of
 /// the endpoint and nothing else; the TLS session with the provider runs inside the tunnel, and
 /// the provider's certificate is verified exactly as without a proxy. A request to a plain-HTTP
 /// loopback endpoint (tests) is forwarded in absolute form. With `https://`, the connection to
-/// the proxy is verified with the context's trust anchors (the platform's and
-/// [`ContextOptions::extra_root_certificates`]). With `http://`, the proxy credentials travel to
-/// the proxy unencrypted; the provider traffic is still protected by TLS.
+/// the proxy is verified with the context's trust anchors (the set of
+/// [`ContextOptions::trust_roots`] and the roots the options add). With `http://`, the proxy
+/// credentials travel to the proxy unencrypted; the provider traffic is still protected by TLS.
 ///
 /// Through a SOCKS5 proxy (RFC 1928), every request, `https://` or plain HTTP, goes through a
 /// SOCKS5 `CONNECT`; the TLS session with an `https://` provider runs inside it, verified as
@@ -340,6 +392,8 @@ mod tests {
         assert_eq!(options.connect_timeout, Duration::from_secs(10));
         assert_eq!(options.request_timeout, Duration::from_secs(30));
         assert!(!options.loopback_only);
+        assert_eq!(options.trust_roots, super::TrustRoots::Mozilla);
+        assert!(!options.russian_trusted_root);
         let ctx = Context::new(options).unwrap();
         assert_eq!(ctx.inner.locks.len(), 0);
         let _clone = ctx.clone();

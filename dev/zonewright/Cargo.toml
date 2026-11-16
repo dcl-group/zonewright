@@ -22,6 +22,12 @@ all-providers = [
 inspector = [
     "dep:hickory-proto", "dep:futures-util", "dep:fastrand", "dep:tracing", "tokio/net", "tokio/io-util",
 ]
+# SOCKS5 proxies (`ContextOptions::proxy` with `socks5://` or `socks5h://`). Enabled by no other
+# feature; `reqwest` is built with its `socks` feature only when this one is on.
+socks = ["reqwest?/socks"]
+# `TrustRoots::Platform`: the operating system's trust store through `rustls-platform-verifier`.
+# Enabled by no other feature.
+platform-verifier = ["dep:rustls-platform-verifier"]
 
 acme_dns = ["__http"]
 beget = ["__http"]
@@ -41,8 +47,8 @@ yandex_cloud = ["__http", "__crypto"]
 
 # Internal: groups of optional dependencies. Not part of the public feature set.
 __http = [
-    "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:rustls-pki-types",
-    "dep:bytes", "dep:jiff", "dep:fastrand", "dep:serde_json", "dep:tracing",
+    "dep:reqwest", "dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots", "dep:bytes",
+    "dep:jiff", "dep:fastrand", "dep:serde_json", "dep:tracing",
 ]
 __crypto = ["dep:aws-lc-rs"]
 __xml = ["dep:roxmltree"]
@@ -59,14 +65,20 @@ tokio = { version = "1.54.1", features = ["sync", "time"] }
 # __http (serde_json and tracing also serve rfc2136; tracing also serves the inspector)
 serde_json = { version = "1.0.154", optional = true }
 tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "socks"], optional = true }
+# `rustls-no-provider` also links `rustls-platform-verifier`: `reqwest` 0.13.5 has no rustls feature
+# without it (`Cargo.toml`, `[features]`). It builds that verifier only for a TLS configuration of
+# its own (`async_impl/client.rs`); the crate always passes a preconfigured one (design section 5.1).
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"], optional = true }
 # Must stay on the same 0.23 line as the rustls inside reqwest.
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
-rustls-platform-verifier = { version = "0.7.1", optional = true }
 rustls-pki-types = { version = "1.16.0", optional = true }
+webpki-roots = { version = "1.0.12", optional = true }
 bytes = { version = "1.12.1", optional = true }
 jiff = { version = "1.0.0", default-features = false, features = ["std"], optional = true }
 fastrand = { version = "2.5.0", optional = true }
+
+# platform-verifier
+rustls-platform-verifier = { version = "0.7.1", optional = true }
 
 # __crypto
 aws-lc-rs = { version = "1.19.0", optional = true }

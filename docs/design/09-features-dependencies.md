@@ -13,24 +13,29 @@ No feature is enabled by default (decision 6).
 | one per provider (2.4) | that provider's client and its `AnyProvider` variant | see the `[features]` table of the manifest                                           |
 | `all-providers`        | all fifteen provider features                        | their union                                                                          |
 | `inspector`            | `zonewright::inspector`                              | `hickory-proto`, `futures-util`, `fastrand`, `tracing`; `tokio/net`, `tokio/io-util` |
+| `socks`                | SOCKS5 proxies in `ContextOptions::proxy` (5.1)      | none; `reqwest`'s `socks` feature, when `reqwest` is in the build                    |
+| `platform-verifier`    | `TrustRoots::Platform` (5.1)                         | `rustls-platform-verifier`                                                           |
 
 Provider feature names are the provider IDs, underscores included: `acme_dns`, `cloud_ru`,
 `selectel_v2`, `timeweb_cloud`, `vk_cloud`, `yandex_360`, `yandex_cloud` and the eight one-word IDs.
 A provider then has one spelling everywhere: the persisted ID, the feature, the module, the test
-file. `all-providers` and `inspector` are the only other public features.
+file. `all-providers`, `inspector`, `socks` and `platform-verifier` are the only other public
+features. `socks` and `platform-verifier` are enabled by no other feature, `all-providers` included
+(decided by the maintainer on 2026-11-16, section 13.3); without an HTTP provider they compile and
+change nothing.
 
 Three private features group optional dependencies. Their names start with two underscores, they are
 documented as internal, and they are not part of the SemVer surface:
 
-| Private feature | Dependencies                                                                                                              | Used by                              |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
-| `__http`        | `reqwest`, `rustls`, `rustls-platform-verifier`, `rustls-pki-types`, `bytes`, `jiff`, `fastrand`, `serde_json`, `tracing` | every provider except `rfc2136`      |
-| `__crypto`      | `aws-lc-rs`                                                                                                               | `rfc2136`, `route53`, `yandex_cloud` |
-| `__xml`         | `roxmltree`                                                                                                               | `route53`, `nicru`                   |
+| Private feature | Dependencies                                                                                                  | Used by                              |
+| --------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| `__http`        | `reqwest`, `rustls`, `rustls-pki-types`, `webpki-roots`, `bytes`, `jiff`, `fastrand`, `serde_json`, `tracing` | every provider except `rfc2136`      |
+| `__crypto`      | `aws-lc-rs`                                                                                                   | `rfc2136`, `route53`, `yandex_cloud` |
+| `__xml`         | `roxmltree`                                                                                                   | `route53`, `nicru`                   |
 
 The feature table is the `[features]` table of `dev/zonewright/Cargo.toml`: `default` is empty,
-`all-providers` and `inspector` are listed first, then one entry per provider, then the three
-private features.
+`all-providers`, `inspector`, `socks` and `platform-verifier` are listed first, then one entry per
+provider, then the three private features.
 
 ### 9.2 What compiles with no features
 
@@ -63,16 +68,26 @@ Why each is there, and what is deliberately absent:
 - `reqwest` with `default-features = false` and `rustls-no-provider` only, as `AGENTS.md` requires.
   Not enabled: `json` (bodies are built and parsed by the transport so that secret-bearing bodies
   stay in zeroizing buffers and every response goes through the size cap), `http2`, `charset`,
-  `gzip`, `cookies`, `system-proxy`, `form`, `query`. `socks` is enabled for SOCKS5 proxies (section
-  5.1); in `reqwest` 0.13.5 it is an empty feature that adds no crate.
+  `gzip`, `cookies`, `system-proxy`, `form`, `query`, and `socks` unless the crate's own `socks`
+  feature is on (`socks = ["reqwest?/socks"]`, section 5.1); in `reqwest` 0.13.5 it is an empty
+  feature that adds no crate, but Cargo unifies it into every `reqwest` client of the application.
+  `rustls-no-provider` also brings `rustls-platform-verifier`: every `rustls` feature of `reqwest`
+  0.13.5 does, and `reqwest` builds it only for a TLS configuration of its own, which the crate
+  never lets it build (section 5.1).
 - `rustls` is a direct dependency only to build the `ClientConfig` of section 5.1; its `aws_lc_rs`
   feature provides the provider the crate passes explicitly. It must stay on the same `0.23` line as
   the `rustls` inside `reqwest`: `tls_backend_preconfigured` recognizes the configuration by type,
   and a second `rustls` version in the tree would make it an "unknown backend" error at
   `Context::new`. `rustls` 0.24 (pre-release at the time of writing) removes built-in providers; the
   move is made together with `reqwest`.
-- `rustls-platform-verifier` for the system trust store; on Unix-like systems it reads the system CA
-  files, so containers need them installed.
+- `webpki-roots` (1.0.12, `CDLA-Permissive-2.0`) supplies Mozilla's root certificates as ready
+  `rustls-pki-types` trust anchors (`TLS_SERVER_ROOTS`), which extend a `rustls::RootCertStore`
+  without parsing; it is the set of `TrustRoots::Mozilla`, the default (section 5.1). Its only
+  dependency is `rustls-pki-types`, already in the tree. `webpki-root-certs` (the same roots as
+  certificates to parse) was not needed.
+- `rustls-platform-verifier`, only with the `platform-verifier` feature, for the system trust store
+  of `TrustRoots::Platform`; on Unix-like systems it reads the system CA files, so containers need
+  them installed.
 - `rustls-pki-types` reads PEM (RSA key for Yandex Cloud, client certificate and key for reg.ru,
   extra roots given as PEM in tests).
 - `jiff` is private (decision 7) and minimal: RFC 3339 timestamps of token expiry, the `x-amz-date`

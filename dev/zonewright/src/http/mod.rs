@@ -43,6 +43,7 @@ pub(crate) mod poll;
 pub(crate) mod proxy;
 pub(crate) mod request;
 mod retry;
+pub(crate) mod roots;
 pub(crate) mod tls;
 pub(crate) mod token;
 pub(crate) mod url;
@@ -198,11 +199,11 @@ impl fmt::Debug for Transport {
 
 impl Transport {
     /// Builds the HTTP client of a context from its options (design section 5.1). An invalid
-    /// extra root certificate or proxy setting is `Error::Config`.
+    /// trust setting (an extra root certificate, a set of roots this build cannot provide, no
+    /// root at all) or proxy setting is `Error::Config`.
     pub(crate) fn new(options: &ContextOptions) -> Result<Transport, Error> {
         let provider = tls::crypto_provider();
-        let extra = tls::extra_roots(&options.extra_root_certificates)?;
-        let trust = Trust::platform(extra, &provider)?;
+        let trust = Trust::from_options(options, &provider)?;
         Transport::with_trust(options, provider, trust)
     }
 

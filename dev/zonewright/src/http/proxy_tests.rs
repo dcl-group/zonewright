@@ -7,9 +7,9 @@
 //!
 //! The HTTP proxy is `zonewright_mock::proxy::ProxyServer`; the `https://` proxy is a
 //! [`TlsFront`](super::testing::TlsFront) in front of it; the SOCKS5 proxy is
-//! `zonewright_mock::socks::SocksServer`. Timing follows the rules at the top of
-//! `tests.rs`: lower bounds only where they are the subject, generous upper bounds, and counts
-//! instead of times.
+//! `zonewright_mock::socks::SocksServer`, and the SOCKS5 tests run with the `socks` feature only.
+//! Timing follows the rules at the top of `tests.rs`: lower bounds only where they are the
+//! subject, generous upper bounds, and counts instead of times.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -20,6 +20,7 @@ use secrecy::SecretString;
 use zonewright_mock::axum::Router;
 use zonewright_mock::axum::http::StatusCode;
 use zonewright_mock::proxy::{Behavior, ProxyServer};
+#[cfg(feature = "socks")]
 use zonewright_mock::socks::{Destination, SocksServer};
 use zonewright_mock::{Fault, MockServer};
 
@@ -569,7 +570,7 @@ async fn proxy_setting_child() {
     // Control: a client that reads the environment sends a request for another loopback
     // address to the environment's proxy, so the variables are in effect.
     let provider = super::tls::crypto_provider();
-    let trust = super::tls::Trust::platform(Vec::new(), &provider).unwrap();
+    let trust = super::tls::Trust::from_options(&ContextOptions::default(), &provider).unwrap();
     let control = reqwest::Client::builder()
         .tls_backend_preconfigured(super::tls::client_config(&provider, &trust, None).unwrap())
         .timeout(Duration::from_millis(500))
@@ -662,6 +663,7 @@ fn excluding(mut options: ContextOptions, exclusions: &[&str]) -> ContextOptions
     options
 }
 
+#[cfg(feature = "socks")]
 #[tokio::test]
 async fn requests_go_through_a_socks5_proxy_without_credentials() {
     let server = ok_server().await;
@@ -702,6 +704,7 @@ async fn requests_go_through_a_socks5_proxy_without_credentials() {
     assert_eq!(target.answered.load(Ordering::SeqCst), 2);
 }
 
+#[cfg(feature = "socks")]
 #[tokio::test]
 async fn a_socks5_proxy_gets_the_credentials_with_rfc_1929() {
     let server = ok_server().await;
@@ -725,6 +728,7 @@ async fn a_socks5_proxy_gets_the_credentials_with_rfc_1929() {
     assert_eq!(server.log().len(), 2);
 }
 
+#[cfg(feature = "socks")]
 #[tokio::test]
 async fn a_refused_socks5_authentication_is_proxy_auth_and_not_retried() {
     let server = ok_server().await;
@@ -761,6 +765,7 @@ async fn a_refused_socks5_authentication_is_proxy_auth_and_not_retried() {
     assert_eq!(server.connections(), 0);
 }
 
+#[cfg(feature = "socks")]
 #[tokio::test]
 async fn socks5_resolves_names_locally_and_socks5h_at_the_proxy() {
     let (ca, issuer) = testing::ca();
@@ -912,22 +917,25 @@ async fn excluded_hosts_are_reached_directly() {
     // A SOCKS5 proxy follows the list the same way. `socks5h`, because with `socks5` `reqwest`
     // 0.13.5 hands the bracketed IPv6 host to its resolver, which fails (`connect.rs`,
     // `socks::connect`, `http_resolve`).
-    let socks = SocksServer::start().await;
-    let ctx = testing::context(excluding(
-        with_proxy(&socks.url("socks5h"), false),
-        &["127.0.0.1"],
-    ));
-    let http = testing::http(&ctx, |b| b);
-    assert_eq!(
-        http.send(&get(&server, "/direct")).await.unwrap().status(),
-        200
-    );
-    assert_eq!(socks.connections(), 0);
-    let response = http.send(&Request::get(url(&v6.url("/c")))).await.unwrap();
-    assert_eq!(response.status(), 200);
-    let log = socks.log();
-    assert_eq!(log.len(), 1);
-    assert_eq!(log[0].destination, Some(Destination::Ip(v6.addr)));
+    #[cfg(feature = "socks")]
+    {
+        let socks = SocksServer::start().await;
+        let ctx = testing::context(excluding(
+            with_proxy(&socks.url("socks5h"), false),
+            &["127.0.0.1"],
+        ));
+        let http = testing::http(&ctx, |b| b);
+        assert_eq!(
+            http.send(&get(&server, "/direct")).await.unwrap().status(),
+            200
+        );
+        assert_eq!(socks.connections(), 0);
+        let response = http.send(&Request::get(url(&v6.url("/c")))).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let log = socks.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].destination, Some(Destination::Ip(v6.addr)));
+    }
 }
 
 #[tokio::test]
@@ -952,14 +960,17 @@ async fn an_excluded_host_is_outside_the_proxy_rules() {
     server.faults().push(Fault::any().always().status(407));
     let response = http.send(&get(&server, "/y")).await.unwrap();
     assert_eq!(response.status(), 407);
-    let socks = SocksServer::start().await;
-    let ctx = testing::context(with_proxy(&socks.url("socks5"), false));
-    let response = testing::http(&ctx, |b| b)
-        .send(&get(&server, "/z"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 407);
-    assert_eq!(socks.log().len(), 1);
+    #[cfg(feature = "socks")]
+    {
+        let socks = SocksServer::start().await;
+        let ctx = testing::context(with_proxy(&socks.url("socks5"), false));
+        let response = testing::http(&ctx, |b| b)
+            .send(&get(&server, "/z"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 407);
+        assert_eq!(socks.log().len(), 1);
+    }
     assert_eq!(proxy.connections(), 0);
 }
 
@@ -989,6 +1000,7 @@ fn invalid_exclusions_are_refused_by_the_context() {
 /// The SOCKS5 password, in any spelling, in no error, `Debug` output or `tracing` event: a
 /// refused password, an unreachable proxy, a successful request and a provider error through
 /// the proxy.
+#[cfg(feature = "socks")]
 #[tokio::test]
 async fn the_socks5_password_never_reaches_errors_debug_or_tracing() {
     let server = ok_server().await;

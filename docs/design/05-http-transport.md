@@ -15,9 +15,8 @@ helper used by three clients and nine hand-written variants of it.)
 
 - TLS: the crate builds its own `rustls::ClientConfig` with
   `ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))`,
-  safe default protocol versions, the platform certificate verifier
-  (`rustls_platform_verifier::Verifier::new_with_extra_roots(extra_roots, provider)`) and
-  `alpn_protocols = ["http/1.1"]`, and passes it to `ClientBuilder::tls_backend_preconfigured`.
+  safe default protocol versions, the certificate verifier of the context's trust anchors (below)
+  and `alpn_protocols = ["http/1.1"]`, and passes it to `ClientBuilder::tls_backend_preconfigured`.
   Nothing is installed process-wide and no process-wide default is consulted (decision 3). With
   `reqwest`'s `rustls-no-provider` feature the ordinary builder path panics when no process-wide
   provider is installed; the preconfigured path does not reach that code.
@@ -27,13 +26,58 @@ helper used by three clients and nine hand-written variants of it.)
   a TLS client certificate (reg.ru) gets a second `ClientConfig` built with `with_client_auth_cert`
   and its own `reqwest::Client` with otherwise identical options, through one private constructor in
   the transport.
-- Trust anchors: the platform's, plus `ContextOptions::extra_root_certificates`. On Unix-like
-  systems without system CA certificates the platform verifier cannot be built. `Context::new` then
-  logs one warning and installs a verifier that rejects every certificate with a clear message,
-  instead of failing: plain-HTTP loopback endpoints (tests) keep working, and an HTTPS request fails
-  with `Error::Config` whose detail says that no CA certificates are available. The condition is
-  permanent for the process, so it is not reported as retryable. An invalid extra certificate is
-  `Error::Config`.
+- Trust anchors (decided by the maintainer on 2026-11-16, section 13.3): the set that
+  `ContextOptions::trust_roots` selects, plus the Russian Trusted Root CA when
+  `ContextOptions::russian_trusted_root` is set, plus `ContextOptions::extra_root_certificates`. The
+  same anchors verify provider endpoints and an `https://` proxy.
+  - `TrustRoots::Mozilla`, the default: the roots of Mozilla's CA program, compiled in from the
+    crate `webpki-roots` (`TLS_SERVER_ROOTS`, trust anchors that need no parsing). The verifier is
+    `rustls`'s WebPKI verifier, built with
+    `WebPkiServerVerifier::builder_with_provider(Arc::new(root_store), provider)`: the crate's
+    explicit provider, nothing process-wide. No file of the operating system is read and no platform
+    API is called. Revocation is not checked (the builder's default: no CRLs given).
+  - `TrustRoots::None`: the same verifier over the roots the options add only. With none, there is
+    nothing to verify against, and `Context::new` fails with `Error::Config` ("trust_roots is None
+    and no root certificate was given") rather than build a context whose every HTTPS request fails.
+  - `TrustRoots::Platform`, with the cargo feature `platform-verifier`: the operating system's trust
+    store through `rustls_platform_verifier::Verifier::new_with_extra_roots(extra_roots, provider)`,
+    the Russian root and the extra roots passed as its extra roots; revocation as the platform
+    checks it. On Unix-like systems without system CA certificates that verifier cannot be built.
+    `Context::new` then logs one warning and installs a verifier that rejects every certificate with
+    a clear message, instead of failing: plain-HTTP loopback endpoints (tests) keep working, and an
+    HTTPS request fails with `Error::Config` whose detail says that no CA certificates are
+    available. The condition is permanent for the process, so it is not reported as retryable.
+    Without the feature, `TrustRoots::Platform` is `Error::Config` from `Context::new`, naming the
+    feature. `TrustRoots` has its three variants in every build.
+  - The Russian Trusted Root CA is compiled in (`dev/zonewright/roots/`, read by the private module
+    `http/roots.rs`); only the root, no intermediate certificate, because `rustls` makes every
+    certificate in a root store a trust anchor of its own, and a server sends its intermediates
+    itself. `roots/README.md` records the file's origin, fingerprints and how to replace it.
+  - An invalid extra certificate is `Error::Config`, named by its position, whatever the set.
+  - In a build without an HTTP provider the trust settings are not used and not checked, like the
+    proxy setting.
+
+  Reasons. Trust that does not depend on the machine: the same build trusts the same authorities
+  everywhere, in a container without CA files as on a desktop. The system store becomes an explicit
+  choice, behind a feature that pulls in its verifier. The Russian root is opt-in because every
+  additional authority widens who can issue a certificate the context accepts for any provider's
+  host, not only for the hosts that need it; an application that wants it for some providers only
+  builds two contexts, one with it and one without. A caller-supplied `rustls::ClientConfig` is not
+  accepted (section 13.3).
+
+  Costs. A corporate intercepting proxy, or an internal authority known only to the system store,
+  needs the feature and `TrustRoots::Platform`, or its root in `extra_root_certificates`. Mozilla's
+  set changes with a dependency update (`webpki-roots`), not with the operating system's updates: a
+  root that Mozilla removes stays trusted until the application updates its dependencies.
+
+  What the dependency tree shows. Without `platform-verifier` the crate's own code never builds a
+  platform verifier. The tree still contains `rustls-platform-verifier` (and, on Unix-like targets
+  other than Apple's and Android, `rustls-native-certs`): `reqwest` 0.13.5 links it with each of its
+  `rustls` features, `rustls-no-provider` included (`Cargo.toml`, `[features]`), and builds it only
+  for a TLS configuration of its own (`async_impl/client.rs`, `ClientBuilder::build`), which the
+  crate never lets it build. An application therefore cannot yet prove "no system store" by banning
+  the two crates; it can once `reqwest` offers a `rustls` feature without the platform verifier.
+
 - HTTP/1.1 only. No provider needs HTTP/2, request rates are a few per second at most, and leaving
   it out removes a dependency subtree.
 - Redirects are never followed (`redirect::Policy::none()`). Credentials travel in headers and
@@ -56,11 +100,17 @@ helper used by three clients and nine hand-written variants of it.)
   one described above.
   - Schemes: `http://` and `https://` proxies, and SOCKS5 as `socks5://` (the client resolves the
     provider's host name and gives the proxy an address) or `socks5h://` (the proxy resolves it),
-    through `reqwest`'s `socks` feature (section 9.3). `socks4`, `socks4a` and every other scheme
-    are refused with `Error::Config`, also because `hyper-util`'s matcher silently ignores a scheme
-    it does not know and the request would go out directly. Through SOCKS5 every request is a SOCKS5
-    `CONNECT` (RFC 1928) with the TLS session to the provider inside it; the connection to the
-    SOCKS5 proxy itself is not encrypted.
+    through `reqwest`'s `socks` feature (section 9.3), which the crate enables only through its own
+    feature `socks` (decided by the maintainer on 2026-11-16, section 13.3): Cargo unifies features,
+    so enabling it unconditionally would give SOCKS5 support to every `reqwest` client of an
+    application that never asked for it. Without the feature a `socks5://` or `socks5h://` URL is
+    still parsed and checked like any other, credentials included, and then refused by
+    `Context::new` with `Error::Config` whose text names the feature; `HttpProxy` is the same type
+    in every build. `socks4`, `socks4a` and every other scheme are refused with `Error::Config`,
+    also because `hyper-util`'s matcher silently ignores a scheme it does not know and the request
+    would go out directly. Through SOCKS5 every request is a SOCKS5 `CONNECT` (RFC 1928) with the
+    TLS session to the provider inside it; the connection to the SOCKS5 proxy itself is not
+    encrypted.
   - An `http://` proxy on another host is allowed (decided by the maintainer on 2026-11-15): the
     proxy credentials then travel to the proxy unencrypted, as they do to any SOCKS5 proxy, while
     the provider traffic stays inside TLS. The rustdoc of `HttpProxy` says so; whether that is

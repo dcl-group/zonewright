@@ -129,6 +129,58 @@ mod http {
         assert_eq!(Context::new(options).unwrap_err().kind(), ErrorKind::Config);
     }
 
+    /// The trust settings through the public API: the default is Mozilla's roots, `None` needs a
+    /// root from the options, `Platform` needs its feature.
+    #[test]
+    fn trust_roots_are_checked_by_the_context() {
+        use zonewright::TrustRoots;
+
+        let options = |trust_roots, russian_trusted_root, extra: Vec<Vec<u8>>| {
+            let mut options = ContextOptions::default();
+            options.trust_roots = trust_roots;
+            options.russian_trusted_root = russian_trusted_root;
+            options.extra_root_certificates = extra;
+            options
+        };
+        let default = ContextOptions::default();
+        assert_eq!(default.trust_roots, TrustRoots::Mozilla);
+        assert_eq!(TrustRoots::default(), TrustRoots::Mozilla);
+        assert!(!default.russian_trusted_root);
+        for (trust_roots, russian, extra) in [
+            (TrustRoots::Mozilla, false, Vec::new()),
+            (TrustRoots::Mozilla, true, vec![root_ca()]),
+            (TrustRoots::None, true, Vec::new()),
+            (TrustRoots::None, false, vec![root_ca()]),
+        ] {
+            assert!(
+                Context::new(options(trust_roots, russian, extra)).is_ok(),
+                "{trust_roots:?} {russian}"
+            );
+        }
+        let e = Context::new(options(TrustRoots::None, false, Vec::new())).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Config);
+        assert!(
+            e.to_string()
+                .contains("trust_roots is None and no root certificate was given"),
+            "{e}"
+        );
+        let platform = Context::new(options(TrustRoots::Platform, false, Vec::new()));
+        if cfg!(feature = "platform-verifier") {
+            // Builds on every platform: with system CA certificates, or with the rejecting
+            // verifier of a host without them.
+            assert!(platform.is_ok());
+        } else {
+            let e = platform.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Config);
+            assert!(
+                e.to_string().contains(
+                    "trust_roots is Platform, which needs the `platform-verifier` feature"
+                ),
+                "{e}"
+            );
+        }
+    }
+
     /// The proxy setting through the public API: refusals without echo, and `Debug` without
     /// credentials.
     #[test]
@@ -163,7 +215,9 @@ mod http {
         for url in [
             "http://127.0.0.1:3128",
             "https://[::1]:8443",
+            #[cfg(feature = "socks")]
             "socks5://127.0.0.1:1080",
+            #[cfg(feature = "socks")]
             "socks5h://[::1]:1080",
         ] {
             let options = with(url, true);
@@ -181,7 +235,12 @@ mod http {
         assert_eq!(e.kind(), ErrorKind::Config);
         assert!(e.to_string().contains("proxy.exclusions[1]"), "{e}");
         assert!(!e.to_string().contains("example"), "{e}");
-        let mut options = with("socks5h://127.0.0.1:1080", true);
+        let proxy_url = if cfg!(feature = "socks") {
+            "socks5h://127.0.0.1:1080"
+        } else {
+            "http://127.0.0.1:3128"
+        };
+        let mut options = with(proxy_url, true);
         options.proxy = options.proxy.map(|p| {
             p.with_exclusions(vec![
                 "api.example.test".to_owned(),
@@ -196,6 +255,37 @@ mod http {
         assert!(!format!("{options:?}").contains("canary"));
         // Without the setting the default is no proxy.
         assert!(ContextOptions::default().proxy.is_none());
+    }
+
+    /// Without the `socks` feature a SOCKS5 proxy is refused when the context is built, with a
+    /// text that names the feature and repeats neither the URL nor a credential.
+    #[cfg(not(feature = "socks"))]
+    #[test]
+    fn a_socks5_proxy_needs_the_socks_feature() {
+        use secrecy::SecretString;
+        use zonewright::HttpProxy;
+
+        for url in ["socks5://127.0.0.1:1080", "socks5h://[::1]:1080"] {
+            for credentials in [false, true] {
+                let mut proxy = HttpProxy::new(url.to_owned());
+                if credentials {
+                    proxy = proxy.with_credentials(
+                        "proxy-user".to_owned(),
+                        SecretString::from("pr0xy-pa55-canary".to_owned()),
+                    );
+                }
+                let mut options = ContextOptions::default();
+                options.proxy = Some(proxy);
+                let e = Context::new(options).unwrap_err();
+                assert_eq!(e.kind(), ErrorKind::Config, "{url}");
+                let text = format!("{e} {e:?}");
+                assert!(
+                    text.contains("proxy.url uses SOCKS5, which needs the `socks` feature"),
+                    "{text}"
+                );
+                assert!(!text.contains("canary") && !text.contains("1080"), "{text}");
+            }
+        }
     }
 
     /// A provider client built through the public API reaches its API through the proxy: the

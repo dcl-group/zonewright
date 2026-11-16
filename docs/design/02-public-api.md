@@ -247,7 +247,7 @@ with a `#[cfg]` on each arm.
 
 ### 2.8 Configuration, credentials and the shared context
 
-- `Context`, `ContextOptions`, `HttpProxy` — `src/context.rs`.
+- `Context`, `ContextOptions`, `HttpProxy`, `TrustRoots` — `src/context.rs`.
 
 Not stated in the rustdoc:
 
@@ -255,10 +255,20 @@ Not stated in the rustdoc:
 - `HttpProxy`'s `Debug` shows the URL, withheld if it contains `@`, and whether credentials are set
   (a code comment in the `Debug` impl in `src/context.rs`, not rustdoc).
 
+`ContextOptions` selects the certificate authorities of HTTPS (section 5.1): `trust_roots`, a
+`TrustRoots` (`Mozilla`, the default: Mozilla's roots compiled in; `Platform`: the operating
+system's trust store, with the `platform-verifier` feature; `None`: only the roots the options add),
+`russian_trusted_root` (default false: the compiled-in Russian Trusted Root CA in addition), and
+`extra_root_certificates` (DER certificates in addition to both). `TrustRoots` has its three
+variants in every build, like `ContextOptions` itself, and no type of `rustls`, `rustls-pki-types`
+or `webpki-roots` appears in these signatures.
+
 `Context::new` checks the options and fails with `Error::Config` for an empty or longer user agent
 suffix or one outside printable ASCII, a zero timeout, and, when an HTTP provider is compiled in, an
-extra root certificate that is not a usable DER trust anchor or a proxy setting that section 5.1
-refuses. It makes no connection and needs no `tokio` runtime.
+extra root certificate that is not a usable DER trust anchor, `TrustRoots::Platform` without the
+`platform-verifier` feature, `TrustRoots::None` with no root added by the options, or a proxy
+setting that section 5.1 refuses (a SOCKS5 proxy without the `socks` feature included). It makes no
+connection and needs no `tokio` runtime.
 
 The proxy setting is a struct rather than a URL string so that the proxy password lives in a
 `SecretString` like every other credential: a URL with embedded user info would carry it as plain

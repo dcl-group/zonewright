@@ -44,7 +44,7 @@ use super::testing::{self, SilentServer, TlsServer};
 use super::tls::{self, Trust};
 use super::token::{Token, TokenSource};
 use super::url::Endpoint;
-use super::{Http, HttpBuilder, Transport, encode};
+use super::{Http, HttpBuilder, encode};
 
 // --- helpers ---
 
@@ -191,8 +191,41 @@ async fn https_fails_without_the_extra_root() {
     assert_eq!(e.kind(), ErrorKind::Config, "{e}");
     assert!(!e.is_retryable());
     assert!(e.to_string().contains("certificate"), "{e}");
+    // Refused as untrusted after a handshake, not as the missing-CA condition.
+    assert!(!e.to_string().contains("no CA certificates"), "{e}");
     assert_eq!(server.connections.load(Ordering::SeqCst), 1);
     assert_eq!(server.answered.load(Ordering::SeqCst), 0);
+}
+
+/// `TrustRoots::None` with the test CA as the only root: the CA's server is accepted; another
+/// CA's server is refused, since no built-in root is left to accept it.
+#[tokio::test]
+async fn trust_roots_none_trusts_only_the_given_roots() {
+    let (ca, issuer) = testing::ca();
+    let (leaf, key) = testing::server_cert(&issuer);
+    let server = TlsServer::start(vec![leaf], key);
+    let (_, other_issuer) = testing::ca();
+    let (other_leaf, other_key) = testing::server_cert(&other_issuer);
+    let other = TlsServer::start(vec![other_leaf], other_key);
+    let mut options = testing::options();
+    options.trust_roots = crate::context::TrustRoots::None;
+    options.extra_root_certificates = vec![ca.der().to_vec()];
+    let http = testing::http(&testing::context(options.clone()), |b| b);
+    let response = http.send(&Request::get(url(&server.url()))).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let e = http
+        .send(&Request::get(url(&other.url())))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Config, "{e}");
+    assert!(e.to_string().contains("certificate"), "{e}");
+    assert_eq!(other.answered.load(Ordering::SeqCst), 0);
+    // The Russian root added to the set changes neither outcome.
+    options.russian_trusted_root = true;
+    let http = testing::http(&testing::context(options), |b| b);
+    let response = http.send(&Request::get(url(&server.url()))).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(http.send(&Request::get(url(&other.url()))).await.is_err());
 }
 
 #[tokio::test]
@@ -214,10 +247,11 @@ async fn a_server_certificate_for_another_name_is_refused_without_retry() {
     assert_eq!(server.connections.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(feature = "platform-verifier")]
 #[tokio::test]
 async fn no_ca_certificates_refuse_https_before_connecting_and_keep_http() {
     let provider = tls::crypto_provider();
-    let transport = Transport::with_trust(
+    let transport = super::Transport::with_trust(
         &testing::options(),
         provider.clone(),
         Trust::reject_all(&provider),
@@ -366,7 +400,7 @@ async fn proxy_child() {
     // Control: a client built the same way but without `no_proxy` uses the proxy from the
     // environment, so the variables are in effect and the check above is not vacuous.
     let provider = tls::crypto_provider();
-    let trust = Trust::platform(Vec::new(), &provider).unwrap();
+    let trust = Trust::from_options(&ContextOptions::default(), &provider).unwrap();
     let control = reqwest::Client::builder()
         .tls_backend_preconfigured(tls::client_config(&provider, &trust, None).unwrap())
         .timeout(Duration::from_millis(500))

@@ -221,5 +221,26 @@ Added after review:
 62. **A whole-set client does not repair surplus singleton records.** Section 3.4. It answers
     `Error::Protocol` and writes nothing; no whole-set API is known to return such a set (decided by
     the maintainer on 2026-11-16).
+63. **The default trust set is Mozilla's roots, compiled in.** Decided by the maintainer on
+    2026-11-16. Section 5.1. `TrustRoots::Mozilla`, from `webpki-roots`, verified by `rustls`'s
+    WebPKI verifier with the crate's provider; what a context trusts does not depend on the machine.
+    `TrustRoots::None` leaves only the roots the options add.
+64. **The operating system's trust store is an optional feature.** Decided by the maintainer on
+    2026-11-16. Section 5.1. `TrustRoots::Platform` needs the cargo feature `platform-verifier`,
+    which no other feature enables; without it the variant is `Error::Config` from `Context::new`.
+65. **The Russian Trusted Root CA is compiled in and opt-in.** Decided by the maintainer on
+    2026-11-16. Section 5.1. `ContextOptions::russian_trusted_root`, default false: an additional
+    authority can issue a certificate for any provider's host, so it is trusted only when the
+    application asks, per context.
+66. **A caller-supplied `rustls::ClientConfig` is not accepted.** Decided by the maintainer on
+    2026-11-16. It would put a `rustls` type into the public API and tie the crate's version to
+    `rustls`'s; and it would bypass what the crate guarantees itself: the explicit crypto provider
+    (decision 3), ALPN `http/1.1`, the client identity of a provider that needs one, and the
+    verification of an `https://` proxy with the context's anchors. Trust is chosen with
+    `TrustRoots`, `russian_trusted_root` and `extra_root_certificates` instead.
+67. **SOCKS5 support is the cargo feature `socks`.** Decided by the maintainer on 2026-11-16.
+    Section 5.1. Cargo unifies features, so `reqwest`'s `socks` enabled unconditionally would reach
+    every `reqwest` client of the application. Without the feature a `socks5://` or `socks5h://`
+    proxy is `Error::Config`; `HttpProxy` is the same in every build.
 
 Section 13.4, the open points, is in [`13-open-points.md`](./13-open-points.md).
