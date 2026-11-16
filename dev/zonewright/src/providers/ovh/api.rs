@@ -379,18 +379,47 @@ impl Drop for Flight<'_> {
     }
 }
 
-/// True when a record write that failed may still have been applied, or be applied later, by
-/// the provider: `unsent` is false (the transport is not certain that nothing was sent, see
-/// `SendError::certainly_unsent` of the transport), and `kind` is not the provider's refusal
-/// (`401`, `403`, `429`, or a `3xx` the transport mapped to `Rejected`). A timeout, a connection
-/// broken after it was established, a `5xx` and an answer that cannot be read are such failures.
-/// The same reading as the `acme_dns` client's.
-fn unknown_outcome(unsent: bool, kind: ErrorKind) -> bool {
-    !unsent
-        && !matches!(
+/// How a record write ended, as far as the transport tells: answered with a status (the
+/// answer of the last attempt), or failed, with whether the transport is certain that no
+/// attempt reached the provider and the kind of the error.
+#[derive(Clone, Copy, Debug)]
+enum Ended {
+    Answered(u16),
+    Failed { unsent: bool, kind: ErrorKind },
+}
+
+/// True when a record write that ended as `ended` may still have been applied, or be applied
+/// later, by the provider.
+///
+/// A write sent once (`repeatable` false) is unsure when it failed, the transport is not certain
+/// that nothing was sent, and the error is not the provider's refusal (`401`, `403`, `429`, or a
+/// `3xx` the transport mapped to `Rejected`): a timeout, a connection broken after it was
+/// established, a `5xx`, an answer that cannot be read. An answer is certain. The same reading
+/// as the `acme_dns` client's.
+///
+/// A write the transport may repeat (`repeatable`: the delete of a record by its identifier) is
+/// judged by its last attempt only, while an earlier attempt that timed out or was answered
+/// `5xx` may have reached the provider. It is therefore unsure unless it succeeded, was answered
+/// `404`, or certainly never left: a late earlier attempt of the same delete changes nothing
+/// after a success or a `404`, but may still apply after any other end.
+fn unknown_outcome(repeatable: bool, ended: Ended) -> bool {
+    match ended {
+        Ended::Answered(status) => repeatable && !(200..300).contains(&status) && status != 404,
+        Ended::Failed { unsent: true, .. } => false,
+        Ended::Failed {
+            unsent: false,
             kind,
-            ErrorKind::Auth | ErrorKind::Forbidden | ErrorKind::RateLimited | ErrorKind::Rejected
-        )
+        } => {
+            repeatable
+                || !matches!(
+                    kind,
+                    ErrorKind::Auth
+                        | ErrorKind::Forbidden
+                        | ErrorKind::RateLimited
+                        | ErrorKind::Rejected
+                )
+        }
+    }
 }
 
 /// A snapshot of the counters of one zone, taken when an operation starts.
@@ -529,7 +558,19 @@ impl Api {
     /// one that fails later, even before any byte left (a second read of the clock, the
     /// signature, the connection), is counted and costs a refresh. A write that ends with an
     /// unknown outcome ([`unknown_outcome`]) or by a dropped future is counted as unsure.
-    async fn send_write(&self, zone: &DomainName, request: Request) -> Result<Response, Error> {
+    /// `repeatable` marks the request idempotent, so that the transport may repeat it, and is
+    /// the one place that decides it, so that the judgment of its end cannot disagree.
+    async fn send_write(
+        &self,
+        zone: &DomainName,
+        request: Request,
+        repeatable: bool,
+    ) -> Result<Response, Error> {
+        let request = if repeatable {
+            request.idempotent()
+        } else {
+            request
+        };
         self.ensure_clock().await?;
         self.with_marks(zone, |m| {
             m.writes = m.writes.saturating_add(1);
@@ -551,10 +592,14 @@ impl Api {
             .http
             .try_send(&request.finish_with(self.signer.clone()))
             .await;
-        flight.unsure = result
-            .as_ref()
-            .err()
-            .is_some_and(|e| unknown_outcome(e.certainly_unsent(), e.error().kind()));
+        let ended = match &result {
+            Ok(response) => Ended::Answered(response.status()),
+            Err(e) => Ended::Failed {
+                unsent: e.certainly_unsent(),
+                kind: e.error().kind(),
+            },
+        };
+        flight.unsure = unknown_outcome(repeatable, ended);
         drop(flight);
         Ok(result?)
     }
@@ -714,7 +759,7 @@ impl Api {
     ) -> Result<(), Error> {
         let url = self.zone_url(zone).path("/record").build()?;
         let request = Request::new(Method::POST, url).json(record)?;
-        let response = self.send_write(zone, request).await?;
+        let response = self.send_write(zone, request, false).await?;
         if response.status() == 404 {
             let refusal = self.refusal(&response);
             return Err(self.zone_missing_or(zone, refusal).await);
@@ -736,7 +781,7 @@ impl Api {
     ) -> Result<Written, Error> {
         let url = self.record_url(zone, id)?;
         let request = Request::new(Method::PUT, url).json(update)?;
-        let response = self.send_write(zone, request).await?;
+        let response = self.send_write(zone, request, false).await?;
         self.written(&response)
     }
 
@@ -746,7 +791,7 @@ impl Api {
     pub(super) async fn delete_record(&self, zone: &DomainName, id: u64) -> Result<Written, Error> {
         let url = self.record_url(zone, id)?;
         let response = self
-            .send_write(zone, Request::new(Method::DELETE, url).idempotent())
+            .send_write(zone, Request::new(Method::DELETE, url), true)
             .await?;
         self.written(&response)
     }
@@ -1003,9 +1048,10 @@ pub(super) fn error_class(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLOCK_MAX_AGE, Filter, Outgoing, ServerClock, Signer, WireRecord, checked, error_class,
-        error_message, filter_for, owner, stated_ttl,
+        CLOCK_MAX_AGE, Ended, Filter, Outgoing, ServerClock, Signer, WireRecord, checked,
+        error_class, error_message, filter_for, owner, stated_ttl, unknown_outcome,
     };
+    use crate::error::ErrorKind;
     use crate::name::DomainName;
     use reqwest::header::HeaderValue;
     use reqwest::{Method, Url};
@@ -1175,5 +1221,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.sub_domain, None);
+    }
+
+    /// Which ends of a record write leave its outcome unknown, for a write sent once and for
+    /// the delete the transport may repeat.
+    #[test]
+    fn unknown_outcomes() {
+        let failed = |unsent, kind| Ended::Failed { unsent, kind };
+        for status in [200, 204, 400, 404, 409] {
+            assert!(!unknown_outcome(false, Ended::Answered(status)), "{status}");
+        }
+        for status in [200, 204, 404] {
+            assert!(!unknown_outcome(true, Ended::Answered(status)), "{status}");
+        }
+        for status in [400, 409] {
+            assert!(unknown_outcome(true, Ended::Answered(status)), "{status}");
+        }
+        for kind in [
+            ErrorKind::Auth,
+            ErrorKind::Forbidden,
+            ErrorKind::RateLimited,
+            ErrorKind::Rejected,
+        ] {
+            assert!(!unknown_outcome(false, failed(false, kind)), "{kind:?}");
+            assert!(unknown_outcome(true, failed(false, kind)), "{kind:?}");
+            assert!(!unknown_outcome(true, failed(true, kind)), "{kind:?}");
+        }
+        for kind in [ErrorKind::Transient, ErrorKind::Protocol, ErrorKind::Config] {
+            assert!(unknown_outcome(false, failed(false, kind)), "{kind:?}");
+            assert!(unknown_outcome(true, failed(false, kind)), "{kind:?}");
+            assert!(!unknown_outcome(false, failed(true, kind)), "{kind:?}");
+            assert!(!unknown_outcome(true, failed(true, kind)), "{kind:?}");
+        }
     }
 }

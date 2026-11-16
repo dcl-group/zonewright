@@ -1380,9 +1380,11 @@ async fn ovh_write_with_an_unknown_outcome_is_owed_once_more() {
     assert_eq!(refreshes(&mock), before + 1);
 }
 
-/// One operation alone: a write the provider refused is certain and costs no further refresh
-/// after the operation's own; a write that failed without an answer, or with a `5xx`, costs one
-/// more, sent by the next operation in the zone, and then none.
+/// One operation alone: a create the provider refused (`400`, `401`, `403`, `429`) is certain
+/// and costs no further refresh after the operation's own; a create that failed without an
+/// answer, or with a `5xx`, costs one more, sent by the next operation in the zone, and then
+/// none. (A failure the transport is certain never left cannot be produced against the mock; the
+/// unit test `unknown_outcomes` covers it.)
 #[tokio::test]
 async fn ovh_only_writes_with_an_unknown_outcome_are_owed_once_more() {
     let (mock, client) = setup().await;
@@ -1392,14 +1394,27 @@ async fn ovh_only_writes_with_an_unknown_outcome_are_owed_once_more() {
             .await
             .unwrap()
     };
-    mock.faults().push(
-        Fault::on("POST", RECORDS).respond(400, r#"{"class":"Client::BadRequest","message":"x"}"#),
-    );
-    let e = add(&client, "AAA").await.unwrap_err();
-    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
-    assert_eq!(refreshes(&mock), 1);
-    read().await;
-    assert_eq!(refreshes(&mock), 1);
+    for (fault, kind) in [
+        (
+            Fault::on("POST", RECORDS)
+                .respond(400, r#"{"class":"Client::BadRequest","message":"x"}"#),
+            ErrorKind::Rejected,
+        ),
+        (Fault::on("POST", RECORDS).status(401), ErrorKind::Auth),
+        (Fault::on("POST", RECORDS).status(403), ErrorKind::Forbidden),
+        (
+            Fault::on("POST", RECORDS).rate_limited("120"),
+            ErrorKind::RateLimited,
+        ),
+    ] {
+        mock.faults().push(fault);
+        let before = refreshes(&mock);
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), kind, "{e:?}");
+        assert_eq!(refreshes(&mock), before + 1);
+        read().await;
+        assert_eq!(refreshes(&mock), before + 1);
+    }
 
     for fault in [
         Fault::on("POST", RECORDS).drop_connection(),
@@ -1415,6 +1430,128 @@ async fn ovh_only_writes_with_an_unknown_outcome_are_owed_once_more() {
         read().await;
         assert_eq!(refreshes(&mock), before + 2);
     }
+}
+
+/// The delete of a record is repeated by the transport. When its first attempt was answered
+/// `503` (it may have reached the provider) and a later one ended in a known way that is not a
+/// success or a `404` (a `429` with a long wait, a refusal), the first attempt may still be
+/// applied after the operation's refresh: the zone is owed once more, the next read refreshes
+/// and the one after does not. A delete that ends in a success after a `503` costs nothing extra.
+#[tokio::test]
+async fn ovh_repeated_delete_that_did_not_succeed_is_owed_once_more() {
+    let (mock, client) = setup().await;
+    let read = || async {
+        client
+            .get_rrset(&zone(), &name(), RecordType::TXT)
+            .await
+            .unwrap()
+    };
+    assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
+    for (last, kind) in [
+        (
+            Fault::on("DELETE", RECORD).rate_limited("120"),
+            ErrorKind::RateLimited,
+        ),
+        (
+            Fault::on("DELETE", RECORD)
+                .respond(400, r#"{"class":"Client::BadRequest","message":"x"}"#),
+            ErrorKind::Rejected,
+        ),
+        (
+            Fault::on("DELETE", RECORD).status(403),
+            ErrorKind::Forbidden,
+        ),
+    ] {
+        mock.faults().push(Fault::on("DELETE", RECORD).status(503));
+        mock.faults().push(last);
+        let deletes = mock.log().count(Some("DELETE"), RECORD);
+        let before = refreshes(&mock);
+        let e = remove(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), kind, "{e:?}");
+        assert_eq!(mock.log().count(Some("DELETE"), RECORD), deletes + 2);
+        assert_eq!(refreshes(&mock), before + 1);
+        read().await;
+        assert_eq!(refreshes(&mock), before + 2);
+        read().await;
+        assert_eq!(refreshes(&mock), before + 2);
+    }
+    mock.faults().push(Fault::on("DELETE", RECORD).status(503));
+    let before = refreshes(&mock);
+    assert_eq!(
+        remove(&client, "AAA").await.unwrap(),
+        RemoveOutcome::RrsetDeleted
+    );
+    assert_eq!(refreshes(&mock), before + 1);
+    read().await;
+    assert_eq!(refreshes(&mock), before + 1);
+}
+
+/// Two refreshes holding different snapshots of the marks of unsure writes complete in the
+/// reverse order of their sending. B's create fails without an answer while R1 (sent before it,
+/// by an operation at another name) is held. R2, a read's refresh sent after B's own refresh
+/// succeeded, settles B and succeeds first; R1, whose snapshot predates B, succeeds last and must
+/// not take back what R2 settled: nothing is owed afterwards.
+#[tokio::test]
+async fn ovh_late_refresh_does_not_unsettle_an_unsure_write() {
+    let (mock, client) = setup().await;
+    let first = mock.control().hold_refreshes(1);
+    let e_op = add_other(&client, "CCC");
+    tokio::pin!(e_op);
+    tokio::select! {
+        _ = &mut e_op => panic!("the operation ended while its refresh was held"),
+        () = held(&first, 1) => {}
+    }
+    // B: its create is answered by a closed connection; its own refresh passes.
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).drop_connection());
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    // R2: B is owed once more; the read's refresh is held, then released first.
+    let second = mock.control().hold_refreshes(1);
+    let (z, n) = (zone(), name());
+    let read = client.get_rrset(&z, &n, RecordType::TXT);
+    tokio::pin!(read);
+    tokio::select! {
+        _ = &mut read => panic!("the read ended while its refresh was held"),
+        () = held(&second, 1) => {}
+    }
+    second.release();
+    read.await.unwrap();
+    first.release();
+    assert_eq!(e_op.await.unwrap(), AddOutcome::Created);
+    let before = refreshes(&mock);
+    client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(refreshes(&mock), before);
+}
+
+/// The same for the first stage of an unsure write. R1, held, was sent before B's create failed
+/// without an answer; B's own refresh succeeds and counts B once. R1 then succeeds with its older
+/// snapshot and must not take that back: the next read's refresh settles B, and the read after it
+/// sends none.
+#[tokio::test]
+async fn ovh_late_refresh_does_not_undo_the_first_refresh_of_an_unsure_write() {
+    let (mock, client) = setup().await;
+    let first = mock.control().hold_refreshes(1);
+    let e_op = add_other(&client, "CCC");
+    tokio::pin!(e_op);
+    tokio::select! {
+        _ = &mut e_op => panic!("the operation ended while its refresh was held"),
+        () = held(&first, 1) => {}
+    }
+    mock.faults()
+        .push(Fault::on("POST", RECORDS).drop_connection());
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    first.release();
+    assert_eq!(e_op.await.unwrap(), AddOutcome::Created);
+    let before = refreshes(&mock);
+    client
+        .get_rrset(&zone(), &name(), RecordType::TXT)
+        .await
+        .unwrap();
+    assert_eq!(refreshes(&mock), before + 1);
+    client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(refreshes(&mock), before + 1);
 }
 
 /// Two refreshes in flight complete in the reverse order of their sending: the later one, which

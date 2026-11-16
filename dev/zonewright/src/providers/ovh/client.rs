@@ -93,12 +93,15 @@ use super::records::Unstated;
 ///   succeeds. While writes of this client in the zone overlap without a gap, a refresh therefore
 ///   stays owed and every read in the zone refreshes first.
 /// - A record write that ended without a certain outcome (no answer: a timeout or a connection
-///   broken after it was established; a `5xx`; an answer that cannot be read; or its future
-///   dropped while it was in flight) may still be applied by the provider later, also after the
-///   refresh its own operation sends on its way out. Such a write stays owed until a second
+///   broken after it was established; a `5xx`; an answer that cannot be read; its future dropped
+///   while it was in flight; or a delete that did not end in a success or a `404`, since the
+///   transport may have repeated it after an attempt that could have reached the provider) may
+///   still be applied by the provider later, also after the refresh its own operation sends on
+///   its way out. Such a write stays owed until a second
 ///   refresh succeeds, sent after the first one succeeded: the client's next operation in the
-///   zone refreshes once more. A write the provider refused, or one the transport is certain it
-///   never sent, costs nothing extra.
+///   zone refreshes once more. A create or a change the provider refused, and a write the
+///   transport is certain it never sent, cost nothing extra; a refused delete costs one refresh
+///   more.
 ///
 /// What is not guaranteed: the mark lives in the client and is lost with it or with the process.
 /// A change staged by a dropped future or a failed refresh and then forgotten that way is published
