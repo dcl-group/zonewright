@@ -100,6 +100,10 @@ The first release.
   Cloud.ru (`CloudRu`), Hetzner (`Hetzner`), nic.ru (`Nicru`) and reg.ru (`Regru`, without zone
   listing). With TXT value operations only: acme-dns (`AcmeDns`, add only) and Beget (`Beget`). The
   record types and limits of each are in `PROVIDERS.md`.
+- Selectel v2 deletes an rrset that a web resource manages (`managed_by`) like any other, by
+  `delete_rrset` and by the removal of its last TXT value; the delete carries the managing resource
+  in the `X-Managed-By` header as read. Taking a record over from an external tool is the
+  application's decision.
 - Guarantees: HTTP clients use `reqwest` with `rustls` and `aws-lc-rs`; `ring`, OpenSSL and
   `native-tls` are not in the dependency tree; the crate never installs a process-wide crypto
   provider. Secrets are held in `secrecy` wrappers and never appear in `Debug` output, error text or
