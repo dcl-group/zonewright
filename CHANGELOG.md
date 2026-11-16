@@ -6,6 +6,12 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.4 - 2026-11-17
+
+Compatible with 0.2.3.
+
 ### Added
 
 - `zonewright-mock`: `ovh::Control::hold_writes` and `ovh::Control::hold_refreshes` hold record

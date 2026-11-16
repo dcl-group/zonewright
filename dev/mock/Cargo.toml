@@ -1,6 +1,6 @@
 [package]
 name = "zonewright-mock"
-version = "0.2.3"
+version = "0.2.4"
 description = "Stateful mock DNS provider APIs for testing zonewright and the applications that use it, without live accounts."
 edition.workspace = true
 rust-version.workspace = true
