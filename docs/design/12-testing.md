@@ -67,6 +67,11 @@ For every client, in its own test file:
 - RFC 2136 has no HTTP echo. Its equivalent, `rfc2136_secret_not_in_errors`, asserts that the TSIG
   secret, in base64 and in hex, does not occur in any error or `Debug` output across the error paths
   of its mock.
+- `<id>_refusal_carries_the_provider_code` and `<id>_provider_code_never_carries_a_credential`, for
+  every client that reads a provider code from an answer: a refusal carries the code of the
+  documented error body, and a code that repeats a credential is not carried and leaves no trace of
+  it in the error. RFC 2136 builds its codes from its own table of RCODE mnemonics, so nothing the
+  server sends enters them; its file tests them under other names.
 - `<id>_no_secret_in_logs`. A `tracing` subscriber at `TRACE` captures everything while the client
   goes through a success, a 401 and a 500; the capture must contain the transport's event and none
   of the canaries or issued tokens.
@@ -123,10 +128,11 @@ with zero requests (every endpoint of the sample configuration points at a loopb
 UDP socket that must see nothing), every default endpoint being `https`, a scan that no file under
 `src/providers/` calls `Detail::new` or a text-taking `Error` constructor, and a scan that every
 provider's test file defines the required test names of sections 12.2 and 12.3, derived from the
-provider's capabilities (and, for `stale_zone_id`, from whether its sources use the zone-ID cache),
-with one explicit exception: `rfc2136` has its own secret test instead of `secret_echo`. It reports
-every missing name of every provider at once. The scan is what keeps "tests cover this for every
-client" true when a provider is added.
+provider's capabilities (and, for `stale_zone_id`, from whether its sources use the zone-ID cache;
+for the two provider-code tests, from whether its sources read a provider code), with two explicit
+exceptions: `rfc2136` has its own secret test instead of `secret_echo`, and it is not held to the
+provider-code tests. It reports every missing name of every provider at once. The scan is what keeps
+"tests cover this for every client" true when a provider is added.
 
 Four of these checks compare the crate with files of the repository: the comparisons with
 `PROVIDERS.md` (identifiers, names, verified flags) and the one that the license texts in the crate

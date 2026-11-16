@@ -1362,6 +1362,11 @@ fn provider_sources_use_no_text_constructors() {
 
 /// True when a file of the provider's module under `src/providers/<id>/` contains `needle`.
 fn provider_sources_contain(id: ProviderId, needle: &str) -> bool {
+    provider_sources_any(id, |text| text.contains(needle))
+}
+
+/// True when a file of the provider's module under `src/providers/<id>/` satisfies `test`.
+fn provider_sources_any(id: ProviderId, test: impl Fn(&str) -> bool) -> bool {
     let mut files = Vec::new();
     rust_files(
         &manifest_dir().join("src/providers").join(id.as_str()),
@@ -1369,7 +1374,21 @@ fn provider_sources_contain(id: ProviderId, needle: &str) -> bool {
     );
     files
         .iter()
-        .any(|path| std::fs::read_to_string(path).unwrap().contains(needle))
+        .any(|path| test(&std::fs::read_to_string(path).unwrap()))
+}
+
+/// Whether `text` gives an error a provider code: it installs a code reader on the HTTP builder
+/// (`.code(api::error_code)`), asks the scrubber for one (`.scrubber().code(&code)`), sets one
+/// with `with_code`, or builds one with `ProviderCode::new`. A call `.code()` without an argument
+/// is another method (the numeric code of a record type) and does not count. Whitespace is
+/// ignored, so that the formatter's line breaks do not matter.
+fn makes_provider_codes(text: &str) -> bool {
+    let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    text.contains(".with_code(")
+        || text.contains("ProviderCode::new(")
+        || text
+            .match_indices(".code(")
+            .any(|(at, call)| !text[at + call.len()..].starts_with(')'))
 }
 
 /// The methods of the `impl Provider for` block in `text`: method name -> body, the body being
@@ -1503,6 +1522,8 @@ fn the_operation_event_scan_reads_methods() {
 }
 
 /// Every provider defines the tests that sections 12.2 and 12.3 require in its own test file.
+/// Which ones are required is derived from its capabilities and, where the capabilities do not
+/// say it, from its sources.
 /// Every missing test of every provider is reported together.
 #[test]
 fn provider_test_files_define_the_required_tests() {
@@ -1529,6 +1550,16 @@ fn provider_test_files_define_the_required_tests() {
         // it caches them is read from its sources: the shared cache is `ZoneCache`.
         if provider_sources_contain(id, "ZoneCache") {
             required.push("stale_zone_id");
+        }
+        // Hard rule 1 and design 12.2: a client that carries a provider code tests that a refusal
+        // carries it and that a code echoing a credential is dropped. Whether it carries one is
+        // read from its sources. RFC 2136 builds its codes from its own table of RCODE mnemonics;
+        // nothing the server sends enters them, and its file tests them under other names.
+        if id != ProviderId::Rfc2136 && provider_sources_any(id, makes_provider_codes) {
+            required.extend([
+                "refusal_carries_the_provider_code",
+                "provider_code_never_carries_a_credential",
+            ]);
         }
         if caps.add_txt_value {
             required.extend(["add_is_idempotent", "concurrent_adds_are_serialized"]);
@@ -1620,6 +1651,32 @@ fn a_required_test_must_be_a_test_that_runs() {
         "#[tokio::test]\nasync fn x_secret_echo_more() {",
         name
     ));
+}
+
+#[test]
+fn the_provider_code_scan_reads_the_ways_to_make_one() {
+    assert!(makes_provider_codes(
+        "let http = Http::builder(ctx)\n    .code(api::error_code)\n    .build()?;"
+    ));
+    assert!(makes_provider_codes(
+        "let c = self.http.scrubber().code(&code);"
+    ));
+    assert!(makes_provider_codes(
+        "self.http\n    .scrubber()\n    .code(\n        code,\n    )"
+    ));
+    assert!(makes_provider_codes(
+        "self.http.reject(response).with_code(code)"
+    ));
+    assert!(makes_provider_codes("ProviderCode::new(mnemonic)"));
+    // The numeric code of a record type is another method.
+    assert!(!makes_provider_codes("let n = rtype.code().ok_or(e)?;"));
+    assert!(!makes_provider_codes(
+        "let n = rtype\n    .code ()\n    .ok_or(e)?;"
+    ));
+    assert!(!makes_provider_codes(
+        "fn error_code(body: &str) -> Option<&str> {"
+    ));
+    assert!(!makes_provider_codes(""));
 }
 
 /// Both crate directories carry the license texts, so that they are in the published packages;

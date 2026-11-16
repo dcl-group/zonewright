@@ -2063,11 +2063,7 @@ async fn a_declared_unix_reset_header_gives_the_wait() {
     server.faults().push(quota(3600).always());
     let started = Instant::now();
     let e = http.send(&get(&server, "/x")).await.unwrap_err();
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "{:?}",
-        started.elapsed()
-    );
+    assert!(started.elapsed() < GENEROUS, "{:?}", started.elapsed());
     let wait = e.retry_after().unwrap();
     assert!(
         wait > Duration::from_secs(3590) && wait <= Duration::from_secs(3600),
