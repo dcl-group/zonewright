@@ -22,9 +22,10 @@ use zonewright::{
     SetOutcome, Ttl, Txt,
 };
 use zonewright_mock::rfc2136::{
-    BADKEY, BADSIG, BADTIME, CLASS_ANY, CLASS_IN, CLASS_NONE, Call, FORMERR, Fault, KEY_NAME_512,
-    MockKey, MockRecord, NOERROR, NOTAUTH, NXDOMAIN, Op, REFUSED, Rfc2136Mock, SERVFAIL,
-    STANDARD_SECRET, STANDARD_SECRET_512, Seed, TYPE_A, TYPE_ANY, TYPE_CNAME, TYPE_TXT, txt_rdata,
+    BADKEY, BADSIG, BADTIME, CLASS_ANY, CLASS_IN, CLASS_NONE, Call, FORMERR, Fault, KEY_NAME_384,
+    KEY_NAME_512, MockKey, MockRecord, NOERROR, NOTAUTH, NXDOMAIN, Op, REFUSED, Rfc2136Mock,
+    SERVFAIL, STANDARD_SECRET, STANDARD_SECRET_384, STANDARD_SECRET_512, Seed, TYPE_A, TYPE_ANY,
+    TYPE_CNAME, TYPE_TXT, txt_rdata,
 };
 
 use common::echo::{LogCapture, assert_clean};
@@ -1016,6 +1017,40 @@ async fn rfc2136_hmac_sha512_key() {
     assert_eq!(mock.control().calls()[0].request_mac.len(), 64);
 }
 
+/// An `hmac-sha384` key (RFC 8945 section 6, table 3): a TXT value is added and removed, each
+/// request carries the 48-octet MAC, and the signed answers verify.
+#[tokio::test]
+async fn rfc2136_hmac_sha384_key() {
+    let mock = Rfc2136Mock::start(Seed::standard()).await;
+    let mut config = settings(&mock, KEY_NAME_384.trim_end_matches('.'));
+    config.algorithm = "hmac-sha384".to_owned();
+    let client = Rfc2136::new(config, credentials(STANDARD_SECRET_384), &context()).unwrap();
+    assert_eq!(add(&client, "v1").await.unwrap(), AddOutcome::Created);
+    assert_eq!(add(&client, "v2").await.unwrap(), AddOutcome::Appended);
+    assert_eq!(mock.control().txt(NAME_DOT), ["v1", "v2"]);
+    assert_eq!(remove(&client, "v1").await.unwrap(), RemoveOutcome::Removed);
+    assert_eq!(mock.control().txt(NAME_DOT), ["v2"]);
+    assert_eq!(
+        remove(&client, "v1").await.unwrap(),
+        RemoveOutcome::NotPresent
+    );
+    let calls = mock.control().calls();
+    assert!(!calls.is_empty());
+    for call in &calls {
+        assert_eq!(call.request_mac.len(), 48, "{call:?}");
+        assert_eq!(call.tsig_error, 0, "{call:?}");
+    }
+    // The same secret under the SHA-512 key name: the server's key has another algorithm.
+    let mut config = settings(&mock, KEY_NAME_512.trim_end_matches('.'));
+    config.algorithm = "hmac-sha384".to_owned();
+    let mismatched = Rfc2136::new(config, credentials(STANDARD_SECRET_384), &context()).unwrap();
+    assert_eq!(
+        add(&mismatched, "v3").await.unwrap_err().kind(),
+        ErrorKind::Auth
+    );
+    assert_eq!(mock.control().txt(NAME_DOT), ["v2"]);
+}
+
 /// A server ignores the add of a TXT record at a name that holds a CNAME and still answers
 /// NOERROR (RFC 2136 section 3.4.2.2). The add carries the prerequisite "no CNAME RRset"
 /// (section 2.4.3), so it is `Rejected` instead of a `Created` for nothing; with read access, on
@@ -1493,7 +1528,14 @@ async fn rfc2136_config_validation() {
         (
             serde_json::json!({ "algorithm": "hmac-md5" }),
             good.clone(),
-            "algorithm",
+            "algorithm must be hmac-sha256, hmac-sha384 or hmac-sha512",
+        ),
+        // A truncated variant of a supported algorithm is not accepted (RFC 8945 section 6,
+        // table 3, lists it under its own name).
+        (
+            serde_json::json!({ "algorithm": "hmac-sha384-192" }),
+            good.clone(),
+            "algorithm must be hmac-sha256, hmac-sha384 or hmac-sha512",
         ),
         (serde_json::json!({ "server": "" }), good.clone(), "server"),
         (

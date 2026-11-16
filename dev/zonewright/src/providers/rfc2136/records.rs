@@ -77,8 +77,9 @@ use super::txt::rcode_error;
 use super::wire::{self, Builder, CLASS_IN, HEADER_LEN, MAX_MESSAGE, TYPE_CNAME, TYPE_NS, rcode};
 
 /// The most a TSIG record adds to a message (RFC 8945 section 4.2): the key name (at most 255
-/// octets) and the fixed RR fields (10), the algorithm name (`hmac-sha512.`, 13 octets), time,
-/// fudge and MAC size (10), the MAC (at most 64), original ID, error and other length (6).
+/// octets) and the fixed RR fields (10), the algorithm name (13 octets for each of `hmac-sha256.`,
+/// `hmac-sha384.` and `hmac-sha512.`), time, fudge and MAC size (10), the MAC (at most 64, from
+/// `hmac-sha512`), original ID, error and other length (6).
 const TSIG_RESERVE: usize = 255 + 10 + 13 + 10 + 64 + 6;
 
 /// Fixed fields of a resource record after its owner name: type, class, TTL, RDLENGTH.

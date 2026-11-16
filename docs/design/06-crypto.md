@@ -11,8 +11,8 @@ public signing API would be a second product with its own compatibility burden.
 Items, all `pub(crate)`, in `src/crypto/` under `dev/zonewright/`:
 
 - `sha256`, `hex_lower`, `push_hex_byte`, `KeyError` — `mod.rs`.
-- `hmac_sha256`, `hmac_sha512`, `hmac_sha256_verify`, `hmac_sha512_verify`, `hmac_sha256_into` —
-  `hmac.rs`.
+- `hmac_sha256`, `hmac_sha384`, `hmac_sha512`, `hmac_sha256_verify`, `hmac_sha384_verify`,
+  `hmac_sha512_verify`, `hmac_sha256_into` — `hmac.rs`.
 - `Ps256Key` (`from_pem`, `sign`) — `ps256.rs`.
 - `sigv4`: `Keys`, `Scope`, `Request`, `ALGORITHM`, `canonical_query`, `payload_hash`,
   `authorization` — `sigv4.rs`.
@@ -36,8 +36,8 @@ Notes:
 
 Test vectors, all taken from their published sources and cited in the test code:
 
-- HMAC-SHA-256 and HMAC-SHA-512: RFC 4231 test cases 1, 2, 3, 4, 6 and 7, plus negative verification
-  (flipped bit, wrong key, truncated tag, changed message).
+- HMAC-SHA-256, HMAC-SHA-384 and HMAC-SHA-512: RFC 4231 test cases 1, 2, 3, 4, 6 and 7, plus
+  negative verification (flipped bit, wrong key, truncated tag, changed message).
 - SHA-256: the NIST example digest of `"abc"`, and the digest of the empty message as the payload
   hash of the AWS SigV4 suite's `get-vanilla` case.
 - SigV4: from the AWS Signature Version 4 test suite, `get-vanilla` (canonical request, string to

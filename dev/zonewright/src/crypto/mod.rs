@@ -21,7 +21,9 @@ pub(crate) mod sigv4;
 #[cfg(any(feature = "rfc2136", feature = "route53"))]
 pub(crate) use hmac::hmac_sha256;
 #[cfg(feature = "rfc2136")]
-pub(crate) use hmac::{hmac_sha256_verify, hmac_sha512, hmac_sha512_verify};
+pub(crate) use hmac::{
+    hmac_sha256_verify, hmac_sha384, hmac_sha384_verify, hmac_sha512, hmac_sha512_verify,
+};
 #[cfg(feature = "yandex_cloud")]
 pub(crate) use ps256::Ps256Key;
 

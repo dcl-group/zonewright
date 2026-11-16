@@ -15,8 +15,8 @@
 //!
 //! Observed with nsupdate 9.10.6 and DiG 9.10.6 (the builds shipped with macOS) on 2026-11-15.
 //! That `nsupdate` accepts `hmac-md5`, `hmac-sha1`, `hmac-sha224`, `hmac-sha256`, `hmac-sha384`
-//! and `hmac-sha512`; the client and the mock implement `hmac-sha256` and `hmac-sha512`, and
-//! those two are covered.
+//! and `hmac-sha512`; the client and the mock implement `hmac-sha256`, `hmac-sha384` and
+//! `hmac-sha512`, and those three are covered.
 #![cfg(feature = "rfc2136")]
 // Test code: a failed assumption is a failed test.
 #![allow(
@@ -176,7 +176,7 @@ fn synthetic_secret(len: usize) -> Vec<u8> {
 struct TestKey {
     /// With the trailing dot.
     name: String,
-    /// `hmac-sha256` or `hmac-sha512`.
+    /// `hmac-sha256`, `hmac-sha384` or `hmac-sha512`.
     algorithm: &'static str,
     secret: Vec<u8>,
 }
@@ -194,7 +194,7 @@ impl TestKey {
         }
     }
 
-    /// `sha256` or `sha512`, for owner names.
+    /// `sha256`, `sha384` or `sha512`, for owner names.
     fn short(&self) -> &'static str {
         self.algorithm.trim_start_matches("hmac-")
     }
@@ -261,6 +261,7 @@ struct Lab {
     mock: Rfc2136Mock,
     dir: TempDir,
     sha256: TestKey,
+    sha384: TestKey,
     sha512: TestKey,
 }
 
@@ -277,13 +278,18 @@ impl Lab {
             algorithm: "hmac-sha256",
             secret: synthetic_secret(32),
         };
+        let sha384 = TestKey {
+            name: "interop-384.".to_owned(),
+            algorithm: "hmac-sha384",
+            secret: synthetic_secret(48),
+        };
         let sha512 = TestKey {
             name: "interop-512.".to_owned(),
             algorithm: "hmac-sha512",
             secret: synthetic_secret(64),
         };
         let mut seed = Seed::standard();
-        seed.keys = [&sha256, &sha512]
+        seed.keys = [&sha256, &sha384, &sha512]
             .iter()
             .map(|k| MockKey {
                 name: k.name.clone(),
@@ -299,12 +305,13 @@ impl Lab {
             mock: Rfc2136Mock::start(seed).await,
             dir: TempDir::new(),
             sha256,
+            sha384,
             sha512,
         }
     }
 
-    fn keys(&self) -> [&TestKey; 2] {
-        [&self.sha256, &self.sha512]
+    fn keys(&self) -> [&TestKey; 3] {
+        [&self.sha256, &self.sha384, &self.sha512]
     }
 
     fn port(&self) -> String {
@@ -876,6 +883,7 @@ async fn nsupdate_with_a_bad_key_is_refused_and_changes_nothing() {
     };
     let cases = [
         (lab.sha256.with_other_secret(), "NOTAUTH(BADSIG)", BADSIG),
+        (lab.sha384.with_other_secret(), "NOTAUTH(BADSIG)", BADSIG),
         (lab.sha512.with_other_secret(), "NOTAUTH(BADSIG)", BADSIG),
         (unknown, "NOTAUTH(BADKEY)", BADKEY),
         (other_algorithm, "NOTAUTH(BADKEY)", BADKEY),

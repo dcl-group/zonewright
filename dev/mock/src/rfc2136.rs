@@ -184,10 +184,14 @@ pub const STANDARD_SECRET: &[u8; 32] = b"zonewright-rfc2136-mock-secret!!";
 /// The secret of the standard SHA-512 key, 64 octets. Synthetic.
 pub const STANDARD_SECRET_512: &[u8; 64] =
     b"zonewright-rfc2136-mock-secret-for-the-hmac-sha512-key-64-octets";
+/// The secret of the standard SHA-384 key, 48 octets. Synthetic.
+pub const STANDARD_SECRET_384: &[u8; 48] = b"zonewright-rfc2136-mock-secret-hmac-sha384-key!!";
 /// The name of the standard SHA-256 key.
 pub const KEY_NAME: &str = "zw-test-key.";
 /// The name of the standard SHA-512 key.
 pub const KEY_NAME_512: &str = "zw-test-key-512.";
+/// The name of the standard SHA-384 key.
+pub const KEY_NAME_384: &str = "zw-test-key-384.";
 /// The zone of the standard seed.
 pub const ZONE: &str = "example.org.";
 
@@ -200,7 +204,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct MockKey {
     /// Lowercase, with the trailing dot.
     pub name: String,
-    /// `hmac-sha256.` or `hmac-sha512.`.
+    /// `hmac-sha256.`, `hmac-sha384.` or `hmac-sha512.`.
     pub algorithm: String,
     /// The shared secret.
     pub secret: Vec<u8>,
@@ -231,8 +235,9 @@ pub struct Seed {
 }
 
 impl Seed {
-    /// One zone, `example.org.`, and two keys: [`KEY_NAME`] (`hmac-sha256`,
-    /// [`STANDARD_SECRET`]) and [`KEY_NAME_512`] (`hmac-sha512`, [`STANDARD_SECRET_512`]).
+    /// One zone, `example.org.`, and three keys: [`KEY_NAME`] (`hmac-sha256`,
+    /// [`STANDARD_SECRET`]), [`KEY_NAME_512`] (`hmac-sha512`, [`STANDARD_SECRET_512`]) and
+    /// [`KEY_NAME_384`] (`hmac-sha384`, [`STANDARD_SECRET_384`]).
     pub fn standard() -> Seed {
         Seed {
             zones: vec![ZONE.to_owned()],
@@ -246,6 +251,11 @@ impl Seed {
                     name: KEY_NAME_512.to_owned(),
                     algorithm: "hmac-sha512.".to_owned(),
                     secret: STANDARD_SECRET_512.to_vec(),
+                },
+                MockKey {
+                    name: KEY_NAME_384.to_owned(),
+                    algorithm: "hmac-sha384.".to_owned(),
+                    secret: STANDARD_SECRET_384.to_vec(),
                 },
             ],
             records: Vec::new(),
@@ -1242,6 +1252,7 @@ fn parse_tsig(rr: &Rr) -> Option<Tsig> {
 fn algorithm(name: &str) -> Option<hmac::Algorithm> {
     match name {
         "hmac-sha256." => Some(hmac::HMAC_SHA256),
+        "hmac-sha384." => Some(hmac::HMAC_SHA384),
         "hmac-sha512." => Some(hmac::HMAC_SHA512),
         _ => None,
     }
@@ -2074,35 +2085,95 @@ mod tests {
         m
     }
 
-    #[tokio::test]
-    async fn signed_update_is_applied_and_answer_is_signed() {
-        let mock = Rfc2136Mock::start(Seed::standard()).await;
-        let key = mock.control().seed().keys[0].clone();
-        let unsigned = add_txt_update(7, "a.example.org.", "v1");
-        let (msg, request_mac) = signed(&unsigned, &key, now(0));
-        let Reply::Send(reply, Write::Full) = handle(&msg, mock.control()).await else {
-            panic!("no reply");
-        };
-        assert_eq!(mock.control().txt("a.example.org."), ["v1"]);
-        assert_eq!(reply[3] & 0x0f, NOERROR);
-        // Verify the answer's MAC as a client would.
-        let req = parse(&reply).unwrap();
-        let tsig = parse_tsig(req.additional.last().unwrap()).unwrap();
+    /// Verifies the MAC of a signed answer to `request_mac` as a client would (RFC 8945
+    /// sections 4.3.2, 4.3.3 and 5.3): the request MAC with its length, the answer without its
+    /// TSIG record (ARCOUNT less one), and the answer's TSIG variables, its error and other data
+    /// included. Returns the answer's TSIG record.
+    fn verified_answer_tsig(reply: &[u8], key: &MockKey, request_mac: &[u8]) -> Tsig {
+        let answer = parse(reply).unwrap();
+        let tsig = parse_tsig(answer.additional.last().unwrap()).unwrap();
+        assert_eq!(
+            (tsig.key_name.as_str(), tsig.algorithm.as_str()),
+            (key.name.as_str(), key.algorithm.as_str())
+        );
         let mut data = (request_mac.len() as u16).to_be_bytes().to_vec();
-        data.extend_from_slice(&request_mac);
+        data.extend_from_slice(request_mac);
         let mut body = reply[..tsig.start].to_vec();
-        body[10..12].copy_from_slice(&0u16.to_be_bytes());
+        let arcount = be16(&body, 10).unwrap() - 1;
+        body[10..12].copy_from_slice(&arcount.to_be_bytes());
         data.extend_from_slice(&body);
         data.extend_from_slice(&variables(
             &tsig.key_name,
             &tsig.algorithm,
             tsig.time,
             tsig.fudge,
-            0,
-            &[],
+            tsig.error,
+            &tsig.other,
         ));
         let alg = algorithm(&key.algorithm).unwrap();
-        assert!(hmac::verify(&hmac::Key::new(alg, &key.secret), &data, &tsig.mac).is_ok());
+        assert!(
+            hmac::verify(&hmac::Key::new(alg, &key.secret), &data, &tsig.mac).is_ok(),
+            "{}",
+            key.algorithm
+        );
+        tsig
+    }
+
+    /// Every key of the standard seed, one per algorithm: the update is applied and the answer
+    /// is signed with the full-length MAC of that algorithm.
+    #[tokio::test]
+    async fn signed_update_is_applied_and_answer_is_signed() {
+        let mock = Rfc2136Mock::start(Seed::standard()).await;
+        let keys = mock.control().seed().keys.clone();
+        let algorithms: Vec<&str> = keys.iter().map(|k| k.algorithm.as_str()).collect();
+        assert_eq!(algorithms, ["hmac-sha256.", "hmac-sha512.", "hmac-sha384."]);
+        for (i, (key, mac_len)) in keys.iter().zip([32, 64, 48]).enumerate() {
+            let name = format!("a{i}.example.org.");
+            let unsigned = add_txt_update(7, &name, "v1");
+            let (msg, request_mac) = signed(&unsigned, key, now(0));
+            assert_eq!(request_mac.len(), mac_len);
+            let Reply::Send(reply, Write::Full) = handle(&msg, mock.control()).await else {
+                panic!("no reply");
+            };
+            assert_eq!(mock.control().txt(&name), ["v1"], "{}", key.algorithm);
+            assert_eq!(reply[3] & 0x0f, NOERROR);
+            let tsig = verified_answer_tsig(&reply, key, &request_mac);
+            assert_eq!((tsig.error, tsig.mac.len()), (0, mac_len));
+        }
+    }
+
+    /// RFC 8945 section 5.2.3: a BADTIME answer is signed by the request's key and carries the
+    /// client's time in Time Signed, the server's time in Other Data, and 6 in Other Len.
+    #[tokio::test]
+    async fn a_badtime_answer_carries_the_clients_time() {
+        let mock = Rfc2136Mock::start(Seed::standard()).await;
+        let key = mock.control().seed().keys[0].clone();
+        let client_time = now(0) - 1000;
+        let (msg, request_mac) = signed(
+            &add_txt_update(5, "a.example.org.", "v1"),
+            &key,
+            client_time,
+        );
+        let before = now(0);
+        let Reply::Send(reply, Write::Full) = handle_on(&msg, mock.control(), Transport::Tcp).await
+        else {
+            panic!("no reply");
+        };
+        let after = now(0);
+        assert_eq!(reply[3] & 0x0f, NOTAUTH);
+        assert!(mock.control().txt("a.example.org.").is_empty());
+        assert_eq!(mock.control().calls()[0].tsig_error, BADTIME);
+        let tsig = verified_answer_tsig(&reply, &key, &request_mac);
+        assert_eq!(tsig.error, BADTIME);
+        assert_eq!(tsig.time, client_time);
+        assert_eq!(tsig.other.len(), 6);
+        let mut server_time = [0u8; 8];
+        server_time[2..].copy_from_slice(&tsig.other);
+        let server_time = u64::from_be_bytes(server_time);
+        assert!(
+            (before..=after).contains(&server_time),
+            "{server_time} not in {before}..={after}"
+        );
     }
 
     #[tokio::test]

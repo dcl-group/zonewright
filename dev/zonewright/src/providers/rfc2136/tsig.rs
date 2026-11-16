@@ -12,7 +12,9 @@
 //!   TSIG error is exempt from the time check.
 //! - Truncated MACs (section 5.2.2.1) are neither sent nor accepted.
 //!
-//! Algorithms: `hmac-sha256` and `hmac-sha512` (section 6, table 3). Fudge 300 s, the value
+//! Algorithms: `hmac-sha256`, `hmac-sha384` and `hmac-sha512` (section 6, table 3: `hmac-sha256`
+//! is mandatory to implement, the other two optional; each MAC is the full hash output, 32, 48
+//! and 64 octets). Fudge 300 s, the value
 //! section 10 recommends, as lego sends it (`providers/dns/rfc2136/rfc2136.go`, `SetTsig(…,
 //! 300, …)`).
 //!
@@ -22,7 +24,10 @@ use std::fmt;
 
 use secrecy::{ExposeSecret as _, SecretSlice};
 
-use crate::crypto::{hmac_sha256, hmac_sha256_verify, hmac_sha512, hmac_sha512_verify};
+use crate::crypto::{
+    hmac_sha256, hmac_sha256_verify, hmac_sha384, hmac_sha384_verify, hmac_sha512,
+    hmac_sha512_verify,
+};
 use crate::error::Error;
 use crate::name::DomainName;
 use crate::redact::Detail;
@@ -49,6 +54,8 @@ const MAX_TIME: u64 = (1 << 48) - 1;
 pub(super) enum Algorithm {
     /// `hmac-sha256`.
     HmacSha256,
+    /// `hmac-sha384`.
+    HmacSha384,
     /// `hmac-sha512`.
     HmacSha512,
 }
@@ -60,6 +67,8 @@ impl Algorithm {
         let name = name.strip_suffix('.').unwrap_or(name);
         if name.eq_ignore_ascii_case("hmac-sha256") {
             Some(Algorithm::HmacSha256)
+        } else if name.eq_ignore_ascii_case("hmac-sha384") {
+            Some(Algorithm::HmacSha384)
         } else if name.eq_ignore_ascii_case("hmac-sha512") {
             Some(Algorithm::HmacSha512)
         } else {
@@ -71,6 +80,7 @@ impl Algorithm {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Algorithm::HmacSha256 => "hmac-sha256",
+            Algorithm::HmacSha384 => "hmac-sha384",
             Algorithm::HmacSha512 => "hmac-sha512",
         }
     }
@@ -79,6 +89,7 @@ impl Algorithm {
     fn text_name(self) -> &'static str {
         match self {
             Algorithm::HmacSha256 => "hmac-sha256.",
+            Algorithm::HmacSha384 => "hmac-sha384.",
             Algorithm::HmacSha512 => "hmac-sha512.",
         }
     }
@@ -87,6 +98,7 @@ impl Algorithm {
     fn wire_name(self) -> &'static [u8] {
         match self {
             Algorithm::HmacSha256 => b"\x0bhmac-sha256\x00",
+            Algorithm::HmacSha384 => b"\x0bhmac-sha384\x00",
             Algorithm::HmacSha512 => b"\x0bhmac-sha512\x00",
         }
     }
@@ -95,6 +107,7 @@ impl Algorithm {
     fn mac_len(self) -> usize {
         match self {
             Algorithm::HmacSha256 => 32,
+            Algorithm::HmacSha384 => 48,
             Algorithm::HmacSha512 => 64,
         }
     }
@@ -102,6 +115,7 @@ impl Algorithm {
     fn mac(self, key: &[u8], data: &[u8]) -> Vec<u8> {
         match self {
             Algorithm::HmacSha256 => hmac_sha256(key, data).to_vec(),
+            Algorithm::HmacSha384 => hmac_sha384(key, data).to_vec(),
             Algorithm::HmacSha512 => hmac_sha512(key, data).to_vec(),
         }
     }
@@ -110,6 +124,7 @@ impl Algorithm {
     fn verify(self, key: &[u8], data: &[u8], tag: &[u8]) -> bool {
         match self {
             Algorithm::HmacSha256 => hmac_sha256_verify(key, data, tag),
+            Algorithm::HmacSha384 => hmac_sha384_verify(key, data, tag),
             Algorithm::HmacSha512 => hmac_sha512_verify(key, data, tag),
         }
     }
@@ -395,6 +410,22 @@ mod tests {
         assert!(sign(&mut vec![0u8; 3], &k512, 1).is_err());
     }
 
+        let k384 = key(Algorithm::HmacSha384, &[5u8; 48]);
+        let unsigned = Builder::update(&zone).finish().unwrap().with_id(11);
+        let mut msg = unsigned.clone();
+        let mac = sign(&mut msg, &k384, 1_700_000_000).unwrap();
+        assert_eq!(mac.len(), 48);
+        let p = parse(&msg).unwrap();
+        let t = p.additional.last().unwrap();
+        let mut data = unsigned;
+        data.extend_from_slice(&variables(&k384, 1_700_000_000, FUDGE, 0, &[]).unwrap());
+        assert_eq!(hmac_sha384(&[5u8; 48], &data).to_vec(), mac);
+        let mut r = Reader::new(&msg, t.rdata.start);
+        assert_eq!(r.name().unwrap(), "hmac-sha384.");
+        assert_eq!(r.u48().unwrap(), 1_700_000_000);
+        assert_eq!(r.u16().unwrap(), FUDGE);
+        assert_eq!(usize::from(r.u16().unwrap()), 48);
+
     /// Builds a signed answer to `request_mac` the way a server does (RFC 8945 section 5.3).
     fn answer(k: &Key, request_mac: &[u8], time: u64, corrupt: bool) -> Vec<u8> {
         let mac = if corrupt { Mac::Corrupt } else { Mac::Good };
@@ -556,12 +587,64 @@ mod tests {
             Verdict::Invalid(_)
         ));
         // Without the TSIG record.
+        // The same for an `hmac-sha384` key: its answer verifies, a 24-octet MAC (the length of
+        // `hmac-sha384-192`, RFC 8945 section 6, table 3) is refused because truncated MACs are
+        // not accepted (section 5.2.2.1), and an `hmac-sha512` key with the same secret cannot
+        // verify it.
+        let k384 = key(Algorithm::HmacSha384, SECRET);
+        let request_mac = [9u8; 48];
+        let good = answer(&k384, &request_mac, now, false);
+        assert_eq!(
+            verify(&good, &parse(&good).unwrap(), &request_mac, &k384, now),
+            Verdict::Ok
+        );
+        let bad = answer(&k384, &request_mac, now, true);
+        assert!(matches!(
+            verify(&bad, &parse(&bad).unwrap(), &request_mac, &k384, now),
+            Verdict::Invalid(_)
+        ));
+        assert!(matches!(
+            verify(&good, &parse(&good).unwrap(), &request_mac, &other_alg, now),
+            Verdict::Invalid(_)
+        ));
+        let truncated = answer_truncated(&k384, &request_mac, now, 24);
+        assert!(matches!(
+            verify(
+                &truncated,
+                &parse(&truncated).unwrap(),
+                &request_mac,
+                &k384,
+                now
+            ),
+            Verdict::Invalid(_)
+        ));
         let zone = DomainName::parse("example.org").unwrap();
         let unsigned = Builder::update(&zone).finish().unwrap().with_id(5);
         assert_eq!(check(&unsigned, &request_mac, now), Verdict::Unsigned);
     }
 
     /// The shape of a signed answer for [`answer_shaped`].
+    /// Like [`answer`], with the correct MAC cut to its first `len` octets.
+    fn answer_truncated(k: &Key, request_mac: &[u8], time: u64, len: usize) -> Vec<u8> {
+        let full = answer(k, request_mac, time, false);
+        let p = parse(&full).unwrap();
+        let t = p.additional.last().unwrap();
+        let mut r = Reader::new(&full, t.rdata.start);
+        r.name().unwrap();
+        r.u48().unwrap();
+        r.u16().unwrap();
+        let mac_len = usize::from(r.u16().unwrap());
+        let mac_at = r.pos();
+        let mut out = full[..mac_at - 2].to_vec();
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+        out.extend_from_slice(&full[mac_at..mac_at + len]);
+        out.extend_from_slice(&full[mac_at + mac_len..]);
+        let rdlength_at = t.rdata.start - 2;
+        let rdlength = (t.rdata.end - t.rdata.start - (mac_len - len)) as u16;
+        out[rdlength_at..rdlength_at + 2].copy_from_slice(&rdlength.to_be_bytes());
+        out
+    }
+
     struct Shape {
         /// Records placed in the additional section before the TSIG record; the MAC covers them.
         extra: Vec<u8>,
@@ -673,7 +756,23 @@ mod tests {
             Some(Algorithm::HmacSha256)
         );
         assert_eq!(Algorithm::parse("hmac-sha512"), Some(Algorithm::HmacSha512));
+        assert_eq!(Algorithm::parse("hmac-sha384"), Some(Algorithm::HmacSha384));
+        assert_eq!(
+            Algorithm::parse(" Hmac-SHA384. "),
+            Some(Algorithm::HmacSha384)
+        );
         assert_eq!(Algorithm::parse("hmac-md5.sig-alg.reg.int"), None);
+        for algorithm in [
+            Algorithm::HmacSha256,
+            Algorithm::HmacSha384,
+            Algorithm::HmacSha512,
+        ] {
+            assert_eq!(Algorithm::parse(algorithm.as_str()), Some(algorithm));
+            assert_eq!(Algorithm::parse(algorithm.text_name()), Some(algorithm));
+            assert_eq!(algorithm.wire_name().len(), 13);
+        }
+        assert_eq!(Algorithm::parse("hmac-sha384-192"), None);
+        assert_eq!(Algorithm::parse("hmac-sha224"), None);
         assert_eq!(Algorithm::parse("hmac-sha1"), None);
     }
 

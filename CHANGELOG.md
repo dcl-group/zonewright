@@ -6,6 +6,13 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
+### Added
+
+- `rfc2136`: TSIG algorithm `hmac-sha384` (RFC 8945 section 6), next to `hmac-sha256` and
+  `hmac-sha512`.
+- `zonewright-mock`: the RFC 2136 mock verifies and signs `hmac-sha384`; `Seed::standard()` gains
+  the key `KEY_NAME_384` with `STANDARD_SECRET_384`.
+
 ### Changed
 
 - Documentation: `ContextOptions::russian_trusted_root` and `extra_root_certificates` now state that

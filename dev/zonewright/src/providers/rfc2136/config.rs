@@ -49,8 +49,8 @@ pub struct Rfc2136Config {
     pub server: String,
     /// The name of the TSIG key, as configured on the server.
     pub key_name: String,
-    /// `hmac-sha256` (the default) or `hmac-sha512`. An absent key, `null` and an empty text
-    /// mean the default.
+    /// `hmac-sha256` (the default), `hmac-sha384` or `hmac-sha512`. An absent key, `null` and an
+    /// empty text mean the default.
     #[serde(
         default = "default_algorithm",
         deserialize_with = "algorithm_or_default"
@@ -118,8 +118,9 @@ impl Rfc2136Config {
             .ok_or_else(|| config("key_name must be a domain-style key name"))?;
         let algorithm = match self.algorithm.trim() {
             "" => Algorithm::HmacSha256,
-            text => Algorithm::parse(text)
-                .ok_or_else(|| config("algorithm must be hmac-sha256 or hmac-sha512"))?,
+            text => Algorithm::parse(text).ok_or_else(|| {
+                config("algorithm must be hmac-sha256, hmac-sha384 or hmac-sha512")
+            })?,
         };
         let ttl = match self.ttl {
             RrsetTtl::Explicit(ttl) if (TTL_MIN..=TTL_MAX).contains(&ttl.as_secs()) => {

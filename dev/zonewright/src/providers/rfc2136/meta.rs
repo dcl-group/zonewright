@@ -57,7 +57,7 @@ const FIELDS: &[ConfigField] = &[
         kind: FieldKind::Text,
         default: Some("hmac-sha256"),
         label: "TSIG algorithm",
-        help: "hmac-sha256 or hmac-sha512.",
+        help: "hmac-sha256, hmac-sha384 or hmac-sha512.",
         advanced: false,
     },
     ConfigField {
