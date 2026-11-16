@@ -217,7 +217,8 @@ impl AcmeDnsMock {
         Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
     }
 
-    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]). On an address other than
+    /// loopback, for an isolated test network only.
     pub async fn start_on(addr: SocketAddr, seed: Seed) -> AcmeDnsMock {
         let changes = Changes::new();
         let state: Shared = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));

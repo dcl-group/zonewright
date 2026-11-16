@@ -32,8 +32,8 @@ HTTPS, SOCKS5 proxies, and SVCB/HTTPS data that is not self-consistent.
   add; with none, `Context::new` is `Error::Config`. `TrustRoots::Platform` without the
   `platform-verifier` feature is `Error::Config`.
 - `ContextOptions::russian_trusted_root` (default false) trusts the Russian Trusted Root CA of the
-  Ministry of Digital Development of Russia, compiled into the crate, in addition to `trust_roots`;
-  `extra_root_certificates` are trusted in addition to both.
+  Ministry of Digital Development and Communications of the Russian Federation, compiled into the
+  crate, in addition to `trust_roots`; `extra_root_certificates` are trusted in addition to both.
 - Cargo features `platform-verifier` and `socks`, enabled by no other feature (not by
   `all-providers`). `rustls-platform-verifier` is a direct dependency only with the first; it stays
   in the dependency tree through `reqwest`, which has no rustls feature without it, but is not used
@@ -52,7 +52,8 @@ HTTPS, SOCKS5 proxies, and SVCB/HTTPS data that is not self-consistent.
   read. To keep the 0.1 behavior, enable the new cargo feature `platform-verifier` and set
   `ContextOptions::trust_roots = TrustRoots::Platform`. A corporate or internal certificate
   authority known only to the system store needs one of those, or its root in
-  `extra_root_certificates`.
+  `extra_root_certificates`. With `TrustRoots::Mozilla` and `TrustRoots::None` certificate
+  revocation is not checked; `TrustRoots::Platform` checks it as far as the platform does.
 - SOCKS5 proxies need the new cargo feature `socks`. Without it a `socks5://` or `socks5h://` proxy
   URL is `Error::Config`. `reqwest` is no longer built with its `socks` feature unless this feature
   is on.

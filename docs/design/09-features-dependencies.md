@@ -59,7 +59,7 @@ is still found.
 
 ### 9.3 Dependencies
 
-Versions are the latest stable releases on 2026-11-14.
+Versions are the latest stable releases on 2026-11-16.
 
 The dependencies are in `dev/zonewright/Cargo.toml`, in `[dependencies]` and `[dev-dependencies]`.
 

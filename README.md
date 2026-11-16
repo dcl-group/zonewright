@@ -242,6 +242,7 @@ a fixed set. `ContextOptions::russian_trusted_root` adds the Russian Trusted Roo
 crate carries and which neither Mozilla's list nor a typical system store has; it is off by default,
 because every additional authority can issue certificates for any provider's host. DER-encoded
 certificates in `ContextOptions::extra_root_certificates` are trusted in addition to all of these.
+With `TrustRoots::Mozilla` and `TrustRoots::None` certificate revocation is not checked.
 
 ```rust
 use zonewright::{Context, ContextOptions, TrustRoots};

@@ -181,11 +181,13 @@ impl Data {
         Data::Name(target.to_owned())
     }
 
-    /// A CAA record (RFC 8659 section 4.1): flags, the tag (at most 255 octets) and the value,
-    /// which is written as its octets, without quotes.
+    /// A CAA record (RFC 8659 section 4.1): flags, the tag and the value, which is written as
+    /// its octets, without quotes. A tag longer than 255 octets is cut to 255.
     pub fn caa(flags: u8, tag: &str, value: &str) -> Data {
+        let tag = tag.as_bytes();
+        let tag = tag.get(..usize::from(u8::MAX)).unwrap_or(tag);
         let mut out = vec![flags, u8::try_from(tag.len()).unwrap_or(u8::MAX)];
-        out.extend_from_slice(tag.as_bytes());
+        out.extend_from_slice(tag);
         out.extend_from_slice(value.as_bytes());
         Data::Raw(out)
     }

@@ -24,6 +24,8 @@ dev/
                          copies of the repository's, so that the published package carries
                          them; a conformance test compares them byte for byte
     README.md            symbolic link to the repository's README.md (`readme = "README.md"`)
+    roots/               the Russian Trusted Root CA (PEM) and a README with its origin and
+                         fingerprints; compiled into `src/http/roots.rs`
     src/
       lib.rs             module tree, re-exports, crate docs
       name.rs            DomainName, TargetName
@@ -42,7 +44,7 @@ dev/
                                                                             acme_dns, beget)
       dns01.rs
       http/              mod.rs, tls.rs, request.rs, retry.rs, token.rs, keystone.rs, gate.rs,
-                         poll.rs, pager.rs, zone_cache.rs, encode.rs, url.rs, proxy.rs;
+                         poll.rs, pager.rs, zone_cache.rs, encode.rs, url.rs, proxy.rs, roots.rs;
                          testing.rs, tests.rs and proxy_tests.rs (test builds only) (__http)
       crypto/            mod.rs, hmac.rs, ps256.rs (yandex_cloud),
                          sigv4.rs (route53)                                       (__crypto)
@@ -65,11 +67,13 @@ dev/
                          timeweb_cloud names.rs
     tests/
       common/            mod.rs (context and client builders, sample configurations), echo.rs
-                         (canaries, echo dialects, tracing capture)
+                         (canaries, echo dialects, tracing capture), link.rs (helpers for the
+                         tests of the link between a provider mock and the DNS mock)
       <id>.rs            one file per provider, `#![cfg(feature = "<id>")]`, live tests #[ignore]d
       conformance.rs     IDs, metadata, PROVIDERS.md, capability/behavior agreement, source
                          scans, required tests
       names.rs, records.rs, dns01.rs, transport.rs, inspector.rs
+      mock_dns_link.rs   a provider mock's records served by the DNS mock
       rfc2136_interop.rs cross-checks of the RFC 2136 mock and client against `nsupdate` and
                          `dig`; #[ignore]d
   mock/
@@ -84,7 +88,10 @@ dev/
       log.rs             request log
       fault.rs           fault injection
       echo.rs            the echo server of section 12.2
-      dns.rs             UDP+TCP DNS server for the inspector tests
+      dns.rs             UDP+TCP DNS server for the inspector tests and for tests of an
+                         application
+      changes.rs         the change reports of the provider mocks
+      link.rs            serves a provider mock's records from the DNS mock
       proxy.rs           HTTP forward proxy (CONNECT and plain) for the transport tests
       socks.rs           SOCKS5 proxy for the transport tests
       <id>.rs            one stateful mock per provider
@@ -97,15 +104,16 @@ configuration.
 
 Ownership, so that fifteen providers can be written in parallel without touching the same file:
 
-- Shared files, edited only by the lead: everything outside `providers/<id>/`, `tests/<id>.rs` and
-  `mock/src/<id>.rs`. That includes both `Cargo.toml` files, `providers/mod.rs`, `id.rs`,
-  `context.rs`, `values.rs`, `rrsets.rs`, the whole `http/`, `crypto/`, `record/`, `redact/` and
-  `inspector/` trees, `tests/common/`, the mock's `lib.rs`, `conn.rs`, `log.rs`, `fault.rs`,
-  `echo.rs`, `dns.rs` and `tests/harness.rs`, and `PROVIDERS.md`, `CHANGELOG.md` and this document.
+- Shared files, edited by one developer at a time: everything outside `providers/<id>/`,
+  `tests/<id>.rs` and `mock/src/<id>.rs`. That includes both `Cargo.toml` files, `providers/mod.rs`,
+  `id.rs`, `context.rs`, `values.rs`, `rrsets.rs`, the whole `http/`, `crypto/`, `record/`,
+  `redact/` and `inspector/` trees, `tests/common/`, the mock's `lib.rs`, `conn.rs`, `log.rs`,
+  `fault.rs`, `echo.rs`, `dns.rs` and `tests/harness.rs`, and `PROVIDERS.md`, `CHANGELOG.md` and
+  this document.
 - Files of one provider, edited by the developer of that provider: `src/providers/<id>/**`,
   `tests/<id>.rs`, `mock/src/<id>.rs`.
 - Every provider has its feature, its `AnyProvider` variant, its module with a complete `meta.rs`,
   its test file and its mock module, so a provider developer never needs a shared file. A need for a
-  new shared helper, or a change to one, goes to the lead.
+  new shared helper, or a change to one, is settled before the provider work goes on.
 - Provider state that must outlive a client (nic.ru, acme-dns; section 11.3) is a type defined in
   the provider's directory and held by `Context` in a field behind the provider's feature.

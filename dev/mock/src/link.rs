@@ -18,7 +18,8 @@
 //! [`DnsMock`] and every published rrset becomes records. From then on every [`Change`] the
 //! provider mock reports is applied as it arrives: an rrset replaces the records of its name and
 //! type, a removal removes them. A zone created later is served once a change arrives for it; a
-//! zone that holds no records by then is not served (queries into it are refused).
+//! zone that holds no records by then is not served (queries into it are refused). A zone removed
+//! from the provider mock keeps being served, without records.
 //!
 //! The types converted from zone-file text to wire form are A, AAAA, TXT, CNAME, NS, MX and CAA;
 //! a name inside a value must be fully qualified, with the trailing dot. A change of another type
@@ -186,6 +187,9 @@ impl Link {
     /// changes have reached the link's queue instead, without waiting for a release, so that a
     /// test can check what DNS answers before the release; it returns at once if the link is
     /// held when it is called and the changes have arrived.
+    ///
+    /// Call it on the runtime the link was made on: the link's task lives there, and once that
+    /// runtime is gone nothing is applied any more and this never returns.
     pub async fn settled(&self) {
         let target = self.changes.emitted();
         let mut progress = self.shared.progress.subscribe();
@@ -347,7 +351,7 @@ fn data(rtype: u16, text: &str) -> Option<Data> {
 }
 
 /// A fully qualified name with the trailing dot, in the plain form the DNS mock writes: labels
-/// of 1 to 63 octets without white space, quotes or escapes, at most 255 octets in all.
+/// of 1 to 63 octets without white space, quotes or escapes, at most 255 octets on the wire.
 fn absolute(text: &str) -> Option<&str> {
     if text == "." {
         return Some(text);
@@ -360,7 +364,9 @@ fn absolute(text: &str) -> Option<&str> {
                 .bytes()
                 .all(|b| b.is_ascii_graphic() && !matches!(b, b'\\' | b'"' | b'(' | b')' | b';'))
     });
-    (plain && text.len() <= 255).then_some(text)
+    // With the trailing dot, a name of 254 characters is 255 octets on the wire (RFC 1035 section
+    // 2.3.4).
+    (plain && text.len() <= 254).then_some(text)
 }
 
 /// The character-strings of `text` in zone-file form (RFC 1035 section 5.1): quoted strings, in

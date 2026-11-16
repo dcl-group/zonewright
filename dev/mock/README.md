@@ -169,7 +169,7 @@ Further servers, for tests that are not about one provider:
 
 - `dns::DnsMock` — a DNS server, authoritative or recursive, on loopback or on a given address
   (`start_on`), for tests of the `inspector` feature of `zonewright` and as the DNS server of an
-  ACME test (below).
+  ACME test (above).
 - `proxy::ProxyServer` and `socks::SocksServer` — an HTTP forward proxy and a SOCKS5 proxy, with
   optional authentication, for tests of a proxy setting.
 - `echo::EchoServer` — a server that quotes each request back in its error messages, credentials
