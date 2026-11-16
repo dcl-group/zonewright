@@ -586,56 +586,31 @@ impl Api {
     /// The TXT rrset of `name` in zone `zone_id`, or `Stale` when the API does not know the
     /// zone (`404`).
     ///
-    /// The listing starts at the given name and type and returns the next rrset in sort order
-    /// when there is no exact match, so the first item's name and type are compared. An rrset
-    /// with a routing policy or an alias is not plain records and is refused (design section
-    /// 3.4).
-    // Source: API reference, `ListResourceRecordSets`: "The results begin with the first
-    // resource record set in the list whose name is greater than or equal to Name, and whose
-    // type is greater than or equal to Type"; `NoSuchHostedZone`, HTTP 404; `SetIdentifier`
-    // and `AliasTarget` mark routing-policy and alias sets.
+    /// The read is the record level's (`rrset_at`): two items are requested, the names
+    /// and types of the items are compared, and an alias, a routing-policy set or a second set
+    /// of the same name and type is not plain records and is refused (design section 3.4),
+    /// whatever the first set carries.
+    // Source: see `rrset_at`. Asking for one item would be enough only if a set without
+    // `SetIdentifier` could never share its name and type with another set; no source states
+    // that, so the TXT read does not rely on it.
     pub(super) async fn txt_rrset(
         &self,
         zone_id: &str,
         name: &DomainName,
     ) -> Result<Attempt<Option<Rrset>>, Error> {
-        let response = self
-            .get(
-                |u| u.path("/2013-04-01/hostedzone").id(zone_id).path("/rrset"),
-                &mut [("maxitems", "1"), ("name", name.as_str()), ("type", "TXT")],
-            )
-            .await?;
-        if response.status() == 404 {
-            return Ok(Attempt::Stale);
-        }
-        if !response.is_success() {
-            return Err(self.refusal(&response));
-        }
-        let text = response.text();
-        let doc = parse(&text)?;
-        let root = doc.root_element();
-        let listed = (root.tag_name().name() == "ListResourceRecordSetsResponse")
-            .then(|| child(root, "ResourceRecordSets"))
-            .flatten()
-            .ok_or_else(|| protocol("the rrset listing is not in the expected form"))?;
-        let Some(set) = children(listed, "ResourceRecordSet").next() else {
-            return Ok(Attempt::Done(None));
-        };
-        let same_name = child_text(set, "Name")
-            .and_then(|raw| owner_name(&raw))
-            .is_some_and(|found| &found == name);
-        if !same_name || child_text(set, "Type").as_deref() != Some("TXT") {
-            return Ok(Attempt::Done(None));
-        }
-        if !is_plain(set) {
-            return Err(Error::Rejected {
-                status: None,
-                detail: Detail::constant(
-                    "the TXT rrset uses a routing policy or is an alias; it is not changed",
-                ),
-            });
-        }
-        plain_rrset(set).map(|rrset| Attempt::Done(Some(rrset)))
+        Ok(match self.rrset_at(zone_id, name, "TXT").await? {
+            Attempt::Stale => Attempt::Stale,
+            Attempt::Done(Lookup::Absent) => Attempt::Done(None),
+            Attempt::Done(Lookup::Plain(rrset)) => Attempt::Done(Some(rrset)),
+            Attempt::Done(Lookup::NotPlain) => {
+                return Err(Error::Rejected {
+                    status: None,
+                    detail: Detail::constant(
+                        "the TXT rrset uses a routing policy or is an alias; it is not changed",
+                    ),
+                });
+            }
+        })
     }
 
     /// The rrset of `name` and `rtype` in zone `zone_id` (record level), or `Stale` when the

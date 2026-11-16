@@ -23,6 +23,8 @@ All notable changes to this crate are recorded in this file. The format follows
 - Hetzner: an action with a status other than `running`, `success` or `error`, and a 2xx answer to a
   write that does not name an action in the expected form, are `Error::Transient` (the write was
   accepted and its outcome is unknown), not `Error::Protocol`.
+- Route 53: the TXT value read asks for two rrsets and refuses a name where a second set shares the
+  name and type of a plain-looking one, as the record-level read already did.
 
 ## 0.1.0 - 2026-11-16
 

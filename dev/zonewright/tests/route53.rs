@@ -1095,6 +1095,30 @@ async fn route53_routing_policy_set_is_refused() {
     assert_eq!(writes(&mock), 0);
 }
 
+/// A plain-looking TXT set followed by a second set of the same name and type is not plain
+/// records either: the TXT read asks for two items, as the record read does, and a value
+/// operation that meets such a name is refused and writes nothing (design section 3.4).
+#[tokio::test]
+async fn route53_second_set_of_the_name_and_type_is_refused() {
+    let (mock, client) = setup().await;
+    mock.control()
+        .insert_rrset(ZID, NAME, "TXT", 60, &["\"plain\""]);
+    mock.control().insert_policy_set(
+        ZID,
+        NAME,
+        "TXT",
+        Some("second"),
+        "<Weight>10</Weight>",
+        60,
+        &["\"weighted\""],
+    );
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert!(matches!(e, Error::Rejected { status: None, .. }), "{e:?}");
+    let e = remove(&client, "plain").await.unwrap_err();
+    assert!(matches!(e, Error::Rejected { status: None, .. }), "{e:?}");
+    assert_eq!(writes(&mock), 0);
+}
+
 /// An rrset holds at most 400 records: the 401st value is refused before the write.
 #[tokio::test]
 async fn route53_rrset_record_limit() {
@@ -1206,7 +1230,7 @@ async fn route53_request_shape() {
     let read = mock.log().matching(Some("GET"), RRSETS).pop().unwrap();
     assert_eq!(
         read.query.as_deref(),
-        Some(format!("maxitems=1&name={NAME}.&type=TXT").as_str())
+        Some(format!("maxitems=2&name={NAME}.&type=TXT").as_str())
     );
     let lookup = mock.log().matching(Some("GET"), ZONES).pop().unwrap();
     assert_eq!(
