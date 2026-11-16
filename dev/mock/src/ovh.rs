@@ -87,6 +87,10 @@
 //! 255 bytes; CNAME and NS the host name with a trailing dot; MX and SRV `target` with a
 //! trailing dot on the host name; every other type `target` as it is. [`Control::reset`]
 //! returns the mock to its seed.
+//!
+//! [`Control::hold_writes`] and [`Control::hold_refreshes`] keep record writes or refreshes from
+//! being processed until the test releases them ([`Hold`]), so that a test can force the order in
+//! which the requests of concurrent operations take effect, without timing.
 
 #![allow(clippy::result_large_err)]
 
@@ -104,6 +108,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::{Map, Value, json};
+use tokio::sync::watch;
 
 use crate::changes::{ChangeSource, Changes, Origin, Published};
 use crate::{Faults, MockServer, RequestLog};
@@ -183,6 +188,10 @@ struct Inner {
     read_lag: u32,
     /// Records that answer `404` to a read this many more times.
     lagging: HashMap<u64, u32>,
+    /// The hold of record writes, if any ([`Control::hold_writes`]).
+    write_hold: Option<Arc<Gate>>,
+    /// The hold of refreshes, if any ([`Control::hold_refreshes`]).
+    refresh_hold: Option<Arc<Gate>>,
 }
 
 impl Inner {
@@ -201,6 +210,8 @@ impl Inner {
             create_without_id: false,
             read_lag: 0,
             lagging: HashMap::new(),
+            write_hold: None,
+            refresh_hold: None,
         }
     }
 
@@ -370,6 +381,89 @@ type Shared = Arc<Mutex<Inner>>;
 fn lock(state: &Shared) -> MutexGuard<'_, Inner> {
     // Every state of the mock is usable; a test that panicked elsewhere must not poison it.
     state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The shared side of a [`Hold`]: how many more requests it takes, how many it took, and
+/// whether it is released.
+#[derive(Debug)]
+struct Gate {
+    remaining: Mutex<usize>,
+    arrived: watch::Sender<usize>,
+    released: watch::Sender<bool>,
+}
+
+impl Gate {
+    fn new(count: usize) -> Gate {
+        Gate {
+            remaining: Mutex::new(count),
+            arrived: watch::Sender::new(0),
+            released: watch::Sender::new(false),
+        }
+    }
+
+    /// Holds the calling request until the gate is released, when the gate still takes one.
+    async fn pass(&self) {
+        {
+            let mut remaining = self
+                .remaining
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if *remaining == 0 || *self.released.borrow() {
+                return;
+            }
+            *remaining -= 1;
+        }
+        self.arrived.send_modify(|n| *n += 1);
+        let mut released = self.released.subscribe();
+        // The sender lives in `self`, so the channel cannot close while this waits.
+        let _ = released.wait_for(|r| *r).await;
+    }
+}
+
+/// Holds the request of a handler at the gate `pick` chooses, if one is set.
+async fn hold_at(state: &Shared, pick: fn(&Inner) -> &Option<Arc<Gate>>) {
+    let gate = pick(&lock(state)).clone();
+    if let Some(gate) = gate {
+        gate.pass().await;
+    }
+}
+
+/// Requests the mock keeps unprocessed until [`Hold::release`] is called or the hold is dropped
+/// ([`Control::hold_writes`], [`Control::hold_refreshes`]).
+///
+/// A held request has been logged (the request log counts it on arrival) and has not been
+/// authorized or applied: nothing of the mock's state changes until it is released. If the client
+/// closes the connection meanwhile, whether the server still processes the request on release is
+/// up to the HTTP server; a test must not rely on either.
+#[derive(Debug)]
+pub struct Hold {
+    gate: Arc<Gate>,
+}
+
+impl Hold {
+    /// The number of requests held so far (released ones included).
+    pub fn arrived(&self) -> usize {
+        *self.gate.arrived.borrow()
+    }
+
+    /// Waits until at least `count` requests have been held. Has no deadline of its own; a test
+    /// puts one around it.
+    pub async fn arrival(&self, count: usize) {
+        let mut arrived = self.gate.arrived.subscribe();
+        // The sender lives in `self.gate`, so the channel cannot close while this waits.
+        let _ = arrived.wait_for(|n| *n >= count).await;
+    }
+
+    /// Lets every held request go on, and every later one pass without being held.
+    pub fn release(&self) {
+        self.gate.released.send_replace(true);
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// A running OVHcloud mock. Dereferences to its [`MockServer`] for the request log and the
@@ -623,6 +717,28 @@ impl Control {
     /// identifier, while the listing already holds it.
     pub fn set_read_lag(&self, reads: u32) {
         lock(&self.state).read_lag = reads;
+    }
+
+    /// Holds the next `count` record writes (`POST .../record`, `PUT` and `DELETE`
+    /// `.../record/{id}`) that reach the mock, before they are authorized or change anything,
+    /// until the returned [`Hold`] is released or dropped. Later writes pass. A request the
+    /// fault queue answers never reaches the hold.
+    ///
+    /// A new hold of writes replaces this one for requests that arrive after it, and
+    /// [`Control::reset`] removes it for them; requests already held stay held until their own
+    /// hold is released or dropped.
+    pub fn hold_writes(&self, count: usize) -> Hold {
+        let gate = Arc::new(Gate::new(count));
+        lock(&self.state).write_hold = Some(gate.clone());
+        Hold { gate }
+    }
+
+    /// The same as [`Control::hold_writes`] for the next `count` refreshes
+    /// (`POST .../refresh`).
+    pub fn hold_refreshes(&self, count: usize) -> Hold {
+        let gate = Arc::new(Gate::new(count));
+        lock(&self.state).refresh_hold = Some(gate.clone());
+        Hold { gate }
     }
 }
 
@@ -962,6 +1078,7 @@ async fn record_create(
     Path(zone): Path<String>,
     body: Bytes,
 ) -> Response {
+    hold_at(&state, |inner| &inner.write_hold).await;
     if let Err(response) = authorize(&state, &method, &uri, &headers, &body) {
         return response;
     }
@@ -1031,6 +1148,7 @@ async fn record_update(
     Path((zone, id)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
+    hold_at(&state, |inner| &inner.write_hold).await;
     if let Err(response) = authorize(&state, &method, &uri, &headers, &body) {
         return response;
     }
@@ -1083,6 +1201,7 @@ async fn record_delete(
     headers: HeaderMap,
     Path((zone, id)): Path<(String, String)>,
 ) -> Response {
+    hold_at(&state, |inner| &inner.write_hold).await;
     if let Err(response) = authorize(&state, &method, &uri, &headers, b"") {
         return response;
     }
@@ -1105,6 +1224,7 @@ async fn zone_refresh(
     Path(zone): Path<String>,
     body: Bytes,
 ) -> Response {
+    hold_at(&state, |inner| &inner.refresh_hold).await;
     if let Err(response) = authorize(&state, &method, &uri, &headers, &body) {
         return response;
     }

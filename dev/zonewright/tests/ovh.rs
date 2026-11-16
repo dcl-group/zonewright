@@ -26,7 +26,7 @@ use zonewright_mock::axum::http::{Method, StatusCode};
 use zonewright_mock::axum::response::IntoResponse as _;
 use zonewright_mock::changes::ChangeSource as _;
 use zonewright_mock::echo::{EchoServer, Echoed, Render};
-use zonewright_mock::ovh::{OvhMock, Seed};
+use zonewright_mock::ovh::{Hold, OvhMock, Seed};
 
 use common::echo::{LogCapture, REDACTED, assert_clean, dialects};
 use common::{context, dn};
@@ -154,6 +154,14 @@ fn published_txt(mock: &OvhMock) -> Vec<String> {
 /// The zone has no staged change that is not published.
 fn settled(mock: &OvhMock) -> bool {
     !mock.control().pending("example.org")
+}
+
+/// Waits until `hold` holds `count` requests. The deadline only fails a test whose request never
+/// arrives; it bounds nothing the test relies on.
+async fn held(hold: &Hold, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), hold.arrival(count))
+        .await
+        .expect("the request did not reach the mock");
 }
 
 // ---- Secrets (design section 12.2) -------------------------------------------------------------
@@ -1134,15 +1142,13 @@ async fn ovh_failed_refresh_then_failed_delete_expectation_publishes() {
 #[tokio::test]
 async fn ovh_dropped_operation_is_published_by_the_next_one() {
     let (mock, client) = setup().await;
-    // The refresh is held long enough for the operation to be dropped, and never applied.
-    let hold = || {
-        Fault::on("POST", REFRESH)
-            .delay(Duration::from_secs(30))
-            .status(503)
-    };
-    mock.faults().push(hold());
-    let dropped = tokio::time::timeout(Duration::from_millis(200), add(&client, "AAA")).await;
-    assert!(dropped.is_err(), "the operation was not dropped");
+    // The operation's refresh is held, and not applied while the test looks; the operation is
+    // dropped once the refresh has reached the mock.
+    let refresh = mock.control().hold_refreshes(1);
+    tokio::select! {
+        _ = add(&client, "AAA") => panic!("the operation was not dropped"),
+        () = held(&refresh, 1) => {}
+    }
     assert_eq!(mock.control().txt_values(NAME), ["\"AAA\""]);
     assert!(!settled(&mock));
     let before = refreshes(&mock);
@@ -1159,14 +1165,130 @@ async fn ovh_dropped_operation_is_published_by_the_next_one() {
     client.list_rrsets(&zone()).await.unwrap();
     assert_eq!(refreshes(&mock), before + 1);
 
-    mock.faults().push(hold());
-    let dropped = tokio::time::timeout(Duration::from_millis(200), add(&client, "BBB")).await;
-    assert!(dropped.is_err(), "the operation was not dropped");
+    let refresh = mock.control().hold_refreshes(1);
+    tokio::select! {
+        _ = add(&client, "BBB") => panic!("the operation was not dropped"),
+        () = held(&refresh, 1) => {}
+    }
     assert!(!settled(&mock));
     let e = add(&client, "two words").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
     assert!(settled(&mock));
     assert_eq!(published_txt(&mock), ["\"AAA\"", "\"BBB\""]);
+}
+
+/// A refresh sent by one operation while a record write of another is in flight does not cover
+/// that write, whichever request reaches the provider first. When the write's own refresh then
+/// fails, the client still owes the zone a refresh, as the write's error says, and the next
+/// operation in the zone sends it.
+#[tokio::test]
+async fn ovh_refresh_does_not_cover_a_write_in_flight() {
+    let (mock, client) = setup().await;
+    // B's record write is held before the mock stores it; the first refresh (A's) passes, the
+    // second (B's own) is refused.
+    let write = mock.control().hold_writes(1);
+    mock.faults().push(
+        Fault::on("POST", REFRESH)
+            .skip(1)
+            .respond(400, r#"{"class":"Client::BadRequest","message":"x"}"#),
+    );
+    let (written, read) = tokio::join!(add(&client, "AAA"), async {
+        held(&write, 1).await;
+        // A refresh is owed (B's write started), so A's read sends one, answered while B's
+        // write is still held.
+        let read = client.get_rrset(&zone(), &name(), RecordType::TXT).await;
+        assert_eq!(refreshes(&mock), 1);
+        write.release();
+        read
+    });
+    assert!(read.unwrap().is_none());
+    let e = written.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert!(e.to_string().contains("not published"), "{e}");
+    assert_eq!(refreshes(&mock), 2);
+    assert!(!settled(&mock));
+    let before = refreshes(&mock);
+    assert!(
+        client
+            .get_rrset(&zone(), &name(), RecordType::TXT)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(refreshes(&mock), before + 1);
+    assert!(settled(&mock));
+    assert_eq!(published_txt(&mock), ["\"AAA\""]);
+}
+
+/// An operation dropped while its record write is in flight, after another operation's refresh
+/// succeeded meanwhile: the write stays owed, and the next operation in the zone refreshes. Once
+/// that refresh succeeded nothing is owed: the dropped write no longer counts as in flight.
+#[tokio::test]
+async fn ovh_write_dropped_in_flight_stays_owed() {
+    let (mock, client) = setup().await;
+    let write = mock.control().hold_writes(1);
+    tokio::select! {
+        _ = add(&client, "AAA") => panic!("the operation was not dropped"),
+        read = async {
+            held(&write, 1).await;
+            client.get_rrset(&zone(), &name(), RecordType::TXT).await
+        } => {
+            read.unwrap();
+        }
+    }
+    assert_eq!(refreshes(&mock), 1);
+    // The held write is not released; whether the mock still stores it once the hold ends is
+    // up to its HTTP server and not asserted.
+    let before = refreshes(&mock);
+    client
+        .get_rrset(&zone(), &name(), RecordType::TXT)
+        .await
+        .unwrap();
+    assert_eq!(refreshes(&mock), before + 1);
+    client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(refreshes(&mock), before + 1);
+}
+
+/// Three operations in one zone. B's record write is held; meanwhile C writes at another name and
+/// refreshes, and A reads. C's refresh covers C's write, not B's, so A's read refreshes again.
+/// B is then dropped: the next operation refreshes once more, and after it nothing is owed.
+#[tokio::test]
+async fn ovh_refresh_of_a_finished_write_does_not_cover_one_in_flight() {
+    let (mock, client) = setup().await;
+    let other = dn("_acme-challenge.www.example.org");
+    let write = mock.control().hold_writes(1);
+    tokio::select! {
+        _ = add(&client, "AAA") => panic!("the operation was not dropped"),
+        () = async {
+            held(&write, 1).await;
+            assert_eq!(
+                client
+                    .add_txt_value(&zone(), &other, &txt("CCC"), None)
+                    .await
+                    .unwrap(),
+                AddOutcome::Created
+            );
+            assert_eq!(refreshes(&mock), 1);
+            client
+                .get_rrset(&zone(), &name(), RecordType::TXT)
+                .await
+                .unwrap();
+            assert_eq!(refreshes(&mock), 2);
+        } => {}
+    }
+    assert_eq!(
+        mock.control()
+            .published_txt_values("_acme-challenge.www.example.org"),
+        ["\"CCC\""]
+    );
+    let before = refreshes(&mock);
+    client
+        .get_rrset(&zone(), &other, RecordType::TXT)
+        .await
+        .unwrap();
+    assert_eq!(refreshes(&mock), before + 1);
+    client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(refreshes(&mock), before + 1);
 }
 
 /// The application secret, which is never sent, is still withheld when an answer states it, in

@@ -599,9 +599,10 @@ Behavior that the design fixes because the generic sections cannot:
   write operation that reached the provider, whatever its outcome (an unchanged result and a
   `PreconditionFailed` included: what the read found may be an earlier operation's change whose
   refresh failed, in any process); one that fails before any request sends none. It also keeps per
-  zone, in the client only, the record writes no successful refresh has covered yet; while one is
-  owed, every write operation refreshes on every exit and `get_rrset` and `list_rrsets` refresh
-  before reading (as nic.ru settles its own staged changes before a read), failing with the
+  zone, in the client only, the record writes no successful refresh has covered yet (a refresh
+  covers only the writes that had ended when it was sent; a write still in flight stays owed); while
+  one is owed, every write operation refreshes on every exit and `get_rrset` and `list_rrsets`
+  refresh before reading (as nic.ru settles its own staged changes before a read), failing with the
   refresh's error if it fails. A dropped operation is thus published by the client's next operation
   in the zone; once the client is gone, by the next write operation in the zone in any process, and
   not by a read elsewhere. A failed refresh after a successful operation is its error, prefixed

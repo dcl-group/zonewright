@@ -86,14 +86,18 @@ use super::records::Unstated;
 ///   is served (a read that publishes is surprising; a read that reports as present a change no
 ///   name server serves is worse). If that refresh fails, the read fails with the refresh's error.
 ///   A write whose future was dropped after it was sent thus is published by the client's next
-///   operation in the zone.
+///   operation in the zone. A refresh sent while another record write of this client is in
+///   flight does not cover that write: it stays owed until a refresh sent after it ended
+///   succeeds.
 ///
 /// What is not guaranteed: the mark lives in the client and is lost with it or with the process.
 /// A change staged by a dropped future or a failed refresh and then forgotten that way is published
 /// only by the next write operation in the zone that reaches the provider, in any process, or by
 /// anyone else's refresh (the control panel's included); a read in another client does not
 /// publish it and reports it as present. Publication of a refreshed zone by the name servers
-/// takes a time the documentation does not state; the default propagation timeout is lego's.
+/// takes a time the documentation does not state; the default propagation timeout is lego's. A
+/// request of a dropped future that the provider processes only after this client's later
+/// refresh is not covered by that refresh either; the client cannot see it.
 ///
 /// # Reads
 ///

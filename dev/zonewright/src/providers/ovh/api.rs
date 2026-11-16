@@ -325,11 +325,31 @@ impl Finish for Signer {
 struct Marks {
     /// Record writes started (counted right before they are sent).
     writes: u64,
-    /// The value of `writes` when the last successful refresh started: every write counted up to
-    /// it is published.
+    /// Record writes sent and not yet ended (answered, failed or dropped).
+    in_flight: u64,
+    /// The number of record writes that had ended when the last successful refresh was sent:
+    /// every write counted up to it is published. A write still in flight at that moment is not
+    /// counted, whatever the order in which the two requests reach the provider.
     published: u64,
     /// Requests about the zone started (reads, writes and refreshes).
     contacts: u64,
+}
+
+/// One record write in flight in `zone`, counted in [`Marks::in_flight`] for as long as this
+/// value lives: it is dropped when the write is answered, when it fails, and when its future is
+/// dropped at any await.
+struct Flight<'a> {
+    api: &'a Api,
+    zone: &'a DomainName,
+}
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        // `with_marks` recovers a poisoned mutex, so this cannot panic.
+        self.api.with_marks(self.zone, |m| {
+            m.in_flight = m.in_flight.saturating_sub(1);
+        });
+    }
 }
 
 /// A snapshot of the counters of one zone, taken when an operation starts.
@@ -398,7 +418,8 @@ impl Api {
     }
 
     /// A refresh of `zone` is owed: this client started a record write there that no successful
-    /// refresh has published yet (its outcome may be unknown, or its operation dropped).
+    /// refresh has published yet (its outcome may be unknown, or its operation dropped), or one
+    /// that was still in flight when the last successful refresh was sent.
     pub(super) fn owed(&self, zone: &DomainName) -> bool {
         self.with_marks(zone, |m| m.writes > m.published)
     }
@@ -460,10 +481,15 @@ impl Api {
     }
 
     /// [`Api::send_in`] for a record write, counted as one right before it is sent (after the
-    /// clock is read, so that a write that never left is not counted).
+    /// clock is read, so that a write that never left is not counted), and as in flight until it
+    /// ends: answered (after the transport's last attempt), failed, or dropped.
     async fn send_write(&self, zone: &DomainName, request: Request) -> Result<Response, Error> {
         self.ensure_clock().await?;
-        self.with_marks(zone, |m| m.writes = m.writes.saturating_add(1));
+        self.with_marks(zone, |m| {
+            m.writes = m.writes.saturating_add(1);
+            m.in_flight = m.in_flight.saturating_add(1);
+        });
+        let _flight = Flight { api: self, zone };
         self.send_in(zone, request).await
     }
 
@@ -661,15 +687,19 @@ impl Api {
 
     /// `POST /domain/zone/{zone}/refresh`: publishes every staged record change of the zone.
     /// Idempotent: a repeat publishes the same staged state, so the transport may retry it. A
-    /// success marks every record write this client had started in the zone when the refresh
-    /// started as published.
+    /// success marks as published every record write this client had started in the zone and
+    /// that had ended (answered, failed or dropped) when the refresh was sent; a write still in
+    /// flight stays owed. Only a success changes the marks, so a refresh that fails or is
+    /// dropped leaves owed what it would have covered.
     // Source: Schema, `refreshZone` ("Applies the pending record changes to the zone", 200,
     // void, no body); lego and Terraform call it after every write. Assumption (not documented,
     // not observed against the live API): that a refresh of a zone without staged changes
     // succeeds.
     pub(super) async fn refresh(&self, zone: &DomainName) -> Result<(), Error> {
         let url = self.zone_url(zone).path("/refresh").build()?;
-        let covered = self.with_marks(zone, |m| m.writes);
+        // Taken before the request is sent, so it counts only writes that had ended by then
+        // (a write that ends in between is left owed, which costs one more refresh at most).
+        let covered = self.with_marks(zone, |m| m.writes.saturating_sub(m.in_flight));
         let response = self
             .send_in(zone, Request::new(Method::POST, url).idempotent())
             .await?;

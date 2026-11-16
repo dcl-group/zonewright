@@ -6,7 +6,18 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- `zonewright-mock`: `ovh::Control::hold_writes` and `ovh::Control::hold_refreshes` hold record
+  writes or refreshes until the returned `ovh::Hold` is released, to force the order of concurrent
+  requests in tests.
+
+### Fixed
+
+- `ovh`: a zone refresh sent while another record write of the same client was in flight counted
+  that write as published. When that write's operation was then dropped, or its own refresh failed,
+  the record stayed stored but not published and no refresh was owed, until the next write in the
+  zone. A refresh now covers only the writes that had ended when it was sent.
 
 ## 0.2.3 - 2026-11-16
 
