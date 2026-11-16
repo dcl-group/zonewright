@@ -907,11 +907,8 @@ async fn call(client: &AnyProvider, op: Operation) -> Result<(), Error> {
 #[tokio::test]
 async fn unsupported_operations_return_unsupported() {
     let ctx = context();
-    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    tcp.set_nonblocking(true).unwrap();
+    let (tcp, udp) = silent_endpoint();
     let addr = tcp.local_addr().unwrap();
-    let udp = std::net::UdpSocket::bind(addr).unwrap();
-    udp.set_nonblocking(true).unwrap();
     let assert_untouched = |what: &str| {
         let would_block =
             |e: std::io::Error| assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{what}: {e}");
@@ -959,6 +956,25 @@ async fn unsupported_operations_return_unsupported() {
     }
 }
 
+/// A loopback port bound for TCP and for UDP, both non-blocking, that nothing should talk to.
+/// The UDP port of a TCP port the system just handed out can be taken by another process, so
+/// the pair is looked for a few times.
+fn silent_endpoint() -> (std::net::TcpListener, std::net::UdpSocket) {
+    let mut last = None;
+    for _ in 0..32 {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        match std::net::UdpSocket::bind(tcp.local_addr().unwrap()) {
+            Ok(udp) => {
+                tcp.set_nonblocking(true).unwrap();
+                udp.set_nonblocking(true).unwrap();
+                return (tcp, udp);
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    panic!("no loopback port free for both TCP and UDP: {last:?}");
+}
+
 /// A request for the provider's default TTL, at a provider that has none a write can ask for,
 /// is `InvalidInput` before any request, for `set_rrset` and `add_txt_value` alike; an explicit
 /// TTL outside the capabilities is refused the same way. Endpoints as in
@@ -966,11 +982,8 @@ async fn unsupported_operations_return_unsupported() {
 #[tokio::test]
 async fn ttl_requests_the_provider_refuses_send_nothing() {
     let ctx = context();
-    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    tcp.set_nonblocking(true).unwrap();
+    let (tcp, udp) = silent_endpoint();
     let addr = tcp.local_addr().unwrap();
-    let udp = std::net::UdpSocket::bind(addr).unwrap();
-    udp.set_nonblocking(true).unwrap();
     let assert_untouched = |what: &str| {
         let would_block =
             |e: std::io::Error| assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{what}: {e}");
