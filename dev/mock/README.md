@@ -11,15 +11,19 @@ The crate serves two purposes:
 - an application that uses `zonewright` can test its own code without accounts at the providers and
   without touching real DNS.
 
-It is test tooling. Its API follows the needs of those tests and changes more freely than that of
-`zonewright`. Both crates are released with the same version number; use the same version of both.
+It is test tooling, and its API follows the needs of those tests. Stable within a minor version are:
+starting a mock (`start`, `start_on`), the seeds, the methods of the control handles, faults, the
+request log, the change reports and the link to the DNS mock. Everything else — the routes a mock
+serves beyond those a client uses, error texts, the exact answers where a provider's documentation
+leaves room — may change in a patch release. Every incompatible change is listed in the changelog.
+Both crates are released with the same version number; use the same version of both.
 
 ## Use in a test
 
 ```toml
 [dev-dependencies]
-zonewright = { version = "0.1", features = ["cloudflare"] }
-zonewright-mock = "0.1"
+zonewright = { version = "0.2", features = ["cloudflare"] }
+zonewright-mock = "0.2"
 secrecy = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -89,11 +93,17 @@ Every provider mock is a module named after the provider ID, with the same parts
 
 - **A seed** (`Seed`, with `Seed::standard()`) — the zones and credentials the mock starts with.
 - **A handle** (`CloudflareMock`, `Route53Mock`, …) — started with `start(seed)`, stopped when
-  dropped. It listens on an ephemeral port, so any number of mocks run side by side in one test
-  binary, and nothing is global.
+  dropped. It listens on `127.0.0.1` with an ephemeral port, so any number of mocks run side by side
+  in one test binary, and nothing is global. `start_on(addr, seed)` listens on a given address
+  instead, for a stand where the client runs in another container; use it on an isolated test
+  network only.
 - **State control** (`control()`) — reads what the mock holds and changes it directly, as another
   writer at the provider would: insert a record behind the client's back, change a zone's status,
-  or, where the provider issues tokens, revoke them.
+  or, where the provider issues tokens, revoke them. `reset()` returns the mock to its seed, so one
+  mock serves several test cases.
+- **Change reports** (`changes()`, the trait `changes::ChangeSource`) — every change of the records
+  the provider would publish, as one type for all providers: the complete rrset of a name and type
+  after the change, in zone-file text. `changes().subscribe()` delivers them in order.
 - **The request log** (`log()`) — every request the mock received: method, path, query, all headers,
   body, and the status it answered with. `count` and `matching` take a method and a path pattern in
   which `*` matches within one path segment and `**` across segments.
@@ -106,6 +116,31 @@ Request and response shapes follow each provider's public documentation, with th
 module. Error texts are invented. A mock is not the provider: it shows that the client sends what
 the documentation asks for and handles the answers the documentation describes, not that the real
 API behaves that way.
+
+## Serving a provider mock's records over DNS
+
+An application that issues certificates over DNS-01 writes TXT records through a provider API, and
+an ACME server then asks a DNS server for them. `link::link` connects the two mocks:
+
+```rust
+use zonewright_mock::dns::{DnsMock, Role};
+use zonewright_mock::link::{LinkOptions, link};
+use zonewright_mock::selectel_v2::{Seed, SelectelV2Mock};
+
+// Inside an async test:
+let provider = SelectelV2Mock::start(Seed::standard()).await;
+let dns = DnsMock::start(Role::Authoritative).await;
+let link = link(&provider, &dns, LinkOptions::new());
+// Point the ACME server's DNS resolver at `dns.addr()` (for Pebble: `-dnsserver`), and the
+// application's client at `provider.base_url()`.
+link.settled().await; // everything written so far is being answered
+```
+
+The `DnsMock` serves every zone and record the provider mock holds, with the AA flag, and follows
+every later change. `Link::settled` replaces sleeping; `Link::hold` and `Link::release`, or
+`LinkOptions::delay`, model propagation that has not happened yet. The link converts A, AAAA, TXT,
+CNAME, NS, MX and CAA; other types are skipped and counted (`Link::skipped`). An application that
+keeps a DNS server of its own subscribes to the changes instead and mirrors them itself.
 
 ## Mocks
 
@@ -132,8 +167,9 @@ server.
 
 Further servers, for tests that are not about one provider:
 
-- `dns::DnsMock` — a loopback DNS server, authoritative or recursive, for tests of the `inspector`
-  feature of `zonewright`.
+- `dns::DnsMock` — a DNS server, authoritative or recursive, on loopback or on a given address
+  (`start_on`), for tests of the `inspector` feature of `zonewright` and as the DNS server of an
+  ACME test (below).
 - `proxy::ProxyServer` and `socks::SocksServer` — an HTTP forward proxy and a SOCKS5 proxy, with
   optional authentication, for tests of a proxy setting.
 - `echo::EchoServer` — a server that quotes each request back in its error messages, credentials

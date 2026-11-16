@@ -1,6 +1,6 @@
 # zonewright design
 
-Status: describes the crate as implemented in `dev/zonewright` (version 0.1.0). Where this document
+Status: describes the crate as implemented in `dev/zonewright` (version 0.2.0). Where this document
 and the code disagree, one of them is fixed in the same change.
 
 Binding rules live in [`AGENTS.md`](../../AGENTS.md) (settled decisions, hard rules, engineering

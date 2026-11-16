@@ -6,6 +6,13 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.0 - 2026-11-16
+
+Incompatible with 0.1 in three places, each described under "Changed": the default trust anchors of
+HTTPS, SOCKS5 proxies, and SVCB/HTTPS data that is not self-consistent.
+
 ### Added
 
 - `zonewright-mock`: provider mocks report every change of their published records as one type,

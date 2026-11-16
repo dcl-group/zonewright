@@ -13,8 +13,8 @@ desired-state diffing, no scheduling, no audit and no metrics.
 
 ## Status
 
-Version 0.1.0, the first release. The provider clients are implemented and tested against mocks. One
-client, Selectel v2, is verified against the live API; the others are not yet.
+Version 0.2.0. The provider clients are implemented and tested against mocks. One client, Selectel
+v2, is verified against the live API; the others are not yet.
 
 [`PROVIDERS.md`](https://github.com/dcl-group/zonewright/blob/main/PROVIDERS.md) is the single list
 of providers, with the state of each client and the definition of "verified". Each provider reports
@@ -25,7 +25,7 @@ not support with an `Unsupported` error rather than failing in some other way.
 
 ```toml
 [dependencies]
-zonewright = { version = "0.1", features = ["cloudflare", "inspector"] }
+zonewright = { version = "0.2", features = ["cloudflare", "inspector"] }
 ```
 
 No feature is enabled by default. A provider that is not compiled in is still a valid `ProviderId`;
@@ -202,6 +202,30 @@ policy refuses) is reported with its reason and, by default, keeps the wait from
 and `max_questions_per_round` (default 1024) for the servers × questions of one round. Answers must
 carry the AA flag; `accept_static_without_aa` lifts that for the servers of a static list only, for
 example a test DNS server that never sets it.
+
+## Testing an ACME application
+
+The crate [`zonewright-mock`](https://crates.io/crates/zonewright-mock) has a stateful mock of every
+provider's API and a mock DNS server. Together they stand in for both sides of a DNS-01 test: the
+provider API the application writes to, and the DNS server the ACME server reads from.
+
+```text
+let provider = SelectelV2Mock::start(Seed::standard()).await;
+let dns = DnsMock::start(Role::Authoritative).await;
+let link = link(&provider, &dns, LinkOptions::new());
+// ACME server (for Pebble: -dnsserver) -> dns.addr()
+// ... the application writes _acme-challenge TXT through provider.base_url() ...
+link.settled().await;
+```
+
+`link::link` makes the `DnsMock` serve every zone and record the provider mock holds, and every
+later change. `Link::settled` returns once what was written is being answered, so a test does not
+sleep. `Link::hold` and `Link::release`, or `LinkOptions::delay`, model propagation that has not
+happened yet; faults on the `DnsMock` (SERVFAIL for a name, answers without the AA flag) model a
+broken name server. For a stand where the ACME server runs in another container, start the mocks
+with `start_on`, for example on `0.0.0.0` with a fixed port, on an isolated test network only: a
+mock is an open server with test credentials. The RFC 2136 mock answers queries itself, so an ACME
+server can be pointed at it directly.
 
 ## TLS and crypto
 

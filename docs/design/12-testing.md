@@ -25,6 +25,16 @@ Mocks that issue tokens can revoke them and count how many they issued. The Rout
 the SigV4 signature, the RFC 2136 mock verifies and produces TSIG, and the Yandex Cloud mock
 verifies the PS256 signature, each with code that shares nothing with the crate under test.
 
+Every provider mock also reports each change of the records it would publish as one type: the
+complete rrset of a name and type after the change, in zone-file text, whatever the shape of the
+provider's API. A mock computes its published state in one function, and the difference before and
+after each change is emitted under the mock's lock, so subscribers see changes in order. A link
+applies these changes to the mock DNS server, so that a test of an application that issues
+certificates over DNS-01 can serve the provider's records to its ACME server: `settled` replaces
+sleeping, and a hold or a delay models propagation. Mocks listen on loopback by default and on a
+given address with `start_on`, for a stand whose parts run in different containers. What is stable
+in the mock's API within a minor version is stated in its crate documentation.
+
 The crate also holds the echo server of the secret tests (section 12.2), a forward proxy (`CONNECT`
 and plain forwarding, optional Basic authentication) and a SOCKS5 proxy (optional username and
 password) for the transport's proxy tests, and a loopback DNS server over UDP and TCP, either

@@ -1,6 +1,6 @@
 [package]
 name = "zonewright"
-version = "0.1.0"
+version = "0.2.0"
 description = "Manage DNS zones at DNS hosting providers: provider clients, record operations, DNS-01 helpers and a propagation inspector."
 edition.workspace = true
 rust-version.workspace = true
@@ -93,7 +93,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 [dev-dependencies]
 serde_json = "1.0.154"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
-zonewright-mock = { version = "0.1.0", path = "../mock" }
+zonewright-mock = { version = "0.2.0", path = "../mock" }
 tokio = { version = "1.54.1", features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

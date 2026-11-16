@@ -2,8 +2,8 @@
 //!
 //! This crate is test tooling. It is published so that the tests of `zonewright` can be built from
 //! its package, and so that an application can test its own use of `zonewright` without live
-//! accounts. Its API follows the needs of those tests and changes more freely than that of
-//! `zonewright`; it is released with the same version number.
+//! accounts. Its API follows the needs of those tests (see "Stability" below); it is released
+//! with the same version number as `zonewright`.
 //!
 //! It holds one stateful mock per provider API (one module per provider ID), the echo server used
 //! by the secret tests ([`echo`]), and the harness they share:
