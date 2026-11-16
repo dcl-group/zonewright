@@ -3227,3 +3227,98 @@ async fn live_regru_record_round_trip() {
     }
     assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
 }
+
+// ---- Served over DNS ---------------------------------------------------------------------------
+
+/// What the mock holds, answered by a DNS mock through a link.
+#[cfg(feature = "inspector")]
+mod over_dns {
+    use zonewright::{Expect, Provider, RecordType};
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+
+    use super::common::link::{ask, is_absent, rd, txt, values};
+    use super::{NAME, SUB, add, remove, rr, setup, zone};
+
+    #[tokio::test]
+    async fn regru_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        // `common::link::txt_round_trip` writes a value with a hyphen, which `add_txt` refuses
+        // (only alphanumeric ASCII); the same round trip with a value reg.ru takes.
+        let link = link(&mock, &dns, LinkOptions::new());
+        add(&client, "roundtrip1").await.unwrap();
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("roundtrip1")]
+        );
+        remove(&client, "roundtrip1").await.unwrap();
+        link.settled().await;
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+        // The API has no TTL: what the client writes is published without one, and a value the
+        // API answers quoted is served the same.
+        mock.control().set_quoted(true);
+        client
+            .set_rrset(
+                &zone(),
+                &rr("www.example.org", RecordType::A, &["192.0.2.10"]),
+                Expect::Absent,
+            )
+            .await
+            .unwrap();
+        add(&client, "abc123").await.unwrap();
+        // The client cannot write a CNAME; another writer can, with the target as reg.ru holds
+        // it, without the trailing dot.
+        mock.control()
+            .add_record("example.org", "alias", "CNAME", "target.example.net");
+        // A domain on other name servers is not published.
+        mock.control()
+            .add_record("elsewhere.example", SUB, "TXT", "elsewhere");
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), "www.example.org", RecordType::A).await),
+            [rd(RecordType::A, "192.0.2.10")]
+        );
+        assert_eq!(
+            values(ask(dns.addr(), NAME, RecordType::TXT).await),
+            [txt("abc123")]
+        );
+        assert_eq!(
+            values(ask(dns.addr(), "alias.example.org", RecordType::CNAME).await),
+            [rd(RecordType::CNAME, "target.example.net.")]
+        );
+        let published = zonewright_mock::changes::ChangeSource::published(&mock);
+        assert_eq!(published.zones, ["example.org"]);
+        assert!(published.rrsets.iter().all(|c| c.zone == "example.org"));
+        assert!(
+            published
+                .rrsets
+                .iter()
+                .all(|c| c.rrset.as_ref().unwrap().ttl.is_none())
+        );
+        assert_eq!(link.skipped(), 0);
+    }
+
+    #[tokio::test]
+    async fn regru_reset_returns_the_mock_to_its_seed() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        add(&client, "beforereset").await.unwrap();
+        link.settled().await;
+        assert!(!is_absent(&ask(dns.addr(), NAME, RecordType::TXT).await));
+
+        mock.control().reset();
+        link.settled().await;
+        assert!(mock.control().txt("example.org", SUB).is_empty());
+        assert!(mock.control().calls().is_empty());
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+        assert!(mock.log().is_empty());
+
+        add(&client, "afterreset").await.unwrap();
+        assert_eq!(mock.control().txt("example.org", SUB), ["afterreset"]);
+    }
+}

@@ -39,7 +39,18 @@
 //! // ... drive the client against mock.base_url() ...
 //! assert_eq!(mock.control().values(&mock.control().subdomain(0)), ["…43 characters…"]);
 //! ```
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`AcmeDnsMock::changes`], and a [`link`](crate::link::link) serves them over DNS. The zone is
+//! the server's own domain ([`Seed::domain`]); published is, per registration, the TXT rrset at
+//! its `fulldomain` (`<subdomain>.<domain>`) with the values of its two slots, each as one quoted
+//! character-string, a value held in both slots once, without a TTL (the mock does not model the
+//! TTL of the server's answers). Left out: a slot that was never written (the mock does not model
+//! what the server answers for an empty row), and the server's own records (its SOA, NS and A
+//! records come from its configuration file, which the mock does not have). [`Control::reset`]
+//! returns the mock to its seed.
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -52,7 +63,8 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::MockServer;
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, MockServer, RequestLog};
 
 /// One registration the server knows.
 #[derive(Clone, Debug)]
@@ -121,11 +133,50 @@ struct Slot {
 #[derive(Debug)]
 struct Inner {
     seed: Seed,
+    changes: Changes,
     /// Two slots per account, in the order of `seed.accounts`.
     slots: Vec<[Slot; 2]>,
     /// When each stored write happened, per account, oldest first.
     writes: Vec<Vec<Instant>>,
     clock: u64,
+}
+
+impl Inner {
+    /// The state of a mock started with `seed`: every slot empty.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        let slots = seed.accounts.iter().map(|_| Default::default()).collect();
+        let writes = seed.accounts.iter().map(|_| Vec::new()).collect();
+        Inner {
+            seed,
+            changes,
+            slots,
+            writes,
+            clock: 0,
+        }
+    }
+
+    /// What the server's DNS side would answer (module documentation).
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        let zone = &self.seed.domain;
+        out.zone(zone);
+        for (account, slots) in self.seed.accounts.iter().zip(&self.slots) {
+            let name = format!("{}.{zone}", account.subdomain);
+            for slot in slots.iter().filter(|s| !s.value.is_empty()) {
+                // A value the server takes is 43 characters of `A-Z a-z 0-9 - _`: nothing to
+                // escape. A control write can hold anything; `"` and `\` are escaped.
+                let escaped = slot.value.replace('\\', "\\\\").replace('"', "\\\"");
+                out.record(zone, &name, "TXT", None, format!("\"{escaped}\""));
+            }
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -147,6 +198,9 @@ pub struct AcmeDnsMock {
 #[derive(Clone)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for AcmeDnsMock {
@@ -158,24 +212,27 @@ impl Deref for AcmeDnsMock {
 }
 
 impl AcmeDnsMock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> AcmeDnsMock {
-        let slots = seed.accounts.iter().map(|_| Default::default()).collect();
-        let writes = seed.accounts.iter().map(|_| Vec::new()).collect();
-        let state: Shared = Arc::new(Mutex::new(Inner {
-            seed,
-            slots,
-            writes,
-            clock: 0,
-        }));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> AcmeDnsMock {
+        let changes = Changes::new();
+        let state: Shared = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new()
             .route("/update", post(update))
             .route("/health", get(|| async { StatusCode::OK }))
             .with_state(state.clone());
-        AcmeDnsMock {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        AcmeDnsMock { server, control }
     }
 
     /// The mock's state.
@@ -184,7 +241,38 @@ impl AcmeDnsMock {
     }
 }
 
+impl ChangeSource for AcmeDnsMock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its registrations with every slot
+    /// empty, no recorded write times, an empty request log and no pending faults. Reports the
+    /// removal of every rrset that was published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.seed.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// The `fulldomain` of registration `i`, without a trailing dot.
     pub fn fulldomain(&self, i: usize) -> String {
         let inner = lock(&self.state);
@@ -245,16 +333,16 @@ impl Control {
 
     /// Writes `value` as another writer would, without a request: into the older slot.
     pub fn write(&self, subdomain: &str, value: &str) {
-        let mut inner = lock(&self.state);
-        let Some(i) = inner
-            .seed
-            .accounts
-            .iter()
-            .position(|a| a.subdomain == subdomain)
-        else {
-            return;
-        };
-        write_oldest(&mut inner, i, value);
+        self.change(|inner| {
+            if let Some(i) = inner
+                .seed
+                .accounts
+                .iter()
+                .position(|a| a.subdomain == subdomain)
+            {
+                write_oldest(inner, i, value);
+            }
+        });
     }
 
     /// When each write to the registration with `subdomain` was stored, oldest first.
@@ -384,6 +472,8 @@ async fn update(State(state): State<Shared>, headers: HeaderMap, body: String) -
     if !valid_txt(&post.txt) {
         return error(StatusCode::BAD_REQUEST, "bad_txt");
     }
+    let before = inner.published();
     write_oldest(&mut inner, i, &post.txt);
+    inner.report(&before, Origin::Api);
     (StatusCode::OK, axum::Json(json!({ "txt": post.txt }))).into_response()
 }

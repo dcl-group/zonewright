@@ -1764,3 +1764,67 @@ async fn live_beget_add_and_remove() {
     }
     assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
 }
+
+// ---- Served over DNS ---------------------------------------------------------------------------
+
+/// What the mock holds, answered by a DNS mock through a link.
+#[cfg(feature = "inspector")]
+mod over_dns {
+    use serde_json::json;
+    use zonewright::RecordType;
+    use zonewright_mock::changes::ChangeSource;
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+
+    use super::common::link::{ask, is_absent, rd, txt_round_trip, values};
+    use super::{NAME, add, setup};
+
+    #[tokio::test]
+    async fn beget_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        // An MX record written by another writer, its priority as a string and its host
+        // without the trailing dot, as the API holds them.
+        mock.control().insert(
+            "mail.example.org",
+            "MX",
+            "mx.example.net",
+            json!("10"),
+            Some(json!(600)),
+        );
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = txt_round_trip(&mock, &client, &dns).await;
+        assert_eq!(
+            values(ask(dns.addr(), "mail.example.org", RecordType::MX).await),
+            [rd(RecordType::MX, "10 mx.example.net.")]
+        );
+        // A domain the mock's name servers do not serve is not published.
+        mock.control().insert_domain("example.net", false);
+        mock.control()
+            .insert_txt("_acme-challenge.example.net", "elsewhere", 300);
+        link.settled().await;
+        let published = ChangeSource::published(&mock);
+        assert_eq!(published.zones, ["example.org"]);
+        assert!(published.rrsets.iter().all(|c| c.zone == "example.org"));
+        assert_eq!(link.skipped(), 0);
+    }
+
+    #[tokio::test]
+    async fn beget_reset_returns_the_mock_to_its_seed() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        add(&client, "before-reset").await.unwrap();
+        link.settled().await;
+        assert!(!is_absent(&ask(dns.addr(), NAME, RecordType::TXT).await));
+
+        mock.control().reset();
+        link.settled().await;
+        assert!(mock.control().txt_values(NAME).is_empty());
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+        assert!(mock.log().is_empty());
+
+        add(&client, "after-reset").await.unwrap();
+        assert_eq!(mock.control().txt_values(NAME), ["after-reset"]);
+    }
+}

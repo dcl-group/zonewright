@@ -66,11 +66,23 @@
 //! // ... drive the client against mock.base_url() ...
 //! assert_eq!(mock.control().txt_values("_acme-challenge.example.org"), ["v1"]);
 //! ```
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`BegetMock::changes`], the records of one name and type grouped into one rrset, and a
+//! [`link`](crate::link::link) serves them over DNS. Published are the A, MX, TXT, NS and CNAME
+//! records of the domains its name servers serve (`is_beget_dns`), each name in the domain that is
+//! the longest suffix of it; a TXT value as one quoted character-string (split every 255 bytes),
+//! MX as `<priority> <host>.`, NS and CNAME with the trailing dot added; the TTL of a set is the
+//! smallest TTL written for its records, none when no record has one. Left out: the `DNS` and
+//! `DNS_IP` settings (name server delegation, not records of the zone), the documented
+//! placeholder entry, and every record of a domain the mock's name servers do not serve.
+//! [`Control::reset`] returns the mock to its seed.
 
 // Reason: the error side of a handler's result is the response it answers with.
 #![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -82,7 +94,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use serde_json::{Map, Value, json};
 
-use crate::{LoggedRequest, MockServer};
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, LoggedRequest, MockServer, RequestLog};
 
 /// Path of the API below the server's base URL.
 pub const API_PATH: &str = "/api";
@@ -154,6 +167,9 @@ struct Domain {
 
 #[derive(Debug)]
 struct Inner {
+    /// The seed the mock was started with, for [`Control::reset`].
+    seed: Seed,
+    changes: Changes,
     login: String,
     password: String,
     domains: Vec<Domain>,
@@ -162,6 +178,109 @@ struct Inner {
     txt_field: TxtField,
     placeholder: bool,
     observed: bool,
+}
+
+impl Inner {
+    /// The state of a mock started with `seed`.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        Inner {
+            seed: seed.clone(),
+            changes,
+            login: seed.login,
+            password: seed.password,
+            domains: seed
+                .domains
+                .into_iter()
+                .map(|name| Domain {
+                    name: name.to_lowercase(),
+                    served: true,
+                })
+                .collect(),
+            records: BTreeMap::new(),
+            txt_field: TxtField::Txtdata,
+            placeholder: true,
+            observed: false,
+        }
+    }
+
+    /// What a DNS server for the mock's domains would answer (module documentation).
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        let served: Vec<&Domain> = self.domains.iter().filter(|d| d.served).collect();
+        for domain in &served {
+            out.zone(&domain.name);
+        }
+        for (name, records) in &self.records {
+            // The zone a DNS server answers the name from: the longest domain it is in. A name
+            // in a domain that is not served is answered by nobody.
+            let Some(zone) = self
+                .domains
+                .iter()
+                .filter(|d| *name == d.name || name.ends_with(&format!(".{}", d.name)))
+                .max_by_key(|d| d.name.len())
+                .filter(|d| d.served)
+            else {
+                continue;
+            };
+            for record in records {
+                let ttl = record
+                    .ttl
+                    .as_ref()
+                    .and_then(Value::as_u64)
+                    .and_then(|t| u32::try_from(t).ok());
+                let host = |value: &str| format!("{}.", value.trim_end_matches('.'));
+                let value = match record.rtype.as_str() {
+                    "A" => record.value.clone(),
+                    "TXT" => quoted(&record.value),
+                    "NS" | "CNAME" => host(&record.value),
+                    "MX" => {
+                        let priority = match &record.priority {
+                            Value::String(s) => s.parse::<u64>().unwrap_or(0),
+                            other => other.as_u64().unwrap_or(0),
+                        };
+                        format!("{priority} {}", host(&record.value))
+                    }
+                    // `DNS` and `DNS_IP` are delegation settings, not records of the zone.
+                    _ => continue,
+                };
+                out.record(&zone.name, name, &record.rtype, ttl, value);
+            }
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+}
+
+/// `text` as quoted character-strings of at most 255 bytes, `"` and `\` escaped.
+fn quoted(text: &str) -> String {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return "\"\"".to_owned();
+    }
+    bytes
+        .chunks(255)
+        .map(|chunk| {
+            let mut out = String::from("\"");
+            for &byte in chunk {
+                match byte {
+                    b'"' | b'\\' => {
+                        out.push('\\');
+                        out.push(char::from(byte));
+                    }
+                    0x20..=0x7e => out.push(char::from(byte)),
+                    _ => out.push_str(&format!("\\{byte:03}")),
+                }
+            }
+            out.push('"');
+            out
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -184,6 +303,9 @@ pub struct BegetMock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for BegetMock {
@@ -195,31 +317,26 @@ impl Deref for BegetMock {
 }
 
 impl BegetMock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let state = Arc::new(Mutex::new(Inner {
-            login: seed.login,
-            password: seed.password,
-            domains: seed
-                .domains
-                .into_iter()
-                .map(|name| Domain {
-                    name: name.to_lowercase(),
-                    served: true,
-                })
-                .collect(),
-            records: BTreeMap::new(),
-            txt_field: TxtField::Txtdata,
-            placeholder: true,
-            observed: false,
-        }));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new()
             .route("/api/{category}/{function}", any(call))
             .with_state(state.clone());
-        Self {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The API endpoint, for the client's `base_url`.
@@ -233,6 +350,16 @@ impl BegetMock {
     }
 }
 
+impl ChangeSource for BegetMock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 /// The key of a name in the mock: lowercase, no trailing dot.
 fn key(name: &str) -> String {
     let lower = name.trim().to_lowercase();
@@ -240,6 +367,27 @@ fn key(name: &str) -> String {
 }
 
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its login, password and domains (all
+    /// served), no records, the default answer shape, an empty request log and no pending
+    /// faults. Reports the removal of every rrset that was published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.seed.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// Every record of `name`, in the order the mock holds them.
     pub fn records(&self, name: &str) -> Vec<Record> {
         lock(&self.state)
@@ -274,16 +422,14 @@ impl Control {
         priority: Value,
         ttl: Option<Value>,
     ) {
-        lock(&self.state)
-            .records
-            .entry(key(name))
-            .or_default()
-            .push(Record {
+        self.change(|inner| {
+            inner.records.entry(key(name)).or_default().push(Record {
                 rtype: rtype.to_owned(),
                 value: value.to_owned(),
                 priority,
                 ttl,
             });
+        });
     }
 
     /// Adds a TXT record with priority 10 and the given TTL.
@@ -293,9 +439,11 @@ impl Control {
 
     /// Removes every record of `name` of type `rtype`, as another writer would.
     pub fn remove_type(&self, name: &str, rtype: &str) {
-        if let Some(records) = lock(&self.state).records.get_mut(&key(name)) {
-            records.retain(|r| r.rtype != rtype);
-        }
+        self.change(|inner| {
+            if let Some(records) = inner.records.get_mut(&key(name)) {
+                records.retain(|r| r.rtype != rtype);
+            }
+        });
     }
 
     /// Chooses the field that holds a TXT record's text in answers.
@@ -318,21 +466,21 @@ impl Control {
 
     /// Adds a domain to the account.
     pub fn insert_domain(&self, name: &str, served: bool) {
-        lock(&self.state).domains.push(Domain {
-            name: key(name),
-            served,
+        self.change(|inner| {
+            inner.domains.push(Domain {
+                name: key(name),
+                served,
+            });
         });
     }
 
     /// Sets whether the mock's name servers serve `domain` (`is_beget_dns`).
     pub fn set_served(&self, domain: &str, served: bool) {
-        for d in lock(&self.state)
-            .domains
-            .iter_mut()
-            .filter(|d| d.name == key(domain))
-        {
-            d.served = served;
-        }
+        self.change(|inner| {
+            for d in inner.domains.iter_mut().filter(|d| d.name == key(domain)) {
+                d.served = served;
+            }
+        });
     }
 }
 
@@ -636,11 +784,13 @@ fn change_records(state: &Shared, input: &Map<String, Value>) -> Response {
     if domain_of(&inner, &name).is_none() {
         return method_error("INVALID_DATA", "The domain is not on the account");
     }
+    let before = inner.published();
     let held = inner.records.entry(name).or_default();
     // The documented group replaces its types: a type of the group that the request leaves out
     // is emptied (an invention, see the module documentation).
     held.retain(|r| !types.contains(&r.rtype.as_str()));
     held.extend(parsed);
+    inner.report(&before, Origin::Api);
     success(json!(true))
 }
 

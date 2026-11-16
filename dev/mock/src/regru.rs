@@ -71,7 +71,19 @@
 //! // ... drive the client against mock.base_url() ...
 //! assert_eq!(mock.control().txt("example.org", "_acme-challenge"), ["v1"]);
 //! ```
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`RegruMock::changes`], the records of one name and type grouped into one rrset, and a
+//! [`link`](crate::link::link) serves them over DNS. Published are the records of the domains
+//! whose zones the provider serves ([`Seed::zones`]), each at `<subname>.<domain>` (the domain
+//! itself for `@`), without a TTL (the API has none). The form of a value: TXT content, which the
+//! mock holds unquoted, as one quoted character-string (split every 255 bytes); CNAME and NS
+//! content with the trailing dot added; MX content as `0 <host>.` (the priority the mock answers
+//! for every record); any other type as held. Left out: records of a domain on other name
+//! servers ([`Seed::foreign_ns_zones`]) or not on the account. [`Control::reset`] returns the
+//! mock to its seed.
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -82,7 +94,8 @@ use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 
-use crate::MockServer;
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, MockServer, RequestLog};
 
 /// Path of the API below the server's base URL.
 pub const API_PATH: &str = "/api/regru2";
@@ -145,9 +158,83 @@ pub struct Call {
 #[derive(Debug)]
 struct Inner {
     seed: Seed,
+    changes: Changes,
     records: Vec<Record>,
     calls: Vec<Call>,
     quoted: bool,
+}
+
+impl Inner {
+    /// The state of a mock started with `seed`.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        Inner {
+            seed,
+            changes,
+            records: Vec::new(),
+            calls: Vec::new(),
+            quoted: false,
+        }
+    }
+
+    /// What a DNS server for the mock's zones would answer (module documentation).
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        for zone in &self.seed.zones {
+            out.zone(zone);
+        }
+        for record in &self.records {
+            if !self.seed.zones.contains(&record.zone) {
+                continue;
+            }
+            let name = if record.sub == "@" {
+                record.zone.clone()
+            } else {
+                format!("{}.{}", record.sub, record.zone)
+            };
+            let host = |value: &str| format!("{}.", value.trim_end_matches('.'));
+            let value = match record.rtype.as_str() {
+                "TXT" => quoted(&record.content),
+                "CNAME" | "NS" => host(&record.content),
+                "MX" => format!("0 {}", host(&record.content)),
+                _ => record.content.clone(),
+            };
+            out.record(&record.zone, &name, &record.rtype, None, value);
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+}
+
+/// `text` as quoted character-strings of at most 255 bytes, `"` and `\` escaped.
+fn quoted(text: &str) -> String {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return "\"\"".to_owned();
+    }
+    bytes
+        .chunks(255)
+        .map(|chunk| {
+            let mut out = String::from("\"");
+            for &byte in chunk {
+                match byte {
+                    b'"' | b'\\' => {
+                        out.push('\\');
+                        out.push(char::from(byte));
+                    }
+                    0x20..=0x7e => out.push(char::from(byte)),
+                    _ => out.push_str(&format!("\\{byte:03}")),
+                }
+            }
+            out.push('"');
+            out
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -170,6 +257,9 @@ pub struct RegruMock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for RegruMock {
@@ -181,19 +271,24 @@ impl Deref for RegruMock {
 }
 
 impl RegruMock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let state = Arc::new(Mutex::new(Inner {
-            seed,
-            records: Vec::new(),
-            calls: Vec::new(),
-            quoted: false,
-        }));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new().fallback(handle).with_state(state.clone());
-        Self {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The API endpoint, for the client's `base_url`.
@@ -207,7 +302,38 @@ impl RegruMock {
     }
 }
 
+impl ChangeSource for RegruMock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: no records, no calls, TXT contents
+    /// answered as written, an empty request log and no pending faults. Reports the removal of
+    /// every rrset that was published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.seed.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// Every record, in the order of creation.
     pub fn records(&self) -> Vec<Record> {
         lock(&self.state).records.clone()
@@ -235,11 +361,13 @@ impl Control {
 
     /// Adds a record directly, as another writer would.
     pub fn add_record(&self, zone: &str, sub: &str, rtype: &str, content: &str) {
-        lock(&self.state).records.push(Record {
-            zone: zone.into(),
-            sub: sub.into(),
-            rtype: rtype.into(),
-            content: content.into(),
+        self.change(|inner| {
+            inner.records.push(Record {
+                zone: zone.into(),
+                sub: sub.into(),
+                rtype: rtype.into(),
+                content: content.into(),
+            });
         });
     }
 
@@ -391,7 +519,10 @@ async fn handle(State(state): State<Shared>, method: Method, uri: Uri, body: Byt
             plain,
         );
     }
+    // A function that fails changes nothing, so the difference it reports is empty.
+    let before = s.published();
     let body = zone_function(&mut s, function, &input);
+    s.report(&before, Origin::Api);
     respond(&body, plain)
 }
 

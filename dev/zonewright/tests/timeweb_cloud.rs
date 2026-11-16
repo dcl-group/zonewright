@@ -3956,3 +3956,82 @@ async fn timeweb_cloud_provider_default_ttl() {
         );
     }
 }
+
+// ---- Served over DNS ---------------------------------------------------------------------------
+
+/// What the mock holds, answered by a DNS mock through a link.
+#[cfg(feature = "inspector")]
+mod over_dns {
+    use zonewright::{Expect, Provider, RecordType};
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+    use zonewright_mock::timeweb_cloud::SubdomainForm;
+
+    use super::common::link::{ask, is_absent, rd, txt, txt_round_trip, values};
+    use super::{NAME, add, rr, setup, zone};
+
+    #[tokio::test]
+    async fn timeweb_cloud_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = txt_round_trip(&mock, &client, &dns).await;
+        // Records of subdomains are listed separately and their names are relative to the
+        // domain, host names in `value` lack the trailing dot; what is published is absolute.
+        mock.control().set_subdomain_form(SubdomainForm::Full);
+        for set in [
+            rr(
+                "www.example.org",
+                RecordType::CNAME,
+                Some(300),
+                &["target.example.net."],
+            ),
+            rr(
+                "mail.example.org",
+                RecordType::MX,
+                Some(600),
+                &["10 mx1.example.net."],
+            ),
+            rr("a.b.example.org", RecordType::TXT, None, &["\"deep\""]),
+        ] {
+            client
+                .set_rrset(&zone(), &set, Expect::Absent)
+                .await
+                .unwrap();
+        }
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), "www.example.org", RecordType::CNAME).await),
+            [rd(RecordType::CNAME, "target.example.net.")]
+        );
+        assert_eq!(
+            values(ask(dns.addr(), "mail.example.org", RecordType::MX).await),
+            [rd(RecordType::MX, "10 mx1.example.net.")]
+        );
+        assert_eq!(
+            values(ask(dns.addr(), "a.b.example.org", RecordType::TXT).await),
+            [txt("deep")]
+        );
+        assert_eq!(link.skipped(), 0);
+    }
+
+    #[tokio::test]
+    async fn timeweb_cloud_reset_returns_the_mock_to_its_seed() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        add(&client, "before-reset").await.unwrap();
+        link.settled().await;
+        assert!(!is_absent(&ask(dns.addr(), NAME, RecordType::TXT).await));
+
+        mock.control().reset();
+        link.settled().await;
+        assert!(mock.control().records().is_empty());
+        assert!(mock.control().subdomains().is_empty());
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+        assert!(mock.log().is_empty());
+
+        add(&client, "after-reset").await.unwrap();
+        assert_eq!(mock.control().txt_values(NAME), ["after-reset"]);
+    }
+}

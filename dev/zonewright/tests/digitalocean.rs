@@ -3106,3 +3106,92 @@ async fn digitalocean_listing_whose_total_changes_is_protocol() {
     let e = client.list_rrsets(&zone()).await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
 }
+
+// ---- Served over DNS ---------------------------------------------------------------------------
+
+/// What the mock holds, answered by a DNS mock through a link.
+#[cfg(feature = "inspector")]
+mod over_dns {
+    use zonewright::{Expect, Provider, RecordType};
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+
+    use super::common::link::{ask, is_absent, rd, txt_round_trip, values};
+    use super::{NAME, add, rr, setup, zone};
+
+    #[tokio::test]
+    async fn digitalocean_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        // What the provider creates with a domain: its SOA is left to the DNS server, its NS
+        // records are served.
+        mock.control().insert_zone_defaults("example.org");
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = txt_round_trip(&mock, &client, &dns).await;
+        // The API states names relative to the domain and host names in `data` in either
+        // form; what is published is absolute with the trailing dot.
+        for set in [
+            rr(
+                "www.example.org",
+                RecordType::CNAME,
+                Some(300),
+                &["target.example.net."],
+            ),
+            rr(
+                "example.org",
+                RecordType::MX,
+                Some(600),
+                &["10 mx1.example.net.", "20 mx2.example.net."],
+            ),
+        ] {
+            client
+                .set_rrset(&zone(), &set, Expect::Absent)
+                .await
+                .unwrap();
+        }
+        mock.control()
+            .insert_record("example.org", "alias", "CNAME", "@", 300);
+        link.settled().await;
+        assert_eq!(
+            values(ask(dns.addr(), "www.example.org", RecordType::CNAME).await),
+            [rd(RecordType::CNAME, "target.example.net.")]
+        );
+        assert_eq!(
+            values(ask(dns.addr(), "alias.example.org", RecordType::CNAME).await),
+            [rd(RecordType::CNAME, "example.org.")]
+        );
+        let mut mx = values(ask(dns.addr(), "example.org", RecordType::MX).await);
+        mx.sort_by_key(|r| r.to_string());
+        assert_eq!(
+            mx,
+            [
+                rd(RecordType::MX, "10 mx1.example.net."),
+                rd(RecordType::MX, "20 mx2.example.net."),
+            ]
+        );
+        assert_eq!(
+            values(ask(dns.addr(), "example.org", RecordType::NS).await).len(),
+            3
+        );
+        assert_eq!(link.skipped(), 0);
+    }
+
+    #[tokio::test]
+    async fn digitalocean_reset_returns_the_mock_to_its_seed() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        add(&client, "before-reset").await.unwrap();
+        link.settled().await;
+        assert!(!is_absent(&ask(dns.addr(), NAME, RecordType::TXT).await));
+
+        mock.control().reset();
+        link.settled().await;
+        assert!(mock.control().records().is_empty());
+        let answer = ask(dns.addr(), NAME, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+        assert!(mock.log().is_empty());
+
+        add(&client, "after-reset").await.unwrap();
+        assert_eq!(mock.control().txt_values(NAME), ["after-reset"]);
+    }
+}

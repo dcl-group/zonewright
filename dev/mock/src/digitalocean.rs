@@ -74,9 +74,23 @@
 //! // ... drive the client against mock.base_url() ...
 //! assert_eq!(mock.control().txt_values("_acme-challenge.example.org"), ["v1"]);
 //! ```
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`DigitalOceanMock::changes`], the records of one name and type grouped into one rrset (the
+//! TTL of the set the smallest of its records), and a [`link`](crate::link::link) serves them
+//! over DNS. Published are the records of the account's domains, each at its absolute name. The
+//! form of a value: A and AAAA `data`; TXT `data`, the value itself, as one quoted
+//! character-string (split every 255 bytes); CNAME and NS `data` with the trailing dot added (a
+//! host name in `data` is absolute, `@` the domain itself); MX as `<priority> <host>.`; SRV as
+//! `<priority> <weight> <port> <target>.`; CAA as `<flags> <tag> "<data>"`. Left out: SOA records
+//! (a DNS server for the zone has its own) and records of a domain that is not on the account.
+//! The answer switches ([`Control::set_name_form`], [`Control::set_apex_target_as_at`]) change
+//! only the API's answers, not what is published. [`Control::reset`] returns the mock to its
+//! seed.
 
 #![allow(clippy::result_large_err)]
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -87,7 +101,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde_json::{Value, json};
 
-use crate::MockServer;
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, MockServer, RequestLog};
 
 /// Path of the API below the server's base URL.
 pub const API_PATH: &str = "/v2";
@@ -162,6 +177,9 @@ pub struct Record {
 
 #[derive(Debug)]
 struct Inner {
+    /// The seed the mock was started with, for [`Control::reset`].
+    seed: Seed,
+    changes: Changes,
     token: String,
     domains: Vec<String>,
     records: Vec<Record>,
@@ -171,6 +189,108 @@ struct Inner {
     name_form: NameForm,
     loose_filter: bool,
     apex_target_as_at: bool,
+}
+
+impl Inner {
+    /// The state of a mock started with `seed`.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        Inner {
+            seed: seed.clone(),
+            changes,
+            token: seed.token,
+            domains: seed.domains,
+            records: Vec::new(),
+            next_id: 1000,
+            page_cap: None,
+            name_form: NameForm::Relative,
+            loose_filter: false,
+            apex_target_as_at: false,
+        }
+    }
+
+    /// What a DNS server for the mock's domains would answer (module documentation).
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        for domain in &self.domains {
+            out.zone(domain);
+        }
+        for record in &self.records {
+            if !self.domains.contains(&record.domain) {
+                continue;
+            }
+            let host = |data: &str| {
+                if data.trim() == "@" {
+                    format!("{}.", record.domain.to_lowercase())
+                } else {
+                    format!("{}.", data.trim().trim_end_matches('.'))
+                }
+            };
+            let f = &record.fields;
+            let n = |v: Option<u64>| v.unwrap_or(0);
+            let value = match record.rtype.as_str() {
+                "TXT" => quoted(&record.data),
+                "CNAME" | "NS" => host(&record.data),
+                "MX" => format!("{} {}", n(f.priority), host(&record.data)),
+                "SRV" => format!(
+                    "{} {} {} {}",
+                    n(f.priority),
+                    n(f.weight),
+                    n(f.port),
+                    host(&record.data)
+                ),
+                "CAA" => format!(
+                    "{} {} {}",
+                    n(f.flags),
+                    f.tag.as_deref().unwrap_or_default(),
+                    quoted(&record.data)
+                ),
+                // A DNS server for the zone answers its own SOA.
+                "SOA" => continue,
+                _ => record.data.clone(),
+            };
+            out.record(
+                &record.domain,
+                &absolute(&record.name, &record.domain),
+                &record.rtype,
+                Some(record.ttl),
+                value,
+            );
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+}
+
+/// `text` as quoted character-strings of at most 255 bytes, `"` and `\` escaped.
+fn quoted(text: &str) -> String {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return "\"\"".to_owned();
+    }
+    bytes
+        .chunks(255)
+        .map(|chunk| {
+            let mut out = String::from("\"");
+            for &byte in chunk {
+                match byte {
+                    b'"' | b'\\' => {
+                        out.push('\\');
+                        out.push(char::from(byte));
+                    }
+                    0x20..=0x7e => out.push(char::from(byte)),
+                    _ => out.push_str(&format!("\\{byte:03}")),
+                }
+            }
+            out.push('"');
+            out
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -193,6 +313,9 @@ pub struct DigitalOceanMock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for DigitalOceanMock {
@@ -204,18 +327,15 @@ impl Deref for DigitalOceanMock {
 }
 
 impl DigitalOceanMock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let state = Arc::new(Mutex::new(Inner {
-            token: seed.token,
-            domains: seed.domains,
-            records: Vec::new(),
-            next_id: 1000,
-            page_cap: None,
-            name_form: NameForm::Relative,
-            loose_filter: false,
-            apex_target_as_at: false,
-        }));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new()
             .route("/v2/account", get(account))
             .route("/v2/domains", get(domains_list))
@@ -229,10 +349,14 @@ impl DigitalOceanMock {
                 axum::routing::delete(record_delete).patch(record_update),
             )
             .with_state(state.clone());
-        Self {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The API endpoint, for the client's `base_url`.
@@ -246,7 +370,39 @@ impl DigitalOceanMock {
     }
 }
 
+impl ChangeSource for DigitalOceanMock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its token and domains, no records,
+    /// identifiers counted from the start again, the default answer forms and filter, no page
+    /// cap, an empty request log and no pending faults. Reports the removal of every rrset that
+    /// was published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.seed.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// Every record, in creation order.
     pub fn records(&self) -> Vec<Record> {
         lock(&self.state).records.clone()
@@ -306,19 +462,20 @@ impl Control {
         ttl: u32,
         fields: Fields,
     ) -> u64 {
-        let mut inner = lock(&self.state);
-        inner.next_id += 1;
-        let id = inner.next_id;
-        inner.records.push(Record {
-            id,
-            domain: domain.to_owned(),
-            name: relative(&given(name, domain), domain),
-            rtype: rtype.to_owned(),
-            data: data.to_owned(),
-            ttl,
-            fields,
-        });
-        id
+        self.change(|inner| {
+            inner.next_id += 1;
+            let id = inner.next_id;
+            inner.records.push(Record {
+                id,
+                domain: domain.to_owned(),
+                name: relative(&given(name, domain), domain),
+                rtype: rtype.to_owned(),
+                data: data.to_owned(),
+                ttl,
+                fields,
+            });
+            id
+        })
     }
 
     /// Seeds what the provider creates with a domain: an SOA record and three NS records at the
@@ -336,12 +493,12 @@ impl Control {
 
     /// Deletes the record `id` directly, as another writer would.
     pub fn delete_record(&self, id: u64) {
-        lock(&self.state).records.retain(|r| r.id != id);
+        self.change(|inner| inner.records.retain(|r| r.id != id));
     }
 
     /// Adds a domain.
     pub fn insert_domain(&self, domain: &str) {
-        lock(&self.state).domains.push(domain.to_owned());
+        self.change(|inner| inner.domains.push(domain.to_owned()));
     }
 
     /// Deletes `domain` with its records and creates it again with the same records under new
@@ -756,7 +913,9 @@ async fn record_create(
     }
     inner.next_id += 1;
     let created = record_json(&record, &inner);
+    let before = inner.published();
     inner.records.push(record);
+    inner.report(&before, Origin::Api);
     (
         StatusCode::CREATED,
         axum::Json(json!({"domain_record": created})),
@@ -829,9 +988,11 @@ async fn record_update(
         return response;
     }
     let answer = record_json(&updated, &inner);
+    let before = inner.published();
     if let Some(slot) = inner.records.get_mut(index) {
         *slot = updated;
     }
+    inner.report(&before, Origin::Api);
     axum::Json(json!({"domain_record": answer})).into_response()
 }
 
@@ -847,6 +1008,7 @@ async fn record_delete(
         return not_found();
     };
     let mut inner = lock(&state);
+    let published = inner.published();
     let before = inner.records.len();
     inner
         .records
@@ -854,5 +1016,6 @@ async fn record_delete(
     if inner.records.len() == before {
         return not_found();
     }
+    inner.report(&published, Origin::Api);
     StatusCode::NO_CONTENT.into_response()
 }

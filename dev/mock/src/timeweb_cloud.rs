@@ -88,12 +88,27 @@
 //! // ... drive the client against mock.base_url() ...
 //! assert_eq!(mock.control().txt_values("_acme-challenge.example.org"), ["v1"]);
 //! ```
+//!
+//! The mock is a [`ChangeSource`]: it reports every change of its published records through
+//! [`TimewebCloudMock::changes`], the records of one name and type grouped into one rrset (the
+//! TTL of the set the smallest of its records, none when no record has one), and a
+//! [`link`](crate::link::link) serves them over DNS. Published are the records of the account's
+//! domains, each at its full name (the domain, or the name relative to it joined with the
+//! domain), whether or not its subdomain is listed: the listings are the API's view, a DNS server
+//! answers every record of the zone. The form of a value: A and AAAA `value`; TXT `value`, the
+//! text itself, as one quoted character-string (split every 255 bytes); CNAME `value` with the
+//! trailing dot added (a host name in `value` is absolute); MX as `<priority> <host>.`; any other
+//! type as held. Left out: SRV records (the mock holds only their host and priority, not a whole
+//! SRV value) and records of a domain that is not on the account. The answer switches (the
+//! subdomain form, the listing scope, the identifier forms) change only the API's answers, not
+//! what is published. [`Control::reset`] returns the mock to its seed.
 
 // Reason: handlers return an axum `Response` as the error of a `Result` to answer early;
 // boxing them would only add noise.
 #![allow(clippy::result_large_err)]
 
 use std::collections::{BTreeSet, HashSet};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -104,7 +119,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use serde_json::{Map, Value, json};
 
-use crate::MockServer;
+use crate::changes::{ChangeSource, Changes, Origin, Published};
+use crate::{Faults, MockServer, RequestLog};
 
 /// Path of the API below the server's base URL.
 pub const API_PATH: &str = "/api";
@@ -193,6 +209,9 @@ pub struct Record {
 
 #[derive(Debug)]
 struct Inner {
+    /// The seed the mock was started with, for [`Control::reset`].
+    seed: Seed,
+    changes: Changes,
     token: String,
     domains: Vec<String>,
     /// Subdomains: (domain, name relative to it).
@@ -212,6 +231,66 @@ struct Inner {
 }
 
 impl Inner {
+    /// The state of a mock started with `seed`.
+    fn new(seed: Seed, changes: Changes) -> Inner {
+        Inner {
+            seed: seed.clone(),
+            changes,
+            token: seed.token,
+            domains: seed.domains,
+            subdomains: BTreeSet::new(),
+            records: Vec::new(),
+            next_id: 1000,
+            page_cap: None,
+            form: SubdomainForm::Relative,
+            float_ids: false,
+            null_ids: HashSet::new(),
+            require_subdomain: false,
+            scope: ListingScope::Everything,
+            addressing: Addressing::RecordId,
+        }
+    }
+
+    /// What a DNS server for the mock's domains would answer (module documentation).
+    fn published(&self) -> Published {
+        let mut out = Published::new();
+        for domain in &self.domains {
+            out.zone(domain);
+        }
+        for record in &self.records {
+            if !self
+                .domains
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&record.domain))
+            {
+                continue;
+            }
+            let host = |value: &str| format!("{}.", value.trim().trim_end_matches('.'));
+            let value = match record.rtype.as_str() {
+                "TXT" => quoted(&record.value),
+                "CNAME" => host(&record.value),
+                "MX" => format!("{} {}", record.priority.unwrap_or(0), host(&record.value)),
+                // Only the host and the priority are held: not a whole SRV value.
+                "SRV" => continue,
+                _ => record.value.clone(),
+            };
+            let name = if record.subdomain.is_empty() {
+                record.domain.clone()
+            } else {
+                format!("{}.{}", record.subdomain, record.domain)
+            };
+            let ttl = record.ttl.and_then(|t| u32::try_from(t).ok());
+            out.record(&record.domain, &name, &record.rtype, ttl, value);
+        }
+        out
+    }
+
+    /// Reports every published rrset that differs from `before`. Called with the state locked,
+    /// after a change.
+    fn report(&self, before: &Published, origin: Origin) {
+        self.changes.emit_diff(before, &self.published(), origin);
+    }
+
     /// Whether the record `r` is the one the path of `domain` and `rel` (relative to it) names.
     fn addressed(&self, r: &Record, domain: &str, rel: &str, id: u64) -> bool {
         r.id == id
@@ -238,6 +317,33 @@ impl Inner {
     }
 }
 
+/// `text` as quoted character-strings of at most 255 bytes, `"` and `\` escaped.
+fn quoted(text: &str) -> String {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return "\"\"".to_owned();
+    }
+    bytes
+        .chunks(255)
+        .map(|chunk| {
+            let mut out = String::from("\"");
+            for &byte in chunk {
+                match byte {
+                    b'"' | b'\\' => {
+                        out.push('\\');
+                        out.push(char::from(byte));
+                    }
+                    0x20..=0x7e => out.push(char::from(byte)),
+                    _ => out.push_str(&format!("\\{byte:03}")),
+                }
+            }
+            out.push('"');
+            out
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 type Shared = Arc<Mutex<Inner>>;
 
 fn lock(state: &Shared) -> MutexGuard<'_, Inner> {
@@ -258,6 +364,9 @@ pub struct TimewebCloudMock {
 #[derive(Clone, Debug)]
 pub struct Control {
     state: Shared,
+    changes: Changes,
+    log: RequestLog,
+    faults: Faults,
 }
 
 impl Deref for TimewebCloudMock {
@@ -269,22 +378,15 @@ impl Deref for TimewebCloudMock {
 }
 
 impl TimewebCloudMock {
-    /// Starts the mock with `seed`.
+    /// Starts the mock with `seed` on `127.0.0.1` with an ephemeral port.
     pub async fn start(seed: Seed) -> Self {
-        let state = Arc::new(Mutex::new(Inner {
-            token: seed.token,
-            domains: seed.domains,
-            subdomains: BTreeSet::new(),
-            records: Vec::new(),
-            next_id: 1000,
-            page_cap: None,
-            form: SubdomainForm::Relative,
-            float_ids: false,
-            null_ids: HashSet::new(),
-            require_subdomain: false,
-            scope: ListingScope::Everything,
-            addressing: Addressing::RecordId,
-        }));
+        Self::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), seed).await
+    }
+
+    /// Starts the mock with `seed` on `addr` ([`MockServer::start_on`]).
+    pub async fn start_on(addr: SocketAddr, seed: Seed) -> Self {
+        let changes = Changes::new();
+        let state = Arc::new(Mutex::new(Inner::new(seed, changes.clone())));
         let router = Router::new()
             .route("/api/v1/domains", get(domains_list))
             .route("/api/v1/domains/{fqdn}", get(domain_get))
@@ -295,10 +397,14 @@ impl TimewebCloudMock {
                 delete(record_delete).patch(record_update),
             )
             .with_state(state.clone());
-        Self {
-            server: MockServer::start(router).await,
-            control: Control { state },
-        }
+        let server = MockServer::start_on(addr, router).await;
+        let control = Control {
+            state,
+            changes,
+            log: server.log().clone(),
+            faults: server.faults().clone(),
+        };
+        Self { server, control }
     }
 
     /// The API endpoint, for the client's `base_url`.
@@ -312,7 +418,39 @@ impl TimewebCloudMock {
     }
 }
 
+impl ChangeSource for TimewebCloudMock {
+    fn changes(&self) -> &Changes {
+        &self.control.changes
+    }
+
+    fn published(&self) -> Published {
+        lock(&self.control.state).published()
+    }
+}
+
 impl Control {
+    /// Runs `f` on the locked state and reports what it changed, with [`Origin::Control`].
+    fn change<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = lock(&self.state);
+        let before = inner.published();
+        let out = f(&mut inner);
+        inner.report(&before, Origin::Control);
+        out
+    }
+
+    /// Returns the mock to the seed it was started with: its token and domains, no subdomains,
+    /// no records, identifiers counted from the start again, the default answer forms, listing
+    /// scope and addressing, no page cap, an empty request log and no pending faults. Reports
+    /// the removal of every rrset that was published.
+    pub fn reset(&self) {
+        self.faults.clear();
+        self.change(|inner| {
+            let seed = inner.seed.clone();
+            *inner = Inner::new(seed, inner.changes.clone());
+        });
+        self.log.clear();
+    }
+
     /// Every record, in creation order.
     pub fn records(&self) -> Vec<Record> {
         lock(&self.state).records.clone()
@@ -386,25 +524,26 @@ impl Control {
         ttl: Option<u64>,
         priority: Option<u64>,
     ) -> u64 {
-        let mut inner = lock(&self.state);
-        inner.next_id += 1;
-        let id = inner.next_id;
-        let subdomain = relative(name, domain);
-        if !subdomain.is_empty() {
-            inner
-                .subdomains
-                .insert((domain.to_owned(), subdomain.clone()));
-        }
-        inner.records.push(Record {
-            id,
-            domain: domain.to_owned(),
-            subdomain,
-            rtype: rtype.to_owned(),
-            value: value.to_owned(),
-            ttl,
-            priority,
-        });
-        id
+        self.change(|inner| {
+            inner.next_id += 1;
+            let id = inner.next_id;
+            let subdomain = relative(name, domain);
+            if !subdomain.is_empty() {
+                inner
+                    .subdomains
+                    .insert((domain.to_owned(), subdomain.clone()));
+            }
+            inner.records.push(Record {
+                id,
+                domain: domain.to_owned(),
+                subdomain,
+                rtype: rtype.to_owned(),
+                value: value.to_owned(),
+                ttl,
+                priority,
+            });
+            id
+        })
     }
 
     /// Adds a subdomain of `domain` (`name` absolute or relative), as the documented
@@ -436,21 +575,22 @@ impl Control {
 
     /// Deletes the record `id` directly, as another writer would.
     pub fn delete_record(&self, id: u64) {
-        lock(&self.state).records.retain(|r| r.id != id);
+        self.change(|inner| inner.records.retain(|r| r.id != id));
     }
 
     /// Changes the record `id` in place, keeping its identifier, as another writer would with
     /// the documented `PATCH /api/v2/domains/{fqdn}/dns-records/{record_id}`.
     pub fn update_record(&self, id: u64, value: &str) {
-        let mut inner = lock(&self.state);
-        if let Some(record) = inner.records.iter_mut().find(|r| r.id == id) {
-            record.value = value.to_owned();
-        }
+        self.change(|inner| {
+            if let Some(record) = inner.records.iter_mut().find(|r| r.id == id) {
+                record.value = value.to_owned();
+            }
+        });
     }
 
     /// Adds a domain.
     pub fn insert_domain(&self, domain: &str) {
-        lock(&self.state).domains.push(domain.to_owned());
+        self.change(|inner| inner.domains.push(domain.to_owned()));
     }
 
     /// Deletes `domain` with its records and creates it again with the same records under new
@@ -818,7 +958,9 @@ async fn record_create(
         priority,
     };
     let created = created_json(&record);
+    let before = inner.published();
     inner.records.push(record);
+    inner.report(&before, Origin::Api);
     (
         StatusCode::CREATED,
         axum::Json(json!({
@@ -844,6 +986,7 @@ async fn record_delete(
     let Ok(id) = id.parse::<u64>() else {
         return bad_request("record_id must be an integer");
     };
+    let published = inner.published();
     let before = inner.records.len();
     let doomed: Vec<u64> = inner
         .records
@@ -855,6 +998,7 @@ async fn record_delete(
     if inner.records.len() == before {
         return not_found("DNS record not found");
     }
+    inner.report(&published, Origin::Api);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -885,6 +1029,7 @@ async fn record_update(
     else {
         return not_found("DNS record not found");
     };
+    let before = inner.published();
     let Some(record) = inner.records.get_mut(index) else {
         return not_found("DNS record not found");
     };
@@ -895,6 +1040,7 @@ async fn record_update(
     record.ttl = fields.ttl;
     record.priority = fields.priority;
     let updated = created_json(record);
+    inner.report(&before, Origin::Api);
     axum::Json(json!({
         "dns_record": updated,
         "response_id": "00000000-0000-0000-0000-00000000mock",

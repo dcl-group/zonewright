@@ -1336,3 +1336,83 @@ async fn live_acme_dns_add() {
         .unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Unsupported);
 }
+
+// ---- Served over DNS ---------------------------------------------------------------------------
+
+/// What the mock holds, answered by a DNS mock through a link. The client cannot remove a value,
+/// so `common::link::txt_round_trip` does not fit; the round trip is written out here.
+#[cfg(feature = "inspector")]
+mod over_dns {
+    use zonewright::RecordType;
+    use zonewright_mock::changes::ChangeSource;
+    use zonewright_mock::dns::{DnsMock, Role};
+    use zonewright_mock::link::{LinkOptions, link};
+
+    use super::common::link::{ask, is_absent, txt, values};
+    use super::{ZONE, add, setup, value};
+
+    #[tokio::test]
+    async fn acme_dns_txt_value_is_served_over_dns() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        assert_eq!(ChangeSource::published(&mock).zones, [ZONE]);
+        let first = mock.control().fulldomain(0);
+        let second = mock.control().fulldomain(1);
+        // Nothing is served before a value is written.
+        let answer = ask(dns.addr(), &first, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+
+        add(&mock, &client, 0, &value('a')).await.unwrap();
+        add(&mock, &client, 1, &value('b')).await.unwrap();
+        link.settled().await;
+        // Each value at the `fulldomain` of its own registration, under the server's domain.
+        assert_eq!(
+            values(ask(dns.addr(), &first, RecordType::TXT).await),
+            [txt(&value('a'))]
+        );
+        assert_eq!(
+            values(ask(dns.addr(), &second, RecordType::TXT).await),
+            [txt(&value('b'))]
+        );
+
+        // A registration holds two values: a second write fills the other slot, a third
+        // replaces the oldest.
+        let subdomain = mock.control().subdomain(0);
+        mock.control().write(&subdomain, &value('c'));
+        link.settled().await;
+        let mut both = values(ask(dns.addr(), &first, RecordType::TXT).await);
+        both.sort_by_key(ToString::to_string);
+        assert_eq!(both, [txt(&value('a')), txt(&value('c'))]);
+        mock.control().write(&subdomain, &value('d'));
+        link.settled().await;
+        let mut both = values(ask(dns.addr(), &first, RecordType::TXT).await);
+        both.sort_by_key(ToString::to_string);
+        assert_eq!(both, [txt(&value('c')), txt(&value('d'))]);
+        assert_eq!(link.skipped(), 0);
+    }
+
+    #[tokio::test]
+    async fn acme_dns_reset_returns_the_mock_to_its_seed() {
+        let (mock, client) = setup().await;
+        let dns = DnsMock::start(Role::Authoritative).await;
+        let link = link(&mock, &dns, LinkOptions::new());
+        let name = mock.control().fulldomain(0);
+        add(&mock, &client, 0, &value('a')).await.unwrap();
+        link.settled().await;
+        assert!(!is_absent(&ask(dns.addr(), &name, RecordType::TXT).await));
+
+        mock.control().reset();
+        link.settled().await;
+        assert_eq!(mock.control().stored(), 0);
+        let answer = ask(dns.addr(), &name, RecordType::TXT).await;
+        assert!(is_absent(&answer), "{answer:?}");
+        assert!(mock.log().is_empty());
+
+        add(&mock, &client, 0, &value('b')).await.unwrap();
+        assert_eq!(
+            mock.control().values(&mock.control().subdomain(0)),
+            [value('b')]
+        );
+    }
+}
