@@ -34,8 +34,10 @@ pub(super) const DEFAULT_USER_DOMAIN: &str = "users";
 /// (providers/dns/vkcloud/vkcloud.go:62, `VK_CLOUD_TTL` default 60), the documented minimum.
 pub(super) const DEFAULT_TTL: u32 = 60;
 
-/// TTL range the client accepts, in seconds. The minimum is the documented one; the documented
-/// maximum (2147483648) is wider than the earlier implementation's bound, which is kept.
+/// Bounds of the `ttl` setting (the TTL of a new record set), in seconds. The minimum is the
+/// documented one; the documented maximum (2147483648) is wider than the earlier implementation's
+/// bound, which is kept for the setting. A TTL given with an operation is bounded by the client's
+/// capabilities instead.
 // Source: the OpenAPI of the public DNS API (`ttl`: minimum 60, maximum 2147483648).
 pub(super) const TTL_MIN: u32 = 60;
 pub(super) const TTL_MAX: u32 = 86_400;

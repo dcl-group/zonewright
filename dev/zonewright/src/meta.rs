@@ -140,8 +140,9 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// The operation is offered. [`Operation::Check`] is always offered: it is the one method
-    /// of [`Provider`](crate::Provider) without a default body.
+    /// The operation is offered. [`Operation::Check`] is always offered:
+    /// [`Provider::check`](crate::Provider::check) has no default body, so every client implements
+    /// it.
     #[must_use]
     pub fn supports(&self, operation: Operation) -> bool {
         match operation {

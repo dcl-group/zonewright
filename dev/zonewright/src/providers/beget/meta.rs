@@ -100,6 +100,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     atomic_rrset_write: true,
     // The API keeps a TTL per record: lego providers/dns/beget/internal/types.go:94 (`ttl` of
     // each written record) and fixtures/getData-real.json (an observed answer, `ttl` on each).
+    // The bounds are an assumption, marked and explained in `config.rs`.
     ttl: TtlSupport::PerRecord {
         min: 60,
         max: 86_400,

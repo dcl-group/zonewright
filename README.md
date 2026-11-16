@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.zones.iter().all(|z| z.found),
     );
 
-    // DNS-01: add one value to _acme-challenge.example.org without touching other values,
+    // DNS-01: add one value to _acme-challenge.www.example.org without touching other values,
     // then remove only that value.
     let name = dns01::challenge_name(&DomainName::parse("www.example.org")?)?;
     let value = Txt::new("placeholder-challenge-digest")?;

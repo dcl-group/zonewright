@@ -98,6 +98,8 @@ const CAPABILITIES: Capabilities = Capabilities {
     // Individual records with IDs: a replacement is several requests (creates, then deletes),
     // and no request carries a condition on the rrset as read.
     atomic_rrset_write: false,
+    // The maximum is an assumption, marked and explained in `config.rs`; the minimum is
+    // documented.
     ttl: TtlSupport::PerRecord {
         min: 30,
         max: 86_400,

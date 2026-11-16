@@ -68,7 +68,8 @@ impl ProviderId {
 
     /// The persisted string. Never changes for an existing variant.
     ///
-    /// This `match` and the one in [`ProviderId::parse`] are the only places the strings exist.
+    /// This `match` and the one in [`ProviderId::parse`] are the only tables that map a variant to
+    /// its string and back.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

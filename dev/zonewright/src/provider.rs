@@ -190,7 +190,8 @@ pub enum AddOutcome {
     Appended,
     /// The value was already there; nothing was written.
     AlreadyPresent,
-    /// The value was sent and not refused; the state before and after could not be observed.
+    /// The value was sent and not refused, or the client held back the repeat of a value it had
+    /// sent shortly before (acme-dns); the state before and after could not be observed.
     Accepted,
 }
 

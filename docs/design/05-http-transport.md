@@ -351,7 +351,8 @@ canary credentials, and asserts that the log is not empty and contains none of t
   for credentials that are no longer accepted.
 - `Keystone`: the OpenStack Identity v3 password exchange with project scope, shared by Selectel v2
   and VK Cloud. The request body, which carries the password, is built once into a zeroizing buffer;
-  `400` and `401` are `Error::Auth`.
+  `401` is `Error::Auth`; so is `400`, and a `200` is accepted like the documented `201`: both are
+  assumptions, marked in the code, and neither can cause a write.
 - `RateGate`: at most one request per configured interval per client, for providers with
   undocumented limits (reg.ru 1000 ms, Beget 1000 ms, nic.ru 500 ms; `min_request_interval_ms`).
 - `Poller`: the bounded polling of section 3.7.
