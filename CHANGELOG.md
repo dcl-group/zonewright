@@ -6,6 +6,15 @@ All notable changes to this crate are recorded in this file. The format follows
 
 ## Unreleased
 
+### Changed
+
+- SVCB and HTTPS data in service mode (priority not 0) must be self-consistent (RFC 9460 section
+  2.4.3): a `mandatory` parameter that lists a key the record does not have, and `no-default-alpn`
+  without `alpn`, are now syntax errors in text parsing, typed construction (`Svcb::to_data`) and
+  wire decoding. Values 0.1.0 accepted are now refused. A provider read keeps such a value as
+  non-canonical data, the inspector reports the answer as failed, and a stored `RrSet` holding such
+  a value as canonical text no longer deserializes.
+
 ### Fixed
 
 - Inspector: the TTL reported for an rrset counts a record's TTL with the most significant bit set

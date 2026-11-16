@@ -158,6 +158,16 @@ select a value to change.
   and `ipv6hint` are comma-separated addresses in the canonical forms of section 4.3, in the given
   order; `ech` is base64; `key<number>` values are written as one quoted string with the escapes of
   section 4.4.
+- Self-consistency (RFC 9460 section 2.4.3) is enforced in service mode (priority not 0): every key
+  `mandatory` lists must be the key of a parameter of the record (section 8), and `no-default-alpn`
+  needs `alpn` (section 7.1.1). Otherwise the value is a syntax error. The RFC asks zone-file
+  implementations to enforce this (SHOULD) and clients to reject such a record (MUST); the crate
+  plays both roles. Alias mode is not checked: recipients ignore its parameters (section 2.4.2). The
+  check is one function used by text parsing, typed construction and wire decoding, so the three
+  paths agree: `Svcb::to_data` and `RecordData::parse` fail, a provider read keeps the provider's
+  text as non-canonical data (section 4.9), and `RecordData::from_wire` fails, so the inspector
+  reports the answer of that server as failed. Version 0.1.0 accepted such values; a stored `RrSet`
+  holding one as canonical text no longer deserializes.
 
 ### 4.7 Unknown types
 

@@ -302,6 +302,33 @@ fn decode_value(key: u16, value: &[u8]) -> Result<SvcParam, RecordError> {
     Ok(param)
 }
 
+/// Checks the requirements the parameters RFC 9460 defines place on each other in a ServiceMode
+/// record (self-consistency, section 2.4.3):
+///
+/// - section 8: "For self-consistency (Section 2.4.3), listed keys MUST also appear in the
+///   SvcParams" — every key `mandatory` lists is the key of a parameter of the record;
+/// - section 7.1.1: "When "no-default-alpn" is specified in an RR, "alpn" must also be specified
+///   in order for the RR to be "self-consistent"".
+fn check_self_consistent(params: &[SvcParam]) -> Result<(), RecordError> {
+    let present = |key: u16| params.iter().any(|param| param.key() == key);
+    for param in params {
+        match param {
+            SvcParam::Mandatory(keys) => {
+                if !keys.iter().all(|&key| present(key)) {
+                    return Err(syntax(
+                        "the mandatory parameter lists a key that is not present",
+                    ));
+                }
+            }
+            SvcParam::NoDefaultAlpn if !present(ALPN) => {
+                return Err(syntax("no-default-alpn needs an alpn parameter"));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Splits an alpn value list (RFC 9460 appendix A.1) after the character-string escapes have
 /// been resolved: `\` escapes the next octet, `,` separates.
 fn split_alpn(value: &[u8]) -> Result<Vec<Vec<u8>>, RecordError> {
@@ -406,7 +433,9 @@ fn parse_param(token: &Token<'_>) -> Result<SvcParam, RecordError> {
 impl Svcb {
     /// The canonical `RecordData`, valid for both [`RecordType::SVCB`] and
     /// [`RecordType::HTTPS`]. Fails for duplicate parameter keys and values without a valid
-    /// encoding.
+    /// encoding, and, in service mode (priority not 0), for parameters that are not
+    /// self-consistent (RFC 9460 section 2.4.3): `mandatory` lists a key that is not present
+    /// (section 8), or `no-default-alpn` is given without `alpn` (section 7.1.1).
     pub fn to_data(&self) -> Result<RecordData, RecordError> {
         Rdata::Svcb(self.clone()).into_data()
     }
@@ -433,6 +462,13 @@ impl Svcb {
             .any(|pair| pair.first().map(SvcParam::key) == pair.get(1).map(SvcParam::key))
         {
             return Err(syntax("a service parameter key occurs twice"));
+        }
+        // RFC 9460 section 2.4.3: "zone-file implementations SHOULD enforce self-consistency",
+        // and clients "MUST reject any RR whose recognized SvcParams are not self-consistent".
+        // Self-consistency is defined for ServiceMode only; in AliasMode (priority 0) recipients
+        // "MUST ignore any SvcParams that are present" (section 2.4.2), so they are kept as given.
+        if self.priority != 0 {
+            check_self_consistent(&params)?;
         }
         Ok(Svcb {
             priority: self.priority,
@@ -514,5 +550,37 @@ impl Svcb {
             out.push(' ');
             param.write_text(out);
         }
+    }
+}
+
+// `RecordData::from_provider` exists only in builds with a record-level client.
+#[cfg(all(test, feature = "selectel_v2"))]
+mod tests {
+    use super::*;
+
+    /// A provider read of a ServiceMode value that is not self-consistent (RFC 9460 section
+    /// 2.4.3) falls back to non-canonical data with the provider's text, as any text the strict
+    /// parser refuses does (design section 4.9); the read itself does not fail.
+    #[test]
+    fn a_provider_read_keeps_an_inconsistent_value_as_non_canonical() {
+        use crate::record::TxtDialect;
+        let origin = DomainName::parse("example.org").ok();
+        for text in ["1 . no-default-alpn", "1 . mandatory=port alpn=h2"] {
+            for rtype in [RecordType::SVCB, RecordType::HTTPS] {
+                for origin in [None, origin.as_ref()] {
+                    let data =
+                        RecordData::from_provider(rtype, text, origin, TxtDialect::Presentation);
+                    assert!(!data.is_canonical(), "{rtype} {text}");
+                    assert_eq!(data.as_str(), text);
+                }
+            }
+        }
+        let alias = RecordData::from_provider(
+            RecordType::HTTPS,
+            "0 svc.example.org. no-default-alpn",
+            None,
+            TxtDialect::Presentation,
+        );
+        assert!(alias.is_canonical());
     }
 }

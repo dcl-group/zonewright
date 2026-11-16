@@ -736,7 +736,10 @@ fn svcb_records() {
             "1 . no-default-alpn alpn=h2",
             "1 . alpn=\"h2\" no-default-alpn",
         ),
-        ("1 . no-default-alpn=", "1 . no-default-alpn"),
+        (
+            "1 . alpn=h2 no-default-alpn=",
+            "1 . alpn=\"h2\" no-default-alpn",
+        ),
         (
             "16 foo.example.org. alpn=h2,h3-19 mandatory=ipv4hint,alpn ipv4hint=192.0.2.1",
             "16 foo.example.org. mandatory=alpn,ipv4hint alpn=\"h2,h3-19\" ipv4hint=192.0.2.1",
@@ -807,6 +810,107 @@ fn svcb_records() {
         RecordData::parse(svcb, "1 . port=70000"),
         Err(RecordError::OutOfRange { field: "port" })
     );
+}
+
+/// RFC 9460 section 2.4.3: a ServiceMode record must be self-consistent. `mandatory` lists only
+/// keys present in the record (section 8), and `no-default-alpn` needs `alpn` (section 7.1.1).
+/// AliasMode (priority 0) keeps its parameters as given (section 2.4.2). Text, typed
+/// construction and wire form refuse the same values.
+#[test]
+fn svcb_self_consistency() {
+    let accepted = [
+        (
+            "0 svc.example.org. no-default-alpn",
+            "0 svc.example.org. no-default-alpn",
+        ),
+        (
+            "0 svc.example.org. mandatory=port",
+            "0 svc.example.org. mandatory=port",
+        ),
+        (
+            "1 . mandatory=port,key65000 port=443 key65000=x",
+            "1 . mandatory=port,key65000 port=443 key65000=\"x\"",
+        ),
+        (
+            "1 . mandatory=alpn alpn=h2 no-default-alpn",
+            "1 . mandatory=alpn alpn=\"h2\" no-default-alpn",
+        ),
+    ];
+    for (input, expected) in accepted {
+        assert_eq!(canonical(RecordType::SVCB, input), expected, "{input}");
+        assert_eq!(canonical(RecordType::HTTPS, input), expected, "{input}");
+    }
+
+    for bad in [
+        "1 . no-default-alpn",
+        "1 . no-default-alpn port=443",
+        "1 . mandatory=port",
+        "1 . mandatory=alpn,port port=443",
+        "1 . mandatory=key65000 alpn=h2",
+        "1 . mandatory=no-default-alpn alpn=h2",
+        "2 svc.example.org. mandatory=ipv4hint ipv6hint=2001:db8::1",
+    ] {
+        assert!(is_syntax(RecordData::parse(RecordType::SVCB, bad)), "{bad}");
+        assert!(
+            is_syntax(RecordData::parse(RecordType::HTTPS, bad)),
+            "{bad}"
+        );
+    }
+
+    // Typed construction.
+    let lone = Svcb {
+        priority: 1,
+        target: TargetName::root(),
+        params: vec![SvcParam::NoDefaultAlpn],
+    };
+    assert!(is_syntax(lone.to_data()));
+    let absent = Svcb {
+        params: vec![
+            SvcParam::Mandatory(vec![3]),
+            SvcParam::Alpn(vec![b"h2".to_vec()]),
+        ],
+        ..lone.clone()
+    };
+    assert!(is_syntax(absent.to_data()));
+    let alias = Svcb {
+        priority: 0,
+        target: tn("svc.example.org"),
+        ..lone.clone()
+    };
+    assert_eq!(
+        alias.to_data().unwrap().as_str(),
+        "0 svc.example.org. no-default-alpn"
+    );
+
+    // Wire form, the path the inspector reads answers through: priority, root target, then
+    // key/length/value.
+    let no_default_alpn = b"\x00\x01\x00\x00\x02\x00\x00";
+    let mandatory_port = b"\x00\x01\x00\x00\x00\x00\x02\x00\x03";
+    for wire in [&no_default_alpn[..], &mandatory_port[..]] {
+        assert!(is_syntax(RecordData::from_wire(RecordType::SVCB, wire)));
+        assert!(is_syntax(RecordData::from_wire(RecordType::HTTPS, wire)));
+    }
+    let alias_wire = b"\x00\x00\x00\x00\x02\x00\x00";
+    assert_eq!(
+        RecordData::from_wire(RecordType::HTTPS, alias_wire)
+            .unwrap()
+            .as_str(),
+        "0 . no-default-alpn"
+    );
+
+    // A stored set that holds such a value as canonical text no longer deserializes; as a raw
+    // member it still does.
+    assert!(
+        serde_json::from_str::<RrSet>(
+            r#"{"name":"example.org.","type":"HTTPS","records":["1 . no-default-alpn"]}"#
+        )
+        .is_err()
+    );
+    let raw: RrSet = serde_json::from_str(
+        r#"{"name":"example.org.","type":"HTTPS","records":[{"raw":"1 . no-default-alpn"}]}"#,
+    )
+    .unwrap();
+    assert!(!raw.records()[0].is_canonical());
 }
 
 #[test]
