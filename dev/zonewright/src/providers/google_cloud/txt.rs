@@ -9,7 +9,8 @@
 //! `rrset.rs`:
 //!
 //! - read: the TXT rrset of the name, under the zone-ID cache;
-//! - write without a prior rrset: `additions` only, with the configured or requested TTL;
+//! - write without a prior rrset: `additions` only, with the configured or requested TTL; that
+//!   it is refused when an rrset was created meanwhile is assumed (`rrset.rs`, "A new rrset");
 //! - write over a prior rrset: `deletions` with the JSON object read, unchanged, and `additions`
 //!   with the same object and the new data;
 //! - delete: `deletions` only; the last value is removed by deleting the rrset.

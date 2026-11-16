@@ -27,6 +27,8 @@ mod client;
 mod config;
 #[cfg(feature = "azure_dns")]
 mod content;
+#[cfg(all(test, feature = "azure_dns"))]
+mod live;
 #[cfg(feature = "azure_dns")]
 mod records;
 #[cfg(feature = "azure_dns")]

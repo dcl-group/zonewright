@@ -23,17 +23,23 @@ All notable changes to this crate are recorded in this file. The format follows
   the mock `PorkbunMock`; the keys travel in the body of writes and in the headers of reads. A
   change of only the priority of an MX or SRV value is refused. Not verified against the live API.
 - OVHcloud (`ovh`) client: TXT value and record-level operations over the OVHcloud API's
-  `/domain/zone` endpoints, with signed requests and a zone refresh after every write, and the mock
-  `OvhMock`. Not verified against the live API.
+  `/domain/zone` endpoints, with signed requests on the server's clock and a zone refresh that ends
+  every write operation and is repeated by the next operation in the zone until it succeeds, and the
+  mock `OvhMock`. Not verified against the live API.
 - Google Cloud DNS (`google_cloud`) client: service account key authentication (RS256 JWT), public
   managed zones, record-level operations for A, AAAA, CAA, CNAME, MX, NS, SOA (read only), SRV, TLSA
   and TXT, and TXT value operations on plain values, every write an atomic change conditional on the
-  rrset as read, with the mock `GoogleCloudMock`. Not verified against the live API.
+  rrset as read (for a new rrset, on the API refusing an addition of an existing rrset, which is not
+  documented), with the mock `GoogleCloudMock`. A `413` or `429` with the reason `quotaExceeded` is
+  `Rejected` with that code. Not verified against the live API.
 - Azure DNS (`azure_dns`) client: public zones of a resource group through Azure Resource Manager,
   authenticated as a service principal with a client secret; record-level operations for A, AAAA,
   CAA, CNAME, MX, NS, PTR, SRV and TXT (SOA read only) and TXT value operations, every write
   conditional on the record set's etag, with the mock `AzureDnsMock`. Not verified against the live
   API.
+- The HTTP transport takes a per-client classifier of answers that carry a rate-limit status but are
+  a permanent refusal (`HttpBuilder::not_rate_limit`, crate-internal); Google Cloud DNS uses it for
+  `quotaExceeded`.
 - `zonewright-mock`: mocks for the nine new providers (`GcoreMock`, `EdgeCenterMock`, `DesecMock`,
   `DnsimpleMock`, `GandiMock`, `PorkbunMock`, `OvhMock`, `GoogleCloudMock`, `AzureDnsMock`), each
   with change reporting, `start_on` and `reset`.

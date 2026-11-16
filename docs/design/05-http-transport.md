@@ -180,6 +180,15 @@ info, a query or a fragment is refused. With `ContextOptions::loopback_only`, an
 not a loopback literal is `Error::Config`; the test suites set it so that a test which forgets to
 point a client at a mock fails at construction instead of contacting a provider.
 
+An endpoint setting (a `*_url`, `base_url` or `endpoint` setting) decides where the client sends
+what it holds: the credential or token of every API request and, at a token or identity endpoint,
+the long-lived secret or the signed assertion itself (Azure DNS's `login_url` receives the client
+secret and its `management_url` the issued token; Google Cloud DNS's `token_url` receives the signed
+JWT and its `dns_url` the access token). Such a setting must therefore be as trusted as the
+credentials and must not come from untrusted input. The URL policy keeps it on `https` and the
+endpoint binding of section 5.2 keeps requests on the configured origins, but neither can tell a
+right host from a wrong one. This holds for every client that has an endpoint setting.
+
 Provider-supplied identifiers placed in a URL path must match `[A-Za-z0-9_-]{1,128}` (or the
 provider's documented narrower form); otherwise `Error::Protocol`. Pagination follows cursors, page
 numbers and tokens only; a URL returned by the provider is never requested.
@@ -227,17 +236,21 @@ a whole rrset, which can hold values another writer added after the read: it is 
 - 429 and other rate-limit answers: a client declares the answers it treats as rate limits besides
   429 with a classifier (`HttpBuilder::rate_limit`; Route 53 answers HTTP 400 with the codes
   `Throttling`, `ThrottlingException` and `PriorRequestNotComplete`), and such an answer is handled
-  exactly like a 429. The wait is taken from `Retry-After` (delay-seconds or an HTTP date in the
-  IMF-fixdate form; the obsolete RFC 850 and asctime forms are not read), a header of the client's
-  own provider that states the end of a rate-limit window as a Unix time, or `RateLimit-Reset` (a
-  value above 10⁹ is a Unix time, as Hetzner sends it, a smaller one delay-seconds), in that order.
-  A client declares the own header with `HttpBuilder::rate_reset_unix`, and it is read for that
-  client only: DNSimple declares `X-RateLimit-Reset`. For an idempotent request with attempts left
-  and a wait of at most 30 s, the transport sleeps for the wait or the back-off, whichever is
-  longer, and retries, so a wait of zero or a time in the past does not produce three requests in a
-  few milliseconds; without a header it uses the back-off. Otherwise the result is
-  `Error::RateLimited { retry_after }`, with the wait clamped to 24 hours so that a caller can add
-  it to an `Instant`.
+  exactly like a 429. A client can also declare answers that carry a rate-limit status but are a
+  permanent refusal (`HttpBuilder::not_rate_limit`): Google Cloud DNS answers an exhausted resource
+  quota (`quotaExceeded`, "an impending change would exceed your current quota") with the same 413
+  or 429 as an exceeded request rate; such an answer is not waited out or repeated and goes back to
+  the client as a refusal. The wait is taken from `Retry-After` (delay-seconds or an HTTP date in
+  the IMF-fixdate form; the obsolete RFC 850 and asctime forms are not read), a header of the
+  client's own provider that states the end of a rate-limit window as a Unix time, or
+  `RateLimit-Reset` (a value above 10⁹ is a Unix time, as Hetzner sends it, a smaller one
+  delay-seconds), in that order. A client declares the own header with
+  `HttpBuilder::rate_reset_unix`, and it is read for that client only: DNSimple declares
+  `X-RateLimit-Reset`. For an idempotent request with attempts left and a wait of at most 30 s, the
+  transport sleeps for the wait or the back-off, whichever is longer, and retries, so a wait of zero
+  or a time in the past does not produce three requests in a few milliseconds; without a header it
+  uses the back-off. Otherwise the result is `Error::RateLimited { retry_after }`, with the wait
+  clamped to 24 hours so that a caller can add it to an `Instant`.
 - A request that fails because a redirect was refused, because `loopback_only` or the endpoint
   binding of section 5.2 blocked it, or because a TLS certificate was refused (the server's, or the
   client certificate by the server) is never retried. A refused certificate is `Error::Config`: the

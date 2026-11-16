@@ -35,12 +35,13 @@
 //! - the per-type properties and objects of the reference (`ARecords`, `caaRecords`,
 //!   `CNAMERecord`, …), `TTL`, `metadata` and `targetResource` (an alias, for A, AAAA and CNAME
 //!   only); `fqdn` and `provisioningState` in answers;
-//! - refused (`400`): an unknown type, a TTL outside 1 to 2147483647, a create of an SOA record
-//!   set, a change of the SOA host, a delete of the SOA record set, a CNAME at the apex, a CNAME
-//!   next to another record set at its name and the reverse, an apex NS record set without the
-//!   Azure name servers, more than 20 records in a record set (400 for TXT), a TXT string longer
-//!   than 255 characters, TXT record sets longer than 4096 characters in all, a CAA tag other
-//!   than `issue`, `issuewild` and `iodef`;
+//! - refused (the documentation says what is not allowed, not with which status; see below): a
+//!   type outside the API version's enumeration, a TTL outside 1 to 2147483647, a create of an
+//!   SOA record set, a change of the SOA host, a delete of the SOA record set, a CNAME at the
+//!   apex, a CNAME next to another record set at its name and the reverse, an apex NS record set
+//!   without the zone's name servers, more than 20 records in a record set (400 in a TXT record
+//!   set), a TXT string longer than 255 characters, TXT strings longer than 4096 characters in
+//!   all in one record set, a CAA tag other than `issue`, `issuewild` and `iodef`;
 //! - Resource Manager throttling: `429` with `Retry-After` ([`Control::set_throttled`]), and
 //!   `429` with the code `RetryableErrorDueToAnotherOperation` while another operation holds the
 //!   resource ([`Control::set_locked`]).
@@ -48,26 +49,41 @@
 //! What the mock invents because the documentation is silent, chosen so that a client cannot
 //! rely on a lenient reading:
 //!
+//! - every status of a refusal other than the token endpoint's `400 invalid_scope` and the
+//!   throttling `429`: the refusals listed above are `400` with the code `BadRequest`, except a
+//!   CNAME next to another record set (and the reverse), which is `409` with `Conflict`;
 //! - every error body is a `CloudError` (`{"error": {"code", "message"}}`) with invented codes
 //!   and texts; the token endpoint's errors are `{"error", "error_description", "error_codes"}`
 //!   with invented `AADSTS` numbers;
-//! - a failed `If-Match` or `If-None-Match` is `412` with the code `PreconditionFailed`;
+//! - a failed `If-Match` or `If-None-Match` is `412` with the code `PreconditionFailed` unless
+//!   [`Control::set_failed_condition`] sets another status and code; the etag of a condition is
+//!   compared byte for byte with the stored one, quotes and a `W/` prefix included; an `etag`
+//!   member in a `PUT` body is ignored;
+//! - a `DELETE` with `If-Match` of a record set that does not exist is `204`, as without it;
 //! - a `GET` of a missing record set or zone is `404`; so is any call naming another
 //!   subscription or resource group, or a zone the group does not hold;
 //! - a request without a token the endpoint issued is `401` with `InvalidAuthenticationToken`;
 //!   [`Control::expire_tokens`] makes every issued token invalid; a wrong client ID or secret is
-//!   `401` with `invalid_client`, another tenant `400` with `invalid_request`;
+//!   `401` with `invalid_client`, another tenant `400` with `invalid_request`; only the scopes of
+//!   [`Seed::scopes`] are accepted (the standard seed: the double-slash form the documentation
+//!   prescribes for Resource Manager, and no other);
 //! - a missing or other `api-version` is `400`;
 //! - a `PUT` without `TTL` is `400`; so is a body member other than `etag` and `properties`, a
 //!   property the reference does not list as writable (`fqdn` and `provisioningState`
-//!   included), the record property of another type, records next to a `targetResource`, and a
-//!   record object with a member its definition does not have;
+//!   included), the record property of another type (also an empty one), records next to a
+//!   `targetResource`, and a record object with a member its definition does not have; an empty
+//!   record list is accepted;
+//! - the lock answer ([`Control::set_locked`]) carries `Retry-After`;
 //! - a record set name is stored lowercase; a wildcard name arrives percent-encoded in a path
 //!   (`%2A`) and is decoded before the record set is looked up, as a web framework decodes a
 //!   path segment;
-//! - the etags are GUID-shaped counters; tokens are `azure-mock-token-<n>`; `$skipToken` is the
-//!   offset of the next page; [`Control::set_paging`] makes the listings page in ways the
-//!   documentation does not exclude ([`Paging`]), for tests of a client's end rule;
+//! - the etags are GUID-shaped counters ([`Control::set_etag`] sets any other); tokens are
+//!   `azure-mock-token-<n>`; `$skipToken` is the offset of the next page, and `nextLink` an
+//!   absolute URL on the host the request named ([`Control::set_link_base`] names another);
+//!   [`Control::set_paging`] makes the listings page in ways the documentation does not exclude
+//!   ([`Paging`]), for tests of a client's end rule;
+//! - the zone's name servers and the SOA contact are names under `example` domains (the seed's
+//!   [`Seed::name_servers`]), not the provider's;
 //! - the published form of a TXT record is its strings quoted, `"` and `\` escaped, joined with
 //!   a space; names in records are published with a trailing dot added.
 //!
@@ -168,7 +184,7 @@ pub struct Seed {
     pub page_size: usize,
     /// `expires_in` of an issued token, in seconds.
     pub token_lifetime: u64,
-    /// The Azure name servers of a new zone (its apex NS record set and SOA host).
+    /// The name servers of a new zone (its apex NS record set and SOA host).
     pub name_servers: Vec<String>,
 }
 
@@ -176,8 +192,9 @@ impl Seed {
     /// The tenant `test-tenant.example`, the client `zw-test-client` with the secret
     /// `test-only-secret`, the scope `https://management.azure.com//.default`, the subscription
     /// `00000000-0000-0000-0000-000000000001` with the resource group `zw-test-rg` holding
-    /// `example.org`, pages of 100, tokens of 3599 seconds, and the name servers of the
-    /// documentation's example zone.
+    /// `example.org`, pages of 100, tokens of 3599 seconds, and the name servers
+    /// `ns1.dns-one.example` to `ns4.dns-four.example` (synthetic names in the reserved
+    /// `example` domain, shaped like the four name servers the provider assigns).
     pub fn standard() -> Self {
         Self {
             tenant_id: "test-tenant.example".into(),
@@ -190,10 +207,10 @@ impl Seed {
             page_size: 100,
             token_lifetime: 3599,
             name_servers: vec![
-                "ns1-01.azure-dns.com".into(),
-                "ns2-01.azure-dns.net".into(),
-                "ns3-01.azure-dns.org".into(),
-                "ns4-01.azure-dns.info".into(),
+                "ns1.dns-one.example".into(),
+                "ns2.dns-two.example".into(),
+                "ns3.dns-three.example".into(),
+                "ns4.dns-four.example".into(),
             ],
         }
     }
@@ -257,12 +274,16 @@ pub enum Paging {
     Documented,
     /// `$skipToken` is ignored: every request answers the first page, with a `nextLink`.
     IgnoreToken,
-    /// The `nextLink` carries the `$skipToken` of the request itself.
+    /// The `nextLink` of every page after the first carries the `$skipToken` of the request
+    /// itself: the second page is served, and the token does not advance from there.
     RepeatToken,
     /// The `nextLink` carries no `$skipToken`.
     NoTokenInLink,
-    /// After the last item, one more page: empty, with a `nextLink`.
+    /// After the last item, one more page: empty, without a `nextLink`.
     EmptyLastPage,
+    /// Between two pages of items, an empty page whose `nextLink` leads to the next page of
+    /// items: the end is only where no `nextLink` is.
+    EmptyPageBetween,
 }
 
 #[derive(Debug)]
@@ -277,6 +298,8 @@ struct Inner {
     paging: Paging,
     throttled: Option<u32>,
     locked: Option<u32>,
+    failed_condition: (u16, String),
+    link_base: Option<String>,
     changes: Changes,
 }
 
@@ -293,6 +316,8 @@ impl Inner {
             paging: Paging::Documented,
             throttled: None,
             locked: None,
+            failed_condition: (412, "PreconditionFailed".into()),
+            link_base: None,
             changes,
         };
         for zone in &seed.zones {
@@ -317,12 +342,12 @@ impl Inner {
             .name_servers
             .first()
             .cloned()
-            .unwrap_or_else(|| "ns1-01.azure-dns.com".into());
+            .unwrap_or_else(|| "ns1.dns-one.example".into());
         let soa = json!({
             "TTL": 3600,
             "SOARecord": {
                 "host": host,
-                "email": "azuredns-hostmaster.microsoft.com",
+                "email": "hostmaster.dns-one.example",
                 "serialNumber": 1,
                 "refreshTime": 3600,
                 "retryTime": 300,
@@ -568,6 +593,40 @@ impl Control {
     /// called with `None`.
     pub fn set_locked(&self, retry_after: Option<u32>) {
         lock(&self.state).locked = retry_after;
+    }
+
+    /// The status and code of the answer to a failed `If-Match` or `If-None-Match` from now on;
+    /// `412` with `PreconditionFailed` unless set. The documentation gives neither.
+    ///
+    /// # Panics
+    ///
+    /// If `status` is not a valid status code.
+    pub fn set_failed_condition(&self, status: u16, code: &str) {
+        assert!(
+            StatusCode::from_u16(status).is_ok(),
+            "invalid status code {status}"
+        );
+        lock(&self.state).failed_condition = (status, code.to_owned());
+    }
+
+    /// With `Some(origin)` (such as `http://127.0.0.1:8080`), every `nextLink` names that origin
+    /// instead of the host the request named, until this is called with `None`.
+    pub fn set_link_base(&self, origin: Option<&str>) {
+        lock(&self.state).link_base = origin.map(|o| o.trim_end_matches('/').to_owned());
+    }
+
+    /// Sets the etag of the record set of `name` and `rtype` to `etag` exactly, as a service
+    /// spelling its etags otherwise would; reports nothing, since nothing published changes.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such record set.
+    pub fn set_etag(&self, name: &str, rtype: &str, etag: &str) {
+        let mut inner = lock(&self.state);
+        let at = inner
+            .find_fqdn(name, rtype)
+            .unwrap_or_else(|| panic!("no record set {name} {rtype}"));
+        inner.sets[at].etag = etag.to_owned();
     }
 
     /// Makes every issued token invalid: the next request with one is `401`.
@@ -970,6 +1029,26 @@ fn listing(
 ) -> Response {
     let size = inner.seed.page_size.max(1);
     let token = query(pairs, "$skipToken");
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("127.0.0.1");
+    let origin = inner
+        .link_base
+        .clone()
+        .unwrap_or_else(|| format!("http://{host}"));
+    let base = format!("{origin}{path}?api-version={API_VERSION}");
+    // An empty page between two pages of items (`Paging::EmptyPageBetween`).
+    if let Some(at) = token.and_then(|t| t.strip_prefix('e')) {
+        let Ok(at) = at.parse::<usize>() else {
+            return bad_request("The skip token is not valid.");
+        };
+        return axum::Json(json!({
+            "value": [],
+            "nextLink": format!("{base}&$skipToken={at}"),
+        }))
+        .into_response();
+    }
     let offset = match (inner.paging, token) {
         (Paging::IgnoreToken, _) | (_, None) => 0,
         (_, Some(token)) => match token.parse::<usize>() {
@@ -979,19 +1058,16 @@ fn listing(
     };
     let total = all.len();
     let items: Vec<Value> = all.into_iter().skip(offset).take(size).collect();
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1");
-    let base = format!("http://{host}{path}?api-version={API_VERSION}");
-    let next = if offset + size < total {
-        Some(match inner.paging {
-            Paging::RepeatToken => token.map_or(base.clone(), |t| format!("{base}&$skipToken={t}")),
-            Paging::NoTokenInLink => base.clone(),
-            _ => format!("{base}&$skipToken={}", offset + size),
+    let after = offset.saturating_add(size);
+    let next = if after < total {
+        Some(match (inner.paging, token) {
+            (Paging::RepeatToken, Some(t)) => format!("{base}&$skipToken={t}"),
+            (Paging::NoTokenInLink, _) => base.clone(),
+            (Paging::EmptyPageBetween, _) => format!("{base}&$skipToken=e{after}"),
+            _ => format!("{base}&$skipToken={after}"),
         })
     } else if inner.paging == Paging::EmptyLastPage && offset < total {
-        Some(format!("{base}&$skipToken={}", offset + size))
+        Some(format!("{base}&$skipToken={after}"))
     } else {
         None
     };
@@ -1149,11 +1225,12 @@ fn locked(inner: &Inner) -> Result<(), Response> {
 
 /// The conditional headers against the record set as it is (`current`: its etag, `None` when
 /// there is none).
-fn precondition(headers: &HeaderMap, current: Option<&str>) -> Result<(), Response> {
+fn precondition(inner: &Inner, headers: &HeaderMap, current: Option<&str>) -> Result<(), Response> {
     let failed = || {
+        let (status, code) = &inner.failed_condition;
         cloud_error(
-            StatusCode::PRECONDITION_FAILED,
-            "PreconditionFailed",
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::PRECONDITION_FAILED),
+            code,
             "The condition specified using HTTP conditional header(s) is not met.",
         )
     };
@@ -1194,7 +1271,8 @@ async fn set_put(
         return bad_request("The record type is not supported.");
     };
     let at = inner.find(&zone, &name, &rtype);
-    if let Err(response) = precondition(&headers, at.map(|at| inner.sets[at].etag.as_str())) {
+    if let Err(response) = precondition(&inner, &headers, at.map(|at| inner.sets[at].etag.as_str()))
+    {
         return response;
     }
     let properties = match parse_body(&body, &rtype, key, single) {
@@ -1501,7 +1579,7 @@ async fn set_delete(
     let Some(at) = inner.find(&zone, &name, &rtype) else {
         return StatusCode::NO_CONTENT.into_response();
     };
-    if let Err(response) = precondition(&headers, Some(inner.sets[at].etag.as_str())) {
+    if let Err(response) = precondition(&inner, &headers, Some(inner.sets[at].etag.as_str())) {
         return response;
     }
     let before = inner.published();

@@ -156,6 +156,26 @@ fn rrset(name: &str, rtype: RecordType, ttl: Option<u32>, texts: &[&str]) -> RrS
     .unwrap()
 }
 
+/// Every `PUT` and `DELETE` of a record set the server received carried exactly one condition:
+/// `If-Match` or `If-None-Match` (a `DELETE` only `If-Match`).
+fn assert_conditional(log: &zonewright_mock::RequestLog) {
+    for entry in log.entries() {
+        let write = entry.matches(Some("PUT"), ANY_SET) || entry.matches(Some("DELETE"), ANY_SET);
+        if !write {
+            continue;
+        }
+        let matched = entry.header("if-match").is_some();
+        let none = entry.header("if-none-match") == Some("*");
+        assert!(
+            matched != none,
+            "a write without exactly one condition: {entry:?}"
+        );
+        if entry.method == Method::DELETE {
+            assert!(matched, "a delete without If-Match: {entry:?}");
+        }
+    }
+}
+
 /// The strings of the TXT records at [`NAME`].
 fn stored_txt(mock: &AzureDnsMock) -> Vec<Vec<String>> {
     mock.control().txt(NAME)
@@ -307,7 +327,9 @@ async fn echo_dialect(dialect: Dialect) {
         let text = format!("{e} | {e:?} | {client:?}");
         assert!(text.contains(REDACTED), "{label}: {text}");
         assert_echo_clean(&label, &text, &echo);
-        assert!(echo.log().count(Some("GET"), ZONES) >= 1, "{label}");
+        // The token `check` obtained is cached, so a 401 replaces it once for the read.
+        let expected = if status == 401 { 2 } else { 1 };
+        assert_eq!(echo.log().count(Some("GET"), ZONES), expected, "{label}");
     }
     // The request of each operation. A 401 to a write is not repeated and ends in a constant
     // text (the cached token was refused), so it is covered by the reads.
@@ -365,6 +387,7 @@ async fn echo_dialect(dialect: Dialect) {
                 expected,
                 "{label}: the request did not reach the echo exactly once"
             );
+            assert_conditional(echo.log());
         }
     }
 }
@@ -450,6 +473,7 @@ async fn azure_dns_no_secret_in_logs() {
             "an issued token leaks: {text}"
         );
     }
+    assert_conditional(mock.log());
 }
 
 /// The token request is the documented form at `/{tenant}/oauth2/v2.0/token` without an
@@ -519,13 +543,17 @@ async fn azure_dns_request_shapes() {
     let put = mock.log().matching(Some("PUT"), TXT_SET).pop().unwrap();
     assert_eq!(put.header("if-match"), Some(etag.as_str()));
     assert_eq!(put.header("if-none-match"), None);
-    // A delete too.
+    // Removing one of two values rewrites the set under its etag; removing the last deletes it
+    // under the etag read just before.
     let etag = mock.control().rrset(NAME, "TXT").unwrap().etag;
     remove(&client, "v1").await.unwrap();
+    let put = mock.log().matching(Some("PUT"), TXT_SET).pop().unwrap();
+    assert_eq!(put.header("if-match"), Some(etag.as_str()));
+    let etag = mock.control().rrset(NAME, "TXT").unwrap().etag;
     remove(&client, "v2").await.unwrap();
-    let _ = etag;
     let delete = mock.log().matching(Some("DELETE"), TXT_SET).pop().unwrap();
-    assert!(delete.header("if-match").is_some());
+    assert_eq!(delete.header("if-match"), Some(etag.as_str()));
+    assert_eq!(delete.header("if-none-match"), None);
     // The apex is `@` in a path.
     let apex = rrset(
         "example.org",
@@ -536,6 +564,7 @@ async fn azure_dns_request_shapes() {
     client.set_rrset(&zone(), &apex, Expect::Any).await.unwrap();
     let put = mock.log().matching(Some("PUT"), ANY_SET).pop().unwrap();
     assert!(put.path.ends_with("/dnsZones/example.org/MX/@"), "{put:?}");
+    assert_conditional(mock.log());
 }
 
 /// One token serves every request until it is refused or due; `check` always obtains a new
@@ -566,6 +595,7 @@ async fn azure_dns_token_is_cached_and_renewed() {
     assert_eq!(mock.log().count(Some("PUT"), TXT_SET), puts + 1);
     assert_eq!(add(&client, "v3").await.unwrap(), AddOutcome::Appended);
     assert_eq!(mock.control().tokens_issued(), 4);
+    assert_conditional(mock.log());
 }
 
 /// A wrong secret (`401 invalid_client`), another tenant and a scope the endpoint refuses
@@ -662,6 +692,7 @@ async fn azure_dns_add_is_idempotent() {
     );
     assert_eq!(writes(&mock), before);
     assert_eq!(stored_txt(&mock), strings(&["AAA", "BBB"]));
+    assert_conditional(mock.log());
 }
 
 /// Removing an absent value next to foreign ones writes nothing; adding and removing our value
@@ -742,6 +773,7 @@ async fn azure_dns_never_removes_foreign_value() {
     );
     assert_eq!(writes(&mock), before);
     assert_eq!(control.txt(other), strings(&["foreign"]));
+    assert_conditional(mock.log());
 }
 
 #[tokio::test]
@@ -755,6 +787,7 @@ async fn azure_dns_remove_last_value_deletes_rrset() {
     assert!(mock.control().rrset(NAME, "TXT").is_none());
     assert_eq!(mock.log().count(Some("DELETE"), TXT_SET), 1);
     assert_eq!(mock.log().count(Some("PUT"), TXT_SET), 1);
+    assert_conditional(mock.log());
 }
 
 #[tokio::test]
@@ -785,6 +818,7 @@ async fn azure_dns_remove_is_idempotent() {
         RemoveOutcome::NotPresent
     );
     assert!(mock.control().rrset(NAME, "TXT").is_none());
+    assert_conditional(mock.log());
 }
 
 /// Two clients sharing a `Context` add to one name at once, the first create delayed: both
@@ -809,16 +843,30 @@ async fn azure_dns_concurrent_adds_are_serialized() {
     values.sort();
     assert_eq!(values, strings(&["AAA", "BBB"]));
     assert_eq!(mock.log().count(Some("PUT"), TXT_SET), 2);
+    assert_conditional(mock.log());
 }
 
 /// Another writer changes the record set between the client's read and its write: the service
-/// refuses the conditional write (`412` at the mock), the client reads again, sees another etag,
-/// and runs the operation once more; the foreign value is kept. When the record set changes
-/// before every write, the second refusal is `Conflict` and nothing of ours was written. The
-/// same for a create meeting a record set created meanwhile, and for a delete.
+/// refuses the conditional write, the client reads again, sees another etag, and runs the
+/// operation once more; the foreign value is kept. When the record set changes before every
+/// write, the second refusal is `Conflict` and nothing of ours was written. The same for a
+/// create meeting a record set created meanwhile, for a delete, and for `set_rrset`. The status
+/// of a failed condition is not documented: the cases run under several, since the client
+/// decides by its new read, not by the status.
 #[tokio::test]
 async fn azure_dns_concurrent_change_is_conflict() {
+    for (status, code) in [
+        (412, "PreconditionFailed"),
+        (409, "Conflict"),
+        (400, "BadRequest"),
+    ] {
+        concurrent_change(status, code).await;
+    }
+}
+
+async fn concurrent_change(status: u16, code: &str) {
     let (mock, client) = setup().await;
+    mock.control().set_failed_condition(status, code);
     add(&client, "AAA").await.unwrap();
     let hook = mock.control().clone();
     mock.faults()
@@ -847,10 +895,12 @@ async fn azure_dns_concurrent_change_is_conflict() {
     assert!(e.is_retryable());
     assert_eq!(mock.log().count(Some("PUT"), TXT_SET), puts + 2);
     assert_eq!(stored_txt(&mock), strings(&["AAA", "foreign", "BBB"]));
-    let deletes = mock.log().count(Some("DELETE"), TXT_SET);
+    // Removing one of three values is a rewrite, refused the same way.
+    let puts = mock.log().count(Some("PUT"), TXT_SET);
     let e = remove(&client, "AAA").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
-    assert_eq!(mock.log().count(Some("DELETE"), TXT_SET), deletes);
+    assert_eq!(mock.log().count(Some("PUT"), TXT_SET), puts + 2);
+    assert_eq!(stored_txt(&mock), strings(&["AAA", "foreign", "BBB"]));
     mock.faults().clear();
 
     // The record level, and a delete under a changed set.
@@ -900,6 +950,81 @@ async fn azure_dns_concurrent_change_is_conflict() {
             .ttl(),
         Some(300)
     );
+
+    // `set_rrset` replacing a set another writer changes after the read: the repeat reads the
+    // change; `Expect::Any` then writes over it, `Expect::Matches` of the first state fails.
+    let first = rrset(REC, RecordType::A, Some(3600), &["192.0.2.1"]);
+    let wanted = rrset(REC, RecordType::A, None, &["192.0.2.2"]);
+    let changed = || {
+        let hook = mock.control().clone();
+        Fault::on("PUT", REC_A).pass().run(move || {
+            hook.edit_rrset(REC, "A", |set| {
+                set.properties
+                    .insert("ARecords".into(), json!([{"ipv4Address": "192.0.2.9"}]));
+            });
+        })
+    };
+    mock.faults().push(changed());
+    let e = client
+        .set_rrset(&zone(), &wanted, Expect::Matches(&first))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{e:?}");
+    assert_eq!(
+        mock.control().rrset(REC, "A").unwrap().records(),
+        [json!({"ipv4Address": "192.0.2.9"})]
+    );
+    mock.control()
+        .insert_rrset(REC, "A", 3600, json!([{"ipv4Address": "192.0.2.1"}]));
+    mock.faults().push(changed());
+    assert_eq!(
+        client
+            .set_rrset(&zone(), &wanted, Expect::Any)
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(
+        mock.control().rrset(REC, "A").unwrap().records(),
+        [json!({"ipv4Address": "192.0.2.2"})]
+    );
+    // `set_rrset` creating a set another writer creates after the read.
+    let created = || {
+        let hook = mock.control().clone();
+        Fault::on("PUT", "**/A/new").pass().run(move || {
+            hook.insert_rrset(
+                "new.example.org",
+                "A",
+                600,
+                json!([{"ipv4Address": "192.0.2.7"}]),
+            );
+        })
+    };
+    let new = rrset("new.example.org", RecordType::A, None, &["192.0.2.8"]);
+    mock.faults().push(created());
+    let e = client
+        .set_rrset(&zone(), &new, Expect::Absent)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{e:?}");
+    assert_eq!(
+        mock.control()
+            .rrset("new.example.org", "A")
+            .unwrap()
+            .records(),
+        [json!({"ipv4Address": "192.0.2.7"})]
+    );
+    mock.control().delete_rrset("new.example.org", "A");
+    mock.faults().push(created());
+    assert_eq!(
+        client.set_rrset(&zone(), &new, Expect::Any).await.unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(
+        mock.control().rrset("new.example.org", "A").unwrap().ttl(),
+        Some(600)
+    );
+    assert_conditional(mock.log());
 }
 
 /// Every write is sent once: a 502, a 429 (throttled, and the documented lock of another
@@ -1038,6 +1163,7 @@ async fn azure_dns_writes_are_sent_once() {
         assert_eq!(mock.log().count(Some("DELETE"), REC_A), deletes + 1);
         assert!(control.rrset(REC, "A").is_some());
     }
+    assert_conditional(mock.log());
 }
 
 /// `Expect::Absent` on an existing set and `Expect::Matches` on a changed one are
@@ -1097,6 +1223,7 @@ async fn azure_dns_failed_expectation_is_precondition_failed() {
     let set = control.rrset(REC, "A").unwrap();
     assert_eq!(set.records(), [json!({"ipv4Address": "192.0.2.2"})]);
     assert_eq!(set.ttl(), Some(7200));
+    assert_conditional(mock.log());
 }
 
 /// The listing holds every record set of the zone, the apex SOA and NS included, values
@@ -1183,7 +1310,7 @@ async fn azure_dns_listing_reports_skipped_sets() {
     assert_eq!(ns.records().len(), 4);
     assert!(
         ns.records()
-            .contains(&rd(RecordType::NS, "ns1-01.azure-dns.com."))
+            .contains(&rd(RecordType::NS, "ns1.dns-one.example."))
     );
     assert_eq!(
         find("c.example.org", RecordType::CNAME),
@@ -1343,6 +1470,7 @@ async fn azure_dns_refusal_carries_the_provider_code() {
         e.to_string().contains("The TXT record is not valid."),
         "{e}"
     );
+    assert_conditional(mock.log());
 }
 
 /// A code that holds the client secret, in any spelling the scrubber knows, is dropped; the
@@ -1366,6 +1494,7 @@ async fn azure_dns_provider_code_never_carries_a_credential() {
         assert!(text.contains(REDACTED), "{text}");
         assert!(!text.contains(secret), "{text}");
     }
+    assert_conditional(mock.log());
 }
 
 fn hex(text: &str) -> String {
@@ -1434,18 +1563,28 @@ async fn azure_dns_listing_ends_under_every_paging_reading() {
     assert_eq!(mock.log().count(Some("GET"), RECORDSETS), 4);
     mock.control().set_paging(Paging::EmptyLastPage);
     assert_eq!(client.list_rrsets(&zone()).await.unwrap().rrsets.len(), 7);
-    for paging in [
-        Paging::IgnoreToken,
-        Paging::RepeatToken,
-        Paging::NoTokenInLink,
+    // An empty page that carries a `nextLink` is not the end.
+    mock.control().set_paging(Paging::EmptyPageBetween);
+    assert_eq!(client.list_rrsets(&zone()).await.unwrap().rrsets.len(), 7);
+    // The zone listing pages the same way: five zones, pages of two.
+    for zone in ["a.example", "b.example", "c.example", "d.example"] {
+        mock.control().insert_zone(zone);
+    }
+    for (paging, text) in [
+        (Paging::IgnoreToken, "repeated a page"),
+        (Paging::RepeatToken, "did not advance"),
+        (Paging::NoTokenInLink, "nextLink"),
     ] {
         mock.control().set_paging(paging);
         let e = client.list_rrsets(&zone()).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Protocol, "{paging:?}: {e:?}");
-        let e = client.list_zones().await;
-        // One zone fits a page; the readings change nothing there.
-        assert!(e.is_ok(), "{paging:?}: {e:?}");
+        assert!(e.to_string().contains(text), "{paging:?}: {e}");
+        let e = client.list_zones().await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{paging:?}: {e:?}");
+        assert!(e.to_string().contains(text), "{paging:?}: {e}");
     }
+    mock.control().set_paging(Paging::EmptyPageBetween);
+    assert_eq!(client.list_zones().await.unwrap().len(), 5);
 }
 
 /// A zone the resource group does not hold is `ZoneNotFound` for the reads and the writes; a
@@ -1482,6 +1621,7 @@ async fn azure_dns_zone_not_found() {
     let e = add(&client, "v1").await.unwrap_err();
     assert!(matches!(e, Error::ZoneNotFound { .. }), "{e:?}");
     assert_eq!(writes(&mock), 1);
+    assert_conditional(mock.log());
 }
 
 /// Throttled reads are repeated after `Retry-After`; a throttle longer than the transport waits
@@ -1557,6 +1697,7 @@ async fn azure_dns_from_json_builds_the_client() {
         "{debug}"
     );
     assert!(!debug.contains(SECRET), "{debug}");
+    assert_conditional(mock.log());
 }
 
 /// Configuration errors name the key and never the value.
@@ -1789,6 +1930,7 @@ async fn azure_dns_record_round_trips() {
             .unwrap(),
         DeleteOutcome::NotPresent
     );
+    assert_conditional(mock.log());
 }
 
 fn stored_a() -> RrSet {
@@ -1843,6 +1985,7 @@ async fn azure_dns_txt_values_and_their_rule() {
         .unwrap_err();
     assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
     assert_eq!(writes(&mock), 3);
+    assert_conditional(mock.log());
 }
 
 /// A TXT record set without records (kept by the service for its metadata) takes an added value
@@ -1862,6 +2005,7 @@ async fn azure_dns_empty_txt_set_is_written_into() {
     assert_eq!(stored.properties["metadata"], json!({"k": "v"}));
     assert_eq!(stored.ttl(), Some(60));
     assert_eq!(stored_txt(&mock), strings(&["v1"]));
+    assert_conditional(mock.log());
 }
 
 /// Two `set_rrset` calls on one name from two clients sharing a `Context` do not interleave.
@@ -1886,6 +2030,327 @@ async fn azure_dns_concurrent_sets_are_serialized() {
     assert_eq!(
         mock.control().rrset(REC, "A").unwrap().records(),
         [json!({"ipv4Address": "192.0.2.2"})]
+    );
+    assert_conditional(mock.log());
+}
+
+// ---- Conditions and their edges ----------------------------------------------------------------
+
+/// A record set read without an etag, or with an empty one, is never written: every operation
+/// that would write ends in `Protocol` before any `PUT` or `DELETE`.
+#[tokio::test]
+async fn azure_dns_set_without_etag_is_not_written() {
+    for etag in [None, Some("")] {
+        let (mock, client) = setup().await;
+        let answer = |name: &str, rtype: &str, key: &str, records: Value| {
+            let mut body = json!({
+                "name": name,
+                "type": format!("Microsoft.Network/dnsZones/{rtype}"),
+                "properties": { "TTL": 60, key: records },
+            });
+            if let Some(etag) = etag {
+                body["etag"] = Value::from(etag);
+            }
+            body.to_string()
+        };
+        let txt_answer = answer(
+            "_acme-challenge",
+            "TXT",
+            "TXTRecords",
+            json!([{"value": ["v1"]}]),
+        );
+        let a_answer = answer(
+            "rec",
+            "A",
+            "ARecords",
+            json!([{"ipv4Address": "192.0.2.1"}]),
+        );
+        let mut errors = Vec::new();
+        mock.faults()
+            .push(Fault::on("GET", TXT_SET).respond(200, txt_answer.clone()));
+        errors.push(add(&client, "v2").await.unwrap_err());
+        mock.faults()
+            .push(Fault::on("GET", TXT_SET).respond(200, txt_answer.clone()));
+        errors.push(remove(&client, "v1").await.unwrap_err());
+        mock.faults()
+            .push(Fault::on("GET", REC_A).respond(200, a_answer.clone()));
+        errors.push(
+            client
+                .set_rrset(
+                    &zone(),
+                    &rrset(REC, RecordType::A, None, &["192.0.2.2"]),
+                    Expect::Any,
+                )
+                .await
+                .unwrap_err(),
+        );
+        mock.faults()
+            .push(Fault::on("GET", REC_A).respond(200, a_answer.clone()));
+        errors.push(
+            client
+                .delete_rrset(&zone(), &dn(REC), RecordType::A, Expect::Any)
+                .await
+                .unwrap_err(),
+        );
+        for e in errors {
+            assert_eq!(e.kind(), ErrorKind::Protocol, "{etag:?}: {e:?}");
+        }
+        assert_eq!(writes(&mock), 0, "{etag:?}");
+    }
+}
+
+/// Removing the last value deletes the record set under its etag. When another writer adds a
+/// value before the `DELETE` arrives, the service refuses it, the new read shows the foreign
+/// value, and the repeat rewrites the set without ours: the foreign value stays. When the set
+/// changes before every `DELETE`, the result is `Conflict` and the set is intact.
+#[tokio::test]
+async fn azure_dns_last_value_delete_racing_a_foreign_add() {
+    let (mock, client) = setup().await;
+    add(&client, "v1").await.unwrap();
+    let hook = mock.control().clone();
+    mock.faults()
+        .push(Fault::on("DELETE", TXT_SET).pass().run(move || {
+            hook.edit_rrset(NAME, "TXT", |set| {
+                set.properties.insert(
+                    "TXTRecords".into(),
+                    json!([{"value": ["v1"]}, {"value": ["foreign"]}]),
+                );
+            });
+        }));
+    assert_eq!(remove(&client, "v1").await.unwrap(), RemoveOutcome::Removed);
+    assert_eq!(stored_txt(&mock), strings(&["foreign"]));
+    assert_eq!(mock.log().count(Some("DELETE"), TXT_SET), 1);
+    assert_eq!(mock.log().count(Some("PUT"), TXT_SET), 2);
+
+    mock.control().delete_rrset(NAME, "TXT");
+    add(&client, "v1").await.unwrap();
+    let hook = mock.control().clone();
+    mock.faults()
+        .push(Fault::on("DELETE", TXT_SET).pass().always().run(move || {
+            hook.edit_rrset(NAME, "TXT", |_| {});
+        }));
+    let deletes = mock.log().count(Some("DELETE"), TXT_SET);
+    let e = remove(&client, "v1").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Conflict, "{e:?}");
+    assert_eq!(mock.log().count(Some("DELETE"), TXT_SET), deletes + 2);
+    assert_eq!(stored_txt(&mock), strings(&["v1"]));
+    assert_conditional(mock.log());
+}
+
+/// The answers a write can meet when the state changed under it: a `DELETE` answered `204`
+/// because the set vanished meanwhile is done; a `DELETE` meeting a zone removed meanwhile is
+/// `ZoneNotFound`; a `PUT` with `If-Match` on a set removed meanwhile is refused, and the
+/// repeat creates the set.
+#[tokio::test]
+async fn azure_dns_writes_meet_a_changed_state() {
+    let (mock, client) = setup().await;
+    add(&client, "v1").await.unwrap();
+    let hook = mock.control().clone();
+    mock.faults().push(
+        Fault::on("DELETE", TXT_SET)
+            .pass()
+            .run(move || hook.delete_rrset(NAME, "TXT")),
+    );
+    assert_eq!(
+        remove(&client, "v1").await.unwrap(),
+        RemoveOutcome::RrsetDeleted
+    );
+    mock.control()
+        .insert_rrset(REC, "A", 60, json!([{"ipv4Address": "192.0.2.1"}]));
+    let hook = mock.control().clone();
+    mock.faults().push(
+        Fault::on("DELETE", REC_A)
+            .pass()
+            .run(move || hook.delete_rrset(REC, "A")),
+    );
+    assert_eq!(
+        client
+            .delete_rrset(&zone(), &dn(REC), RecordType::A, Expect::Any)
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+
+    // A replace whose set another writer removed: refused, read again, created.
+    add(&client, "v1").await.unwrap();
+    let hook = mock.control().clone();
+    mock.faults().push(
+        Fault::on("PUT", TXT_SET)
+            .pass()
+            .run(move || hook.delete_rrset(NAME, "TXT")),
+    );
+    let puts = mock.log().count(Some("PUT"), TXT_SET);
+    assert_eq!(add(&client, "v2").await.unwrap(), AddOutcome::Created);
+    assert_eq!(stored_txt(&mock), strings(&["v2"]));
+    assert_eq!(mock.log().count(Some("PUT"), TXT_SET), puts + 2);
+    let puts = mock.log().matching(Some("PUT"), TXT_SET);
+    assert!(puts[puts.len() - 2].header("if-match").is_some());
+    assert_eq!(puts[puts.len() - 1].header("if-none-match"), Some("*"));
+
+    // A delete meeting a zone removed meanwhile.
+    let hook = mock.control().clone();
+    mock.faults().push(
+        Fault::on("DELETE", TXT_SET)
+            .pass()
+            .run(move || hook.remove_zone("example.org")),
+    );
+    let e = remove(&client, "v2").await.unwrap_err();
+    assert!(matches!(e, Error::ZoneNotFound { .. }), "{e:?}");
+    assert_conditional(mock.log());
+}
+
+/// A replacement sends exactly `TTL`, the kept `metadata` and the type's records: an empty
+/// `targetResource`, a `null` `metadata` and empty lists of other types carry nothing and are
+/// left out; the read-only `fqdn` and `provisioningState` are never sent.
+#[tokio::test]
+async fn azure_dns_replacement_body_is_exact() {
+    let (mock, client) = setup().await;
+    mock.control()
+        .insert_rrset(NAME, "TXT", 60, json!([{"value": ["foreign"]}]));
+    mock.control().edit_rrset(NAME, "TXT", |set| {
+        set.properties.insert("targetResource".into(), json!({}));
+        set.properties.insert("metadata".into(), Value::Null);
+        set.properties.insert("ARecords".into(), json!([]));
+        set.properties.insert("CNAMERecord".into(), Value::Null);
+    });
+    assert_eq!(add(&client, "ours").await.unwrap(), AddOutcome::Appended);
+    let put = mock.log().matching(Some("PUT"), TXT_SET).pop().unwrap();
+    assert_eq!(
+        put.body_json().unwrap(),
+        json!({"properties": {
+            "TTL": 60, "TXTRecords": [{"value": ["foreign"]}, {"value": ["ours"]}],
+        }})
+    );
+    assert_conditional(mock.log());
+}
+
+/// The etag goes back byte for byte, a quoted and a weak one included; one that cannot be a
+/// header value is `Protocol` with nothing written.
+#[tokio::test]
+async fn azure_dns_etag_spellings() {
+    let (mock, client) = setup().await;
+    add(&client, "v1").await.unwrap();
+    for (etag, value) in [("\"q-1\"", "v2"), ("W/\"w-1\"", "v3")] {
+        mock.control().set_etag(NAME, "TXT", etag);
+        assert_eq!(add(&client, value).await.unwrap(), AddOutcome::Appended);
+        let put = mock.log().matching(Some("PUT"), TXT_SET).pop().unwrap();
+        assert_eq!(put.header("if-match"), Some(etag));
+    }
+    mock.control().set_etag(NAME, "TXT", "bad\netag");
+    let before = writes(&mock);
+    let e = add(&client, "v4").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
+    assert_eq!(writes(&mock), before);
+    assert_conditional(mock.log());
+}
+
+/// More writes sent once: the lock of another operation at the record level, the rewrite that
+/// removes one value, a `500` on the last-value delete, a `503`, and a write that times out.
+#[tokio::test]
+async fn azure_dns_more_writes_are_sent_once() {
+    let (mock, client) = setup().await;
+    mock.control().set_locked(Some(1));
+    let puts = mock.log().count(Some("PUT"), REC_A);
+    let e = client
+        .set_rrset(
+            &zone(),
+            &rrset(REC, RecordType::A, None, &["192.0.2.1"]),
+            Expect::Any,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::RateLimited, "{e:?}");
+    assert_eq!(mock.log().count(Some("PUT"), REC_A), puts + 1);
+    mock.control().set_locked(None);
+
+    add(&client, "AAA").await.unwrap();
+    add(&client, "BBB").await.unwrap();
+    mock.faults().push(Fault::on("PUT", TXT_SET).status(503));
+    let puts = mock.log().count(Some("PUT"), TXT_SET);
+    let e = remove(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(mock.log().count(Some("PUT"), TXT_SET), puts + 1);
+    remove(&client, "AAA").await.unwrap();
+
+    mock.faults().push(Fault::on("DELETE", TXT_SET).status(500));
+    let e = remove(&client, "BBB").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(mock.log().count(Some("DELETE"), TXT_SET), 1);
+    assert_eq!(stored_txt(&mock), strings(&["BBB"]));
+
+    // A write that times out is not repeated.
+    let mut options = zonewright::ContextOptions::default();
+    options.loopback_only = true;
+    options.request_timeout = Duration::from_millis(300);
+    let ctx = Context::new(options).unwrap();
+    let slow = client_for(&mock, &Seed::standard(), SECRET, &ctx);
+    mock.faults()
+        .push(Fault::on("PUT", TXT_SET).delay(Duration::from_millis(1500)));
+    let puts = mock.log().count(Some("PUT"), TXT_SET);
+    let e = add(&slow, "CCC").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(mock.log().count(Some("PUT"), TXT_SET), puts + 1);
+    assert_conditional(mock.log());
+}
+
+/// The answers of the token endpoint the client reads: an empty token and a token of another
+/// type are `Protocol`; `expires_in` as text is read; a `5xx` is repeated, then `Transient`.
+/// The credentials type prints no secret.
+#[tokio::test]
+async fn azure_dns_token_answers() {
+    let (mock, client) = setup().await;
+    for body in [
+        json!({"access_token": "", "token_type": "Bearer", "expires_in": 3599}),
+        json!({"access_token": "t", "token_type": "MAC", "expires_in": 3599}),
+        json!({"token_type": "Bearer"}),
+    ] {
+        mock.faults()
+            .push(Fault::on("POST", TOKEN_PATH).respond(200, body.to_string()));
+        let e = client.check(&[zone()]).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Protocol, "{body}: {e:?}");
+    }
+    // `expires_in` as text: the token (one the mock issued to another client) is used.
+    let other = client_for(&mock, &Seed::standard(), SECRET, &context());
+    other.check(&[zone()]).await.unwrap();
+    mock.faults().push(Fault::on("POST", TOKEN_PATH).respond(
+        200,
+        json!({"access_token": "azure-mock-token-1", "token_type": "Bearer", "expires_in": "3599"})
+            .to_string(),
+    ));
+    client.list_zones().await.unwrap();
+    mock.log().clear();
+    mock.faults()
+        .push(Fault::on("POST", TOKEN_PATH).times(3).status(503));
+    let e = client.check(&[zone()]).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(mock.log().count(Some("POST"), TOKEN_PATH), 3);
+    let credentials = AzureDnsCredentials::new(SecretString::from(SECRET));
+    assert!(!format!("{credentials:?}").contains(SECRET));
+}
+
+/// A listing whose `nextLink` names another host still reads every page from the configured
+/// endpoint, with the link's `$skipToken`: the other host gets no request.
+#[tokio::test]
+async fn azure_dns_next_link_host_is_never_requested() {
+    let (mock, client) = setup().await;
+    let other = AzureDnsMock::start(Seed::standard()).await;
+    for i in 0..5 {
+        mock.control().insert_rrset(
+            &format!("h{i}.example.org"),
+            "A",
+            60,
+            json!([{"ipv4Address": "192.0.2.1"}]),
+        );
+    }
+    mock.control().set_page_size(2);
+    mock.control().set_link_base(Some(&other.management_url()));
+    assert_eq!(client.list_rrsets(&zone()).await.unwrap().rrsets.len(), 7);
+    assert!(other.log().is_empty(), "{:?}", other.log().entries());
+    let pages = mock.log().matching(Some("GET"), RECORDSETS);
+    assert_eq!(pages.len(), 4);
+    assert_eq!(
+        pages[1].query.as_deref(),
+        Some("api-version=2018-05-01&$skipToken=2")
     );
 }
 

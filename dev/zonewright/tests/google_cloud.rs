@@ -29,7 +29,9 @@ use zonewright_mock::axum;
 use zonewright_mock::axum::http::{Method, StatusCode};
 use zonewright_mock::axum::response::IntoResponse as _;
 use zonewright_mock::echo::{DEFAULT_ISSUED_TOKEN, Echo, EchoServer, Echoed, Render};
-use zonewright_mock::google_cloud::{GoogleCloudMock, Seed, SeedZone, other_test_key, test_key};
+use zonewright_mock::google_cloud::{
+    AdditionOfExisting, GoogleCloudMock, Seed, SeedZone, other_test_key, test_key,
+};
 
 use common::echo::{CANARY_KEY, CANARY_USER, LogCapture, REDACTED, assert_clean, dialects};
 use common::{context, dn};
@@ -700,13 +702,17 @@ async fn google_cloud_concurrent_adds_are_serialized() {
 }
 
 /// A foreign change between the read and the change is not lost, whatever status the provider
-/// answers the failed deletion match with: the change is refused, the client reads again and
-/// repeats the operation once; a second refusal is a retryable `Conflict` with nothing written.
+/// answers the failed deletion match, or the addition of an rrset created meanwhile, with: the
+/// change is refused, the client reads again and repeats the operation once; a second refusal is
+/// a retryable `Conflict` with nothing written. A `404` also makes the client look the zone up
+/// again before the new read.
 #[tokio::test]
 async fn google_cloud_concurrent_change_is_conflict() {
-    for status in [412u16, 400, 409] {
+    for status in [412u16, 400, 409, 404] {
         let (mock, client) = setup().await;
         mock.control().set_precondition_status(status);
+        mock.control()
+            .set_addition_of_existing(AdditionOfExisting::Refuse(status));
         add(&client, "AAA").await.unwrap();
 
         // One foreign change: the repeat succeeds and keeps it.
@@ -714,10 +720,16 @@ async fn google_cloud_concurrent_change_is_conflict() {
         mock.faults().push(Fault::on("POST", CHANGES).run(move || {
             hook.append_txt(ZONE, NAME, "foreign1");
         }));
+        let looked_up = lookups(&mock);
         assert_eq!(
             add(&client, "BBB").await.unwrap(),
             AddOutcome::Appended,
             "{status}"
+        );
+        assert_eq!(
+            lookups(&mock),
+            looked_up + usize::from(status == 404),
+            "{status}: the zone is looked up again after a 404 only"
         );
         assert_eq!(data(&mock), ["\"AAA\"", "foreign1", "\"BBB\""], "{status}");
 
@@ -809,6 +821,214 @@ async fn google_cloud_concurrent_change_is_conflict() {
         );
         assert_eq!(mock.control().txt(ZONE, lone), ["foreign4"]);
     }
+}
+
+/// The other reading of the undocumented answer to an addition of an rrset that exists: the
+/// service applies it as a replacement. An rrset another writer creates between the client's
+/// read and its addition is then replaced, and the client reports `Created`: the other writer's
+/// value is lost and nothing reports it. No client code can detect it, since the API offers no
+/// other condition on the absence of an rrset; the guarantee for a new rrset rests on the
+/// refusal (`src/providers/google_cloud/rrset.rs`, "A new rrset"), which the ignored test
+/// `live_google_cloud_change_semantics` settles. An rrset that exists at the read stays
+/// protected by the deletion match under either reading.
+#[tokio::test]
+async fn google_cloud_addition_of_an_existing_rrset_under_the_other_reading() {
+    let (mock, client) = setup().await;
+    mock.control()
+        .set_addition_of_existing(AdditionOfExisting::Replace);
+    let other = "_acme-challenge.www.example.org";
+    let hook = mock.control().clone();
+    mock.faults().push(Fault::on("POST", CHANGES).run(move || {
+        hook.append_txt(ZONE, other, "foreign");
+    }));
+    assert_eq!(
+        client
+            .add_txt_value(&zone(), &dn(other), &txt("ours"), None)
+            .await
+            .unwrap(),
+        AddOutcome::Created
+    );
+    assert_eq!(
+        mock.control().txt(ZONE, other),
+        ["\"ours\""],
+        "the foreign value is gone"
+    );
+
+    // An rrset that existed at the read: the deletion match keeps the foreign value.
+    add(&client, "AAA").await.unwrap();
+    let hook = mock.control().clone();
+    mock.faults().push(Fault::on("POST", CHANGES).run(move || {
+        hook.append_txt(ZONE, NAME, "foreign");
+    }));
+    assert_eq!(add(&client, "BBB").await.unwrap(), AddOutcome::Appended);
+    assert_eq!(data(&mock), ["\"AAA\"", "foreign", "\"BBB\""]);
+}
+
+/// A refusal is decided by the new read, not by its body: a body without a reason and a body
+/// that is not JSON still end in a repeat that keeps the foreign value, and with the refusal
+/// returned as it is when nothing changed.
+#[tokio::test]
+async fn google_cloud_conflict_is_decided_by_the_read() {
+    let (mock, client) = setup().await;
+    add(&client, "AAA").await.unwrap();
+    for (status, body) in [
+        (
+            412u16,
+            r#"{"error":{"code":412,"message":"Precondition not met"}}"#,
+        ),
+        (400, "<html>bad request</html>"),
+        (409, ""),
+    ] {
+        let hook = mock.control().clone();
+        let value = format!("foreign-{status}");
+        mock.faults().push(
+            Fault::on("POST", CHANGES)
+                .run(move || hook.append_txt(ZONE, NAME, &value))
+                .respond(status, body),
+        );
+        let ours = format!("ours-{status}");
+        assert_eq!(
+            add(&client, &ours).await.unwrap(),
+            AddOutcome::Appended,
+            "{status}"
+        );
+        let held = data(&mock);
+        assert!(held.contains(&format!("foreign-{status}")), "{held:?}");
+        assert!(held.contains(&format!("\"{ours}\"")), "{held:?}");
+        // Nothing changed: the refusal is the error, with no code where the body has none.
+        mock.faults()
+            .push(Fault::on("POST", CHANGES).respond(status, body));
+        let e = add(&client, "never").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{status}: {e:?}");
+        assert_eq!(e.provider_code(), None, "{status}");
+    }
+}
+
+/// A resource quota (`quotaExceeded`) answered with 413 or 429 is a permanent refusal: `Rejected`
+/// with the status and the reason, not waited out, not repeated; a 413 or 429 with another reason
+/// stays a rate limit.
+#[tokio::test]
+async fn google_cloud_resource_quota_is_a_refusal() {
+    let (mock, client) = setup().await;
+    let quota = |status: u16| {
+        format!(
+            r#"{{"error":{{"code":{status},"message":"Quota exceeded for quota metric 'rrsets per zone'","errors":[{{"domain":"global","reason":"quotaExceeded"}}]}}}}"#
+        )
+    };
+    for status in [413u16, 429] {
+        mock.faults()
+            .push(Fault::on("POST", CHANGES).respond(status, quota(status)));
+        let before = writes(&mock);
+        let e = add(&client, "AAA").await.unwrap_err();
+        match &e {
+            Error::Rejected {
+                status: got, code, ..
+            } => {
+                assert_eq!(*got, Some(status));
+                assert_eq!(code.as_ref().map(|c| c.as_str()), Some("quotaExceeded"));
+            }
+            other => panic!("{status}: {other:?}"),
+        }
+        assert!(!e.is_retryable());
+        assert_eq!(writes(&mock), before + 1, "{status}");
+        // On a read: refused at once, not repeated.
+        mock.faults()
+            .push(Fault::on("GET", RRSETS).respond(status, quota(status)));
+        let reads = mock.log().count(Some("GET"), RRSETS);
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{status}: {e:?}");
+        assert_eq!(mock.log().count(Some("GET"), RRSETS), reads + 1, "{status}");
+    }
+    // Another reason: a rate limit, written once.
+    for status in [413u16, 429] {
+        mock.faults().push(Fault::on("POST", CHANGES).respond(
+            status,
+            r#"{"error":{"code":429,"message":"slow down","errors":[{"reason":"rateLimitExceeded"}]}}"#,
+        ));
+        let before = writes(&mock);
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::RateLimited, "{status}: {e:?}");
+        assert_eq!(writes(&mock), before + 1, "{status}");
+    }
+    assert!(data(&mock).is_empty());
+}
+
+/// More ways a change can fail, each sent once: a 503, a dropped connection, an answer slower
+/// than the request timeout, the removal of one of several values, and a change the provider
+/// applied whose answer was lost (a 502 after the change). The repeat converges every time.
+#[tokio::test]
+async fn google_cloud_more_writes_are_sent_once() {
+    let mock = GoogleCloudMock::start(Seed::standard()).await;
+    let mut options = zonewright::ContextOptions::default();
+    options.loopback_only = true;
+    options.request_timeout = Duration::from_millis(700);
+    let ctx = Context::new(options).unwrap();
+    let client = client_with(&mock, &ctx);
+
+    // 503 on a create, a dropped connection on an update.
+    mock.faults().push(Fault::on("POST", CHANGES).status(503));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(writes(&mock), 1);
+    assert!(data(&mock).is_empty());
+    assert_eq!(add(&client, "AAA").await.unwrap(), AddOutcome::Created);
+    mock.faults()
+        .push(Fault::on("POST", CHANGES).drop_connection());
+    let before = writes(&mock);
+    let e = add(&client, "BBB").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(writes(&mock), before + 1);
+    assert_eq!(data(&mock), ["\"AAA\""]);
+    assert_eq!(add(&client, "BBB").await.unwrap(), AddOutcome::Appended);
+
+    // The removal of one of two values (a deletion and an addition) answered 502.
+    mock.faults().push(Fault::on("POST", CHANGES).status(502));
+    let before = writes(&mock);
+    let e = remove(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(writes(&mock), before + 1);
+    assert_eq!(data(&mock), ["\"AAA\"", "\"BBB\""]);
+    assert_eq!(
+        remove(&client, "AAA").await.unwrap(),
+        RemoveOutcome::Removed
+    );
+
+    // Applied, answer lost: the change takes effect, the client gets a 502.
+    let hook = mock.control().clone();
+    mock.faults().push(
+        Fault::on("POST", CHANGES)
+            .run(move || hook.append_txt(ZONE, NAME, "\"CCC\""))
+            .status(502),
+    );
+    let before = writes(&mock);
+    let e = add(&client, "CCC").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(
+        add(&client, "CCC").await.unwrap(),
+        AddOutcome::AlreadyPresent
+    );
+    assert_eq!(writes(&mock), before + 1, "the repeat writes nothing");
+
+    // An answer slower than the request timeout: sent once, the outcome unknown; whether the
+    // mock applied it after the client gave up, the repeat converges.
+    mock.faults()
+        .push(Fault::on("POST", CHANGES).delay(Duration::from_millis(1200)));
+    let before = writes(&mock);
+    let e = add(&client, "DDD").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    assert_eq!(writes(&mock), before + 1);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let outcome = add(&client, "DDD").await.unwrap();
+    assert!(
+        matches!(outcome, AddOutcome::AlreadyPresent | AddOutcome::Appended),
+        "{outcome:?}"
+    );
+    let held = data(&mock);
+    assert_eq!(
+        held.iter().filter(|v| *v == "\"DDD\"").count(),
+        1,
+        "{held:?}"
+    );
 }
 
 /// The managed zone is deleted and created again under a new ID while the client has the old
@@ -1538,7 +1758,7 @@ async fn google_cloud_jwt_and_token_request_shape() {
     let claims = decode_part(parts[1]);
     assert_eq!(
         claims["iss"],
-        "zw-test@zw-test-project.iam.gserviceaccount.com"
+        "zw-test@zw-test-project.iam.gserviceaccount.test"
     );
     assert_eq!(
         claims["scope"],
@@ -1628,7 +1848,7 @@ async fn google_cloud_wrong_key_is_auth() {
     let seed = Seed::standard();
     let wrong = [seed.key_file(&other_test_key().private_pem), {
         let mut k = seed.key_file(&test_key().private_pem);
-        k["client_email"] = json!("other@zw-test-project.iam.gserviceaccount.com");
+        k["client_email"] = json!("other@zw-test-project.iam.gserviceaccount.test");
         k
     }];
     for key in wrong {
@@ -2227,13 +2447,20 @@ async fn google_cloud_set_replaces_and_keeps_the_rest() {
         r#"{"rrsets":[{"kind":"dns#resourceRecordSet","name":"rec.example.org.","type":"A","ttl":120,"rrdatas":["192.0.2.2","192.0.2.9"],"healthCheck":"x"}]}"#,
     ));
     let before = writes(&mock);
-    let _ = client
-        .set_rrset(
-            &zone(),
-            &rrset(REC, RecordType::A, None, &["192.0.2.7"]),
-            Expect::Any,
-        )
-        .await;
+    // The change with the unknown member is refused; the new read finds the rrset as the mock
+    // holds it (without the member), so the layer runs once more and replaces it.
+    assert_eq!(
+        client
+            .set_rrset(
+                &zone(),
+                &rrset(REC, RecordType::A, None, &["192.0.2.7"]),
+                Expect::Any,
+            )
+            .await
+            .unwrap(),
+        SetOutcome::Replaced
+    );
+    assert_eq!(writes(&mock), before + 2);
     let body = mock.log().matching(Some("POST"), CHANGES)[before]
         .body_json()
         .unwrap();
@@ -2479,10 +2706,11 @@ async fn google_cloud_listing_pages_oddly() {
 
 #[tokio::test]
 async fn google_cloud_record_concurrent_change_is_conflict() {
-    for status in [412u16, 400] {
+    for status in [412u16, 400, 409, 404] {
         let (mock, client) = setup().await;
         let control = mock.control();
         control.set_precondition_status(status);
+        control.set_addition_of_existing(AdditionOfExisting::Refuse(status));
         control.insert_rrset(ZONE, REC, "A", 60, &["192.0.2.1"]);
         let foreign_change = |data: &'static [&'static str]| {
             let hook = control.clone();
@@ -2902,7 +3130,10 @@ async fn live_google_cloud_record_round_trip() {
     assert!(cleanup.is_empty(), "cleanup failed: {cleanup:?}");
 }
 
-/// The assumptions the client depends on that no source states, each exercised under a name
+/// The assumptions the client depends on that no source states, through the public operations
+/// (the change semantics themselves, a stale deletion, an addition of an existing rrset and a
+/// mixed change, are probed directly by `live_google_cloud_change_semantics` in
+/// `src/providers/google_cloud/live.rs`), each exercised under a name
 /// prefix the maintainer gives (`ZONEWRIGHT_LIVE_GOOGLE_CLOUD_PREFIX`, a label below the zone):
 ///
 /// 1. a missing rrset is an empty listing for a name and type, not a 404;
@@ -2963,12 +3194,12 @@ async fn google_cloud_live_assumptions() {
                 .unwrap()
                 .unwrap();
             eprintln!("assumption probe: TXT read back as {read:?}");
-            let expected: Vec<RecordData> =
+            let mut expected: Vec<RecordData> =
                 values[..2].iter().map(|v| v.to_data().unwrap()).collect();
-            assert!(
-                read.records().iter().all(|r| expected.contains(r)),
-                "{read:?}"
-            );
+            expected.sort();
+            let mut records = read.records().to_vec();
+            records.sort();
+            assert_eq!(records, expected, "{read:?}");
             // 2: two clients on separate contexts change the same rrset at once; neither value
             // is lost, and a refusal surfaces only as `Conflict`.
             let (a, b) = tokio::join!(

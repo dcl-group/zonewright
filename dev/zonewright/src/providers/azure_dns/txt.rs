@@ -15,6 +15,9 @@
 //! - write over a prior set: a `PUT` with `If-Match`, the records kept exactly as read plus the
 //!   new one, the TTL and the `metadata` as read;
 //! - delete: the last value is removed by deleting the record set (`DELETE` with `If-Match`).
+//!   The record set goes with its `metadata`: the contract of design section 3.5 deletes the
+//!   rrset when the value was its only one, and no source says that the service keeps or serves
+//!   a TXT record set without records, so the client does not write one to keep the metadata.
 //!
 //! A TXT record set without records, should the service return one (the reference does not say
 //! that a record list may be empty, nor that it may not), reads as no set; it is carried in the

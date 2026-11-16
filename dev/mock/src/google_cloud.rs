@@ -23,10 +23,10 @@
 //!   (`pending` or `done`), `isServing`, `additions` and `deletions`, applied atomically;
 //!   deletions "Must match existing data exactly". Members outside these schemas are refused.
 //! - Errors (<https://google.aip.dev/193>, <https://docs.cloud.google.com/dns/docs/error-messages>):
-//!   `{"error": {"code", "message", "status", "errors": [{"domain", "reason", "message"}]}}` with
-//!   the reasons `alreadyExists`, `notFound`, `preconditionFailed`, `invalidValue`,
+//!   `{"error": {"code", "message", "status", "details"}}` (AIP-193), and the reasons of the
+//!   error messages page: `alreadyExists`, `notFound`, `preconditionFailed`, `invalidValue`,
 //!   `invalidRecordCount`, `cnameResourceRecordSetConflict`, `recordTypeDisallowedAtZoneApex`,
-//!   `wildcardNotAllowed`.
+//!   `wildcardNotAllowed`. Neither page shows where a reason stands in the body (see below).
 //! - Limits (<https://docs.cloud.google.com/dns/quotas>, records pages): 1000 additions and 1000
 //!   deletions per change; 100000 bytes of rrdata per change; a TXT rrdata of at most 1000
 //!   characters with character-strings of at most 255; NS and SOA at the zone apex are created
@@ -38,11 +38,26 @@
 //! cannot rely on a lenient reading. A test that depends on one of them proves only how the
 //! client handles that answer, not that the provider gives it:
 //!
+//! - the error body carries the reason as `error.errors[0].reason`, with `domain` `global`: the
+//!   shape of google-api-go-client (`googleapi.go`, `Error.Errors[].Reason`), the library lego
+//!   uses, not of a Cloud DNS page; `status` is the `google.rpc.Code` name of the HTTP status;
+//! - whether an addition of an rrset that exists is refused: by default it is, with
+//!   `alreadyExists` and 409; [`Control::set_addition_of_existing`] sets another status, or
+//!   applies the addition as a replacement (the other reading);
+//! - whether a `pending` change is visible to a listing: by default it is (the change is applied
+//!   when it is accepted); with [`Control::set_pending_visible`] it is applied when it is `done`;
+//! - the token endpoint refuses a body that is not a form and a form member other than
+//!   `grant_type` and `assertion` (`invalid_request`); it refuses a JWT whose `scope` holds a
+//!   comma or no scope that allows `changes.create` (`invalid_scope`), and answers `200`; its
+//!   tokens are `mock-access-token-NNNN`;
+//! - names are compared ASCII-case-insensitively and stored lowercase; the `dnsName` parameter
+//!   without the trailing dot is refused like `name`;
 //! - an rrdata of an addition that the deletion of the same rrset in the same change carries is
 //!   not checked against the forms above: it is the provider's own data written back (data put
 //!   in with [`Control::insert_rrset`] is never checked, so that a test can seed what the API
 //!   might return);
-//! - the statuses of the reasons: `alreadyExists` 409, `notFound` 404, `preconditionFailed` 412
+//! - the statuses of the reasons (the error messages page gives none): `alreadyExists` 409,
+//!   `notFound` 404, `preconditionFailed` 412
 //!   by default ([`Control::set_precondition_status`] sets another), the other refusals of a
 //!   change 400; a missing managed zone 404; a missing or revoked token 401 (`authError`); a
 //!   project other than the seed's 403 (`forbidden`);
@@ -52,9 +67,9 @@
 //! - an addition without `ttl`, a name without the trailing dot or outside the zone, and the
 //!   `name` query parameter without the trailing dot are refused (`invalidValue`); the removal of
 //!   the apex NS or SOA without an addition of the same name and type is `invalidValue`;
-//! - a change is applied when it is accepted and answered `pending`; it is `done` on the first
-//!   `changes.get` ([`Control::set_change_polls`] changes the number of looks, 0 answers `done`
-//!   at once);
+//! - a change is answered `pending`; it is `done` on the first `changes.get`
+//!   ([`Control::set_change_polls`] changes the number of looks, 0 answers `done` at once;
+//!   [`Control::complete_pending`] finishes every pending change);
 //! - an empty listing has no `rrsets` (or `managedZones`) member; listings are in the order the
 //!   rrsets and zones were created; a page token is an offset, any other token is
 //!   `invalidValue`; `filter` is refused (the client does not use it, and a mock that ignored
@@ -69,8 +84,10 @@
 //!
 //! The mock is a [`ChangeSource`]: it reports every change of its published records through
 //! [`GoogleCloudMock::changes`], and a [`link`](crate::link::link) serves them over DNS. A change
-//! is published when the mock applies it, which is when it is accepted: polling it changes
-//! nothing, and a change refused publishes nothing. Only public managed zones are published;
+//! is published when the mock applies it, which is when it is accepted, or when it is `done`
+//! while pending changes are not visible; a change refused publishes nothing. The apex name
+//! servers and the SOA of every zone use names under `.test` (`ns-cloud-aN.googledomains.test.`,
+//! `cloud-dns-hostmaster.google.test.`), never the provider's real hosts. Only public managed zones are published;
 //! rrsets with a routing policy are left out (they are answered dynamically, which the mock does
 //! not model), the SOA rrset (the server that serves the zone answers with its own, as in the
 //! Route 53 mock), and an rrset whose owner name is outside its zone (possible only through
@@ -233,14 +250,14 @@ pub struct SeedZone {
 }
 
 impl Seed {
-    /// Service account `zw-test@zw-test-project.iam.gserviceaccount.com` with key
+    /// Service account `zw-test@zw-test-project.iam.gserviceaccount.test` with key
     /// `0123456789abcdef0123456789abcdef01234567` of [`test_key`], project `zw-test-project`
     /// holding the private managed zone `example-org-private` and the public managed zone
     /// `example-org`, both for `example.org.`, in that order. Tokens state a lifetime of one
     /// hour.
     pub fn standard() -> Self {
         Self {
-            client_email: "zw-test@zw-test-project.iam.gserviceaccount.com".into(),
+            client_email: "zw-test@zw-test-project.iam.gserviceaccount.test".into(),
             private_key_id: "0123456789abcdef0123456789abcdef01234567".into(),
             public_key: test_key().public_der.clone(),
             project_id: "zw-test-project".into(),
@@ -344,6 +361,37 @@ impl Rrset {
     }
 }
 
+/// What the mock does with an addition of an rrset that exists (not documented; see the
+/// module).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AdditionOfExisting {
+    /// The change is refused with `alreadyExists` and this status.
+    Refuse(u16),
+    /// The addition replaces the rrset (the other reading of the documentation).
+    Replace,
+}
+
+/// A change accepted but not applied yet.
+#[derive(Debug)]
+struct Held {
+    id: String,
+    zone_id: String,
+    deletions: Vec<Rrset>,
+    additions: Vec<Rrset>,
+}
+
+/// Removes from `state` the rrsets of `deletions` and of `additions` (by zone, name and type)
+/// and adds `additions`.
+fn apply(state: &mut Vec<Rrset>, zone_id: &str, deletions: &[Rrset], additions: &[Rrset]) {
+    for set in deletions.iter().chain(additions) {
+        state.retain(|r| {
+            !(r.zone_id == zone_id && fqdn(&r.name) == set.name && r.rtype == set.rtype)
+        });
+    }
+    state.extend(additions.iter().cloned());
+}
+
 #[derive(Debug)]
 struct Inner {
     /// The seed the mock was started with, for [`Control::reset`].
@@ -360,6 +408,10 @@ struct Inner {
     pending: HashMap<String, (String, u32, Value)>,
     change_polls: u32,
     precondition_status: StatusCode,
+    addition_of_existing: AdditionOfExisting,
+    pending_visible: bool,
+    /// Accepted changes not yet applied (only while `pending_visible` is false), in order.
+    held: Vec<Held>,
     zone_page_size: Option<usize>,
     rrset_page_size: Option<usize>,
     next_id: u64,
@@ -381,6 +433,9 @@ impl Inner {
             pending: HashMap::new(),
             change_polls: 1,
             precondition_status: StatusCode::PRECONDITION_FAILED,
+            addition_of_existing: AdditionOfExisting::Refuse(409),
+            pending_visible: true,
+            held: Vec::new(),
             zone_page_size: None,
             rrset_page_size: None,
             next_id: 1_000_000_000_000_000_000,
@@ -389,6 +444,31 @@ impl Inner {
             inner.add_zone(&zone.name, &zone.dns_name, zone.public);
         }
         inner
+    }
+
+    /// The rrsets with every held change applied: the state new changes are checked against.
+    fn effective(&self) -> Vec<Rrset> {
+        let mut state = self.rrsets.clone();
+        for held in &self.held {
+            apply(&mut state, &held.zone_id, &held.deletions, &held.additions);
+        }
+        state
+    }
+
+    /// Applies the held change `id`, if any, and reports what it changed.
+    fn complete(&mut self, id: &str) {
+        let Some(at) = self.held.iter().position(|h| h.id == id) else {
+            return;
+        };
+        let held = self.held.remove(at);
+        let before = self.published();
+        apply(
+            &mut self.rrsets,
+            &held.zone_id,
+            &held.deletions,
+            &held.additions,
+        );
+        self.report(&before, Origin::Api);
     }
 
     fn new_id(&mut self) -> String {
@@ -413,7 +493,7 @@ impl Inner {
     /// The NS and SOA rrsets Cloud DNS creates at the apex of a new zone.
     fn add_apex(&mut self, zone_id: &str, dns_name: &str) {
         let servers: Vec<String> = (1..=4)
-            .map(|n| format!("ns-cloud-a{n}.googledomains.com."))
+            .map(|n| format!("ns-cloud-a{n}.googledomains.test."))
             .collect();
         self.rrsets.push(Rrset {
             zone_id: zone_id.to_owned(),
@@ -430,7 +510,7 @@ impl Inner {
             rtype: "SOA".into(),
             ttl: Some(21600),
             rrdatas: vec![
-                "ns-cloud-a1.googledomains.com. cloud-dns-hostmaster.google.com. 1 21600 3600 \
+                "ns-cloud-a1.googledomains.test. cloud-dns-hostmaster.google.test. 1 21600 3600 \
                  259200 300"
                     .into(),
             ],
@@ -865,6 +945,33 @@ impl Control {
             StatusCode::from_u16(status).expect("a valid HTTP status");
     }
 
+    /// How an addition of an rrset that exists is answered (not documented; see the module):
+    /// refused with `alreadyExists` and a status (the default, 409), or applied as a
+    /// replacement.
+    pub fn set_addition_of_existing(&self, mode: AdditionOfExisting) {
+        lock(&self.state).addition_of_existing = mode;
+    }
+
+    /// Whether a change that is still `pending` is visible to `resourceRecordSets.list` (not
+    /// documented; the default is visible). When it is not, the change is applied when it is
+    /// `done`; new changes are checked against the state with it applied.
+    pub fn set_pending_visible(&self, visible: bool) {
+        lock(&self.state).pending_visible = visible;
+    }
+
+    /// Completes every pending change: each is `done` on its next look, and a change held back
+    /// by [`Control::set_pending_visible`] is applied now.
+    pub fn complete_pending(&self) {
+        let mut inner = lock(&self.state);
+        for (_, polls, _) in inner.pending.values_mut() {
+            *polls = 1;
+        }
+        let ids: Vec<String> = inner.held.iter().map(|h| h.id.clone()).collect();
+        for id in ids {
+            inner.complete(&id);
+        }
+    }
+
     /// Page size of the managed zone listing.
     pub fn set_zone_page_size(&self, size: usize) {
         lock(&self.state).zone_page_size = Some(size);
@@ -1018,8 +1125,18 @@ fn check_jwt(inner: &Inner, jwt: &str) -> Result<(), (&'static str, &'static str
     Ok(())
 }
 
-async fn token(State(state): State<Shared>, body: Bytes) -> Response {
+async fn token(State(state): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let form_body = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/x-www-form-urlencoded"));
+    if !form_body {
+        return token_error("invalid_request", "the body must be a form");
+    }
     let form = form_pairs(&body);
+    if form.keys().any(|k| k != "grant_type" && k != "assertion") {
+        return token_error("invalid_request", "unknown form member");
+    }
     if form.get("grant_type").map(String::as_str) != Some(GRANT_TYPE) {
         return token_error("unsupported_grant_type", "Invalid grant_type");
     }
@@ -1030,7 +1147,7 @@ async fn token(State(state): State<Shared>, body: Bytes) -> Response {
     if let Err((code, description)) = check_jwt(&inner, jwt) {
         return token_error(code, description);
     }
-    let token = format!("ya29.mock-access-token-{:04}", inner.issued.len() + 1);
+    let token = format!("mock-access-token-{:04}", inner.issued.len() + 1);
     inner.tokens.insert(token.clone(), false);
     inner.issued.push(token.clone());
     axum::Json(json!({
@@ -1077,7 +1194,7 @@ fn zone_json(zone: &Zone) -> Value {
         "dnsName": zone.dns_name,
         "description": "",
         "creationTime": "2026-01-10T12:00:00.000Z",
-        "nameServers": (1..=4).map(|n| format!("ns-cloud-a{n}.googledomains.com.")).collect::<Vec<_>>(),
+        "nameServers": (1..=4).map(|n| format!("ns-cloud-a{n}.googledomains.test.")).collect::<Vec<_>>(),
     });
     if zone.public {
         out["visibility"] = json!("public");
@@ -1134,6 +1251,9 @@ async fn zones_list(
     let inner = lock(&state);
     if let Err(response) = authorize(&inner, &headers, &project) {
         return response;
+    }
+    if q.get("dnsName").is_some_and(|n| !n.ends_with('.')) {
+        return invalid("dnsName must be a fully qualified domain name");
     }
     let wanted = q.get("dnsName").map(|n| fqdn(n));
     let all: Vec<Value> = inner
@@ -1463,7 +1583,7 @@ async fn change_create(
             return error(StatusCode::BAD_REQUEST, reason, &message);
         }
     }
-    let mut next = inner.rrsets.clone();
+    let mut next = inner.effective();
     for (index, deletion) in deletions.iter().enumerate() {
         let position = next.iter().position(|r| {
             r.zone_id == zone.id && fqdn(&r.name) == deletion.name && r.rtype == deletion.rtype
@@ -1487,8 +1607,13 @@ async fn change_create(
     for (index, addition) in additions.iter().enumerate() {
         let same = |r: &Rrset| r.zone_id == zone.id && fqdn(&r.name) == addition.name;
         if next.iter().any(|r| same(r) && r.rtype == addition.rtype) {
+            let AdditionOfExisting::Refuse(status) = inner.addition_of_existing else {
+                next.retain(|r| !(same(r) && r.rtype == addition.rtype));
+                next.push(addition.clone());
+                continue;
+            };
             return error(
-                StatusCode::CONFLICT,
+                StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT),
                 "alreadyExists",
                 &format!(
                     "The resource 'entity.change.additions[{index}]' named '{} ({})' already exists",
@@ -1516,11 +1641,20 @@ async fn change_create(
             return invalid("the NS and SOA records at the zone apex cannot be deleted");
         }
     }
-    let before = inner.published();
-    inner.rrsets = next;
-    inner.report(&before, Origin::Api);
     let id = inner.new_id();
     let polls = inner.change_polls;
+    if inner.pending_visible || polls == 0 {
+        let before = inner.published();
+        apply(&mut inner.rrsets, &zone.id, &deletions, &additions);
+        inner.report(&before, Origin::Api);
+    } else {
+        inner.held.push(Held {
+            id: id.clone(),
+            zone_id: zone.id.clone(),
+            deletions: deletions.clone(),
+            additions: additions.clone(),
+        });
+    }
     let mut change = json!({
         "kind": "dns#change",
         "id": id,
@@ -1575,14 +1709,69 @@ async fn change_get(
         );
     }
     *polls = polls.saturating_sub(1);
+    let done = *polls == 0;
     let mut out = body.clone();
-    out["status"] = json!(if *polls == 0 { "done" } else { "pending" });
+    out["status"] = json!(if done { "done" } else { "pending" });
+    if done {
+        inner.complete(&change);
+    }
     axum::Json(out).into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{check_data, published_value, txt_strings};
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Bytes;
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use serde_json::json;
+
+    use super::{Inner, Seed, change_create, check_data, lock, published_value, txt_strings};
+    use crate::changes::Changes;
+
+    /// A change with a valid addition and a deletion that matches nothing is refused as a
+    /// whole: the addition is not applied, and neither is a valid deletion next to it.
+    #[tokio::test]
+    async fn a_change_is_all_or_nothing() {
+        let state = Arc::new(Mutex::new(Inner::new(
+            Seed::standard(),
+            Changes::new(),
+            String::new(),
+        )));
+        let zone_id = {
+            let mut inner = lock(&state);
+            inner.tokens.insert("t".into(), false);
+            inner.zones[1].id.clone()
+        };
+        let before = lock(&state).rrsets.clone();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer t".parse().unwrap());
+        let ns = before
+            .iter()
+            .find(|r| r.zone_id == zone_id && r.rtype == "NS")
+            .unwrap()
+            .to_json();
+        let body = json!({
+            "additions": [
+                {"name": "new.example.org.", "type": "A", "ttl": 60, "rrdatas": ["192.0.2.1"]},
+                ns,
+            ],
+            "deletions": [
+                ns,
+                {"name": "gone.example.org.", "type": "A", "ttl": 60, "rrdatas": ["192.0.2.2"]},
+            ],
+        });
+        let response = change_create(
+            State(state.clone()),
+            headers,
+            Path(("zw-test-project".to_owned(), zone_id)),
+            Bytes::from(body.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(lock(&state).rrsets, before);
+    }
 
     #[test]
     fn data_follow_the_record_pages() {

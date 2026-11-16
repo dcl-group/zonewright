@@ -73,11 +73,13 @@ pub struct AzureDnsConfig {
     #[serde(default = "default_ttl")]
     pub ttl: RrsetTtl,
     /// Azure Resource Manager endpoint; default `https://management.azure.com` (the public
-    /// cloud).
+    /// cloud). Every request to it carries the access token, so it must be trusted as much as
+    /// the credentials themselves.
     #[serde(default = "default_management_url")]
     pub management_url: String,
     /// Microsoft identity platform host; default `https://login.microsoftonline.com` (the
-    /// public cloud).
+    /// public cloud). The token request sends the client secret itself to this host, so it must
+    /// be trusted as much as the credentials themselves.
     #[serde(default = "default_login_url")]
     pub login_url: String,
     /// The scope of the token request; default `https://management.azure.com//.default` (the

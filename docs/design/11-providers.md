@@ -66,7 +66,7 @@ this table is a guess about such an API.
 | `google_cloud`  | yes; plain values                                                                                              | list, get, set, delete; routing-policy and signed rrsets are skipped and refused                                  | A, AAAA, CAA, CNAME, MX, NS, SOA (read only), SRV, TLSA, TXT                                          | 120                   | 180 s                       | Presentation (quoted strings or one unquoted string) / Presentation                                          | Cloud DNS API v1 reference and discovery document, Google OAuth 2.0 service account page, lego, dns-update |
 | `hetzner`       | yes; plain values                                                                                              | list, get, set, delete (a TTL change of an existing set is a second request)                                      | A, AAAA, CNAME, MX, NS, PTR, SOA (read only), SRV, TLSA, TXT                                          | 60                    | 120 s                       | Auto / Presentation                                                                                          | Hetzner Cloud API reference, lego, hcloud-go schema                                                        |
 | `nicru`         | yes; plain values                                                                                              | list, get, set, delete; one commit per operation                                                                  | A, AAAA, CNAME, DNAME, MX, NS, PTR, SOA (read only), SRV, TXT                                         | 30                    | 1200 s                      | Raw / Raw                                                                                                    | the provider's request description (2013, read in the Internet Archive copy), lego                         |
-| `ovh`           | yes; plain values                                                                                              | list, get, set, delete (several requests per set); one refresh per operation                                      | A, AAAA, CAA, CNAME, MX, NS, SRV, TLSA, TXT                                                           | 120                   | 60 s                        | Auto / Raw                                                                                                   | the provider's API schema, go-ovh, the provider's guides and Terraform provider, lego, dns-update          |
+| `ovh`           | yes; plain values                                                                                              | list, get, set, delete (several requests per set); one refresh per operation, and before a read while one is owed | A, AAAA, CAA, CNAME, MX, NS, SRV, TLSA, TXT                                                           | 120                   | 60 s                        | Auto / Raw                                                                                                   | the provider's API schema, go-ovh, the provider's guides and Terraform provider, lego, dns-update          |
 | `porkbun`       | yes; plain values                                                                                              | list, get, set, delete (several requests per set; a change of only the priority of an MX or SRV value is refused) | A, AAAA, CAA, CNAME, MX, NS, SRV, TLSA, TXT                                                           | 600                   | 600 s                       | Auto / Raw                                                                                                   | Porkbun API v3 OpenAPI description and knowledge base, lego, dns-update                                    |
 | `regru`         | yes; plain values                                                                                              | list, get, set, delete for A, AAAA, TXT (several requests per set)                                                | A, AAAA, TXT                                                                                          | not settable          | —                           | Auto / Raw                                                                                                   | reg.ru API 2 documentation, lego. Earlier version proven live                                              |
 | `rfc2136`       | yes                                                                                                            | list by zone transfer (AXFR), get, set, delete with server-checked prerequisites                                  | any type with a wire form; SOA read only                                                              | 60                    | —                           | wire format                                                                                                  | RFC 2136, RFC 8945, RFC 5936, RFC 7766, RFC 1035                                                           |
@@ -404,32 +404,39 @@ Behavior that the design fixes because the generic sections cannot:
   and `.default` prescribes for Resource Manager, and is a setting of its own, not derived from
   `management_url`: the documentation states the identifier for the public cloud only. The token is
   cached and renewed before `expires_in`; `check` always obtains a new one. A `400` from the token
-  endpoint is `Auth`, as is a `401`. The client secret travels only in that form body. The zone name
-  is a path key (no identifiers to cache). Reads are `GET …/{zone}/{type}/{name}`; a `404` is "no
-  record set" (as lego reads it), and the zone is then read: its `404` is `ZoneNotFound` (assumed).
-  Writes, each sent once: `PUT` with the whole record set and `If-None-Match: *` (create) or
-  `If-Match: <etag as returned>` (replace), and `DELETE` with `If-Match`. The status of a failed
-  condition is not documented, so any refusal of a write is followed by a new read: a record set
-  that appeared, vanished or has another etag is `Conflict` (the layers then run the operation once
-  more from the read), otherwise the refusal is `Rejected` with `error.code` as the provider code. A
-  `DELETE` answered `204` ("not found") or refused is done when the new read finds no record set.
-  The body of a replacement is the properties as read without `fqdn` and `provisioningState`, with
-  the type's record property and `TTL`; `metadata` is kept, and record objects of values that stay
-  are sent back as returned. A record set with `targetResource.id` (alias) is skipped in a listing
-  (`NotPlainRecords`) and refused by every operation (`Rejected`, status `None`); one with a
-  property the reference does not list is read but not written (assumed, conservative); a listed set
-  of a type outside the ten of `2018-05-01` is skipped as `NotPlainRecords`. Names inside records
-  are written without the trailing dot and read as absolute (the documentation's examples). TXT: a
-  record is a list of strings; a string of printable ASCII without `"` and `\` stands for itself
-  (assumed for the space); values are split into strings of at most 255 octets; any other record is
-  a foreign value kept as non-canonical data. Listings send no `$top`, take only the `$skipToken` of
-  `nextLink` (spelled with a literal `$`, as the documentation's example) and never request the
-  link; they end at a page without `nextLink` or an empty page, and a link without `$skipToken`, a
-  token that does not advance and a repeated page are `Protocol`. Zones with `zoneType` `Private`
-  are left out (defensive). `429` with `Retry-After` is handled by the transport, also for
+  endpoint is `Auth`, as is a `401`. The client secret travels only in that form body; `login_url`
+  therefore receives the secret and `management_url` the token, and both settings must be trusted
+  like the credentials (section 5.1). The zone name is a path key (no identifiers to cache). Reads
+  are `GET …/{zone}/{type}/{name}`; a `404` is "no record set" (as lego reads it), and the zone is
+  then read: its `404` is `ZoneNotFound` (assumed). Writes, each sent once: `PUT` with the whole
+  record set and `If-None-Match: *` (create) or `If-Match: <etag as returned>` (replace), and
+  `DELETE` with `If-Match`. The status of a failed condition is not documented, so any refusal of a
+  write is followed by a new read: a record set that appeared, vanished or has another etag is
+  `Conflict` (the layers then run the operation once more from the read), otherwise the refusal is
+  `Rejected` with `error.code` as the provider code. A `DELETE` answered `204` ("not found") or
+  refused is done when the new read finds no record set. The body of a replacement is the properties
+  as read without `fqdn` and `provisioningState`, with the type's record property and `TTL`;
+  `metadata` is kept, and record objects of values that stay are sent back as returned. A record set
+  with `targetResource.id` (alias) is skipped in a listing (`NotPlainRecords`) and refused by every
+  operation (`Rejected`, status `None`); one with a property the reference does not list is read but
+  not written (assumed, conservative); a listed set of a type outside the ten of `2018-05-01` is
+  skipped as `NotPlainRecords`. Names inside records are written without the trailing dot and read
+  as absolute (the documentation's examples). TXT: a record is a list of strings; a string of
+  printable ASCII without `"` and `\` stands for itself (assumed for the space); values are split
+  into strings of at most 255 octets; any other record is a foreign value kept as non-canonical
+  data. Listings send no `$top`, take only the `$skipToken` of `nextLink` (spelled with a literal
+  `$`, as the documentation's example) and never request the link; that the link carries nothing
+  else the service needs is assumed (the documentation says to request it). They end at a page
+  without `nextLink`, also an empty one; an empty page with a `nextLink` is followed. A link without
+  `$skipToken`, a token that does not advance and a repeated page are `Protocol`, and the shared
+  page limit bounds a run of empty pages. Zones with `zoneType` `Private` are left out (defensive).
+  `429` with `Retry-After` is handled by the transport, also for
   `RetryableErrorDueToAnotherOperation`: reads are repeated, writes end with `RateLimited`. A
   national cloud needs `management_url`, `login_url` and `scope` (the defaults are the public
-  cloud's).
+  cloud's). Removing the last TXT value deletes the record set together with its `metadata` (section
+  3.5; no source says the service keeps a TXT record set without records). The documented limits (20
+  records per set, 400 per TXT set, 4,096 TXT characters per set, raisable through support) are not
+  checked before a request.
 - `desec`. API `https://desec.io/api/v1`, `Authorization: Token <token>`. The zone name is the key
   of every path (no identifiers to cache); the owner is the `subname` relative to the zone, `@` in a
   path and `""` in a body. Reads are `GET …/rrsets/{subname}/{type}/`; a `404` covers a missing
@@ -542,50 +549,81 @@ Behavior that the design fixes because the generic sections cannot:
   up again). Writes: one `changes.create` with the rrset JSON exactly as read in `deletions` (no
   normalization, members the model does not carry included) and the new rrset (the read object with
   `rrdatas` replaced, the TTL only when requested) in `additions`; a new rrset is an addition only,
-  a delete a deletion only; sent once. Any refusal is followed by a new read: a changed rrset (exact
-  JSON comparison, since the API's deletion match is exact) or a zone under another ID is
-  `Conflict`, which both layers repeat once; a delete whose rrset is gone is done. lego's two-change
-  replacement and its whole-rrset cleanup are not copied, nor its treatment of a `404` to a change
-  as success. A `pending` change is polled with `changes.get` (section 3.7); a look that fails, a
-  change still pending or an unknown status is `Transient`. Errors: the message is `error.message`
-  (token endpoint `error_description`), the provider code `error.errors[0].reason`; `413` (the
-  quotas page) is a rate limit like `429`. rrdata are presentation format (RFC 1035 section 5, per
-  the discovery document): names with the trailing dot, a dotless name or `@` is non-canonical data;
-  TXT is read by the strict parser (quoted strings, or one unquoted string as lego writes) and
-  written quoted; canonical text with a backslash is not sent, nor TXT rrdata over 1000 characters
-  (counted on the text sent). An rrset with `routingPolicy` or `signatureRrdatas` is skipped
-  (`NotPlainRecords`) and refused (`Rejected`). TTL 1 to 2147483647 (int32, "positive integer");
-  default 120 (lego); propagation timeout 180 s (lego).
+  a delete a deletion only; sent once. The provider checks the precondition for an rrset that exists
+  (the deletion must match exactly; documented). That an addition of an rrset that exists is refused
+  is assumed (the error messages page lists `alreadyExists` without naming the case); if the service
+  applied it as a replacement, an rrset another writer creates between the read and the addition
+  would be replaced without an error, and the guarantee would hold only for rrsets that exist at the
+  read. No client code can detect that; the ignored test `live_google_cloud_change_semantics`
+  decides it. Any refusal is followed by a new read: a changed rrset (exact JSON comparison, since
+  the API's deletion match is exact) or a zone under another ID is `Conflict`, which both layers
+  repeat once; a delete whose rrset is gone is done. lego's two-change replacement and its
+  whole-rrset cleanup are not copied, nor its treatment of a `404` to a change as success. A
+  `pending` change is polled with `changes.get` (section 3.7); a look that fails, a change still
+  pending or an unknown status is `Transient`. Errors: the message is `error.message` (token
+  endpoint `error_description`), the provider code `error.errors[0].reason` (the body shape of
+  google-api-go-client, which lego uses; no Cloud DNS page shows it); `413` (the quotas page) is a
+  rate limit like `429`, except that either status with the reason `quotaExceeded` (a resource
+  quota, "an impending change would exceed your current quota") is `Rejected` with that code and is
+  not repeated. rrdata are presentation format (RFC 1035 section 5, per the discovery document):
+  names with the trailing dot, a dotless name or `@` is non-canonical data; TXT is read by the
+  strict parser (quoted strings, or one unquoted string as lego writes) and written quoted;
+  canonical text with a backslash is not sent, nor TXT rrdata over 1000 characters (counted on the
+  text sent). An rrset with `routingPolicy` or `signatureRrdatas` is skipped (`NotPlainRecords`) and
+  refused (`Rejected`). TTL 1 to 2147483647 (int32, "positive integer"); default 120 (lego);
+  propagation timeout 180 s (lego). `dns_url` and `token_url` receive the access token and the
+  signed JWT: they need the same trust as the credentials (section 5.1). `list_zones` needs
+  `dns.managedZones.list` on the project even when every zone is in `managed_zones`; `check` uses
+  `managedZones.get` for configured zones and `managedZones.list` for the others.
 - `ovh`. Settings `application_key` (sent in `X-Ovh-Application`), `endpoint` (`ovh-eu`, `ovh-ca`,
   `ovh-us`, mapped to the `api.{eu,ca,us}.ovhcloud.com/1.0` hosts of go-ovh, the provider's client;
   the API schema and dns-update still name `eu.api.ovh.com`), `base_url` (overrides `endpoint`, for
-  tests) and `ttl`; credentials `application_secret` (never sent) and `consumer_key` (sent in
-  `X-Ovh-Consumer`). Every request but `GET /auth/time` carries `X-Ovh-Timestamp` and
+  tests), `ttl` and `read_retry_ms` (first pause before a listed record that answered 404 is read
+  again, 1 to 60000, default 1000, doubling); credentials `application_secret` (never sent) and
+  `consumer_key` (sent in `X-Ovh-Consumer`), both visible ASCII without whitespace. Every request
+  but `GET /auth/time` carries `X-Ovh-Timestamp` and
   `X-Ovh-Signature: "$1$" + hex(SHA1(AS+"+"+CK+"+"+METHOD+"+"+URL+"+"+BODY+"+"+TS))`, computed per
-  attempt over the exact URL (query included) and body; the difference between the local clock and
-  `/auth/time` is read once per client before the first signed request and kept (as go-ovh). SHA-1
-  comes from `aws-lc-rs` (`crypto::sha1`, compiled with `ovh` only). OAuth2 service accounts are not
-  implemented: the provider's guide (`www.ovh.com/auth/oauth2/token`) and go-ovh
-  (`auth.eu.ovhcloud.com/oauth2/token`) disagree on the token endpoint. The record API stages every
-  change; `POST /domain/zone/{zone}/refresh` publishes all staged changes of the zone, including
-  others', and nothing discards them. The client refreshes after every successful write operation,
-  also when it found nothing to change (so that a change of an earlier operation whose refresh did
-  not happen, in this or another process, is published by the repeat), and after a failed one that
-  sent a record write; an operation that fails before any record write sends none. A failed refresh
-  after a successful operation is its error, prefixed "stored ... but not published"; nothing is
-  undone. Reads list identifiers with `fieldType` and, except at the apex or for a name with a
-  backslash, `subDomain` (both pattern filters, LIKE and ILIKE: the records whose type and name
-  equal the filter are among the answer under every reading), then read each record (N + 1 requests,
-  at most 1000 records, else `Protocol`), and compare type and name exactly. A listed record whose
-  read answers 404 is read again (pauses 1, 2, 4 s; Terraform retries such reads for a minute) while
-  the listing still holds it, then `Transient`; one the listing no longer holds is left out. A 404
-  is `ZoneNotFound` only when `GET /domain/zone` no longer lists the zone; a 404 to an update is
-  `Conflict` when a new read no longer finds the record, else the refusal; a 404 to a delete follows
-  the per-record rule. The create answer is not read (it may lack the `id`, Terraform). Updates send
-  `target` and `ttl`, and `subDomain` when not empty, as read unless they change. A record's `ttl`
-  of `0` or `null` reads as no TTL (`ProviderDefaultTtl::Absent`); the error `class` is the provider
-  code. Lego deletes the record by the id it remembered from its create; this client deletes only
-  records that hold the value, found by a read.
+  attempt over the exact URL (query included) and body, in a buffer sized up front and wiped. The
+  timestamp is the last reading of `/auth/time` plus the time elapsed since, on a monotonic clock;
+  the reading is made before the first signed request and again after an hour (the client's choice;
+  go-ovh reads once and keeps a wall-clock difference). No documented refusal names the timestamp,
+  so none triggers a new reading. The answer is unsigned and trusted: forging it can make requests
+  fail or yield future-dated signatures for one exact request each, no secret. SHA-1 comes from
+  `aws-lc-rs` (`crypto::sha1`, compiled with `ovh` only). A 403 is `Forbidden`, which at this
+  provider can also mean an expired or revoked consumer key (go-ovh README); no documented `class`
+  separates the cases. OAuth2 service accounts are not implemented: the provider's guide
+  (`www.ovh.com/auth/oauth2/token`) and go-ovh (`auth.eu.ovhcloud.com/oauth2/token`) disagree on the
+  token endpoint. The record API stages every change; `POST /domain/zone/{zone}/refresh` publishes
+  all staged changes of the zone, including others', and nothing discards them. Assumed without a
+  source: the record endpoints report the staged state. The client refreshes at the end of every
+  write operation that reached the provider, whatever its outcome (an unchanged result and a
+  `PreconditionFailed` included: what the read found may be an earlier operation's change whose
+  refresh failed, in any process); one that fails before any request sends none. It also keeps per
+  zone, in the client only, the record writes no successful refresh has covered yet; while one is
+  owed, every write operation refreshes on every exit and `get_rrset` and `list_rrsets` refresh
+  before reading (as nic.ru settles its own staged changes before a read), failing with the
+  refresh's error if it fails. A dropped operation is thus published by the client's next operation
+  in the zone; once the client is gone, by the next write operation in the zone in any process, and
+  not by a read elsewhere. A failed refresh after a successful operation is its error, prefixed
+  "stored ... but not published" where the kind has a text (`RateLimited` has none); nothing is
+  undone. The refresh runs after the name lock is released; the writes of one replacement are
+  published together unless another refresh of the zone runs between them. Reads list identifiers
+  with `fieldType` and, except at the apex or for a name with a backslash, `subDomain` (pattern
+  filters, LIKE and ILIKE; assumed never to leave out an exact match), then read each record (N + 1
+  requests; at the apex every record of the type; at most 1000 records, else `Protocol`), and
+  compare type and name exactly. TXT reads and writes cover `fieldType` TXT only: records of the
+  types SPF, DKIM and DMARC at a name are not part of its TXT rrset, and whether the name servers
+  serve them as TXT is not established. A listed record whose read answers 404 is read again (pauses
+  of `read_retry_ms` doubling; Terraform retries such reads for a minute) while the listing still
+  holds it, then `Transient`; one the listing no longer holds is left out. A 404 is `ZoneNotFound`
+  only when `GET /domain/zone` no longer lists the zone; a 404 to an update is `Conflict` when a new
+  read no longer finds the record, else the refusal; a 404 to a delete follows the per-record rule.
+  The create answer is not read (it may lack the `id`, Terraform). Updates send `target` and `ttl`,
+  and `subDomain` when not empty, as read unless they change. A record's `ttl` of `0` or `null`
+  reads as no TTL (`ProviderDefaultTtl::Absent`); a record created next to such records gets their
+  form (`0`, or no `ttl` member; Terraform sends `0` when unset), not the `ttl` setting. The error
+  `class` is the provider code. Lego deletes the record by the id it remembered from its create;
+  this client deletes only records that hold the value, found by a read.
 - `porkbun`. Writes (`POST`) carry the keys as `apikey` and `secretapikey`, the first members of the
   JSON body, and no key header: the request schemas of the writes list them as required, the
   description calls the body "the standard method", and lego and dns-update do the same; the delete

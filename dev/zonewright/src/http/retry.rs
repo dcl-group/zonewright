@@ -9,7 +9,9 @@
 //!   the wait comes from `Retry-After` (seconds or an HTTP date), a header the client declares
 //!   as a Unix time (`HttpBuilder::rate_reset_unix`), or `RateLimit-Reset`. An
 //!   idempotent request with attempts left sleeps for a wait of at most [`MAX_INLINE_WAIT`] and
-//!   retries, or uses the back-off when no wait is given; otherwise `Error::RateLimited`.
+//!   retries, or uses the back-off when no wait is given; otherwise `Error::RateLimited`. An
+//!   answer the client's classifier `HttpBuilder::not_rate_limit` marks is none of this: it is a
+//!   permanent refusal and goes back to the client.
 //! - 401 to a request made with a token from a [`TokenSource`]: the token's generation is
 //!   invalidated. An idempotent request with attempts left gets a new token and is repeated once;
 //!   the repeat counts toward the attempts, and a 401 for a token fetched during the call is
@@ -425,8 +427,11 @@ impl Http {
             if request.keep.contains(&status) {
                 return Ok(response);
             }
-            let rate_limited =
-                status == 429 || self.rate_limit.is_some_and(|classify| classify(&response));
+            let rate_limited = (status == 429
+                || self.rate_limit.is_some_and(|classify| classify(&response)))
+                && !self
+                    .not_rate_limit
+                    .is_some_and(|classify| classify(&response));
             if rate_limited {
                 let wait = rate_wait(
                     &response.headers,

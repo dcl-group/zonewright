@@ -614,8 +614,8 @@ impl Api {
         self.dns.url().path("/projects").segment(&self.project)
     }
 
-    /// An answer the client does not expect. 401, 403, 429, 413 and 5xx were mapped by the
-    /// transport already. A 4xx is a refusal (`Rejected`) with the provider's message and reason;
+    /// An answer the client does not expect. 401, 403, 5xx, and 429 and 413 other than a
+    /// resource quota were mapped by the transport already. A 4xx is a refusal (`Rejected`) with the provider's message and reason;
     /// anything else is an answer the client cannot interpret.
     // Source: AIP-193 (4xx statuses of the `google.rpc.Code` mapping: 400, 404, 409, 412 among
     // them); Error messages (reasons without statuses).
@@ -643,12 +643,32 @@ fn accepted_unreadable() -> Error {
     }
 }
 
-/// The documented answer to an exceeded quota besides `429`: `413` (design section 5.3 treats
-/// both alike).
-// Source: Quotas ("If you exceed a quota, ... an API request returns HTTP 413"); AIP-193
-// (`RESOURCE_EXHAUSTED`, 429). The two pages disagree; both statuses are rate limits here.
+/// The reason of a refusal for an exhausted resource quota.
+// Source: Error messages (`quotaExceeded`: "You get this error when an impending change would
+// exceed your current quota", for example the rrsets of a zone or the records of an rrset).
+const QUOTA_EXCEEDED: &str = "quotaExceeded";
+
+/// A rate-limit answer besides `429`: a `413` (design section 5.3), unless
+/// [`resource_quota_exceeded`] makes it a permanent refusal.
+// Source: Quotas ("If you exceed a quota with an API request, Google Cloud returns the following
+// HTTP status code: 413 Request Entity Too Large"); AIP-193 (`RESOURCE_EXHAUSTED`, 429). The two
+// pages disagree on the status, so both are read. The quotas page counts request rates (reads and
+// writes per minute) among its quotas, so a `413` is a quota of either kind.
 pub(super) fn rate_limited(response: &Response) -> bool {
     response.status() == 413
+}
+
+/// A `413` or `429` whose reason is `quotaExceeded` is a resource quota: a change that would
+/// exceed it is refused until the quota or the zone changes, so it is a permanent refusal
+/// (`Error::Rejected` with the reason as its code), not a rate limit to wait out.
+// Source: Error messages (`quotaExceeded` names an "impending change" that would exceed a quota).
+// Assumption (not observed against the live API): an exceeded request rate carries another
+// reason, or none, and stays a rate limit; the page names no reason for request rates. If the
+// service gave `quotaExceeded` for a request rate too, a rate-limited write would end in
+// `Rejected` instead of `RateLimited`, and nothing would be written either way.
+pub(super) fn resource_quota_exceeded(response: &Response) -> bool {
+    matches!(response.status(), 413 | 429)
+        && error_code(&response.text()).as_deref() == Some(QUOTA_EXCEEDED)
 }
 
 /// The provider's error message: `error.message` of the API's error body, else the token
@@ -733,24 +753,24 @@ mod tests {
         assert!(zone("{}").address().is_err());
     }
 
-    /// The number of looks at a pending change is bounded: a change that stays pending ends the
-    /// write with `Transient` after the last look, and the change is not sent again. The bound
-    /// of the client is `MAX_POLLS`; the test lowers it so that it does not wait 120 looks at
-    /// the 250 ms floor.
-    #[tokio::test]
-    async fn a_change_that_stays_pending_is_transient_after_the_last_look() {
-        use std::time::Duration;
+    use std::time::Duration;
 
-        use zonewright_mock::google_cloud::{GoogleCloudMock, Seed, test_key};
+    use zonewright_mock::google_cloud::{GoogleCloudMock, Seed, test_key};
 
-        use crate::context::{Context, ContextOptions};
-        use crate::error::ErrorKind;
-        use crate::http::Poller;
-        use crate::name::DomainName;
-        use crate::provider::Provider as _;
-        use crate::providers::google_cloud::{GoogleCloud, GoogleCloudConfig};
-        use crate::record::Txt;
+    use crate::context::{Context, ContextOptions};
+    use crate::error::ErrorKind;
+    use crate::http::Poller;
+    use crate::name::DomainName;
+    use crate::provider::{AddOutcome, Provider as _};
+    use crate::providers::google_cloud::{GoogleCloud, GoogleCloudConfig};
+    use crate::record::Txt;
 
+    const CHANGES: &str = "/dns/v1/projects/*/managedZones/*/changes";
+
+    /// A mock whose changes stay pending, with `visible` pending changes or not, and a client
+    /// whose bound on the looks is lowered to 3 (the client's own is `MAX_POLLS`, 120 looks at
+    /// the 250 ms floor would take half a minute).
+    async fn stuck(visible: bool) -> (GoogleCloudMock, GoogleCloud) {
         let ctx = Context::new(ContextOptions {
             loopback_only: true,
             ..ContextOptions::default()
@@ -758,6 +778,7 @@ mod tests {
         .unwrap();
         let mock = GoogleCloudMock::start(Seed::standard()).await;
         mock.control().set_change_polls(u32::MAX);
+        mock.control().set_pending_visible(visible);
         let mut config = GoogleCloudConfig::new("zw-test-project".into());
         config.dns_url = mock.dns_url();
         config.token_url = mock.token_url();
@@ -768,15 +789,67 @@ mod tests {
         let mut client = GoogleCloud::new(config, credentials, &ctx).unwrap();
         assert_eq!(super::MAX_POLLS, 120);
         client.api.poller = Poller::new(Duration::from_millis(250), 3);
+        (mock, client)
+    }
+
+    async fn add(client: &GoogleCloud, value: &str) -> Result<AddOutcome, crate::Error> {
         let zone = DomainName::parse("example.org").unwrap();
         let name = DomainName::parse("_acme-challenge.example.org").unwrap();
-        let e = client
-            .add_txt_value(&zone, &name, &Txt::new("v1").unwrap(), None)
+        client
+            .add_txt_value(&zone, &name, &Txt::new(value).unwrap(), None)
             .await
-            .unwrap_err();
+    }
+
+    /// The number of looks at a pending change is bounded: a change that stays pending ends the
+    /// write with `Transient` after the last look, and the change is not sent again. When the
+    /// pending change is visible to a read, the repeat finds the value without a second change.
+    #[tokio::test]
+    async fn a_change_that_stays_pending_is_transient_after_the_last_look() {
+        let (mock, client) = stuck(true).await;
+        let e = add(&client, "v1").await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
-        let changes = "/dns/v1/projects/*/managedZones/*/changes";
-        assert_eq!(mock.log().count(Some("GET"), &format!("{changes}/*")), 3);
-        assert_eq!(mock.log().count(Some("POST"), changes), 1);
+        assert_eq!(mock.log().count(Some("GET"), &format!("{CHANGES}/*")), 3);
+        assert_eq!(mock.log().count(Some("POST"), CHANGES), 1);
+        assert_eq!(
+            add(&client, "v1").await.unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert_eq!(mock.log().count(Some("POST"), CHANGES), 1);
+        mock.control().complete_pending();
+        assert_eq!(
+            add(&client, "v1").await.unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+    }
+
+    /// The same when a pending change is not visible to a read: the repeat while the change is
+    /// pending does not see the value, its addition meets the pending rrset and is refused, and
+    /// the repeat ends in an error with nothing written; once the change is done, the next repeat
+    /// finds the value.
+    #[tokio::test]
+    async fn a_pending_change_that_reads_do_not_see_converges_once_done() {
+        let (mock, client) = stuck(false).await;
+        let e = add(&client, "v1").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+        let e = add(&client, "v1").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+        assert_eq!(e.provider_code().map(|c| c.as_str()), Some("alreadyExists"));
+        assert_eq!(mock.log().count(Some("POST"), CHANGES), 2);
+        assert!(
+            mock.control()
+                .txt("example.org", "_acme-challenge.example.org")
+                .is_empty()
+        );
+        mock.control().complete_pending();
+        assert_eq!(
+            add(&client, "v1").await.unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert_eq!(mock.log().count(Some("POST"), CHANGES), 2);
+        assert_eq!(
+            mock.control()
+                .txt("example.org", "_acme-challenge.example.org"),
+            ["\"v1\""]
+        );
     }
 }

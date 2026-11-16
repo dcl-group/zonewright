@@ -28,7 +28,7 @@ use zonewright_mock::changes::ChangeSource as _;
 use zonewright_mock::echo::{EchoServer, Echoed, Render};
 use zonewright_mock::ovh::{OvhMock, Seed};
 
-use common::echo::{CANARY_KEY, CANARY_TOKEN, LogCapture, REDACTED, assert_clean, dialects};
+use common::echo::{LogCapture, REDACTED, assert_clean, dialects};
 use common::{context, dn};
 
 // ---- Fixtures ----------------------------------------------------------------------------------
@@ -37,6 +37,12 @@ use common::{context, dn};
 const AK: &str = "test-only-ak";
 const AS: &str = "test-only-as";
 const CK: &str = "test-only-ck";
+
+/// Canary credentials for the secret tests: the shared canaries' characters without
+/// whitespace, which neither key may contain (a header value loses surrounding whitespace in
+/// transit while the signature covers it).
+const CANARY_AS: &str = "cAnaryAQ7x\"Za\'&Yb<Xc>Wd\\Ve~Uf*Tg=Sh+z/w@v";
+const CANARY_CK: &str = "cAnaryCQ9w\"Qa\'&Rb<Sc>Td\\Ue~Vf*Wg=Xh@p/q+r";
 
 /// The owner name most tests write to.
 const NAME: &str = "_acme-challenge.example.org";
@@ -64,6 +70,8 @@ fn txt(value: &str) -> Txt {
 fn settings(base_url: String) -> OvhConfig {
     let mut config = OvhConfig::new(AK);
     config.base_url = Some(base_url);
+    // Reads of a record that is not readable yet are repeated without a noticeable wait.
+    config.read_retry_ms = 1;
     config
 }
 
@@ -247,7 +255,7 @@ fn zones_then(errors: Render) -> Render {
 fn echo_client(echo: &EchoServer, ctx: &Context) -> Ovh {
     Ovh::new(
         settings(echo.url("/1.0")),
-        credentials(CANARY_KEY, CANARY_TOKEN),
+        credentials(CANARY_AS, CANARY_CK),
         ctx,
     )
     .unwrap()
@@ -398,15 +406,15 @@ async fn ovh_secret_echo() {
                     text.contains(REDACTED),
                     "{label}: the echo did not reach the error: {text}"
                 );
-                assert_clean(&label, &text, &[CANARY_TOKEN, CANARY_KEY]);
+                assert_clean(&label, &text, &[CANARY_CK, CANARY_AS]);
                 assert_eq!(
                     echo.log().count(Some(method), path),
                     1,
                     "{label}: the request did not reach the echo exactly once"
                 );
                 // The consumer key reached the echo; the application secret never did.
-                assert!(echo.log().contains(CANARY_TOKEN), "{label}");
-                assert!(!echo.log().contains(CANARY_KEY), "{label}");
+                assert!(echo.log().contains(CANARY_CK), "{label}");
+                assert!(!echo.log().contains(CANARY_AS), "{label}");
             }
         }
     }
@@ -418,13 +426,13 @@ async fn ovh_secret_echo() {
 async fn ovh_no_secret_in_logs() {
     let (capture, _guard) = LogCapture::install();
     let mut seed = Seed::standard();
-    seed.application_secret = CANARY_KEY.into();
-    seed.consumer_key = CANARY_TOKEN.into();
+    seed.application_secret = CANARY_AS.into();
+    seed.consumer_key = CANARY_CK.into();
     let mock = OvhMock::start(seed).await;
     let ctx = context();
     let client = Ovh::new(
         settings(mock.base_url()),
-        credentials(CANARY_KEY, CANARY_TOKEN),
+        credentials(CANARY_AS, CANARY_CK),
         &ctx,
     )
     .unwrap();
@@ -456,7 +464,7 @@ async fn ovh_no_secret_in_logs() {
 
     let wrong = Ovh::new(
         settings(mock.base_url()),
-        credentials(CANARY_KEY, "wrong-consumer-key"),
+        credentials(CANARY_AS, "wrong-consumer-key"),
         &ctx,
     )
     .unwrap();
@@ -471,7 +479,7 @@ async fn ovh_no_secret_in_logs() {
     );
     texts.push(capture.text());
     for text in &texts {
-        assert_clean("ovh logs and errors", text, &[CANARY_TOKEN, CANARY_KEY]);
+        assert_clean("ovh logs and errors", text, &[CANARY_CK, CANARY_AS]);
     }
 }
 
@@ -924,10 +932,6 @@ async fn ovh_failed_refresh_is_reported_and_repeated() {
     let (mock, client) = setup().await;
     for (fault, kind) in [
         (
-            Fault::on("POST", REFRESH).always().status(503),
-            ErrorKind::Transient,
-        ),
-        (
             Fault::on("POST", REFRESH).respond(
                 403,
                 r#"{"class":"Client::Forbidden","message":"User not granted for this request"}"#,
@@ -960,6 +964,19 @@ async fn ovh_failed_refresh_is_reported_and_repeated() {
         assert_eq!(published_txt(&mock), ["\"AAA\""]);
         assert!(settled(&mock));
     }
+    // A refresh refused with a long wait: the kind has no text of its own, so no notice; the
+    // repeat converges all the same.
+    mock.control().reset();
+    mock.faults()
+        .push(Fault::on("POST", REFRESH).rate_limited("120"));
+    let e = add(&client, "AAA").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::RateLimited, "{e:?}");
+    assert!(!settled(&mock));
+    assert_eq!(
+        add(&client, "AAA").await.unwrap(),
+        AddOutcome::AlreadyPresent
+    );
+    assert!(settled(&mock));
     // The refresh is idempotent: a 503 is repeated by the transport.
     mock.faults().push(Fault::on("POST", REFRESH).status(503));
     let before = refreshes(&mock);
@@ -970,7 +987,8 @@ async fn ovh_failed_refresh_is_reported_and_repeated() {
 
 /// A changed value staged by another writer that did not refresh is published by the next
 /// operation in the zone, even one that writes nothing: a refresh covers the whole zone. An
-/// operation that fails before any record write sends no refresh.
+/// operation that fails after it reached the provider refreshes; one that fails before any
+/// request does not, and reads refresh only while this client owes the zone a refresh.
 #[tokio::test]
 async fn ovh_refresh_covers_the_zone() {
     let (mock, client) = setup().await;
@@ -993,8 +1011,12 @@ async fn ovh_refresh_covers_the_zone() {
         .push(Fault::on("GET", RECORDS).respond(400, r#"{"message":"no"}"#));
     let e = add(&client, "AAA").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
-    assert_eq!(refreshes(&mock), 0);
-    // `get_rrset` and listings never refresh.
+    assert_eq!(refreshes(&mock), 1);
+    mock.log().clear();
+    let e = add(&client, "two words").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    assert!(mock.log().is_empty());
+    // Reads without a refresh owed do not refresh.
     client
         .get_rrset(&zone(), &name(), RecordType::TXT)
         .await
@@ -1038,6 +1060,144 @@ async fn ovh_failure_after_a_write_refreshes() {
     );
     assert_eq!(stored(&mock, www, "A"), ["192.0.2.2"]);
     assert!(settled(&mock));
+}
+
+/// A replacement under `Expect::Absent` whose refresh failed is stored but not published; its
+/// repeat, by this client or by a new one that knows nothing of it, reads the stored set and
+/// fails with `PreconditionFailed`, and refreshes first, so that the refusal describes what is
+/// served.
+#[tokio::test]
+async fn ovh_failed_refresh_then_failed_expectation_publishes() {
+    let (mock, client) = setup().await;
+    let www = "www.example.org";
+    let set = rr(www, RecordType::A, None, &["192.0.2.7"]);
+    mock.faults().push(Fault::on("POST", REFRESH).respond(
+        403,
+        r#"{"class":"Client::Forbidden","message":"User not granted"}"#,
+    ));
+    let e = client
+        .set_rrset(&zone(), &set, Expect::Absent)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Forbidden, "{e:?}");
+    assert!(e.to_string().contains("not published"), "{e}");
+    assert!(!settled(&mock));
+    for repeat in [&client, &client_with(&mock, &context())] {
+        let e = repeat
+            .set_rrset(&zone(), &set, Expect::Absent)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{e:?}");
+        assert!(settled(&mock));
+    }
+    assert_eq!(
+        mock.control()
+            .published_records()
+            .iter()
+            .map(|r| r.target.as_str())
+            .collect::<Vec<_>>(),
+        ["192.0.2.7"]
+    );
+}
+
+/// The same for a delete under `Expect::Matches`: the record is gone from the listing but still
+/// served until the repeat's refusal refreshes the zone.
+#[tokio::test]
+async fn ovh_failed_refresh_then_failed_delete_expectation_publishes() {
+    let (mock, client) = setup().await;
+    let www = "www.example.org";
+    mock.control()
+        .insert_record("example.org", www, "A", "192.0.2.1", Some(600));
+    let current = rr(www, RecordType::A, Some(600), &["192.0.2.1"]);
+    mock.faults().push(
+        Fault::on("POST", REFRESH).respond(400, r#"{"class":"Client::BadRequest","message":"x"}"#),
+    );
+    let e = client
+        .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Matches(&current))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+    assert!(mock.control().records().is_empty());
+    assert_eq!(mock.control().published_records().len(), 1);
+    let e = client
+        .delete_rrset(&zone(), &dn(www), RecordType::A, Expect::Matches(&current))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{e:?}");
+    assert!(settled(&mock));
+    assert!(mock.control().published_records().is_empty());
+}
+
+/// An operation dropped after its record write and before its refresh answered: the client
+/// owes the zone a refresh, and its next operation there sends it, a read before reading and a
+/// write on any exit, also one refused before any request.
+#[tokio::test]
+async fn ovh_dropped_operation_is_published_by_the_next_one() {
+    let (mock, client) = setup().await;
+    // The refresh is held long enough for the operation to be dropped, and never applied.
+    let hold = || {
+        Fault::on("POST", REFRESH)
+            .delay(Duration::from_secs(30))
+            .status(503)
+    };
+    mock.faults().push(hold());
+    let dropped = tokio::time::timeout(Duration::from_millis(200), add(&client, "AAA")).await;
+    assert!(dropped.is_err(), "the operation was not dropped");
+    assert_eq!(mock.control().txt_values(NAME), ["\"AAA\""]);
+    assert!(!settled(&mock));
+    let before = refreshes(&mock);
+    assert!(
+        client
+            .get_rrset(&zone(), &name(), RecordType::TXT)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(refreshes(&mock), before + 1);
+    assert!(settled(&mock));
+    // Nothing owed any more: a read does not refresh.
+    client.list_rrsets(&zone()).await.unwrap();
+    assert_eq!(refreshes(&mock), before + 1);
+
+    mock.faults().push(hold());
+    let dropped = tokio::time::timeout(Duration::from_millis(200), add(&client, "BBB")).await;
+    assert!(dropped.is_err(), "the operation was not dropped");
+    assert!(!settled(&mock));
+    let e = add(&client, "two words").await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e:?}");
+    assert!(settled(&mock));
+    assert_eq!(published_txt(&mock), ["\"AAA\"", "\"BBB\""]);
+}
+
+/// The application secret, which is never sent, is still withheld when an answer states it, in
+/// `message` or in a `details` value.
+#[tokio::test]
+async fn ovh_application_secret_in_an_answer_is_redacted() {
+    let mut seed = Seed::standard();
+    seed.application_secret = CANARY_AS.into();
+    seed.consumer_key = CANARY_CK.into();
+    let mock = OvhMock::start(seed).await;
+    let client = Ovh::new(
+        settings(mock.base_url()),
+        credentials(CANARY_AS, CANARY_CK),
+        &context(),
+    )
+    .unwrap();
+    for body in [
+        serde_json::json!({"class": "Client::BadRequest", "message": CANARY_AS}),
+        serde_json::json!({
+            "class": "Client::BadRequest", "message": "refused",
+            "details": {"secret": CANARY_AS, "key": CANARY_CK}
+        }),
+    ] {
+        mock.faults()
+            .push(Fault::on("POST", RECORDS).respond(400, body.to_string()));
+        let e = add(&client, "AAA").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Rejected, "{e:?}");
+        let text = format!("{e} | {e:?}");
+        assert!(text.contains(REDACTED), "{text}");
+        assert_clean("ovh secret in an answer", &text, &[CANARY_AS, CANARY_CK]);
+    }
 }
 
 // ---- Authentication ----------------------------------------------------------------------------
@@ -1247,13 +1407,14 @@ async fn ovh_listed_record_not_yet_readable_is_read_again() {
     );
     assert_eq!(mock.log().count(Some("GET"), RECORD), reads + 2);
 
-    // Deleted between the listing and the read: left out, without a pause.
+    // Deleted between the listing and the read: left out after one new listing, without a
+    // second read.
     control.set_read_lag(0);
     let id = control.records()[0].id;
     let hook = control.clone();
     mock.faults()
         .push(Fault::on("GET", RECORD).run(move || hook.delete_record(id)));
-    let started = std::time::Instant::now();
+    mock.log().clear();
     assert_eq!(
         client
             .get_rrset(&zone(), &name(), RecordType::TXT)
@@ -1261,7 +1422,8 @@ async fn ovh_listed_record_not_yet_readable_is_read_again() {
             .unwrap(),
         None
     );
-    assert!(started.elapsed() < Duration::from_millis(900));
+    assert_eq!(mock.log().count(Some("GET"), RECORD), 1);
+    assert_eq!(mock.log().count(Some("GET"), RECORDS), 2);
 }
 
 /// A listed record that stays unreadable ends the read with `Transient` after the bounded
@@ -1271,11 +1433,13 @@ async fn ovh_listed_record_that_stays_unreadable_is_transient() {
     let (mock, client) = setup().await;
     mock.control().set_read_lag(10);
     add(&client, "AAA").await.unwrap();
-    let before = writes(&mock);
+    mock.log().clear();
     let e = add(&client, "AAA").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Transient, "{e:?}");
+    // Four reads, each 404 followed by a listing that still holds the record.
     assert_eq!(mock.log().count(Some("GET"), RECORD), 4);
-    assert_eq!(writes(&mock), before);
+    assert_eq!(mock.log().count(Some("GET"), RECORDS), 5);
+    assert_eq!(writes(&mock), 0);
 }
 
 /// Odd listings: a repeated identifier, more records than the client reads one by one, and a
@@ -1311,7 +1475,6 @@ async fn ovh_odd_listings_are_protocol_errors() {
     let e = add(&client, "new").await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Protocol, "{e:?}");
     assert_eq!(writes(&mock), 0);
-    assert_eq!(refreshes(&mock), 0);
 }
 
 /// The TTL a value is written with: the configured one for a new set, the caller's when given,
@@ -1353,28 +1516,48 @@ async fn ovh_ttl_policy() {
         .await
         .unwrap();
     assert_eq!(mock.control().records_at(NAME, "TXT")[1].ttl, Some(120));
-    // A record with a TTL of 0 or none is read without a TTL; a value joining it gets the
-    // configured TTL.
-    mock.control()
-        .insert_record("example.org", "_z.example.org", "TXT", "\"a\"", Some(0));
-    mock.control()
-        .insert_record("example.org", "_n.example.org", "TXT", "\"a\"", None);
-    for owner in ["_z.example.org", "_n.example.org"] {
+    // A record with a TTL of 0 or none is read without a TTL; a value joining it, or a record
+    // created by a replacement next to it, takes the same form (`0`, or no `ttl` member), never
+    // the configured TTL, so that the rrset does not get two TTLs.
+    let control = mock.control();
+    for (owner, form) in [
+        ("_z.example.org", Some(0)),
+        ("_n.example.org", None),
+        ("z.example.org", Some(0)),
+        ("n.example.org", None),
+    ] {
+        let rtype = if owner.starts_with('_') { "TXT" } else { "A" };
+        let first = if rtype == "TXT" { "\"a\"" } else { "192.0.2.1" };
+        control.insert_record("example.org", owner, rtype, first, form);
         let set = client
-            .get_rrset(&zone(), &dn(owner), RecordType::TXT)
+            .get_rrset(&zone(), &dn(owner), rtype.parse().unwrap())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(set.ttl(), None, "{owner}");
-        configured
-            .add_txt_value(&zone(), &dn(owner), &txt("b"), None)
-            .await
-            .unwrap();
+        mock.log().clear();
+        if rtype == "TXT" {
+            configured
+                .add_txt_value(&zone(), &dn(owner), &txt("b"), None)
+                .await
+                .unwrap();
+        } else {
+            configured
+                .set_rrset(
+                    &zone(),
+                    &rr(owner, RecordType::A, None, &["192.0.2.1", "192.0.2.2"]),
+                    Expect::Any,
+                )
+                .await
+                .unwrap();
+        }
+        let post = mock.log().matching(Some("POST"), RECORDS).pop().unwrap();
         assert_eq!(
-            mock.control().records_at(owner, "TXT")[1].ttl,
-            Some(3600),
+            post.body_json().unwrap().get("ttl").cloned(),
+            form.map(serde_json::Value::from),
             "{owner}"
         );
+        assert_eq!(control.records_at(owner, rtype)[1].ttl, form, "{owner}");
     }
 }
 
@@ -1544,6 +1727,21 @@ fn ovh_config_errors_name_no_value() {
             r#"{"application_key":"k"}"#,
             r#"{"consumer_key":"c0nsumer-value"}"#,
             "application_secret",
+        ),
+        (
+            r#"{"application_key":"k"}"#,
+            r#"{"application_secret":"s3cret-value","consumer_key":" c0nsumer-value"}"#,
+            "consumer_key",
+        ),
+        (
+            r#"{"application_key":"k"}"#,
+            r#"{"application_secret":"s3cret-value\t","consumer_key":"c0nsumer-value"}"#,
+            "application_secret",
+        ),
+        (
+            r#"{"application_key":"k","read_retry_ms":0}"#,
+            keys,
+            "read_retry_ms",
         ),
     ] {
         let e = build(settings, credentials).unwrap_err();
@@ -1719,8 +1917,10 @@ async fn ovh_failed_expectation_is_precondition_failed() {
         assert_eq!(e.kind(), ErrorKind::PreconditionFailed, "{expect:?}: {e:?}");
     }
     assert_eq!(writes(&mock), 0);
-    assert_eq!(refreshes(&mock), 0);
     assert_eq!(control.records(), original);
+    // Each refused operation read the zone and then refreshed it, so that a refusal describes
+    // a published state (nothing was staged here).
+    assert!(settled(&mock));
 
     let current = rr(www, RecordType::A, Some(600), &["192.0.2.1"]);
     assert_eq!(
@@ -2034,7 +2234,6 @@ async fn ovh_values_without_an_encoding_are_refused() {
         .unwrap_err();
     assert_eq!(e.kind(), ErrorKind::UnsupportedRecordType, "{e:?}");
     assert_eq!(writes(&mock), 0);
-    assert_eq!(refreshes(&mock), 0);
 }
 
 /// Record writes that carry no condition are sent once for every failing status; an update
@@ -2186,7 +2385,9 @@ fn live_client() -> (Arc<AnyProvider>, DomainName) {
 }
 
 /// Adds and removes two values under a generated label in the zone the maintainer names, and
-/// removes exactly the values it added afterwards, also when the body failed.
+/// removes exactly the values it added afterwards, also when the body failed. Every operation
+/// refreshes the zone, which publishes whatever else is staged in it: run it on a zone with
+/// nothing staged.
 #[tokio::test]
 #[ignore = "live API: run only by the maintainer"]
 async fn live_ovh_add_and_remove() {
@@ -2263,10 +2464,21 @@ fn live_set(name: DomainName, rtype: RecordType, ttl: Option<u32>, text: &str) -
 ///   `target` and `ttl` (and `subDomain` as read);
 /// - a refresh of a zone without staged changes succeeding (the repeat of an add);
 /// - CAA written as `0 issue "letsencrypt.org"`, TLSA as its zone-file text, MX and SRV with a
-///   trailing dot, all read back equal.
+///   trailing dot, all read back equal;
+/// - a TTL of 86400, the upper bound of the client's range;
+/// - the apex form of `subDomain` (`null` or `""`): a value of its own added to the apex TXT set,
+///   read back, and removed, without touching the set's other values;
+/// - no listing lag after a create: an add repeated at once is `AlreadyPresent`, not a
+///   duplicate.
 ///
-/// Everything it created is deleted afterwards by name and type, also when a step failed; it
-/// touches nothing else.
+/// Not exercised: that the record endpoints report the staged state (every write refreshes, and
+/// a lookup at the zone's name servers is outside the test); a PUT without `ttl` (sent only for
+/// a record read with `ttl` `null`, which the client never creates outside such a set); the
+/// served TTL of a record created with `0` or without `ttl`.
+///
+/// Everything it created is deleted afterwards by name and type (the apex value by value), also
+/// when a step failed. Every operation refreshes the zone, which publishes whatever else is
+/// staged in it: run it on a zone with nothing staged.
 #[tokio::test]
 #[ignore = "live API: run only by the maintainer"]
 async fn ovh_live_assumptions() {
@@ -2300,14 +2512,63 @@ async fn ovh_live_assumptions() {
         ),
         live_set(owner("_txt"), RecordType::TXT, None, "\"zw-live-value\""),
         live_set(owner("*"), RecordType::A, None, "192.0.2.20"),
+        live_set(owner("ttl-max"), RecordType::A, Some(86_400), "192.0.2.30"),
     ];
+    let apex_value = txt(&format!("zw-live-apex-{:016x}", random_u64()));
     let created: Vec<(DomainName, RecordType)> =
         sets.iter().map(|s| (s.name().clone(), s.rtype())).collect();
     let body = {
-        let (client, zone, sets, base) = (client.clone(), zone.clone(), sets.clone(), base.clone());
+        let (client, zone, sets, base, apex_value) = (
+            client.clone(),
+            zone.clone(),
+            sets.clone(),
+            base.clone(),
+            apex_value.clone(),
+        );
         tokio::spawn(async move {
             let report = client.check([&zone]).await.unwrap();
             assert!(report.zones[0].found, "{report:?}");
+            // The apex: our own value only, read back through the apex form of `subDomain`.
+            client
+                .add_txt_value(&zone, &zone, &apex_value, None)
+                .await
+                .unwrap();
+            let apex = client
+                .get_rrset(&zone, &zone, RecordType::TXT)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                apex.records()
+                    .iter()
+                    .any(|r| Txt::from_data(r).ok().as_ref() == Some(&apex_value)),
+                "{apex:?}"
+            );
+            assert_ne!(
+                client
+                    .remove_txt_value(&zone, &zone, &apex_value)
+                    .await
+                    .unwrap(),
+                RemoveOutcome::NotPresent
+            );
+            // No listing lag: an add repeated at once finds the value.
+            let lag = base.prepend("_lag").unwrap();
+            let value = txt("zw-live-lag");
+            client
+                .add_txt_value(&zone, &lag, &value, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                client
+                    .add_txt_value(&zone, &lag, &value, None)
+                    .await
+                    .unwrap(),
+                AddOutcome::AlreadyPresent
+            );
+            assert_eq!(
+                client.remove_txt_value(&zone, &lag, &value).await.unwrap(),
+                RemoveOutcome::RrsetDeleted
+            );
             for set in &sets {
                 assert_eq!(
                     client.set_rrset(&zone, set, Expect::Absent).await.unwrap(),
@@ -2368,6 +2629,16 @@ async fn ovh_live_assumptions() {
     };
     let outcome = body.await;
     let mut cleanup = Vec::new();
+    if let Err(e) = client.remove_txt_value(&zone, &zone, &apex_value).await {
+        cleanup.push(format!("apex value: {e}"));
+    }
+    let lag = base.prepend("_lag").unwrap();
+    if let Err(e) = client
+        .remove_txt_value(&zone, &lag, &txt("zw-live-lag"))
+        .await
+    {
+        cleanup.push(format!("{lag}: {e}"));
+    }
     for (name, rtype) in &created {
         if let Err(e) = client.delete_rrset(&zone, name, *rtype, Expect::Any).await {
             cleanup.push(format!("{name} {rtype}: {e}"));

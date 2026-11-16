@@ -2,6 +2,8 @@
 //!
 //! The keys are a compatibility surface: applications persist them.
 
+use std::time::Duration;
+
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +49,13 @@ pub(super) const DEFAULT_TTL: u32 = 120;
 pub(super) const TTL_MIN: u32 = 60;
 pub(super) const TTL_MAX: u32 = 86_400;
 
+/// The first pause before a listed record that answered `404` is read again, in milliseconds.
+// The client's own choice: Terraform retries such a read for up to one minute without stating
+// a spacing (see `api.rs`, `READ_ATTEMPTS`). The lower bound lets tests run without waiting.
+pub(super) const DEFAULT_READ_RETRY_MS: u64 = 1000;
+pub(super) const READ_RETRY_MS_MIN: u64 = 1;
+pub(super) const READ_RETRY_MS_MAX: u64 = 60_000;
+
 /// Settings of the OVHcloud client: the non-secret part of its configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,6 +73,15 @@ pub struct OvhConfig {
     /// TTL of a new record, in seconds: 60 to 86400, default 120.
     #[serde(default = "default_ttl")]
     pub ttl: RrsetTtl,
+    /// The first pause, in milliseconds, before a record the listing holds but whose read
+    /// answered `404` is read again; it doubles for each of the following reads: 1 to 60000,
+    /// default 1000.
+    #[serde(default = "default_read_retry_ms")]
+    pub read_retry_ms: u64,
+}
+
+fn default_read_retry_ms() -> u64 {
+    DEFAULT_READ_RETRY_MS
 }
 
 fn default_endpoint() -> String {
@@ -83,6 +101,7 @@ impl OvhConfig {
             endpoint: default_endpoint(),
             base_url: None,
             ttl: default_ttl(),
+            read_retry_ms: DEFAULT_READ_RETRY_MS,
         }
     }
 
@@ -101,6 +120,9 @@ impl OvhConfig {
                 ));
             }
         };
+        if !(READ_RETRY_MS_MIN..=READ_RETRY_MS_MAX).contains(&self.read_retry_ms) {
+            return Err(config("read_retry_ms must be between 1 and 60000"));
+        }
         let key = self.application_key.trim();
         // The key is sent as a header value and is a part of every signature.
         if key.is_empty() || !key.bytes().all(|b| b.is_ascii_graphic()) {
@@ -123,6 +145,7 @@ impl OvhConfig {
             api,
             application_key: key.to_owned(),
             ttl,
+            read_pause: Duration::from_millis(self.read_retry_ms),
         })
     }
 }
@@ -136,6 +159,8 @@ pub(super) struct Settings {
     pub(super) application_key: String,
     /// TTL of a new record.
     pub(super) ttl: u32,
+    /// The first pause before a listed record is read again.
+    pub(super) read_pause: Duration,
 }
 
 /// Credentials of the OVHcloud client: the secret part of its configuration.
@@ -162,21 +187,22 @@ impl OvhCredentials {
         }
     }
 
-    /// Both values are present; the consumer key can be a header value.
+    /// Both values are non-empty visible ASCII without whitespace. The consumer key is sent in
+    /// a header, where surrounding whitespace is removed in transit while the signature covers
+    /// it, and both are parts of the signed text: a value with whitespace would make every
+    /// request fail.
     pub(super) fn validate(&self) -> Result<(), Error> {
-        if self.application_secret.expose_secret().is_empty() {
-            return Err(config("application_secret must not be empty"));
-        }
-        let ck = self.consumer_key.expose_secret();
-        if ck.is_empty() {
-            return Err(config("consumer_key must not be empty"));
-        }
-        if !ck
-            .bytes()
-            .all(|b| b == b' ' || b == b'\t' || b.is_ascii_graphic())
-        {
+        let visible = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_graphic());
+        if !visible(self.application_secret.expose_secret()) {
             return Err(config(
-                "consumer_key contains a character that cannot be sent in an HTTP header",
+                "application_secret must be a non-empty string of visible ASCII characters \
+                 without whitespace",
+            ));
+        }
+        if !visible(self.consumer_key.expose_secret()) {
+            return Err(config(
+                "consumer_key must be a non-empty string of visible ASCII characters without \
+                 whitespace",
             ));
         }
         Ok(())

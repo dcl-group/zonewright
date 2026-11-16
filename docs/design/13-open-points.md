@@ -218,27 +218,39 @@ delete of a record already gone is answered `INVALID_RECORD_ID`. Not exercised: 
 account's minimum is refused rather than raised, the real maximum TTL, and that only the last page
 of `/domain/listAll` holds fewer than 1000 domains.
 
-**37.** **Live check of the OVHcloud client.** `ovh_live_assumptions` (ignored) is the run; the
-consumer key needs GET, POST, PUT and DELETE on `/domain/zone/*` (inferred from the endpoints; lego
-names only POST and DELETE). Settled by it: the host `api.eu.ovhcloud.com` serves `/domain/zone`
-(the CA and US hosts are not checked); the signature over the URL as sent, with the percent-encoded
-query, is accepted; the `subDomain` filter never leaves out a record whose name equals it (names
-with `_` and `*` included) and the `fieldType` filter matches the type; `subDomain` of a record is
-answered relative to the zone, `""` or `null` at the apex; TXT `target` quoted or as the value reads
-the same; host names in `target` are absolute, written with the dot; CAA as
-`0 issue "letsencrypt.org"` and TLSA as `3 1 1 <hex>` are accepted and read back equal; TTL 60 is
-accepted and a PUT with `target`, `ttl` and `subDomain` changes the TTL; a refresh of a zone without
-staged changes succeeds. Not covered: the TTL upper bound 86400, what `ttl` `0` and `null` mean on
-read, whether a PUT without `ttl` leaves the TTL, the status and `class` of an unknown zone and of
-the signature and key failures, how long a refreshed zone takes to be served (60 s assumed), and
-when a new record becomes readable (the client waits 7 s at most).
+**37.** **Live check of the OVHcloud client.** `ovh_live_assumptions` (ignored) is the run, on a
+zone with nothing staged (every operation refreshes the zone and so publishes whatever else is
+staged); the consumer key needs GET, POST, PUT and DELETE on `/domain/zone/*` (inferred from the
+endpoints; lego names only POST and DELETE). Settled by it: the host `api.eu.ovhcloud.com` serves
+`/domain/zone` (the CA and US hosts are not checked); the signature over the URL as sent, with the
+percent-encoded query, is accepted; the `subDomain` filter never leaves out a record whose name
+equals it (names with `_` and `*` included) and the `fieldType` filter matches the type; `subDomain`
+of a record is answered relative to the zone, and the apex form (`""` or `null`) reads as the apex
+(a value of its own added to and removed from the apex TXT set); TXT `target` quoted or as the value
+reads the same; host names in `target` are absolute, written with the dot; CAA as
+`0 issue "letsencrypt.org"` and TLSA as `3 1 1 <hex>` are accepted and read back equal; TTL 60 and
+86400 (the client's bounds) are accepted and a PUT with `target`, `ttl` and `subDomain` changes the
+TTL; a refresh of a zone without staged changes succeeds; an add repeated at once finds the value
+(no listing lag after a create). Not covered: that the record endpoints report the staged state
+(everything rests on it; a lookup at the zone's name servers is outside the test); what `ttl` `0`
+and `null` mean on read and the served TTL of a record created with `0` or without `ttl` next to
+such records; whether a PUT without `ttl` leaves the TTL; whether SPF, DKIM and DMARC records are
+served as TXT; the status and `class` of an unknown zone and of the signature, key and timestamp
+failures; how long a refreshed zone takes to be served (60 s assumed); when a new record becomes
+readable (the client waits 7 s at most with the default `read_retry_ms`).
 
-**38.** **Live check of the Google Cloud DNS client.** `google_cloud_live_assumptions` and the two
-`live_google_cloud_*` tests (ignored) are the run. Settled by it: a missing managed zone is answered
-`404` by `managedZones.get` (and by `rrsets.list`, which is not probed live); `rrsets.list` with
-`name` and `type` answers a missing rrset with an empty list; a failed deletion match and an
-addition of an existing rrset are refused synchronously with some 4xx (the client re-reads whatever
-the status; the test races two clients and prints the outcomes); `changes.create` answers `pending`
+**38.** **Live check of the Google Cloud DNS client.** `google_cloud_live_assumptions`, the two
+`live_google_cloud_*` tests in `tests/google_cloud.rs` and `live_google_cloud_change_semantics` (in
+the crate, `src/providers/google_cloud/live.rs`) are the run, all ignored. The last calls
+`changes.create` directly and decides the questions the guarantees rest on: a deletion that differs
+from the stored rrset (its TTL) is refused and the rrset is unchanged; an addition of an rrset that
+exists is refused and the rrset is unchanged (if it is accepted, the test fails, and a create at
+Google is read-then-write for rrsets created between the read and the write); a change with a valid
+addition and a deletion that matches nothing is refused as a whole. It prints the status and the
+reason of each refusal. Also settled: a missing managed zone is answered `404` by `managedZones.get`
+(and by `rrsets.list`, which is not probed live); `rrsets.list` with `name` and `type` answers a
+missing rrset with an empty list; a resource quota is `quotaExceeded` and a request rate carries
+another reason (not probed; seen only if the run meets a quota); `changes.create` answers `pending`
 or `done` and `changes.get` answers it by `id`; a plain TXT value written quoted reads back to the
 same value, also with spaces and 300 characters; a managed zone without `visibility` is public
 unless it has `privateVisibilityConfig` (lego's reading); TTL range 1 to 2147483647 (not probed
@@ -246,22 +258,26 @@ beyond 120). Not live steps: the conservative refusals (values needing backslash
 over 1000 characters, rrsets with `signatureRrdatas`, zones with forwarding, peering, reverse-lookup
 or service-directory configuration, a change with an unknown status).
 
-**39.** **Live check of the Azure DNS client.** `azure_dns_live_assumptions` (ignored) is the run.
-Settled by it: the scope `https://management.azure.com//.default` is accepted for the client
-credentials grant; `GET` of a missing record set is `404` (lego relies on it) and of a zone the
-resource group does not hold is `404` (not documented); a space in a TXT string stands for itself,
-and 300 octets split into 255 and 45 read back as one value; names in CNAME, MX, SRV, NS and PTR
-records written without the trailing dot read back as the same absolute names, and CAA values
-round-trip; a wildcard name percent-encoded in a path is decoded; `If-Match` and `If-None-Match: *`
-are enforced (two clients adding values to one name at once never lose a value; the losers end in
-`Conflict`); the listing of a zone holds every set created. Not covered: the status and code of a
-failed condition (the client does not depend on them); whether a `nextLink`'s `$skipToken` works
-with the client's own path and `api-version` (needs a zone with over 100 record sets or a resource
-group with over 100 zones); whether the service returns TXT strings with RFC 1035 escapes it applied
-on write; whether a record set can have an empty record list; national clouds (the China identity
-host is `login.partner.microsoftonline.cn` on the national-cloud page and `login.chinacloudapi.cn`
-in the Go SDK, and the scope for the US Government and China Resource Manager is not stated; both
-are settings, `login_url` and `scope`).
+**39.** **Live check of the Azure DNS client.** Two ignored tests are the run:
+`azure_dns_live_assumptions` (public API) and `azure_dns_live_conditions_are_enforced` (inside the
+crate: a `PUT` and a `DELETE` with a stale etag and a create with `If-None-Match: *` over an
+existing set must each be refused and change nothing; it records the status and code of the
+refusal). Settled by them: the scope `https://management.azure.com//.default` is accepted for the
+client credentials grant; `GET` of a missing record set is `404` (lego relies on it) and of a zone
+the resource group does not hold is `404` (not documented); a space in a TXT string stands for
+itself, and 300 octets split into 255 and 45 read back as one value; names in CNAME, MX, SRV, NS and
+PTR records written without the trailing dot read back as the same absolute names, and CAA values
+round-trip; a wildcard name percent-encoded in a path is decoded; `If-Match` with the etag as
+returned and `If-None-Match: *` are enforced on `PUT`, and `If-Match` on `DELETE` (the conditions
+test; two clients adding values to one name at once never lose a value either); the listing of a
+zone holds every set created; the status and code of a failed condition are recorded (the client
+does not depend on them). Not covered: whether a `nextLink`'s `$skipToken` works with the client's
+own path and `api-version` (needs a zone with over 100 record sets or a resource group with over 100
+zones); whether the service returns TXT strings with RFC 1035 escapes it applied on write; whether a
+record set can have an empty record list; national clouds (the China identity host is
+`login.partner.microsoftonline.cn` on the national-cloud page and `login.chinacloudapi.cn` in the Go
+SDK, and the scope for the US Government and China Resource Manager is not stated; both are
+settings, `login_url` and `scope`).
 
 #### Open: needs the maintainer's decision
 

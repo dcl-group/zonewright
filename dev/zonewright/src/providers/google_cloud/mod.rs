@@ -9,9 +9,10 @@
 //! operations. The TXT value operations accept plain values only. Every write reads the rrset
 //! and sends one change whose deletions carry the rrset exactly as read; the provider applies a
 //! change atomically and refuses it when a deletion does not match the stored rrset, so a
-//! concurrent writer outside this process cannot lose its change (see
-//! [`ValueGuarantee::Conditional`](crate::ValueGuarantee::Conditional) and
-//! [`Preconditions::Atomic`](crate::Preconditions::Atomic)).
+//! concurrent writer outside this process cannot lose its change. For a new rrset this rests on
+//! the assumption that the API refuses an addition of an rrset that exists (`rrset.rs`, "A new
+//! rrset"). See [`ValueGuarantee::Conditional`](crate::ValueGuarantee::Conditional) and
+//! [`Preconditions::Atomic`](crate::Preconditions::Atomic).
 //!
 //! Authentication is the service account key only: a JWT signed with the key (RS256) is
 //! exchanged for an access token. Credentials from the metadata server, workload identity
@@ -27,6 +28,8 @@ mod api;
 mod client;
 #[cfg(feature = "google_cloud")]
 mod config;
+#[cfg(all(test, feature = "google_cloud"))]
+mod live;
 #[cfg(feature = "google_cloud")]
 mod records;
 #[cfg(feature = "google_cloud")]

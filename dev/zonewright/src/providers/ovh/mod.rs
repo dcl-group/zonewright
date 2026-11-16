@@ -12,9 +12,15 @@
 //! requests, creates before deletes, without a condition the provider checks (see
 //! [`Preconditions::ReadThenWrite`](crate::Preconditions::ReadThenWrite)). Record changes are
 //! staged by the API and published by a refresh of the whole zone, which the client sends at the
-//! end of every write operation; when the refresh fails, the operation's error says that the
-//! changes are stored but not published, and the repeat of the operation publishes them. The
-//! OAuth2 service-account credentials of the API are not supported.
+//! end of every write operation that reaches the provider, whatever its outcome, and, while a
+//! refresh this client started a write for has not succeeded, also before a read and on every
+//! exit of a write operation in the zone. That mark is kept in the client only: a change left
+//! staged by a dropped operation or a failed refresh in a client that is gone is published by
+//! the next write operation in the zone that reaches the provider, in any process. The client assumes, without a source,
+//! that the record endpoints report the staged state. TXT reads cover `fieldType` TXT only:
+//! records of the types SPF, DKIM and DMARC, which the name servers may serve as TXT, are not
+//! part of a TXT rrset the client reads or writes. The OAuth2 service-account credentials of
+//! the API are not supported.
 
 pub(crate) mod meta;
 

@@ -33,6 +33,15 @@
 //! writes SOA, design section 3.4). The NS record set at the apex is created with the zone and
 //! its Azure name servers cannot be removed (Records); the record layer refuses writes to it
 //! before any request.
+//!
+//! # Limits left to the service
+//!
+//! The documentation states 20 records per record set, 400 records per TXT record set and 4,096
+//! characters in all the TXT strings of one record set ("DNS zones and records", Limits,
+//! <https://learn.microsoft.com/en-us/azure/dns/dns-zones-records>), and says that limits can be
+//! raised through support. The client does not check them before a request: a check would
+//! refuse a write that an account with a raised limit may make. A write over a limit costs one
+//! request and comes back `Error::Rejected` with the service's code.
 
 use serde_json::Value;
 

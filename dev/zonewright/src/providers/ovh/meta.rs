@@ -59,7 +59,7 @@ const FIELDS: &[ConfigField] = &[
         kind: FieldKind::Text,
         default: None,
         label: "Consumer key",
-        help: "The consumer key (CK) validated for the account, with GET, POST, PUT and DELETE on /domain/zone/*.",
+        help: "The consumer key (CK) validated for the account, with GET, POST, PUT and DELETE on /domain/zone/*; create it with unlimited validity for unattended use, since an expired or revoked key is refused with 403 (Forbidden).",
         advanced: false,
     },
     ConfigField {
@@ -84,6 +84,16 @@ const FIELDS: &[ConfigField] = &[
         default: Some("120"),
         label: "Record TTL, s",
         help: "TTL of new records, in seconds; 60 to 86400.",
+        advanced: true,
+    },
+    ConfigField {
+        key: "read_retry_ms",
+        secret: false,
+        required: false,
+        kind: FieldKind::Integer { min: 1, max: 60000 },
+        default: Some("1000"),
+        label: "Read retry pause, ms",
+        help: "First pause before a listed record that is not readable yet is read again; it doubles for each of three repeats.",
         advanced: true,
     },
     ConfigField {
@@ -128,7 +138,9 @@ const CAPABILITIES: Capabilities = Capabilities {
     txt_values: ValueGuarantee::PerValue,
     preconditions: Preconditions::ReadThenWrite,
     // Individual records with IDs: a replacement is several requests (creates, then deletes),
-    // published together by one refresh, and no request carries a condition on the rrset.
+    // and no request carries a condition on the rrset. They are published together by the
+    // operation's refresh unless another refresh of the zone (by another operation, process or
+    // the control panel) runs while they are being sent.
     atomic_rrset_write: false,
     // The range is partly an assumption, marked and explained in `config.rs`.
     ttl: TtlSupport::PerRecord {

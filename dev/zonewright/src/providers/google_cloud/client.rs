@@ -113,7 +113,8 @@ impl GoogleCloud {
             .secret(key.client_email.expose_secret())
             .message(api::error_message)
             .code(api::error_code)
-            .rate_limit(api::rate_limited);
+            .rate_limit(api::rate_limited)
+            .not_rate_limit(api::resource_quota_exceeded);
         if let Some(id) = &key.private_key_id {
             builder = builder.secret(id.expose_secret());
         }
@@ -231,7 +232,11 @@ impl Provider for GoogleCloud {
     }
 
     /// Exchanges a newly signed JWT for a new token (which verifies the key) and looks every
-    /// zone up afresh.
+    /// zone up afresh: a zone of `managed_zones` with `managedZones.get` (permission
+    /// `dns.managedZones.get`), any other with `managedZones.list` on the project
+    /// (`dns.managedZones.list`).
+    // Source: https://docs.cloud.google.com/dns/docs/access-control (`roles/dns.reader` holds
+    // `dns.managedZones.get` and `dns.managedZones.list`).
     async fn check<'a>(
         &self,
         zones: impl IntoIterator<Item = &'a DomainName> + Send,
@@ -251,7 +256,8 @@ impl Provider for GoogleCloud {
     }
 
     /// The public managed zones of the project, all pages, and the zones of `managed_zones`
-    /// whose managed zone matches their name. A name held by more than one public managed zone
+    /// whose managed zone matches their name. Needs `dns.managedZones.list` on the project, also
+    /// when every zone is configured in `managed_zones`. A name held by more than one public managed zone
     /// is listed once and not cached. The identifiers are cached.
     async fn list_zones(&self) -> Result<Vec<ZoneInfo>, Error> {
         Call::list_zones()

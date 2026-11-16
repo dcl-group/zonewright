@@ -74,6 +74,12 @@ pub struct GoogleCloudConfig {
     /// granted on managed zones rather than on the project, or for a zone name that more than
     /// one public managed zone of the project holds. Accepted as a JSON object or as a string
     /// holding one.
+    ///
+    /// A configured zone is read with `managedZones.get` (permission `dns.managedZones.get` on
+    /// the managed zone). Every other zone, and `list_zones` always, uses `managedZones.list` on
+    /// the project (permission `dns.managedZones.list`): a service account whose role is granted
+    /// on managed zones only gets `Error::Forbidden` from `list_zones` and from `check` of a zone
+    /// that is not configured here.
     #[serde(default, deserialize_with = "managed_zones")]
     pub managed_zones: Option<BTreeMap<String, String>>,
     /// TTL of a new rrset, in seconds: 1 to 2147483647, default 120.
@@ -83,11 +89,16 @@ pub struct GoogleCloudConfig {
     /// 1000.
     #[serde(default = "default_poll_ms")]
     pub change_poll_ms: u64,
-    /// Cloud DNS API endpoint; default `https://dns.googleapis.com/dns/v1`.
+    /// Cloud DNS API endpoint; default `https://dns.googleapis.com/dns/v1`. Every request to it
+    /// carries the access token, which can read and change the project's DNS records for an
+    /// hour: the value needs the same trust as the credentials and must not come from untrusted
+    /// input.
     #[serde(default = "default_dns_url")]
     pub dns_url: String,
     /// OAuth 2.0 token endpoint; default `https://oauth2.googleapis.com/token`. It is also the
-    /// audience of the signed JWT.
+    /// audience of the signed JWT. It receives the signed JWT and answers with the access token,
+    /// so the value needs the same trust as the credentials and must not come from untrusted
+    /// input.
     #[serde(default = "default_token_url")]
     pub token_url: String,
 }

@@ -65,8 +65,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Method, Url};
@@ -100,12 +100,10 @@ pub(super) const MAX_RECORDS: usize = 1000;
 /// How many times a record whose identifier is still listed is read before the read gives up.
 // Source: Terraform, `ovhDomainZoneRecord`: a record read right after its create may answer
 // `404`, and the provider's own Terraform provider retries that read for up to one minute. This
-// client reads a listed record at most this often, with pauses of 1, 2 and 4 seconds, and then
-// fails with `Error::Transient` instead of reporting the record as absent.
+// client reads a listed record at most this often, with pauses of the `read_retry_ms` setting
+// doubling (1, 2 and 4 seconds by default), and then fails with `Error::Transient` instead of
+// reporting the record as absent.
 const READ_ATTEMPTS: u32 = 4;
-
-/// The first pause between two reads of a listed record that answered `404`.
-const READ_PAUSE: Duration = Duration::from_secs(1);
 
 /// The record type name as the API spells it.
 pub(super) const TXT: &str = "TXT";
@@ -169,8 +167,10 @@ pub(super) struct NewRecord<'a> {
     pub(super) sub_domain: Option<&'a str>,
     /// The value.
     pub(super) target: &'a str,
-    /// TTL in seconds.
-    pub(super) ttl: u32,
+    /// TTL in seconds: `0`, or left out, for a record created next to records that state no
+    /// TTL in that form (see `records.rs`, [`Unstated`](super::records::Unstated)).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ttl: Option<u32>,
 }
 
 /// The body of `PUT .../record/{id}`.
@@ -201,9 +201,37 @@ pub(super) enum Written {
     NotFound(Error),
 }
 
+/// How long a reading of the server's clock is used before `/auth/time` is read again. The
+/// client's own choice, not a fact of the API: a monotonic clock does not count the time a host
+/// was suspended on every platform, so a reading is not trusted for ever.
+const CLOCK_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// One reading of the server's clock: its seconds since the Unix epoch, and the monotonic instant
+/// of the reading. A timestamp is the reading plus the time elapsed since, so the local wall
+/// clock plays no part once the reading is made.
+#[derive(Clone, Copy, Debug)]
+struct ServerClock {
+    server: i64,
+    read_at: Instant,
+}
+
+impl ServerClock {
+    /// The server's time at `now`, in whole seconds.
+    fn timestamp(&self, now: Instant) -> i64 {
+        let elapsed = now.saturating_duration_since(self.read_at).as_secs();
+        self.server
+            .saturating_add(i64::try_from(elapsed).unwrap_or(i64::MAX))
+    }
+
+    /// The reading is older than [`CLOCK_MAX_AGE`] at `now`.
+    fn stale(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.read_at) >= CLOCK_MAX_AGE
+    }
+}
+
 /// Signs every attempt of a request right before the transport sends it, over exactly what the
-/// attempt sends, with a timestamp from the local clock corrected by the server's (go-ovh
-/// `NewRequest`). A repeated attempt carries a timestamp and a signature of its own.
+/// attempt sends, with a timestamp on the server's clock (go-ovh `NewRequest`). A repeated
+/// attempt carries a timestamp and a signature of its own.
 ///
 /// The application secret is never sent; the consumer key goes in its own header, set by the
 /// transport. Both are registered with the client's scrubber when the client is built.
@@ -211,25 +239,47 @@ pub(super) struct Signer {
     application_key: HeaderValue,
     application_secret: SecretString,
     consumer_key: SecretString,
-    /// Local clock minus server clock, in seconds; set once per client from `/auth/time`.
-    delta: OnceLock<i64>,
+    /// The last reading of the server's clock.
+    clock: Mutex<Option<ServerClock>>,
 }
 
 impl Signer {
-    /// The string the signature is computed over, in a buffer that is wiped when dropped.
+    /// The string the signature is computed over, in a buffer sized up front and wiped when
+    /// dropped, so that no reallocation leaves a copy of the secret behind.
     fn signed_text(&self, attempt: &Outgoing<'_>, timestamp: i64) -> Zeroizing<Vec<u8>> {
-        let mut text = Zeroizing::new(Vec::new());
-        text.extend_from_slice(self.application_secret.expose_secret().as_bytes());
-        text.push(b'+');
-        text.extend_from_slice(self.consumer_key.expose_secret().as_bytes());
-        text.push(b'+');
-        text.extend_from_slice(attempt.method.as_str().as_bytes());
-        text.push(b'+');
-        text.extend_from_slice(attempt.url.as_str().as_bytes());
-        text.push(b'+');
-        text.extend_from_slice(attempt.body);
-        text.push(b'+');
-        text.extend_from_slice(timestamp.to_string().as_bytes());
+        let secret = self.application_secret.expose_secret().as_bytes();
+        let consumer = self.consumer_key.expose_secret().as_bytes();
+        let method = attempt.method.as_str().as_bytes();
+        let url = attempt.url.as_str().as_bytes();
+        let stamp = timestamp.to_string();
+        let capacity = [
+            secret.len(),
+            consumer.len(),
+            method.len(),
+            url.len(),
+            attempt.body.len(),
+            stamp.len(),
+            5,
+        ]
+        .iter()
+        .fold(0usize, |sum, n| sum.saturating_add(*n));
+        let mut text = Zeroizing::new(Vec::with_capacity(capacity));
+        for (i, part) in [
+            secret,
+            consumer,
+            method,
+            url,
+            attempt.body,
+            stamp.as_bytes(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            if i > 0 {
+                text.push(b'+');
+            }
+            text.extend_from_slice(part);
+        }
         text
     }
 
@@ -240,6 +290,10 @@ impl Signer {
             hex_lower(&sha1(&self.signed_text(attempt, timestamp)))
         )
     }
+
+    fn reading(&self) -> Option<ServerClock> {
+        *self.clock.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl Finish for Signer {
@@ -248,8 +302,8 @@ impl Finish for Signer {
             detail: Detail::constant("the request could not be signed"),
             code: None,
         };
-        let delta = *self.delta.get().ok_or_else(unsigned)?;
-        let timestamp = local_seconds()?.saturating_sub(delta);
+        let clock = self.reading().ok_or_else(unsigned)?;
+        let timestamp = clock.timestamp(Instant::now());
         let signature = self.signature(attempt, timestamp);
         Ok(vec![
             (X_OVH_APPLICATION, self.application_key.clone()),
@@ -265,46 +319,53 @@ impl Finish for Signer {
     }
 }
 
-/// The local clock in whole seconds since the Unix epoch.
-fn local_seconds() -> Result<i64, Error> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_secs()).ok())
-        .ok_or(Error::InvalidInput {
-            detail: Detail::constant("the local clock is before the Unix epoch"),
-            code: None,
-        })
+/// What this client did in one zone, for the refresh rule of the client (see the client's
+/// documentation, "Staged changes and the refresh").
+#[derive(Clone, Copy, Debug, Default)]
+struct Marks {
+    /// Record writes started (counted right before they are sent).
+    writes: u64,
+    /// The value of `writes` when the last successful refresh started: every write counted up to
+    /// it is published.
+    published: u64,
+    /// Requests about the zone started (reads, writes and refreshes).
+    contacts: u64,
 }
 
-/// The client's handle on the API: the transport, the endpoint, the signer and the zones with
-/// record changes this client sent.
+/// A snapshot of the counters of one zone, taken when an operation starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Contacts(u64);
+
+/// The client's handle on the API: the transport, the endpoint, the signer, the pause between
+/// reads of a listed record, and per zone what this client sent.
 pub(super) struct Api {
     http: Http,
     base: Endpoint,
     signer: Arc<Signer>,
-    /// Per zone, how many record writes this client has sent (or started to send). An operation
-    /// that fails after one of them refreshes the zone (see the client's documentation).
-    writes: Mutex<HashMap<DomainName, u64>>,
+    read_pause: Duration,
+    marks: Mutex<HashMap<DomainName, Marks>>,
 }
 
 impl fmt::Debug for Api {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Api")
             .field("base", &self.base)
-            .field("clock_delta", &self.signer.delta.get())
+            .field("server_clock", &self.signer.reading().map(|c| c.server))
+            .field("read_pause", &self.read_pause)
             .finish_non_exhaustive()
     }
 }
 
 impl Api {
-    /// The API at `base`, signing with these keys. `http` sends the consumer key.
+    /// The API at `base`, signing with these keys. `http` sends the consumer key. `read_pause`
+    /// is the first pause before a listed record that answered `404` is read again.
     pub(super) fn new(
         http: Http,
         base: Endpoint,
         application_key: &str,
         application_secret: SecretString,
         consumer_key: SecretString,
+        read_pause: Duration,
     ) -> Result<Api, Error> {
         let application_key =
             HeaderValue::from_str(application_key).map_err(|_| Error::Config {
@@ -319,28 +380,27 @@ impl Api {
                 application_key,
                 application_secret,
                 consumer_key,
-                delta: OnceLock::new(),
+                clock: Mutex::new(None),
             }),
-            writes: Mutex::new(HashMap::new()),
+            read_pause,
+            marks: Mutex::new(HashMap::new()),
         })
     }
 
-    /// The number of record writes this client has started in `zone`.
-    pub(super) fn writes(&self, zone: &DomainName) -> u64 {
-        self.writes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(zone)
-            .copied()
-            .unwrap_or(0)
+    fn with_marks<R>(&self, zone: &DomainName, f: impl FnOnce(&mut Marks) -> R) -> R {
+        let mut marks = self.marks.lock().unwrap_or_else(PoisonError::into_inner);
+        f(marks.entry(zone.clone()).or_default())
     }
 
-    /// Counts a record write in `zone`, before it is sent: once sent, whether it was applied is
-    /// unknown until its answer arrives.
-    fn count_write(&self, zone: &DomainName) {
-        let mut writes = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
-        let count = writes.entry(zone.clone()).or_insert(0);
-        *count = count.saturating_add(1);
+    /// The requests about `zone` this client has started so far.
+    pub(super) fn contacts(&self, zone: &DomainName) -> Contacts {
+        Contacts(self.with_marks(zone, |m| m.contacts))
+    }
+
+    /// A refresh of `zone` is owed: this client started a record write there that no successful
+    /// refresh has published yet (its outcome may be unknown, or its operation dropped).
+    pub(super) fn owed(&self, zone: &DomainName) -> bool {
+        self.with_marks(zone, |m| m.writes > m.published)
     }
 
     /// `GET /auth/time`: the server's clock, in seconds since the Unix epoch. Not signed.
@@ -355,15 +415,31 @@ impl Api {
         response.json("the provider's time answer is not an integer")
     }
 
-    /// Reads the difference between the local clock and the server's once per client, as
-    /// go-ovh does (`getTimeDelta`), before the first signed request. A failed read is not
-    /// remembered.
+    /// Reads the server's clock before the first signed request, and again once the reading is
+    /// older than [`CLOCK_MAX_AGE`]. go-ovh reads it once per client (`getTimeDelta`) and keeps
+    /// the difference to the local wall clock; this client keeps the reading with a monotonic
+    /// instant instead, so that a step of the local wall clock changes nothing. A failed read is
+    /// not remembered. No documented refusal names the timestamp as its cause, so a refusal does
+    /// not trigger a new reading.
+    ///
+    /// The answer is not signed and is trusted as it comes, over the same connection policy as
+    /// every other request: whoever can forge it can make every signed request fail, or make
+    /// the client sign requests with a future timestamp, which that party could replay (each
+    /// one exact request: method, URL, body) for as long as the server accepts the timestamp.
+    /// No secret is exposed by it.
     async fn ensure_clock(&self) -> Result<(), Error> {
-        if self.signer.delta.get().is_none() {
+        let current = self.signer.reading();
+        if current.is_none_or(|c| c.stale(Instant::now())) {
             let server = self.server_time().await?;
-            let delta = local_seconds()?.saturating_sub(server);
-            // A second set by a concurrent first request is harmless: both read the same clock.
-            let _ = self.signer.delta.set(delta);
+            let reading = ServerClock {
+                server,
+                read_at: Instant::now(),
+            };
+            *self
+                .signer
+                .clock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(reading);
         }
         Ok(())
     }
@@ -374,6 +450,21 @@ impl Api {
         self.http
             .send(&request.finish_with(self.signer.clone()))
             .await
+    }
+
+    /// [`Api::send`] for a request about `zone`, counted as a contact with it.
+    async fn send_in(&self, zone: &DomainName, request: Request) -> Result<Response, Error> {
+        self.ensure_clock().await?;
+        self.with_marks(zone, |m| m.contacts = m.contacts.saturating_add(1));
+        self.send(request).await
+    }
+
+    /// [`Api::send_in`] for a record write, counted as one right before it is sent (after the
+    /// clock is read, so that a write that never left is not counted).
+    async fn send_write(&self, zone: &DomainName, request: Request) -> Result<Response, Error> {
+        self.ensure_clock().await?;
+        self.with_marks(zone, |m| m.writes = m.writes.saturating_add(1));
+        self.send_in(zone, request).await
     }
 
     /// `/domain/zone/{zone}` with the zone's name without its trailing dot (lego and dns-update
@@ -423,6 +514,8 @@ impl Api {
     // filters are pattern matches: under every reading (exact, LIKE, case-insensitive ILIKE, a
     // substring) the records whose type and name equal the filter's are among the answer, so
     // the caller compares type and name itself and never relies on the filter's precision.
+    // Assumption (not documented, not observed against the live API): that the filters are one
+    // of these readings and never leave out a record whose type and name equal them.
     // `subDomain` is never sent empty (for the apex) and never with a backslash, which a LIKE
     // pattern may take as an escape: the effect of either is not documented.
     async fn record_ids(&self, zone: &DomainName, filter: Filter<'_>) -> Result<Vec<u64>, Error> {
@@ -433,7 +526,7 @@ impl Api {
         if let Some(sub_domain) = filter.sub_domain {
             url = url.query("subDomain", sub_domain);
         }
-        let response = self.send(Request::get(url.build()?)).await?;
+        let response = self.send_in(zone, Request::get(url.build()?)).await?;
         if response.status() == 404 {
             let refusal = self.refusal(&response);
             return Err(self.zone_missing_or(zone, refusal).await);
@@ -477,7 +570,8 @@ impl Api {
     /// `GET /domain/zone/{zone}/record/{id}`, checked against the request. `None` when the read
     /// answers `404` and a new listing with `filter` no longer holds the identifier (the record
     /// was deleted after the listing). While the listing still holds it, the read is repeated
-    /// ([`READ_ATTEMPTS`]); after the last attempt the result is `Error::Transient`.
+    /// ([`READ_ATTEMPTS`], pauses of `read_pause` doubling); after the last attempt the result is
+    /// `Error::Transient`.
     async fn record(
         &self,
         zone: &DomainName,
@@ -489,9 +583,9 @@ impl Api {
             .path("/record")
             .id(&id.to_string())
             .build()?;
-        let mut pause = READ_PAUSE;
+        let mut pause = self.read_pause;
         for attempt in 1..=READ_ATTEMPTS {
-            let response = self.send(Request::get(url.clone())).await?;
+            let response = self.send_in(zone, Request::get(url.clone())).await?;
             if response.is_success() {
                 let wire: WireRecord =
                     response.json("the provider's record answer is not in the expected form")?;
@@ -528,8 +622,7 @@ impl Api {
     ) -> Result<(), Error> {
         let url = self.zone_url(zone).path("/record").build()?;
         let request = Request::new(Method::POST, url).json(record)?;
-        self.count_write(zone);
-        let response = self.send(request).await?;
+        let response = self.send_write(zone, request).await?;
         if response.status() == 404 {
             let refusal = self.refusal(&response);
             return Err(self.zone_missing_or(zone, refusal).await);
@@ -551,8 +644,7 @@ impl Api {
     ) -> Result<Written, Error> {
         let url = self.record_url(zone, id)?;
         let request = Request::new(Method::PUT, url).json(update)?;
-        self.count_write(zone);
-        let response = self.send(request).await?;
+        let response = self.send_write(zone, request).await?;
         self.written(&response)
     }
 
@@ -561,23 +653,25 @@ impl Api {
     // Source: Schema, `deleteRecord` (200, void); lego `CleanUp`.
     pub(super) async fn delete_record(&self, zone: &DomainName, id: u64) -> Result<Written, Error> {
         let url = self.record_url(zone, id)?;
-        self.count_write(zone);
         let response = self
-            .send(Request::new(Method::DELETE, url).idempotent())
+            .send_write(zone, Request::new(Method::DELETE, url).idempotent())
             .await?;
         self.written(&response)
     }
 
     /// `POST /domain/zone/{zone}/refresh`: publishes every staged record change of the zone.
-    /// Idempotent: a repeat publishes the same staged state, so the transport may retry it.
+    /// Idempotent: a repeat publishes the same staged state, so the transport may retry it. A
+    /// success marks every record write this client had started in the zone when the refresh
+    /// started as published.
     // Source: Schema, `refreshZone` ("Applies the pending record changes to the zone", 200,
     // void, no body); lego and Terraform call it after every write. Assumption (not documented,
     // not observed against the live API): that a refresh of a zone without staged changes
     // succeeds.
     pub(super) async fn refresh(&self, zone: &DomainName) -> Result<(), Error> {
         let url = self.zone_url(zone).path("/refresh").build()?;
+        let covered = self.with_marks(zone, |m| m.writes);
         let response = self
-            .send(Request::new(Method::POST, url).idempotent())
+            .send_in(zone, Request::new(Method::POST, url).idempotent())
             .await?;
         if response.status() == 404 {
             let refusal = self.refusal(&response);
@@ -586,6 +680,7 @@ impl Api {
         if !response.is_success() {
             return Err(self.refusal(&response));
         }
+        self.with_marks(zone, |m| m.published = m.published.max(covered));
         Ok(())
     }
 
@@ -622,13 +717,14 @@ impl Api {
         }
     }
 
-    /// The text of an error whose record changes stay staged because the refresh that publishes
-    /// them failed: `error` with that said first.
+    /// The error of a refresh that failed after the operation's record changes were stored:
+    /// `error` with that said first. Kinds without a text of their own (`RateLimited`,
+    /// `ZoneNotFound`, `ProxyAuth` and the kinds no refresh returns) are returned as they are.
     pub(super) fn unpublished(&self, error: Error) -> Error {
-        const PREFIX: &str = "the record changes are stored at the provider but not published, \
-             because the zone refresh failed; repeating the operation refreshes the zone";
-        let prefixed =
-            |detail: &Detail| self.http.detail(&format!("{PREFIX}: {}", detail.as_str()));
+        let prefixed = |detail: &Detail| {
+            self.http
+                .detail(&format!("{UNPUBLISHED}: {}", detail.as_str()))
+        };
         match error {
             Error::Transient { detail } => Error::Transient {
                 detail: prefixed(&detail),
@@ -642,6 +738,10 @@ impl Api {
                 detail: prefixed(&detail),
                 code,
             },
+            Error::InvalidInput { detail, code } => Error::InvalidInput {
+                detail: prefixed(&detail),
+                code,
+            },
             Error::Forbidden { detail } => Error::Forbidden {
                 detail: prefixed(&detail),
             },
@@ -651,10 +751,24 @@ impl Api {
             Error::Protocol { detail } => Error::Protocol {
                 detail: prefixed(&detail),
             },
+            Error::Conflict { detail } => Error::Conflict {
+                detail: prefixed(&detail),
+            },
+            Error::PreconditionFailed { detail } => Error::PreconditionFailed {
+                detail: prefixed(&detail),
+            },
+            Error::Config { detail } => Error::Config {
+                detail: prefixed(&detail),
+            },
             other => other,
         }
     }
 }
+
+/// What the error of a failed refresh after stored record changes says first.
+pub(super) const UNPUBLISHED: &str = "the record changes are stored at the provider but not \
+     published, because the zone refresh failed; this client's next operation in the zone \
+     refreshes it, and so does a repeat of this operation that reaches the provider";
 
 /// `wire`, the answer to the read of record `id`, checked against the request: an answer about
 /// another record or zone, or of another type than the filter's, is `Error::Protocol`; a member
@@ -779,21 +893,45 @@ pub(super) fn error_class(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Filter, Outgoing, Signer, WireRecord, checked, error_class, error_message, filter_for,
-        owner, stated_ttl,
+        CLOCK_MAX_AGE, Filter, Outgoing, ServerClock, Signer, WireRecord, checked, error_class,
+        error_message, filter_for, owner, stated_ttl,
     };
     use crate::name::DomainName;
     use reqwest::header::HeaderValue;
     use reqwest::{Method, Url};
     use secrecy::SecretString;
-    use std::sync::OnceLock;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// A timestamp is the server's reading plus the monotonic time elapsed since; the reading is
+    /// stale after the bound.
+    #[test]
+    fn the_server_clock_advances_monotonically() {
+        let read_at = Instant::now();
+        let clock = ServerClock {
+            server: 1_700_000_000,
+            read_at,
+        };
+        assert_eq!(clock.timestamp(read_at), 1_700_000_000);
+        assert_eq!(
+            clock.timestamp(read_at + Duration::from_millis(2_500)),
+            1_700_000_002
+        );
+        assert!(!clock.stale(read_at));
+        assert!(!clock.stale(read_at + CLOCK_MAX_AGE - Duration::from_secs(1)));
+        assert!(clock.stale(read_at + CLOCK_MAX_AGE));
+        assert_eq!(
+            clock.timestamp(read_at + CLOCK_MAX_AGE),
+            1_700_000_000 + 3600
+        );
+    }
 
     fn signer() -> Signer {
         Signer {
             application_key: HeaderValue::from_static("test-only-ak"),
             application_secret: SecretString::from("test-only-as".to_owned()),
             consumer_key: SecretString::from("test-only-ck".to_owned()),
-            delta: OnceLock::new(),
+            clock: Mutex::new(None),
         }
     }
 

@@ -103,7 +103,7 @@ const FIELDS: &[ConfigField] = &[
         kind: FieldKind::Url,
         default: Some("https://management.azure.com"),
         label: "Resource Manager URL",
-        help: "Endpoint of Azure Resource Manager; change it for a national cloud or to point the client at a test server.",
+        help: "Endpoint of Azure Resource Manager, which receives the access token; set it only to a host trusted like the credentials (a national cloud, a test server).",
         advanced: true,
     },
     ConfigField {
@@ -113,7 +113,7 @@ const FIELDS: &[ConfigField] = &[
         kind: FieldKind::Url,
         default: Some("https://login.microsoftonline.com"),
         label: "Identity platform URL",
-        help: "Host of the Microsoft identity platform; change it for a national cloud or to point the client at a test server.",
+        help: "Host of the Microsoft identity platform, which receives the client secret; set it only to a host trusted like the credentials (a national cloud, a test server).",
         advanced: true,
     },
     ConfigField {

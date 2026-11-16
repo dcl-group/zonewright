@@ -8,13 +8,43 @@
 //!   which is then looked up again.
 //! - write: one `changes.create`. A write over an existing rrset carries it, exactly as read, in
 //!   `deletions` and the new rrset in `additions`; a write of a new rrset carries the addition
-//!   only, which the API refuses when an rrset of that name and type exists (`alreadyExists`); a
-//!   delete carries the deletion only.
+//!   only (see "A new rrset" below); a delete carries the deletion only.
 //! - after a refused change: which status a failed deletion match (`preconditionFailed`)
 //!   produces is not documented, so every refusal is followed by a new read: an rrset that
 //!   differs from the one the change was conditional on (or a zone now known under another ID)
 //!   is `Error::Conflict`, which both layers answer by running the operation once more; a delete
 //!   whose rrset is gone now is a success; otherwise the refusal is the error.
+//!
+//! # A new rrset
+//!
+//! What the deletion match gives an existing rrset, a new one gets only if the API refuses an
+//! addition of an rrset that already exists. That is assumed, not documented: the discovery
+//! document says that additions and deletions are applied atomically and that deletions "Must
+//! match existing data exactly", but nothing about an addition that meets an existing rrset; the
+//! error messages page (<https://docs.cloud.google.com/dns/docs/error-messages>) lists
+//! `alreadyExists` ("The specified resource already exists; you cannot create a duplicate")
+//! without naming the case; a search result, not a primary source, shows it for
+//! `entity.change.additions[N]`. Not observed against the live API; the ignored test
+//! `live_google_cloud_change_semantics` (`live.rs`) settles it.
+//!
+//! Under the assumption, an rrset created by another writer between the read and the addition
+//! makes the change fail, the new read finds the rrset, and the result is `Error::Conflict`,
+//! which the layers repeat with a deletion of that rrset. If the service instead accepted the
+//! addition as a replacement, the other writer's rrset would be replaced and the client would
+//! report `Created` (or `Appended`): the guarantee against writers outside this process would
+//! hold only for rrsets that exist when the client reads them, and a create would be a
+//! read-then-write (`ReadThenWrite`) for that window. No client code can detect it: the API
+//! offers no condition on the absence of an rrset other than this refusal.
+//!
+//! # A pending change and the next read
+//!
+//! Whether a change that is still `pending` is visible to `resourceRecordSets.list` is not
+//! documented. The client waits for `done` before it reports a write, so only a change it gave
+//! up on (`Error::Transient` after the last look) can be pending when a repeat reads. If such a
+//! change is visible, the repeat finds the value (`AlreadyPresent`); if it is not, the repeat's
+//! change is refused or applied against a state that does not show it yet, and the repeat ends in
+//! an error or converges once the change is done. Either way nothing is written twice over a
+//! value it cannot see as long as the API refuses an addition of an existing rrset (above).
 //!
 //! # Rrsets that are not plain records
 //!

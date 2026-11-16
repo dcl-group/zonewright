@@ -500,11 +500,17 @@ impl Api {
     /// contains a URL"; Zones List, the example `nextLink` with `$skipToken`): an answer holds
     /// `value` and, when more items exist, `nextLink`. The link itself is never requested
     /// (design section 5.4): only its `$skipToken` is taken and sent with this client's own
-    /// path. No page size is sent (`$top` has a default of 100 and no documented maximum).
+    /// path and `api-version`. That the link carries nothing else the service needs is an
+    /// assumption, not observed against the live API: the documentation says to request the
+    /// link, and shows only `api-version` and `$skipToken` in it. A link without `$skipToken`
+    /// fails the listing rather than being followed. No page size is sent (`$top` has a default
+    /// of 100 and no documented maximum).
     ///
-    /// The listing ends at a page without `nextLink`, and at an empty page. A `nextLink` without
-    /// `$skipToken`, a token equal to the one just used, and a page that repeats the one before
-    /// it are `Error::Protocol`, and `pager::collect` stops at its page limit.
+    /// The listing ends at a page without `nextLink`, whether or not it holds items: an empty
+    /// page that carries a `nextLink` is followed, since the link says that more may come. A
+    /// `nextLink` without `$skipToken`, a token equal to the one just used, and a page with
+    /// items that repeats the one before it are `Error::Protocol`, and `pager::collect` stops
+    /// at its page limit, so a run of empty pages cannot go on without end.
     async fn list<T, U>(
         &self,
         url: U,
@@ -542,11 +548,7 @@ impl Api {
                     }
                     *previous = Some(items.clone());
                 }
-                let next = if items.is_empty() {
-                    None
-                } else {
-                    next_token(page.next_link.as_deref(), &request)?
-                };
+                let next = next_token(page.next_link.as_deref(), &request)?;
                 let items: Vec<T> =
                     serde_json::from_value(Value::Array(items)).map_err(|_| malformed_listing())?;
                 Ok(Page { items, next })

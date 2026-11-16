@@ -5,7 +5,8 @@
 //! The native unit is the rrset, addressed by name and type, and every write is one
 //! `changes.create`: a write over an existing rrset carries it, exactly as read, in `deletions`
 //! and the new rrset in `additions`; a write of a new rrset carries only the addition, which the
-//! API refuses when an rrset of that name and type exists; a delete carries only the deletion.
+//! API is assumed to refuse when an rrset of that name and type exists (not documented; see
+//! `rrset.rs`, "A new rrset"); a delete carries only the deletion.
 //! "A Change represents a set of ResourceRecordSet additions and deletions applied atomically to
 //! a ManagedZone"; `deletions`: "Must match existing data exactly"
 //! (<https://www.googleapis.com/discovery/v1/apis/dns/v1/rest>, `Change`). So the provider

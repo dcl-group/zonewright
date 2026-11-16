@@ -330,6 +330,9 @@ pub(crate) struct Http {
     code: Option<MessageFn>,
     /// Marks further answers as rate-limit answers, treated like a 429.
     rate_limit: Option<RateLimitFn>,
+    /// Marks answers of a rate-limit status that are a permanent refusal instead
+    /// ([`HttpBuilder::not_rate_limit`]).
+    not_rate_limit: Option<RateLimitFn>,
     /// A header of the client's provider that states, as a Unix time, when a rate limit ends
     /// ([`HttpBuilder::rate_reset_unix`]).
     rate_reset_unix: Option<&'static str>,
@@ -428,6 +431,7 @@ pub(crate) struct HttpBuilder {
     message: MessageFn,
     code: Option<MessageFn>,
     rate_limit: Option<RateLimitFn>,
+    not_rate_limit: Option<RateLimitFn>,
     rate_reset_unix: Option<&'static str>,
     origins: Vec<Origin>,
     error: Option<Error>,
@@ -446,6 +450,7 @@ impl HttpBuilder {
             message: request::default_message,
             code: None,
             rate_limit: None,
+            not_rate_limit: None,
             rate_reset_unix: None,
             origins: Vec::new(),
             error: None,
@@ -555,6 +560,16 @@ impl HttpBuilder {
         self
     }
 
+    /// Declares answers that carry a rate-limit status (429, or one [`HttpBuilder::rate_limit`]
+    /// marks) but are a permanent refusal, for a provider that answers an exhausted resource
+    /// quota with the same status as an exceeded request rate and tells them apart in the body.
+    /// An answer for which `classify` is true is not waited out or repeated: it goes back to the
+    /// client like any other 4xx.
+    pub(crate) fn not_rate_limit(mut self, classify: RateLimitFn) -> HttpBuilder {
+        self.not_rate_limit = Some(classify);
+        self
+    }
+
     /// Reads the wait of a rate-limit answer also from `header`, a Unix time in seconds at which
     /// the limit ends, for a provider that states the end of its window only there. Consulted
     /// after `Retry-After` and before `RateLimit-Reset` (design section 5.3); what such a header
@@ -591,6 +606,7 @@ impl HttpBuilder {
             message: self.message,
             code: self.code,
             rate_limit: self.rate_limit,
+            not_rate_limit: self.not_rate_limit,
             rate_reset_unix: self.rate_reset_unix,
             origins: self.origins,
             identity,

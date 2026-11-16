@@ -27,7 +27,7 @@ use crate::values::{PerRecord, PerRecordRead, TxtBase, TxtRecord, WriteTtl};
 
 use super::api::{NewRecord, TXT, Written};
 use super::client::Ovh;
-use super::records::{Handle, TXT_READ, TXT_WRITE, outside_zone, ttl_of};
+use super::records::{Handle, TXT_READ, TXT_WRITE, Unstated, outside_zone, ttl_of};
 
 impl TxtBase for Ovh {
     fn provider(&self) -> ProviderId {
@@ -53,6 +53,9 @@ impl PerRecord for Ovh {
         name: &DomainName,
     ) -> Result<PerRecordRead<Handle>, Error> {
         let records = self.records_at(zone, name, RecordType::TXT).await?;
+        let unstated = (!records.is_empty() && records.iter().all(|r| ttl_of(r).is_none()))
+            .then(|| Unstated::of(records.iter().map(|r| r.ttl)));
+        self.remember_unstated(zone, name, unstated);
         Ok(PerRecordRead::Records(
             records
                 .iter()
@@ -78,11 +81,13 @@ impl PerRecord for Ovh {
         })?;
         let ttl = match ttl {
             WriteTtl::New(Some(RrsetTtl::Explicit(ttl)))
-            | WriteTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
-            // Every record the client writes states its TTL (`provider_default_ttl` is
-            // `Absent`): the configured TTL stands for a set without one.
+            | WriteTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => Some(ttl.as_secs()),
+            // The rrset's records state no TTL: the form they have (`records.rs`, `Unstated`),
+            // as the read of this operation found it under the name lock.
+            WriteTtl::Existing(None) => self.unstated(zone, name).ttl(),
+            // `provider_default_ttl` is `Absent`: the configured TTL stands for a new set.
             WriteTtl::New(None | Some(RrsetTtl::ProviderDefault))
-            | WriteTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => self.ttl,
+            | WriteTtl::Existing(Some(RrsetTtl::ProviderDefault)) => Some(self.ttl),
         };
         let relative = name
             .relative_to(zone)

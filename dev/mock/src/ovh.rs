@@ -30,29 +30,37 @@
 //!   ([`Control::set_create_without_id`]); a record read right after its create may answer `404`
 //!   for a while ([`Control::set_read_lag`]).
 //!
-//! The mock holds every record twice: as staged (what the record endpoints read and change) and
-//! as published (what the last refresh of its zone applied). Only the published records are
-//! reported as changes and served by a [`link`](crate::link::link).
+//! The mock holds every record twice: as staged and as published (what the last refresh of its
+//! zone applied). Only the published records are reported as changes and served by a
+//! [`link`](crate::link::link).
 //!
 //! Answers this mock invents because the documentation is silent, each chosen so that a client
 //! cannot rely on a lenient reading. A test that depends on one of them proves only how the
 //! client handles that answer, not that the provider gives it:
 //!
+//! - the record endpoints read and change the staged records, so a change that is stored but not
+//!   refreshed reads as present (the documentation says only that a change "applies after the
+//!   zone is refreshed");
 //! - an unknown application key, a wrong consumer key, a timestamp more than 300 seconds away
 //!   from the mock's clock, and a wrong or missing signature are `403` with the class
-//!   `Client::Forbidden` (only the class and status of a permission refusal are documented);
+//!   `Client::Forbidden` (only the class and status of a permission refusal are documented),
+//!   checked in that order;
 //! - an unknown zone or record is `404` with the class `Client::NotFound`;
 //! - `400` with the class `Client::BadRequest` for a body that is not a JSON object, a member
 //!   the documented model does not have (also the read-only `id` and `zone`), a missing
 //!   `fieldType` or `target`, a type outside the enumeration, a `ttl` that is not an integer or
 //!   lies between 1 and 59 (the lower bound of the Terraform provider), and a `fieldType` filter
-//!   outside the enumeration;
+//!   outside the enumeration, an empty `target`, and a `subDomain` with a trailing dot or a
+//!   space;
+//! - a `subDomain` is stored in lower case;
 //! - the filters are SQL patterns: `fieldType` LIKE (case-sensitive) and `subDomain` ILIKE
 //!   (case-insensitive), `%` any text, `_` one character, `\` the escape; a record whose
 //!   `subDomain` is the apex is stored as `""` and answered as `""`, or as `null` with
 //!   [`Control::set_apex_null`]; `null` matches no `subDomain` filter;
-//! - a record created without `ttl` stores `0`; `ttl` `0` or `null` is published with the
-//!   zone's TTL of 3600;
+//! - a record created without `ttl` stores none (answered `null`); `ttl` `0` or `null` is
+//!   published with the zone's TTL of 3600;
+//! - records of the types DKIM, DMARC and SPF are published under those type names, as the API
+//!   names them (whether the name servers serve them as TXT is not established);
 //! - a host name in `target` (CNAME, NS, MX, SRV) is published as absolute, a trailing dot
 //!   added when missing;
 //! - creating a record equal to an existing one is accepted (no source says otherwise);
@@ -989,7 +997,7 @@ async fn record_create(
             Ok(ttl) => ttl,
             Err(response) => return response,
         },
-        None => Some(0),
+        None => None,
     };
     inner.next_id += 1;
     let record = Record {

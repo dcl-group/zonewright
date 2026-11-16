@@ -49,7 +49,7 @@ const FIELDS: &[ConfigField] = &[
         kind: FieldKind::Multiline,
         default: None,
         label: "Managed zones (JSON)",
-        help: "A JSON object mapping zone names to managed zone names or IDs, for a service account whose role is granted on managed zones or for a name held by several managed zones.",
+        help: "A JSON object mapping zone names to managed zone names or IDs, for a service account whose role is granted on managed zones (listing zones still needs dns.managedZones.list on the project) or for a name held by several managed zones.",
         advanced: true,
     },
     ConfigField {
@@ -96,7 +96,7 @@ const FIELDS: &[ConfigField] = &[
         kind: FieldKind::Url,
         default: Some("https://dns.googleapis.com/dns/v1"),
         label: "Cloud DNS API URL",
-        help: "Endpoint of the provider's API; change it only to point the client at a test server.",
+        help: "Endpoint of the provider's API, which receives the access token; change it only to point the client at a test server you trust like the credentials.",
         advanced: true,
     },
     ConfigField {
@@ -106,7 +106,7 @@ const FIELDS: &[ConfigField] = &[
         kind: FieldKind::Url,
         default: Some("https://oauth2.googleapis.com/token"),
         label: "Token URL",
-        help: "OAuth 2.0 token endpoint, also the audience of the signed JWT; change it only to point the client at a test server.",
+        help: "OAuth 2.0 token endpoint, which receives the signed JWT and is its audience; change it only to point the client at a test server you trust like the credentials.",
         advanced: true,
     },
 ];

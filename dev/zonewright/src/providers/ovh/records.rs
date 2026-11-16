@@ -59,7 +59,12 @@
 //! Reading: text the parser refuses is kept as non-canonical data (design section 4.9): listed,
 //! compared by text, written back only as it is. The other types of `domain.zone.RecordTypeEnum`
 //! (DKIM, DMARC, DNAME, HTTPS, LOC, NAPTR, PTR, RP, SPF, SSHFP, SVCB) have no `target` form a
-//! source shows: a listing carries them, they cannot be read alone or written.
+//! source shows: a listing carries them, they cannot be read alone or written. Whether the name
+//! servers serve records of the types SPF, DKIM and DMARC as TXT records is not established
+//! (Schema: they are `fieldType` values of their own). If they do, a TXT read here, which lists
+//! `fieldType=TXT` only, misses them: the TXT value operations then report `RrsetDeleted` or
+//! `NotPresent` as if no other value existed, a `set_rrset` of TXT replaces only the `TXT`
+//! records, and the served set differs from what `get_rrset` reports.
 //!
 //! Writing stays within what the sources show, and [`RrsetBase::can_send`] refuses everything
 //! else with `Error::InvalidInput` before any write:
@@ -74,7 +79,9 @@
 //!
 //! TTL: a record states its own (`ttl`). A record read with `ttl` `null` or `0` is reported
 //! without a TTL ([`stated_ttl`](super::api::stated_ttl)); a write without a TTL leaves every
-//! record's own, a write with one sets it on every record (design section 3.6).
+//! record's own, a write with one sets it on every record (design section 3.6). A record created
+//! without a requested TTL next to records that state none gets their form (`0`, or no `ttl`
+//! member), not the `ttl` setting ([`Unstated`]).
 
 use std::collections::BTreeMap;
 
@@ -217,6 +224,42 @@ fn host(name: &TargetName) -> Option<String> {
     Some(text.to_owned())
 }
 
+/// How the records of an rrset that states no TTL spell it (`ttl` `0` or `null`, both read as no
+/// TTL, see [`stated_ttl`](super::api::stated_ttl)), so that a record created next to them gets
+/// the same form instead of the `ttl` setting, which would give one rrset two TTLs (RFC 2181
+/// section 5.2).
+// Source: Terraform sends `ttl` `0` for a record without a configured TTL; the schema makes `ttl`
+// of a create optional (`domain.zone.RecordCreate`, "required": false) and not nullable, so the
+// `null` form is written by leaving the member out. Assumption (not documented, not observed
+// against the live API): that a record created so is served with the same TTL as its siblings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Unstated {
+    /// No record states `0`: the member is left out.
+    #[default]
+    Null,
+    /// A record states `0`: `0` is sent.
+    Zero,
+}
+
+impl Unstated {
+    /// The form of the records whose raw `ttl` values these are.
+    pub(super) fn of(ttls: impl IntoIterator<Item = Option<i64>>) -> Unstated {
+        if ttls.into_iter().any(|t| t == Some(0)) {
+            Unstated::Zero
+        } else {
+            Unstated::Null
+        }
+    }
+
+    /// The `ttl` member of a create in this form.
+    pub(super) fn ttl(self) -> Option<u32> {
+        match self {
+            Unstated::Zero => Some(0),
+            Unstated::Null => None,
+        }
+    }
+}
+
 // ---- The record layer ----------------------------------------------------------------------------
 
 impl Ovh {
@@ -244,16 +287,19 @@ impl Ovh {
             .collect())
     }
 
-    /// The TTL of a new record: the layer's choice when it is a number, else the setting.
-    fn new_ttl(&self, ttl: SetTtl) -> u32 {
+    /// The `ttl` of a new record: the layer's choice when it is a number; for a record that
+    /// joins an rrset whose records state no TTL, the form they have ([`Unstated`]); else the
+    /// setting.
+    fn new_ttl(&self, ttl: SetTtl, unstated: Unstated) -> Option<u32> {
         match ttl {
             SetTtl::Requested(RrsetTtl::Explicit(ttl))
-            | SetTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => ttl.as_secs(),
-            // Every record the client writes states its TTL (`provider_default_ttl` is
-            // `Absent`): the configured TTL stands for a set without one (design section 3.6).
+            | SetTtl::Existing(Some(RrsetTtl::Explicit(ttl))) => Some(ttl.as_secs()),
+            SetTtl::Existing(None) => unstated.ttl(),
+            // `provider_default_ttl` is `Absent`, so the layer never asks for the provider's
+            // default; the configured TTL stands for a new set (design section 3.6).
             SetTtl::Default
             | SetTtl::Requested(RrsetTtl::ProviderDefault)
-            | SetTtl::Existing(None | Some(RrsetTtl::ProviderDefault)) => self.ttl,
+            | SetTtl::Existing(Some(RrsetTtl::ProviderDefault)) => Some(self.ttl),
         }
     }
 }
@@ -286,18 +332,18 @@ fn not_sendable() -> Error {
 impl PerRecord for Ovh {
     /// The record as read.
     type Handle = Handle;
-    /// The zone's name is the key of every path: nothing to carry.
-    type Context = ();
+    /// How the records read state no TTL, for a create next to them.
+    type Context = Unstated;
 
     async fn read(
         &self,
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-    ) -> Result<RecordsRead<Handle, ()>, Error> {
-        let records = self
-            .records_at(zone, name, rtype)
-            .await?
+    ) -> Result<RecordsRead<Handle, Unstated>, Error> {
+        let found = self.records_at(zone, name, rtype).await?;
+        let unstated = Unstated::of(found.iter().map(|r| r.ttl));
+        let records = found
             .iter()
             .map(|record| Stored {
                 data: read_record(rtype, &record.target),
@@ -308,7 +354,7 @@ impl PerRecord for Ovh {
             })
             .collect();
         Ok(RecordsRead {
-            context: (),
+            context: unstated,
             records,
         })
     }
@@ -318,7 +364,7 @@ impl PerRecord for Ovh {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &(),
+        context: &Unstated,
         data: &RecordData,
         ttl: SetTtl,
     ) -> Result<(), Error> {
@@ -331,7 +377,7 @@ impl PerRecord for Ovh {
             field_type: &type_name,
             sub_domain: (!relative.is_empty()).then_some(relative),
             target: &target,
-            ttl: self.new_ttl(ttl),
+            ttl: self.new_ttl(ttl, *context),
         };
         self.api.create_record(zone, &record).await
     }
@@ -341,7 +387,7 @@ impl PerRecord for Ovh {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &(),
+        _context: &Unstated,
         record: &Stored<Handle>,
         update: &LayerUpdate<'_>,
     ) -> Result<(), Error> {
@@ -396,7 +442,7 @@ impl PerRecord for Ovh {
         zone: &DomainName,
         name: &DomainName,
         rtype: RecordType,
-        _context: &(),
+        _context: &Unstated,
         record: &Stored<Handle>,
     ) -> Result<(), Error> {
         match self.api.delete_record(zone, record.handle.id).await? {

@@ -10,9 +10,10 @@
 //! The zone's name is the key of every path, so there are no zone identifiers to cache and none
 //! to go stale.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
+use std::sync::{Mutex, PoisonError};
 
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -32,14 +33,22 @@ use crate::{rrsets, values};
 
 use super::api::{self, Api};
 use super::config::{self, OvhConfig, OvhCredentials};
+use super::records::Unstated;
 
 /// The OVHcloud DNS client (the `/domain/zone` API, version 1.0).
 ///
 /// Authenticates with an application key, an application secret and a consumer key: every
 /// request carries the application key and the consumer key in headers and a signature over the
 /// method, the full URL, the body and a timestamp, made with the application secret, which is
-/// never sent. The timestamp follows the provider's clock: the difference to the local clock is
-/// read once per client from `/auth/time`, unauthenticated, before the first signed request.
+/// never sent. The timestamp follows the provider's clock: `/auth/time`, unauthenticated, is read
+/// before the first signed request and again after an hour, and the time elapsed since a reading
+/// is counted with a monotonic clock.
+///
+/// A `403` answer is [`Error::Forbidden`](crate::Error::Forbidden). At this provider it means a
+/// missing permission or a consumer key that expired or was revoked (go-ovh README: "your
+/// application should be prepared to receive 403 HTTP errors and prompt the user to
+/// re-authenticate"); no error class documented by the sources tells the two apart. A consumer
+/// key for unattended use should be created with unlimited validity.
 ///
 /// The native unit is the individual record with an identifier: TXT value operations create one
 /// record for the value being added and delete only the records that hold the value being
@@ -52,32 +61,49 @@ use super::config::{self, OvhConfig, OvhCredentials};
 ///
 /// The API stages every record change; a change is served only after a refresh of the zone,
 /// `POST /domain/zone/{zone}/refresh`, which publishes every staged change of the zone at once,
-/// including changes staged by anyone else, and has no counterpart that discards them. The
-/// record listing shows the staged state. The client therefore:
+/// including changes staged by anyone else, and has no counterpart that discards them.
+/// Everything below rests on one assumption, not documented and not observed against the live
+/// API: that the record endpoints read the staged state, so that a change that is stored but
+/// not published reads as present (the schema says only that a change "applies after the zone
+/// is refreshed"). The rules:
 ///
-/// - ends every write operation that succeeds with a refresh of the zone, also when the
-///   operation found nothing to change (`AlreadyPresent`, `NotPresent`, `Unchanged`): the value
-///   it found may be a change of an earlier operation whose refresh did not happen, in this or
-///   another process, and the operation's success means that the state it reports is published.
-///   A refresh is idempotent and is retried by the transport like a read;
-/// - when the refresh fails, returns its error, stating that the record changes are stored but
-///   not published. Nothing is undone: the staged changes stay and are published by the next
-///   refresh of the zone, which the repeat of the operation sends;
-/// - when a write operation fails after it sent a record write (a replacement that failed
-///   part-way, a write whose outcome is unknown), refreshes the zone too, so that what the record
-///   listing shows and what is published do not drift apart, and returns the operation's error.
-///   An operation that fails before any record write sends no refresh.
+/// - Every write operation that reaches the provider (sends at least one request about the
+///   zone) ends with a refresh of the zone, whatever its outcome: also when it found nothing to
+///   change (`AlreadyPresent`, `NotPresent`, `Unchanged`) and when it fails after its read
+///   (`PreconditionFailed` included). What it read may be a change of an earlier operation, in
+///   this or another process, whose refresh failed or never happened; the refresh publishes it,
+///   so an operation that succeeds reports a published state, and a `PreconditionFailed` describes
+///   one too once its refresh succeeded. A refresh is idempotent and is retried by the transport
+///   like a read. It runs after the operation's name lock is released.
+/// - When the refresh of an operation that succeeded fails, the operation fails with the
+///   refresh's error, its text saying that the changes are stored but not published (where the
+///   kind has a text: `RateLimited` has none). Nothing is undone. When the operation itself
+///   failed, its own error is returned and the refresh's result is dropped.
+/// - The client keeps, per zone and in this client only, the record writes it started that no
+///   successful refresh has covered yet ("a refresh is owed"). While one is owed, every operation
+///   in the zone refreshes: a write operation at its end on every exit, also one that fails before
+///   any request; `get_rrset` and `list_rrsets` before they read, so that what they report is what
+///   is served (a read that publishes is surprising; a read that reports as present a change no
+///   name server serves is worse). If that refresh fails, the read fails with the refresh's error.
+///   A write whose future was dropped after it was sent thus is published by the client's next
+///   operation in the zone.
 ///
-/// Publication of a refreshed zone by the name servers takes a time the documentation does not
-/// state; the default propagation timeout is lego's.
+/// What is not guaranteed: the mark lives in the client and is lost with it or with the process.
+/// A change staged by a dropped future or a failed refresh and then forgotten that way is published
+/// only by the next write operation in the zone that reaches the provider, in any process, or by
+/// anyone else's refresh (the control panel's included); a read in another client does not
+/// publish it and reports it as present. Publication of a refreshed zone by the name servers
+/// takes a time the documentation does not state; the default propagation timeout is lego's.
 ///
 /// # Reads
 ///
 /// The record listing answers identifiers only, filtered by type and name with pattern matches;
-/// every record is then read on its own, so a read of a name with N records costs N + 1 requests
-/// and a zone listing as many as the zone has records plus one. A read of more than 1000 records
-/// fails with `Error::Protocol` instead of returning part of them. The type and name of every
-/// record are compared exactly on the client's side.
+/// every record is then read on its own. A read of a name with N records of the type costs
+/// N + 1 requests; at the apex, and for a name with a backslash escape, the listing is filtered
+/// by type only, so the read costs every record of that type in the zone plus one. A zone
+/// listing costs the zone's records plus one. A read of more than 1000 records fails with
+/// `Error::Protocol` instead of returning part of them. The type and name of every record are
+/// compared exactly on the client's side. Reads report the staged state (see above).
 pub struct Ovh {
     config: OvhConfig,
     /// The API.
@@ -86,6 +112,9 @@ pub struct Ovh {
     pub(super) locks: NameLocks,
     /// TTL of a new record.
     pub(super) ttl: u32,
+    /// For a TXT rrset whose records state no TTL: the form they have, from the read of the
+    /// operation that holds the name's lock, for the create that follows it.
+    txt_unstated: Mutex<HashMap<(DomainName, DomainName), Unstated>>,
 }
 
 impl fmt::Debug for Ovh {
@@ -132,36 +161,87 @@ impl Ovh {
                 &settings.application_key,
                 application_secret,
                 consumer_key,
+                settings.read_pause,
             )?,
             locks: ctx.locks().clone(),
             ttl: settings.ttl,
+            txt_unstated: Mutex::new(HashMap::new()),
             config,
         })
     }
 
-    /// Runs the write operation `work` in `zone` and publishes its changes: a refresh after
-    /// success, and after a failure that came after a record write (see the type's
-    /// documentation, "Staged changes and the refresh").
+    /// Remembers how the TXT rrset at `name` states no TTL (`None`: it states one, or there is
+    /// none). Called by the TXT read under the name's lock.
+    pub(super) fn remember_unstated(
+        &self,
+        zone: &DomainName,
+        name: &DomainName,
+        unstated: Option<Unstated>,
+    ) {
+        let mut map = self
+            .txt_unstated
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let key = (zone.clone(), name.clone());
+        match unstated {
+            Some(form) => {
+                map.insert(key, form);
+            }
+            None => {
+                map.remove(&key);
+            }
+        }
+    }
+
+    /// The form the last TXT read at `name` found.
+    pub(super) fn unstated(&self, zone: &DomainName, name: &DomainName) -> Unstated {
+        self.txt_unstated
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(zone.clone(), name.clone()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Runs the write operation `work` in `zone` and publishes what is staged (see the type's
+    /// documentation, "Staged changes and the refresh"): a refresh after success, after a
+    /// failure once the operation reached the provider, and on every exit while a refresh is
+    /// owed.
     async fn published<T>(
         &self,
         zone: &DomainName,
         work: impl Future<Output = Result<T, Error>>,
     ) -> Result<T, Error> {
-        let before = self.api.writes(zone);
+        let before = self.api.contacts(zone);
         match work.await {
             Ok(outcome) => match self.api.refresh(zone).await {
                 Ok(()) => Ok(outcome),
                 Err(e) => Err(self.api.unpublished(e)),
             },
             Err(e) => {
-                if self.api.writes(zone) != before {
-                    // The operation's error is the result; a failed refresh changes nothing
-                    // about it, and the next operation's refresh publishes what is staged.
+                if self.api.contacts(zone) != before || self.api.owed(zone) {
+                    // The operation's error is the result; a failed refresh leaves the mark,
+                    // and the next operation in the zone refreshes again.
                     let _ = self.api.refresh(zone).await;
                 }
                 Err(e)
             }
         }
+    }
+
+    /// Runs the read `work` in `zone`, after a refresh when one is owed.
+    async fn settled<T>(
+        &self,
+        zone: &DomainName,
+        work: impl Future<Output = Result<T, Error>>,
+    ) -> Result<T, Error> {
+        if self.api.owed(zone) {
+            self.api
+                .refresh(zone)
+                .await
+                .map_err(|e| self.api.unpublished(e))?;
+        }
+        work.await
     }
 }
 
@@ -212,14 +292,16 @@ impl Provider for Ovh {
     }
 
     /// Every record of the zone, read one by one, grouped into rrsets. Records of types outside
-    /// the record-level type list are listed too. The listing shows staged changes that no
-    /// refresh has published yet.
+    /// the record-level type list are listed too. The listing reports the staged state; a
+    /// refresh this client owes the zone is sent first.
     async fn list_rrsets(&self, zone: &DomainName) -> Result<ZoneListing, Error> {
         Call::list_rrsets(zone)
-            .observe(self, self.list_zone(zone))
+            .observe(self, self.settled(zone, self.list_zone(zone)))
             .await
     }
 
+    /// The rrset as the record endpoints report it (the staged state); a refresh this client
+    /// owes the zone is sent first.
     async fn get_rrset(
         &self,
         zone: &DomainName,
@@ -227,7 +309,10 @@ impl Provider for Ovh {
         rtype: RecordType,
     ) -> Result<Option<RrSet>, Error> {
         Call::get_rrset(zone, name, rtype)
-            .observe(self, rrsets::get_per_record(self, zone, name, rtype))
+            .observe(
+                self,
+                self.settled(zone, rrsets::get_per_record(self, zone, name, rtype)),
+            )
             .await
     }
 
